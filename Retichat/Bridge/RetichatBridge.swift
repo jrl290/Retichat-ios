@@ -1,0 +1,288 @@
+//
+//  RetichatBridge.swift
+//  Retichat
+//
+//  Swift wrapper around the C FFI to Reticulum/LXMF Rust libraries.
+//  Transport, settings, raw packet, link request, and callback dispatch.
+//  LXMF protocol operations are handled by LxmfClient.swift.
+//
+
+import Foundation
+
+// MARK: - Callback protocols
+
+protocol MessageCallback: AnyObject {
+    func onMessage(hash: Data, srcHash: Data, destHash: Data,
+                   title: String, content: String, timestamp: Double,
+                   signatureValid: Bool, fieldsRaw: Data)
+}
+
+protocol AnnounceCallback: AnyObject {
+    func onAnnounce(destHash: Data, displayName: String?)
+}
+
+/// Receives outbound message state transitions from Rust.
+/// Fired at: SENT (0x04), DELIVERED (0x08), REJECTED (0xFD), CANCELLED (0xFE), FAILED (0xFF).
+protocol MessageStateCallback: AnyObject {
+    func onMessageState(hash: Data, state: UInt8)
+}
+
+// MARK: - Message delivery method constants
+
+enum LxmfMethod {
+    static let opportunistic: UInt8 = 0x01
+    static let direct: UInt8 = 0x02
+    static let propagated: UInt8 = 0x03
+}
+
+// MARK: - Message state constants
+
+enum LxmfState {
+    static let new_: Int32 = 0
+    static let generating: Int32 = 1
+    static let sent: Int32 = 2
+    static let delivered: Int32 = 4
+    static let failed: Int32 = 255
+}
+
+// MARK: - RetichatBridge
+
+final class RetichatBridge: @unchecked Sendable {
+    static let shared = RetichatBridge()
+
+    private weak var messageCallback: MessageCallback?
+    private weak var announceCallback: AnnounceCallback?
+    private weak var messageStateCallback: (any MessageStateCallback)?
+
+    private init() {}
+
+    // MARK: - Callback wiring
+
+    /// Wire LxmfClient callbacks through this bridge's dispatch mechanism.
+    func wireCallbacks(to client: LxmfClient, messageCallback: MessageCallback, announceCallback: AnnounceCallback?, messageStateCallback: (any MessageStateCallback)? = nil) {
+        self.messageCallback = messageCallback
+        self.announceCallback = announceCallback
+        self.messageStateCallback = messageStateCallback
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        client.setDeliveryCallback(deliveryTrampoline, context: ctx)
+        if announceCallback != nil {
+            client.setAnnounceCallback(announceTrampoline, context: ctx)
+        }
+        client.setMessageStateCallback(messageStateTrampoline, context: ctx)
+    }
+
+    // MARK: - Last error
+
+    func lastError() -> String? {
+        guard let ptr = lxmf_last_error() else { return nil }
+        let str = String(cString: ptr)
+        lxmf_free_string(ptr)
+        return str
+    }
+
+    // MARK: - Transport
+
+    func transportHasPath(destHash: Data) -> Bool {
+        return destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_transport_has_path(ptr, UInt32(destHash.count)) == 1
+        }
+    }
+
+    func transportRequestPath(destHash: Data) -> Bool {
+        return destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_transport_request_path(ptr, UInt32(destHash.count)) == 0
+        }
+    }
+
+    func transportHopsTo(destHash: Data) -> Int32 {
+        return destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_transport_hops_to(ptr, UInt32(destHash.count))
+        }
+    }
+
+    // MARK: - Settings
+
+    func setDropAnnounces(enabled: Bool) {
+        retichat_set_drop_announces(enabled ? 1 : 0)
+    }
+
+    /// Add a destination to the announce watchlist so its announces pass
+    /// through even when drop_announces is enabled.
+    func watchAnnounce(destHash: Data) {
+        destHash.withUnsafeBytes { buf in
+            retichat_watch_announce(buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    UInt32(destHash.count))
+        }
+    }
+
+    /// Remove a destination from the announce watchlist.
+    func unwatchAnnounce(destHash: Data) {
+        destHash.withUnsafeBytes { buf in
+            retichat_unwatch_announce(buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                      UInt32(destHash.count))
+        }
+    }
+
+    func setKeepaliveInterval(secs: Double) -> Bool {
+        return retichat_set_keepalive_interval(secs) == 0
+    }
+
+    // MARK: - Network Connectivity
+
+    /// Signal that network connectivity has been restored.
+    /// Wakes TCP reconnect loops for an immediate retry.
+    func nudgeReconnect() {
+        rns_nudge_reconnect()
+    }
+
+    // MARK: - Raw packet send
+
+    func packetSendToHash(destHash: Data, appName: String, aspects: String,
+                          payload: Data) -> Bool {
+        return destHash.withUnsafeBytes { hashBuf in
+            payload.withUnsafeBytes { payBuf in
+                appName.withCString { cApp in
+                    aspects.withCString { cAsp in
+                        let hPtr = hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                        let pPtr = payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                        return retichat_packet_send_to_hash(
+                            hPtr, UInt32(destHash.count),
+                            cApp, cAsp,
+                            pPtr, UInt32(payload.count)
+                        ) == 0
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Link request
+
+    func linkRequest(destHash: Data, appName: String, aspects: String,
+                     identityHandle: UInt64, path: String,
+                     payload: Data, timeoutSecs: Double = 15.0) -> Data? {
+        return destHash.withUnsafeBytes { hashBuf in
+            payload.withUnsafeBytes { payBuf in
+                appName.withCString { cApp in
+                    aspects.withCString { cAsp in
+                        path.withCString { cPath in
+                            var outLen: UInt32 = 0
+                            let hPtr = hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                            let pPtr = payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                            guard let ptr = retichat_link_request(
+                                hPtr, UInt32(destHash.count),
+                                cApp, cAsp,
+                                identityHandle,
+                                cPath,
+                                pPtr, UInt32(payload.count),
+                                timeoutSecs,
+                                &outLen
+                            ) else {
+                                return nil
+                            }
+                            let data = Data(bytes: ptr, count: Int(outLen))
+                            lxmf_free_bytes(ptr, outLen)
+                            return data
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Internal callback dispatch
+
+    func handleDelivery(hash: Data, srcHash: Data, destHash: Data,
+                        title: String, content: String, timestamp: Double,
+                        signatureValid: Bool, fieldsRaw: Data) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                print("[RetichatBridge] handleDelivery: DROPPED - bridge deallocated")
+                return
+            }
+            guard let cb = self.messageCallback else {
+                print("[RetichatBridge] handleDelivery: DROPPED - messageCallback is nil (ChatRepository deallocated?)")
+                return
+            }
+            cb.onMessage(
+                hash: hash, srcHash: srcHash, destHash: destHash,
+                title: title, content: content, timestamp: timestamp,
+                signatureValid: signatureValid, fieldsRaw: fieldsRaw
+            )
+        }
+    }
+
+    func handleAnnounce(destHash: Data, displayName: String?) {
+        DispatchQueue.main.async { [weak self] in
+            self?.announceCallback?.onAnnounce(destHash: destHash, displayName: displayName)
+        }
+    }
+
+    func handleMessageState(hash: Data, state: UInt8) {
+        DispatchQueue.main.async { [weak self] in
+            self?.messageStateCallback?.onMessageState(hash: hash, state: state)
+        }
+    }
+}
+
+// MARK: - C callback trampolines
+
+/// Called from Rust on a background thread when a message is delivered.
+private func deliveryTrampoline(
+    context: UnsafeMutableRawPointer?,
+    hash: UnsafePointer<UInt8>?, hashLen: UInt32,
+    srcHash: UnsafePointer<UInt8>?, srcLen: UInt32,
+    destHash: UnsafePointer<UInt8>?, destLen: UInt32,
+    title: UnsafePointer<CChar>?,
+    content: UnsafePointer<CChar>?,
+    timestamp: Double,
+    signatureValid: Int32,
+    fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32
+) {
+    guard let context = context else { return }
+    let bridge = Unmanaged<RetichatBridge>.fromOpaque(context).takeUnretainedValue()
+
+    let hashData = hash.map { Data(bytes: $0, count: Int(hashLen)) } ?? Data()
+    let srcData = srcHash.map { Data(bytes: $0, count: Int(srcLen)) } ?? Data()
+    let destData = destHash.map { Data(bytes: $0, count: Int(destLen)) } ?? Data()
+    let titleStr = title.map { String(cString: $0) } ?? ""
+    let contentStr = content.map { String(cString: $0) } ?? ""
+    let fieldsData = fieldsRaw.map { Data(bytes: $0, count: Int(fieldsLen)) } ?? Data()
+
+    bridge.handleDelivery(
+        hash: hashData, srcHash: srcData, destHash: destData,
+        title: titleStr, content: contentStr, timestamp: timestamp,
+        signatureValid: signatureValid != 0, fieldsRaw: fieldsData
+    )
+}
+
+/// Called from Rust on a background thread when an announce is received.
+private func announceTrampoline(
+    context: UnsafeMutableRawPointer?,
+    destHash: UnsafePointer<UInt8>?, destLen: UInt32,
+    displayName: UnsafePointer<CChar>?
+) {
+    guard let context = context else { return }
+    let bridge = Unmanaged<RetichatBridge>.fromOpaque(context).takeUnretainedValue()
+
+    let hashData = destHash.map { Data(bytes: $0, count: Int(destLen)) } ?? Data()
+    let nameStr = displayName.map { String(cString: $0) }
+
+    bridge.handleAnnounce(destHash: hashData, displayName: nameStr)
+}
+
+/// Called from Rust on a background thread when an outbound message changes state.
+private func messageStateTrampoline(
+    context: UnsafeMutableRawPointer?,
+    msgHash: UnsafePointer<UInt8>?, hashLen: UInt32,
+    state: UInt8
+) {
+    guard let context = context else { return }
+    let bridge = Unmanaged<RetichatBridge>.fromOpaque(context).takeUnretainedValue()
+
+    let hashData = msgHash.map { Data(bytes: $0, count: Int(hashLen)) } ?? Data()
+    bridge.handleMessageState(hash: hashData, state: state)
+}

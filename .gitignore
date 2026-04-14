@@ -1,0 +1,31 @@
+# === Build artifacts ===
+Frameworks/
+Retichat/RetichatFFI.xcframework/
+rust/retichat-ffi/target/
+build/
+DerivedData/
+.build/
+*.xcarchive
+*.bak
+
+# === Xcode user-specific ===
+xcuserdata/
+*.xcuserdatad/
+*.xcbkptlist
+
+# === Logs (may contain runtime keys/hashes) ===
+*.log
+retichat.log
+
+# === macOS junk ===
+.DS_Store
+.DS_Store?
+
+# === Local artifacts ===
+~/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*~

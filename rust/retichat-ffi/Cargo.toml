@@ -1,0 +1,11 @@
+[package]
+name = "retichat-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+reticulum_rust = { path = "../../../Reticulum-rust", default-features = false }
+lxmf_rust = { path = "../../../LXMF-rust" }

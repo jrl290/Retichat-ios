@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.retichat.refresh</string>
+		<string>com.retichat.processing</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Retichat uses the camera to scan QR codes for adding contacts.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Retichat needs local network access to connect to nearby Reticulum nodes.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_reticulum._tcp</string>
+	</array>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+</dict>
+</plist>

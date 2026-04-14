@@ -1,0 +1,1768 @@
+//
+//  ChatRepository.swift
+//  Retichat
+//
+//  Core data repository: message send/receive, group chat, attachments.
+//  Mirrors the Android ChatRepository.kt.
+//
+
+import Foundation
+import SwiftData
+import Combine
+
+@MainActor
+final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback, MessageStateCallback {
+    // MARK: - Published state
+
+    @Published var chats: [Chat] = []
+    @Published var serviceRunning = false
+    @Published var ownHashHex: String = ""
+    @Published var statusMessage: String = "Idle"
+
+    // MARK: - Handles
+
+    private(set) var lxmfClient: LxmfClient?
+    private(set) var ownHash: Data = Data()
+
+    // MARK: - Dependencies
+
+    private let bridge = RetichatBridge.shared
+    private let prefs = UserPreferences.shared
+    private let propManager = PropagationNodeManager.shared
+    private let notifManager = NotificationManager.shared
+
+    private var modelContext: ModelContext?
+    private var pollTimer: Timer?
+    private var announceTimer: Timer?
+
+    // MARK: - Outbound message state tracking
+    //
+    // Keyed by LXMF message hash hex.  Populated at send time, removed when
+    // the message reaches a terminal state (delivered, sent-to-prop, or failed).
+    // The message_state_callback from Rust drives all state transitions.
+
+    private struct PendingOutbound {
+        let messageId: String      // DB record primary key (= original msg hash hex)
+        let chatId: String
+        let peerHash: Data
+        let method: UInt8          // LxmfMethod.direct or .propagated
+        let msgHandle: UInt64
+        let content: String
+        let title: String
+        let hasAttachments: Bool
+    }
+
+    private var pendingOutbound: [String: PendingOutbound] = [:]
+
+    // MARK: - Init
+
+    func configure(modelContext: ModelContext) {
+        self.modelContext = modelContext
+    }
+
+    // MARK: - Service lifecycle
+
+    func startService() {
+        guard !serviceRunning else { return }
+
+        print("[Retichat] v1.0 build 2 starting")
+
+        statusMessage = "Starting…"
+
+        let configDir = reticulumConfigDir()
+        generateConfig(configDir: configDir)
+
+        let idPath = configDir + "/identity"
+        let storagePath = configDir + "/lxmf_storage"
+        try? FileManager.default.createDirectory(
+            atPath: storagePath, withIntermediateDirectories: true
+        )
+
+        let config = LxmfClientConfig(
+            configDir: configDir,
+            storagePath: storagePath,
+            identityPath: idPath,
+            createIdentity: true,
+            displayName: prefs.displayName,
+            logLevel: 4,
+            stampCost: -1
+        )
+
+        // Heavy FFI call (TCP connect, transport init, ratchet load) runs off
+        // the main thread so the UI stays responsive during startup.
+        Task.detached(priority: .userInitiated) { [config, idPath, configDir, storagePath] in
+            let result: Result<LxmfClient, Error> = Result {
+                try LxmfClient.start(config: config)
+            }
+
+            // App Group file copies are pure I/O — keep them off main thread too
+            PendingNotification.copyIdentityToAppGroup(from: idPath)
+            PendingNotification.copyConfigToAppGroup(from: configDir + "/config")
+            PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
+
+            await MainActor.run { [weak self] in
+                self?.finishStartService(result: result, configDir: configDir, storagePath: storagePath)
+            }
+        }
+    }
+
+    /// Second half of startup — runs on @MainActor after the FFI call completes.
+    private func finishStartService(result: Result<LxmfClient, Error>, configDir: String, storagePath: String) {
+        let client: LxmfClient
+        switch result {
+        case .success(let c):
+            client = c
+        case .failure(let error):
+            print("[Retichat] Failed to start: \(error.localizedDescription)")
+            statusMessage = "Failed to start"
+            return
+        }
+
+        self.lxmfClient = client
+        ownHash = client.destHash
+        ownHashHex = client.destHashHex
+        print("[Retichat] Identity hash: \(client.identityHashHex)")
+
+        // Set callbacks
+        bridge.wireCallbacks(to: lxmfClient!, messageCallback: self, announceCallback: self, messageStateCallback: self)
+
+        // Leaf-node mode: drop unsolicited network-wide announces; only PATH_RESPONSE
+        // replies to our own transportRequestPath calls pass through.
+        bridge.setDropAnnounces(enabled: prefs.dropAnnounces)
+
+        // Register with the connection state manager (path requests, peer tracking).
+        ConnectionStateManager.shared.register(lxmfClient: client)
+
+        serviceRunning = true
+        statusMessage = "Connected — \(ownHashHex.prefix(8))…"
+
+        // Announce our delivery destination immediately, then every 30 minutes
+        announce()
+        announceTimer = Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.announce()
+            }
+        }
+
+        // Sync ratchets to App Group after announce (so the NSE can decrypt).
+        // Heavy file-copy I/O runs off the main thread.
+        Task.detached(priority: .utility) {
+            PendingNotification.syncRatchetsToAppGroup(from: storagePath)
+        }
+
+        // Start propagation polling
+        startPropagationPolling()
+
+        // Register with rfed notify service so the relay can wake this device.
+        registerRfedNotify()
+
+        // Network reconnect handler
+        NetworkMonitor.shared.onConnect = { [weak self] in
+            // Immediately wake any TCP reconnect loops that are sleeping
+            RetichatBridge.shared.nudgeReconnect()
+            Task { @MainActor in
+                ConnectionStateManager.shared.onNetworkReconnect()
+                self?.announce()
+                self?.flushPendingMessages()
+            }
+        }
+
+        // Import any messages the NSE delivered while we were dead
+        importNSEMessages()
+
+        print("[Retichat] Service started. Hash: \(ownHashHex)")
+    }
+
+    func stopService() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        announceTimer?.invalidate()
+        announceTimer = nil
+
+        // Destroy any message handles still in flight.
+        for (_, pending) in pendingOutbound {
+            LxmfClient.messageDestroy(pending.msgHandle)
+        }
+        pendingOutbound.removeAll()
+
+        lxmfClient?.shutdown()
+        lxmfClient = nil
+        serviceRunning = false
+        statusMessage = "Stopped"
+    }
+
+    // MARK: - RFed APNs token registration
+
+    /// Registers this device for push notifications:
+    /// 1. Sends APNs token to the apns_bridge (rfed.apns, hardcoded).
+    /// 2. Registers the relay hash with rfed (rfed.notify Link request).
+    private func registerRfedNotify() {
+        guard !ownHash.isEmpty, let client = lxmfClient else { return }
+        // 1. Register APNs token with the apns_bridge (plain packet → rfed.apns)
+        ApnsTokenRegistrar.shared.registerIfNeeded(subscriberHash: ownHash)
+        // 2. Register relay hash with rfed (Link request → rfed.notify)
+        RfedNotifyRegistrar.shared.registerIfNeeded(identityHandle: client.identityHandle)
+    }
+
+    // MARK: - Config generation
+
+    private func reticulumConfigDir() -> String {
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first!.path
+        let dir = appSupport + "/reticulum"
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true
+        )
+        return dir
+    }
+
+    private func generateConfig(configDir: String) {
+        let configPath = configDir + "/config"
+
+        // Build config with proper format:
+        //   [[InterfaceName]]      <- user-friendly name as section header
+        //     type = TCPClientInterface   <- type key inside section
+        var lines: [String] = []
+        lines.append("[reticulum]")
+        lines.append("  enable_transport = false")
+        lines.append("  share_instance = false")
+        lines.append("  panic_on_interface_errors = false")
+        lines.append("")
+        lines.append("[logging]")
+        lines.append("  loglevel = 4")
+        lines.append("")
+        lines.append("[interfaces]")
+
+        // Get user-configured interfaces from database
+        var addedInterfaces = false
+        if let ctx = modelContext {
+            let descriptor = FetchDescriptor<InterfaceConfigEntity>(
+                predicate: #Predicate { $0.enabled == true }
+            )
+            if let interfaces = try? ctx.fetch(descriptor), !interfaces.isEmpty {
+                for iface in interfaces {
+                    lines.append("")
+                    lines.append("  [[\(iface.name)]]")
+                    lines.append("    type = TCPClientInterface")
+                    lines.append("    target_host = \(iface.targetHost)")
+                    lines.append("    target_port = \(iface.targetPort)")
+                    lines.append("    enabled = yes")
+                }
+                addedInterfaces = true
+            }
+        }
+
+        if !addedInterfaces {
+            // Use a single random default endpoint when no user-configured interfaces exist
+            if let ep = DefaultEndpointManager.endpoints.randomElement() {
+                lines.append("")
+                lines.append("  [[Default 1]]")
+                lines.append("    type = TCPClientInterface")
+                lines.append("    target_host = \(ep.host)")
+                lines.append("    target_port = \(ep.port)")
+                lines.append("    enabled = yes")
+            }
+        }
+
+        let config = lines.joined(separator: "\n") + "\n"
+        try? config.write(toFile: configPath, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - Propagation polling
+
+    private func startPropagationPolling() {
+        // Apply user-configured node before the first poll fires.
+        propManager.setUserConfiguredNode(prefs.lxmfPropagationHash)
+
+        // Share propagation node list with NSE so it can sync on its own.
+        syncPropagationNodesToAppGroup()
+
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.pollPropagationNode()
+            }
+        }
+        // Initial poll after 5 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.pollPropagationNode()
+        }
+    }
+
+    /// Write the full propagation node list to the App Group so the NSE can
+    /// request messages when the main app is dead (force-quit).
+    private func syncPropagationNodesToAppGroup() {
+        var hashes: [String] = []
+        // User-configured node first (if any)
+        let userHash = prefs.lxmfPropagationHash.trimmingCharacters(in: .whitespaces).lowercased()
+        if userHash.count == 32, userHash.allSatisfy({ $0.isHexDigit }) {
+            hashes.append(userHash)
+        }
+        // Add the current node from the manager (may differ from user hash)
+        if let current = propManager.currentNode() {
+            let hex = current.map { String(format: "%02x", $0) }.joined()
+            if !hashes.contains(hex) { hashes.append(hex) }
+        }
+        // Heavy I/O (persist + file copies) runs off the main thread
+        let configDir = reticulumConfigDir()
+        let client = lxmfClient
+        let hashSnapshot = hashes
+        Task.detached(priority: .utility) {
+            PendingNotification.writePropagationNodes(hashSnapshot)
+            client?.persist()
+            PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
+            PendingNotification.syncRatchetsToAppGroup(from: configDir + "/lxmf_storage")
+        }
+    }
+
+    /// Flush in-memory path table and ratchets to disk so they survive app suspension.
+    func persist() {
+        lxmfClient?.persist()
+    }
+
+    // MARK: - NSE message import
+
+    /// Import messages that the NSE delivered while the app was not running.
+    func importNSEMessages() {
+        let messages = PendingNotification.readAndClearNSEMessages()
+        guard !messages.isEmpty, let ctx = modelContext else { return }
+        print("[Retichat] importing \(messages.count) NSE message(s)")
+
+        for msg in messages {
+            // Dedup — skip if we already have this message
+            let hashHex = msg.messageHash
+            let dup = FetchDescriptor<MessageEntity>(
+                predicate: #Predicate { $0.id == hashHex }
+            )
+            if let existing = try? ctx.fetch(dup), !existing.isEmpty { continue }
+
+            let srcHex = msg.senderHash
+
+            // Decode LXMF fields
+            let fieldsData = Data(base64Encoded: msg.fieldsRawBase64) ?? Data()
+            let fields = LxmfFieldsDecoder.decode(fieldsData)
+
+            if let groupId = fields.groupId {
+                // For invites: filter by sender, not groupId (groupId not in allowlist yet)
+                // For all other group actions: filter by groupId (must be a known group)
+                let shouldProcess: Bool
+                if fields.groupAction == GroupAction.invite {
+                    shouldProcess = isAllowlisted(destHash: srcHex)
+                } else {
+                    shouldProcess = isAllowlisted(destHash: groupId)
+                }
+                if shouldProcess {
+                    handleGroupMessage(
+                        hash: Data(hexString: msg.messageHash) ?? Data(),
+                        srcHash: Data(hexString: srcHex) ?? Data(),
+                        content: msg.content,
+                        timestamp: msg.timestamp,
+                        fields: fields,
+                        groupId: groupId
+                    )
+                }
+                continue
+            }
+
+            // Filter: drop messages from senders not in the contact allowlist
+            guard isAllowlisted(destHash: srcHex) else { continue }
+
+            let chatId = srcHex
+            ensureChat(id: chatId, peerHash: srcHex)
+            ensureContact(destHash: srcHex)
+
+            let entity = MessageEntity(
+                id: hashHex,
+                chatId: chatId,
+                senderHash: srcHex,
+                content: msg.content,
+                title: msg.title,
+                timestamp: msg.timestamp,
+                isOutgoing: false,
+                deliveryState: DeliveryState.delivered,
+                signatureValid: msg.signatureValid
+            )
+            ctx.insert(entity)
+
+            for (filename, data) in fields.attachments {
+                let att = AttachmentEntity(
+                    id: UUID().uuidString,
+                    messageId: hashHex,
+                    filename: filename,
+                    data: data
+                )
+                ctx.insert(att)
+            }
+
+            updateChatTimestamp(chatId: chatId, timestamp: msg.timestamp)
+        }
+
+        try? ctx.save()
+        refreshChats()
+    }
+
+    func pollPropagationNode() {
+        guard let client = lxmfClient else { return }
+        propManager.setUserConfiguredNode(prefs.lxmfPropagationHash)
+
+        if let nodeHash = propManager.currentNode() {
+            if !client.sync(nodeHash: nodeHash) {
+                propManager.rotateToNext()
+            }
+        }
+    }
+
+    // MARK: - Send message
+
+    func sendMessage(chatId: String, content: String, attachments: [(String, Data)] = []) {
+        print("[Retichat] sendMessage called chatId=\(chatId.prefix(8)) content=\(content.prefix(20))")
+        guard let ctx = modelContext else {
+            print("[Retichat] sendMessage: ABORT - modelContext is nil")
+            return
+        }
+
+        // Look up the chat
+        let chatDescriptor = FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.id == chatId }
+        )
+        guard let chat = try? ctx.fetch(chatDescriptor).first else {
+            print("[Retichat] sendMessage: ABORT - chat not found for id=\(chatId)")
+            return
+        }
+
+        // Branch: group vs. direct
+        if chat.isGroup {
+            sendGroupMessage(chat: chat, chatId: chatId, content: content, attachments: attachments)
+            return
+        }
+
+        let destHashHex = chat.peerHash
+        print("[Retichat] sendMessage: destHashHex=\(destHashHex.prefix(8)) lxmfClientNil=\(lxmfClient == nil)")
+        guard let destData = Data(hexString: destHashHex) else {
+            print("[Retichat] sendMessage: ABORT - invalid destHashHex=\(destHashHex)")
+            return
+        }
+
+        // Create message via LxmfClient
+        guard let client = lxmfClient else {
+            print("[Retichat] sendMessage: ABORT - lxmfClient is nil")
+            return
+        }
+
+        // Decide delivery method at send time from live link state (no polling).
+        let method = ConnectionStateManager.shared.deliveryMethod(for: destData)
+        let methodName = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
+        print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
+
+        let msgHandle = client.createMessage(
+            to: destData,
+            content: content,
+            title: "",
+            method: method
+        )
+        guard msgHandle != 0 else {
+            print("[Retichat] Failed to create message: \(LxmfClient.lastError ?? "")")
+            return
+        }
+
+        // Add attachments
+        for (filename, data) in attachments {
+            _ = LxmfClient.messageAddAttachment(msgHandle, filename: filename, data: data)
+        }
+
+        // Send first — pack() runs synchronously inside sendMessage and
+        // computes the hash, so messageHash() is only valid after this call.
+        guard client.sendMessage(msgHandle) else {
+            print("[Retichat] Failed to send message: \(LxmfClient.lastError ?? "")")
+            LxmfClient.messageDestroy(msgHandle)
+            return
+        }
+
+        // Hash is now available after pack().
+        guard let msgHashData = LxmfClient.messageHash(msgHandle), !msgHashData.isEmpty else {
+            print("[Retichat] Failed to get message hash after send")
+            LxmfClient.messageDestroy(msgHandle)
+            return
+        }
+        let msgHashHex = msgHashData.hexString
+
+        // Insert into database (optimistic — state callbacks dispatch async
+        // via Task { @MainActor in ... } so this always runs first).
+        let msgEntity = MessageEntity(
+            id: msgHashHex,
+            chatId: chatId,
+            senderHash: ownHashHex,
+            content: content,
+            timestamp: Date().timeIntervalSince1970,
+            isOutgoing: true,
+            deliveryState: DeliveryState.pending,
+            nativeHandle: msgHandle
+        )
+        ctx.insert(msgEntity)
+
+        // Save attachments
+        for (filename, data) in attachments {
+            let att = AttachmentEntity(
+                id: UUID().uuidString,
+                messageId: msgHashHex,
+                filename: filename,
+                data: data
+            )
+            ctx.insert(att)
+        }
+
+        // Update chat timestamp
+        chat.lastMessageTime = msgEntity.timestamp
+        try? ctx.save()
+
+        pendingOutbound[msgHashHex] = PendingOutbound(
+            messageId: msgHashHex,
+            chatId: chatId,
+            peerHash: destData,
+            method: method,
+            msgHandle: msgHandle,
+            content: content,
+            title: "",
+            hasAttachments: !attachments.isEmpty
+        )
+
+        refreshChats()
+    }
+
+    // MARK: - Group message send (fanout to all accepted members)
+
+    private func sendGroupMessage(
+        chat: ChatEntity, chatId: String, content: String, attachments: [(String, Data)]
+    ) {
+        guard let ctx = modelContext, let client = lxmfClient else { return }
+
+        // Get accepted members excluding self
+        let memberDesc = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == chatId }
+        )
+        let allMembers = (try? ctx.fetch(memberDesc)) ?? []
+        let targets = allMembers
+            .filter { $0.inviteStatus == MemberStatus.accepted && $0.memberHash != ownHashHex }
+            .map { $0.memberHash }
+
+        // Generate a stable local ID for this outbound group message
+        let msgId = "grp_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(8))"
+
+        // Insert optimistically
+        let msgEntity = MessageEntity(
+            id: msgId,
+            chatId: chatId,
+            senderHash: ownHashHex,
+            content: content,
+            timestamp: Date().timeIntervalSince1970,
+            isOutgoing: true,
+            deliveryState: DeliveryState.sent   // fanout is fire-and-forget
+        )
+        ctx.insert(msgEntity)
+
+        for (filename, data) in attachments {
+            ctx.insert(AttachmentEntity(
+                id: UUID().uuidString, messageId: msgId, filename: filename, data: data
+            ))
+        }
+
+        chat.lastMessageTime = msgEntity.timestamp
+        try? ctx.save()
+
+        // Fan out to accepted members
+        GroupChatManager.shared.fanoutMessage(
+            groupId: chatId,
+            groupName: chat.groupName ?? "Group",
+            content: content,
+            attachments: attachments,
+            to: targets,
+            from: ownHashHex,
+            via: client
+        )
+
+        refreshChats()
+    }
+
+    // MARK: - Group invite / accept / leave
+
+    /// Accept a pending group invite: mark all members as allowlisted,
+    /// record ourselves as accepted, and broadcast acceptance to others.
+    func acceptGroupInvite(groupId: String) {
+        guard let ctx = modelContext, let client = lxmfClient else { return }
+
+        let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
+        guard let chat = try? ctx.fetch(chatDesc).first else { return }
+
+        // Promote from pending to active
+        chat.groupStatus = "active"
+
+        // Gather the full member list stored from the invite
+        let memberDesc = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == groupId }
+        )
+        let existingMembers = (try? ctx.fetch(memberDesc)) ?? []
+        let allHashes = existingMembers.map { $0.memberHash }
+
+        // Mark ourselves as accepted (add our entry if absent)
+        if let selfEntry = existingMembers.first(where: { $0.memberHash == ownHashHex }) {
+            selfEntry.inviteStatus = MemberStatus.accepted
+        } else {
+            ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: ownHashHex,
+                                         inviteStatus: MemberStatus.accepted))
+        }
+
+        // Add all group members to allowlist (key spec requirement)
+        for hash in allHashes {
+            ensureAllowlistedContact(destHash: hash)
+            if hash != ownHashHex, let hashData = Data(hexString: hash) {
+                RetichatBridge.shared.watchAnnounce(destHash: hashData)
+            }
+        }
+        ensureAllowlistedContact(destHash: groupId)
+
+        try? ctx.save()
+
+        // Broadcast acceptance to everyone else
+        let targets = allHashes.filter { $0 != ownHashHex }
+        GroupChatManager.shared.sendAccept(
+            groupId: groupId, to: targets, from: ownHashHex, via: client
+        )
+
+        refreshChats()
+    }
+
+    /// Decline a pending group invite and remove all local state.
+    func declineGroupInvite(groupId: String) {
+        deleteChat(chatId: groupId)
+    }
+
+    /// Leave an active group: notify accepted members, then delete local state.
+    func leaveGroup(chatId: String) {
+        guard let client = lxmfClient else {
+            deleteChat(chatId: chatId)
+            return
+        }
+
+        let acceptedMembers = (groupMembersWithStatus(groupId: chatId) ?? [])
+            .filter { $0.inviteStatus == MemberStatus.accepted && $0.memberHash != ownHashHex }
+            .map { $0.memberHash }
+
+        GroupChatManager.shared.sendLeave(
+            groupId: chatId, to: acceptedMembers, from: ownHashHex, via: client
+        )
+        deleteChat(chatId: chatId)
+    }
+
+    // MARK: - Conversation lifecycle (delegates to ConnectionStateManager)
+
+    /// Call when a direct-chat conversation screen appears.
+    func openConversation(chatId: String) {
+        guard let ctx = modelContext else { return }
+        let desc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
+        guard let chat = try? ctx.fetch(desc).first,
+              !chat.isGroup,
+              let peerHash = Data(hexString: chat.peerHash) else { return }
+        ConnectionStateManager.shared.openConversation(peerHash: peerHash)
+    }
+
+    /// Call when a conversation screen disappears.
+    func closeConversation(chatId: String) {
+        guard let ctx = modelContext else { return }
+        let desc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
+        guard let chat = try? ctx.fetch(desc).first,
+              !chat.isGroup,
+              let peerHash = Data(hexString: chat.peerHash) else { return }
+        ConnectionStateManager.shared.closeConversation(peerHash: peerHash)
+    }
+
+    // MARK: - MessageStateCallback
+
+    nonisolated func onMessageState(hash: Data, state: UInt8) {
+        Task { @MainActor in
+            self.handleMessageState(hash: hash, state: state)
+        }
+    }
+
+    private func handleMessageState(hash: Data, state: UInt8) {
+        let hashHex = hash.hexString
+        guard let pending = pendingOutbound[hashHex] else { return }
+
+        switch state {
+
+        case 0x04:  // SENT — propagated message accepted by the prop node.
+            updateDeliveryState(messageId: pending.messageId, state: DeliveryState.sent)
+            completePending(hashHex: hashHex, pending: pending)
+
+        case 0x08:  // DELIVERED — recipient downloaded and decrypted the message.
+            updateDeliveryState(messageId: pending.messageId, state: DeliveryState.delivered)
+            completePending(hashHex: hashHex, pending: pending)
+
+        case 0xFD, 0xFE, 0xFF:  // REJECTED, CANCELLED, FAILED.
+            if pending.method == LxmfMethod.direct && !pending.hasAttachments {
+                // Direct link failed.  Mark peer as degraded and retry via prop node.
+                ConnectionStateManager.shared.markPeerDegraded(
+                    destHex: pending.peerHash.hexString
+                )
+                pendingOutbound.removeValue(forKey: hashHex)
+                LxmfClient.messageDestroy(pending.msgHandle)
+                retrySendViaPropNode(pending)
+            } else {
+                // Propagated failed (or had attachments) — final failure.
+                updateDeliveryState(messageId: pending.messageId, state: DeliveryState.failed)
+                completePending(hashHex: hashHex, pending: pending)
+            }
+
+        default:
+            break  // Intermediate states (e.g. SENDING=0x02) — no DB update.
+        }
+    }
+
+    private func completePending(hashHex: String, pending: PendingOutbound) {
+        pendingOutbound.removeValue(forKey: hashHex)
+        LxmfClient.messageDestroy(pending.msgHandle)
+    }
+
+    /// Retry a failed direct-mode message via the propagation node.
+    private func retrySendViaPropNode(_ original: PendingOutbound) {
+        guard let client = lxmfClient else {
+            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+            return
+        }
+
+        let msgHandle = client.createMessage(
+            to: original.peerHash,
+            content: original.content,
+            title: original.title,
+            method: LxmfMethod.propagated
+        )
+        guard msgHandle != 0 else {
+            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+            return
+        }
+
+        // Send first so pack() runs and computes the hash.
+        guard client.sendMessage(msgHandle) else {
+            LxmfClient.messageDestroy(msgHandle)
+            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+            return
+        }
+
+        guard let hashData = LxmfClient.messageHash(msgHandle), !hashData.isEmpty else {
+            LxmfClient.messageDestroy(msgHandle)
+            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+            return
+        }
+
+        let newHashHex = hashData.hexString
+        pendingOutbound[newHashHex] = PendingOutbound(
+            messageId: original.messageId,     // same DB row
+            chatId: original.chatId,
+            peerHash: original.peerHash,
+            method: LxmfMethod.propagated,
+            msgHandle: msgHandle,
+            content: original.content,
+            title: original.title,
+            hasAttachments: false
+        )
+    }
+
+    private func updateDeliveryState(messageId: String, state: Int) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<MessageEntity>(
+            predicate: #Predicate { $0.id == messageId }
+        )
+        if let msg = try? ctx.fetch(descriptor).first {
+            msg.deliveryState = state
+            try? ctx.save()
+        }
+    }
+
+    // MARK: - Flush pending
+
+    func flushPendingMessages() {
+        lxmfClient?.processOutbound()
+    }
+
+    // MARK: - MessageCallback
+
+    nonisolated func onMessage(hash: Data, srcHash: Data, destHash: Data,
+                               title: String, content: String, timestamp: Double,
+                               signatureValid: Bool, fieldsRaw: Data) {
+        Task { @MainActor in
+            self.handleIncomingMessage(
+                hash: hash, srcHash: srcHash, destHash: destHash,
+                title: title, content: content, timestamp: timestamp,
+                signatureValid: signatureValid, fieldsRaw: fieldsRaw
+            )
+        }
+    }
+
+    private func handleIncomingMessage(hash: Data, srcHash: Data, destHash: Data,
+                                        title: String, content: String, timestamp: Double,
+                                        signatureValid: Bool, fieldsRaw: Data) {
+        let srcHexForLog = srcHash.hexString
+        let msgHashHexForLog = hash.hexString
+        print("[Retichat] handleIncomingMessage: hash=\(msgHashHexForLog.prefix(8)) src=\(srcHexForLog.prefix(8)) dest=\(destHash.hexString.prefix(8)) len=\(content.count)")
+        guard let ctx = modelContext else {
+            print("[Retichat] handleIncomingMessage: DROPPED - modelContext is nil")
+            return
+        }
+
+        let srcHex = srcHash.hexString
+        let msgHashHex = hash.hexString
+
+        // Check for duplicate
+        let dupDescriptor = FetchDescriptor<MessageEntity>(
+            predicate: #Predicate { $0.id == msgHashHex }
+        )
+        if let existing = try? ctx.fetch(dupDescriptor), !existing.isEmpty {
+            print("[Retichat] handleIncomingMessage: DROPPED duplicate \(msgHashHex.prefix(8))")
+            return  // Already have this message
+        }
+
+        // Decode LXMF fields
+        let fields = LxmfFieldsDecoder.decode(fieldsRaw)
+
+        // Handle group message
+        if let groupId = fields.groupId {
+            // For invites: filter by sender; for other group actions: filter by known groupId
+            let shouldProcess: Bool
+            if fields.groupAction == GroupAction.invite {
+                shouldProcess = isAllowlisted(destHash: srcHex)
+            } else {
+                shouldProcess = isAllowlisted(destHash: groupId)
+            }
+            if shouldProcess {
+                handleGroupMessage(
+                    hash: hash, srcHash: srcHash, content: content,
+                    timestamp: timestamp, fields: fields, groupId: groupId
+                )
+            }
+            return
+        }
+
+        // Filter: drop direct messages from senders not in the contact allowlist.
+        // Do this before any DB writes so strangers consume no resources.
+        guard isAllowlisted(destHash: srcHex) else {
+            print("[Retichat] handleIncomingMessage: DROPPED filterStrangers=\(prefs.filterStrangers) src=\(srcHex.prefix(8))")
+            return
+        }
+        print("[Retichat] handleIncomingMessage: ACCEPTED src=\(srcHex.prefix(8))")
+
+        // Direct message — find or create chat
+        let chatId = srcHex
+        ensureChat(id: chatId, peerHash: srcHex)
+        ensureContact(destHash: srcHex)
+
+        // Watch for announces from this sender so their display name is received
+        RetichatBridge.shared.watchAnnounce(destHash: srcHash)
+        lxmfClient?.watch(destHash: srcHash)
+
+        // Attempt to fill in the contact's display name from the Identity
+        // announce cache right now (covers the case where their announce
+        // arrived before they were added to the watch list).
+        if let name = lxmfClient?.recallDisplayName(for: srcHash), !name.isEmpty {
+            updateContactNameIfEmpty(destHash: srcHex, name: name)
+        }
+
+        // Insert message
+        let msgEntity = MessageEntity(
+            id: msgHashHex,
+            chatId: chatId,
+            senderHash: srcHex,
+            content: content,
+            title: title,
+            timestamp: timestamp,
+            isOutgoing: false,
+            deliveryState: DeliveryState.delivered,
+            signatureValid: signatureValid
+        )
+        ctx.insert(msgEntity)
+
+        // Handle attachments from fields
+        for (filename, data) in fields.attachments {
+            let att = AttachmentEntity(
+                id: UUID().uuidString,
+                messageId: msgHashHex,
+                filename: filename,
+                data: data
+            )
+            ctx.insert(att)
+        }
+
+        // Update chat timestamp
+        updateChatTimestamp(chatId: chatId, timestamp: timestamp)
+        try? ctx.save()
+
+        // Get sender name for notification
+        let senderName = contactDisplayName(for: srcHex)
+        notifManager.postMessageNotification(
+            chatId: chatId, senderName: senderName, content: content
+        )
+
+        refreshChats()
+    }
+
+    private func handleGroupMessage(hash: Data, srcHash: Data, content: String,
+                                     timestamp: Double, fields: LxmfFields, groupId: String) {
+        let srcHex = srcHash.hexString
+        let actualSender = fields.groupSender ?? srcHex
+        let action = fields.groupAction  // nil = regular message
+
+        switch action {
+        case GroupAction.invite:
+            handleGroupInvite(srcHex: srcHex, content: content, timestamp: timestamp,
+                              fields: fields, groupId: groupId)
+        case GroupAction.accept:
+            handleGroupAccept(memberHex: actualSender, groupId: groupId)
+        case GroupAction.leave:
+            handleGroupLeave(memberHex: actualSender, groupId: groupId,
+                             timestamp: timestamp, msgId: hash.hexString)
+        case GroupAction.relayRequest:
+            handleGroupRelayRequest(srcHex: srcHex, content: content,
+                                    fields: fields, groupId: groupId)
+        case GroupAction.relayDone:
+            print("[GroupChat] relay-done from \(srcHex.prefix(8)) for group \(groupId.prefix(8))")
+        default:
+            // Regular group message
+            handleGroupChatMessage(hash: hash, srcHash: srcHash, content: content,
+                                   timestamp: timestamp, fields: fields, groupId: groupId)
+        }
+    }
+
+    /// Incoming invite to join a group.
+    private func handleGroupInvite(
+        srcHex: String, content: String, timestamp: Double,
+        fields: LxmfFields, groupId: String
+    ) {
+        // Apply stranger filter to the inviting node
+        guard isAllowlisted(destHash: srcHex) else {
+            print("[GroupChat] Dropped invite from stranger \(srcHex.prefix(8))")
+            return
+        }
+
+        guard let ctx = modelContext else { return }
+
+        // Skip if we're already an active member of this group
+        let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
+        if let existing = try? ctx.fetch(chatDesc).first, existing.groupStatus != "pending" {
+            return
+        }
+
+        let memberList = fields.groupMembers ?? [srcHex]
+        let groupName = fields.groupName ?? "Group"
+
+        if (try? ctx.fetch(chatDesc).first) == nil {
+            // Create a pending chat entry
+            let chat = ChatEntity(
+                id: groupId, peerHash: srcHex, isGroup: true,
+                groupName: groupName, groupStatus: "pending"
+            )
+            ctx.insert(chat)
+
+            // Populate member list from invite
+            for memberHash in memberList {
+                let member = GroupMemberEntity(groupId: groupId, memberHash: memberHash,
+                                               inviteStatus: MemberStatus.invited)
+                ctx.insert(member)
+            }
+        }
+
+        // Add the inviting sender to our allowlist so we can reply
+        ensureAllowlistedContact(destHash: srcHex)
+
+        // Insert a system message representing the invite notification
+        let inviteMsgId = "inv_\(groupId.prefix(16))"
+        let dupDesc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == inviteMsgId })
+        if (try? ctx.fetch(dupDesc).first) == nil {
+            let msg = MessageEntity(
+                id: inviteMsgId, chatId: groupId, senderHash: srcHex,
+                content: "Group invite from \(contactDisplayName(for: srcHex)): \"\(groupName)\"",
+                timestamp: timestamp, isOutgoing: false, deliveryState: DeliveryState.delivered
+            )
+            ctx.insert(msg)
+        }
+
+        updateChatTimestamp(chatId: groupId, timestamp: timestamp)
+        try? ctx.save()
+
+        notifManager.postMessageNotification(
+            chatId: groupId,
+            senderName: contactDisplayName(for: srcHex),
+            content: "Group invite: \"\(groupName)\" — tap to accept or decline"
+        )
+        refreshChats()
+    }
+
+    /// Another member accepted the group invite — update their status.
+    private func handleGroupAccept(memberHex: String, groupId: String) {
+        guard let ctx = modelContext else { return }
+        let memberDesc = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == groupId && $0.memberHash == memberHex }
+        )
+        if let entry = try? ctx.fetch(memberDesc).first {
+            entry.inviteStatus = MemberStatus.accepted
+        } else {
+            // Member not in our list yet (can happen if invite processing was partial)
+            ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: memberHex,
+                                          inviteStatus: MemberStatus.accepted))
+        }
+        // Add this newly confirmed member to our allowlist and watchlist
+        ensureAllowlistedContact(destHash: memberHex)
+        if let hashData = Data(hexString: memberHex) {
+            RetichatBridge.shared.watchAnnounce(destHash: hashData)
+        }
+
+        // Insert a system message so the group timeline shows who joined
+        let sysId = "acc_\(memberHex.prefix(8))_\(groupId.prefix(8))"
+        let dupDesc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == sysId })
+        if (try? ctx.fetch(dupDesc).first) == nil {
+            let msg = MessageEntity(
+                id: sysId, chatId: groupId, senderHash: memberHex,
+                content: "\(contactDisplayName(for: memberHex)) joined the group",
+                timestamp: Date().timeIntervalSince1970,
+                isOutgoing: false, deliveryState: DeliveryState.delivered
+            )
+            ctx.insert(msg)
+        }
+
+        try? ctx.save()
+        refreshChats()
+    }
+
+    /// A member left the group — update their status and show a system message.
+    private func handleGroupLeave(
+        memberHex: String, groupId: String, timestamp: Double, msgId: String
+    ) {
+        guard let ctx = modelContext else { return }
+        let memberDesc = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == groupId && $0.memberHash == memberHex }
+        )
+        if let entry = try? ctx.fetch(memberDesc).first {
+            entry.inviteStatus = MemberStatus.left
+            if let hashData = Data(hexString: memberHex) {
+                RetichatBridge.shared.unwatchAnnounce(destHash: hashData)
+            }
+        }
+        let dupDesc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == msgId })
+        if (try? ctx.fetch(dupDesc).first) == nil {
+            let msg = MessageEntity(
+                id: msgId, chatId: groupId, senderHash: memberHex,
+                content: "\(contactDisplayName(for: memberHex)) left the group",
+                timestamp: timestamp, isOutgoing: false, deliveryState: DeliveryState.delivered
+            )
+            ctx.insert(msg)
+        }
+        updateChatTimestamp(chatId: groupId, timestamp: timestamp)
+        try? ctx.save()
+        refreshChats()
+    }
+
+    /// Another member is asking us to relay their message.
+    private func handleGroupRelayRequest(
+        srcHex: String, content: String, fields: LxmfFields, groupId: String
+    ) {
+        guard let ctx = modelContext, let client = lxmfClient else { return }
+        let originalSender = fields.groupSender ?? srcHex
+        let alreadySeen = fields.groupRelaySeen ?? []
+
+        // Gather all accepted members
+        let accepted = (groupMembersWithStatus(groupId: groupId) ?? [])
+            .filter { $0.inviteStatus == MemberStatus.accepted }
+            .map { $0.memberHash }
+
+        let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
+        let groupName = (try? ctx.fetch(chatDesc).first)?.groupName ?? "Group"
+
+        GroupChatManager.shared.performRelay(
+            groupId: groupId,
+            groupName: groupName,
+            content: content,
+            originalSender: originalSender,
+            alreadySeen: alreadySeen,
+            requester: srcHex,
+            allAcceptedMembers: accepted,
+            selfHash: ownHashHex,
+            via: client
+        )
+    }
+
+    /// Regular group content message.
+    private func handleGroupChatMessage(
+        hash: Data, srcHash: Data, content: String, timestamp: Double,
+        fields: LxmfFields, groupId: String
+    ) {
+        guard let ctx = modelContext else { return }
+
+        let srcHex = srcHash.hexString
+        let msgHashHex = hash.hexString
+        let actualSender = fields.groupSender ?? srcHex
+
+        // Only accept messages for groups we actively belong to
+        let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
+        guard let chat = try? ctx.fetch(chatDesc).first,
+              chat.groupStatus != "pending" else {
+            print("[GroupChat] Dropped msg for unknown/pending group \(groupId.prefix(8))")
+            return
+        }
+
+        // Dedup
+        let dupDesc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == msgHashHex })
+        if let _ = try? ctx.fetch(dupDesc).first { return }
+
+        // Ensure the group chat exists locally (handles the incoming group name update)
+        if let groupName = fields.groupName, let existingChat = try? ctx.fetch(chatDesc).first {
+            if existingChat.groupName == nil { existingChat.groupName = groupName }
+        }
+
+        let msg = MessageEntity(
+            id: msgHashHex, chatId: groupId, senderHash: actualSender,
+            content: content, timestamp: timestamp,
+            isOutgoing: actualSender == ownHashHex,
+            deliveryState: DeliveryState.delivered
+        )
+        ctx.insert(msg)
+
+        for (filename, data) in fields.attachments {
+            ctx.insert(AttachmentEntity(
+                id: UUID().uuidString, messageId: msgHashHex, filename: filename, data: data
+            ))
+        }
+
+        updateChatTimestamp(chatId: groupId, timestamp: timestamp)
+        try? ctx.save()
+
+        if actualSender != ownHashHex {
+            let senderName = contactDisplayName(for: actualSender)
+            let groupName = chat.groupName ?? "Group"
+            notifManager.postMessageNotification(
+                chatId: groupId,
+                senderName: "\(senderName) (\(groupName))",
+                content: content
+            )
+        }
+
+        refreshChats()
+    }
+
+    // MARK: - AnnounceCallback
+
+    nonisolated func onAnnounce(destHash: Data, displayName: String?) {
+        Task { @MainActor in
+            self.handleAnnounce(destHash: destHash, displayName: displayName)
+        }
+    }
+
+    private func handleAnnounce(destHash: Data, displayName: String?) {
+        // Track announce for reachability and link-degradation recovery.
+        ConnectionStateManager.shared.didReceiveAnnounce(destHash: destHash)
+
+        guard let ctx = modelContext else { return }
+        let hex = destHash.hexString
+
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == hex }
+        )
+        if let contact = try? ctx.fetch(descriptor).first {
+            // Only update displayName if the contact has no name yet (preserves user renames)
+            if let name = displayName, !name.isEmpty, contact.displayName.isEmpty {
+                contact.displayName = name
+            }
+            contact.lastSeen = Date().timeIntervalSince1970
+            try? ctx.save()
+            refreshChats()
+        } else if let name = displayName, !name.isEmpty, !prefs.filterStrangers {
+            // Only auto-create a contact stub from announces when the stranger
+            // filter is off — otherwise we'd be storing data for unknown senders.
+            let contact = ContactEntity(
+                destHash: hex,
+                displayName: name,
+                lastSeen: Date().timeIntervalSince1970
+            )
+            ctx.insert(contact)
+            try? ctx.save()
+        }
+    }
+
+    // MARK: - Chat management
+
+    func createDirectChat(destHash: String) -> String {
+        // Unarchive if the chat already exists but was archived
+        if let ctx = modelContext {
+            let descriptor = FetchDescriptor<ChatEntity>(
+                predicate: #Predicate { $0.id == destHash }
+            )
+            if let existing = try? ctx.fetch(descriptor).first, existing.isArchived {
+                existing.isArchived = false
+                try? ctx.save()
+            }
+        }
+
+        ensureChat(id: destHash, peerHash: destHash)
+        ensureAllowlistedContact(destHash: destHash)
+
+        // Watch for announces
+        if let hashData = Data(hexString: destHash) {
+            RetichatBridge.shared.watchAnnounce(destHash: hashData)
+            lxmfClient?.watch(destHash: hashData)
+        }
+
+        refreshChats()
+        return destHash
+    }
+
+    func createGroupChat(name: String, memberHashes: [String]) -> String {
+        guard let ctx = modelContext else { return "" }
+
+        // Generate a 16-byte random group ID → 32-char hex string (Android-compatible)
+        var randomBytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, 16, &randomBytes)
+        let groupId = randomBytes.map { String(format: "%02x", $0) }.joined()
+
+        let chat = ChatEntity(
+            id: groupId, peerHash: "", isGroup: true, groupName: name, groupStatus: "active"
+        )
+        ctx.insert(chat)
+
+        // Add all members, including self
+        var allMembers = memberHashes
+        if !allMembers.contains(ownHashHex) {
+            allMembers.append(ownHashHex)
+        }
+        for memberHash in allMembers {
+            let status = memberHash == ownHashHex ? MemberStatus.accepted : MemberStatus.invited
+            let member = GroupMemberEntity(groupId: groupId, memberHash: memberHash,
+                                           inviteStatus: status)
+            ctx.insert(member)
+            ensureAllowlistedContact(destHash: memberHash)
+            if memberHash != ownHashHex, let hashData = Data(hexString: memberHash) {
+                RetichatBridge.shared.watchAnnounce(destHash: hashData)
+            }
+        }
+        // Allowlist the group ID so inbound group messages pass the filter
+        ensureAllowlistedContact(destHash: groupId)
+
+        try? ctx.save()
+
+        // Send invites to everyone except self (fire-and-forget)
+        if let client = lxmfClient {
+            GroupChatManager.shared.sendInvites(
+                groupId: groupId,
+                groupName: name,
+                allMembers: allMembers,
+                from: ownHashHex,
+                via: client
+            )
+        }
+
+        refreshChats()
+        return groupId
+    }
+
+    func archiveChat(chatId: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.id == chatId }
+        )
+        if let chat = try? ctx.fetch(descriptor).first {
+            if !chat.isGroup, let hashData = Data(hexString: chat.peerHash) {
+                RetichatBridge.shared.unwatchAnnounce(destHash: hashData)
+            } else if chat.isGroup {
+                let memberDesc = FetchDescriptor<GroupMemberEntity>(
+                    predicate: #Predicate { $0.groupId == chatId }
+                )
+                for member in (try? ctx.fetch(memberDesc)) ?? [] where member.memberHash != ownHashHex {
+                    if let hashData = Data(hexString: member.memberHash) {
+                        RetichatBridge.shared.unwatchAnnounce(destHash: hashData)
+                    }
+                }
+            }
+            chat.isArchived = true
+            try? ctx.save()
+            refreshChats()
+        }
+    }
+
+    /// Permanently delete a chat and all its messages and attachments.
+    func deleteChat(chatId: String) {
+        guard let ctx = modelContext else { return }
+
+        // Remove from transport announce watchlist before deleting the entity.
+        let chatLookup = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
+        if let chat = try? ctx.fetch(chatLookup).first {
+            if !chat.isGroup, let hashData = Data(hexString: chat.peerHash) {
+                RetichatBridge.shared.unwatchAnnounce(destHash: hashData)
+            } else if chat.isGroup {
+                let memberDesc = FetchDescriptor<GroupMemberEntity>(
+                    predicate: #Predicate { $0.groupId == chatId }
+                )
+                for member in (try? ctx.fetch(memberDesc)) ?? [] where member.memberHash != ownHashHex {
+                    if let hashData = Data(hexString: member.memberHash) {
+                        RetichatBridge.shared.unwatchAnnounce(destHash: hashData)
+                    }
+                }
+            }
+        }
+
+        // Delete all attachments for messages in this chat
+        let attDescriptor = FetchDescriptor<AttachmentEntity>(
+            predicate: #Predicate { $0.messageId != "" }  // fetch all; filter below
+        )
+        // Fetch messages first so we have their IDs
+        let msgDescriptor = FetchDescriptor<MessageEntity>(
+            predicate: #Predicate { $0.chatId == chatId }
+        )
+        if let messages = try? ctx.fetch(msgDescriptor) {
+            let msgIds = Set(messages.map { $0.id })
+            if let atts = try? ctx.fetch(attDescriptor) {
+                for att in atts where msgIds.contains(att.messageId) {
+                    ctx.delete(att)
+                }
+            }
+            for msg in messages {
+                ctx.delete(msg)
+            }
+        }
+
+        // Delete group members if applicable
+        let memberDescriptor = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == chatId }
+        )
+        if let members = try? ctx.fetch(memberDescriptor) {
+            for member in members { ctx.delete(member) }
+        }
+
+        // Delete the chat entity
+        let chatDescriptor = FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.id == chatId }
+        )
+        if let chat = try? ctx.fetch(chatDescriptor).first {
+            ctx.delete(chat)
+        }
+
+        try? ctx.save()
+        refreshChats()
+    }
+
+    /// Search across both active and archived chats. Used when the user types
+    /// in the search bar so archived chats are discoverable.
+    func searchAllChats(query: String) -> [Chat] {
+        guard let ctx = modelContext else { return [] }
+        let lower = query.lowercased()
+
+        let descriptor = FetchDescriptor<ChatEntity>(
+            sortBy: [SortDescriptor(\.lastMessageTime, order: .reverse)]
+        )
+        guard let entities = try? ctx.fetch(descriptor) else { return [] }
+
+        let nameCache = batchContactDisplayNames(
+            hashes: Set(entities.compactMap { $0.isGroup ? nil : $0.peerHash })
+        )
+
+        return entities.compactMap { entity -> Chat? in
+            let displayName: String
+            if entity.isGroup {
+                displayName = entity.groupName ?? "Group"
+            } else {
+                displayName = nameCache[entity.peerHash] ?? shortHash(entity.peerHash)
+            }
+            guard displayName.localizedCaseInsensitiveContains(lower) ||
+                  entity.peerHash.localizedCaseInsensitiveContains(lower) else { return nil }
+
+            let lastMsg = lastMessage(forChatId: entity.id)
+            return Chat(
+                id: entity.id,
+                peerHash: entity.peerHash,
+                displayName: displayName,
+                lastMessage: lastMsg?.content ?? "",
+                lastMessageTime: entity.lastMessageTime,
+                unreadCount: 0,
+                isArchived: entity.isArchived,
+                isGroup: entity.isGroup,
+                groupName: entity.groupName,
+                groupStatus: entity.groupStatus
+            )
+        }
+    }
+
+    // MARK: - Data queries
+
+    func messages(forChatId chatId: String, limit: Int = 50, offset: Int = 0) -> [ChatMessage] {
+        guard let ctx = modelContext else { return [] }
+
+        var descriptor = FetchDescriptor<MessageEntity>(
+            predicate: #Predicate { $0.chatId == chatId },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = limit
+        descriptor.fetchOffset = offset
+
+        guard let entities = try? ctx.fetch(descriptor) else { return [] }
+
+        // Batch-fetch attachments for these messages using Array.contains
+        // (SwiftData translates this to SQL IN (...) — much faster than
+        //  fetching ALL blobs and filtering in memory)
+        let messageIds = entities.map { $0.id }
+        let attDescriptor = FetchDescriptor<AttachmentEntity>(
+            predicate: #Predicate<AttachmentEntity> { att in
+                messageIds.contains(att.messageId)
+            }
+        )
+        let allAttachments = (try? ctx.fetch(attDescriptor)) ?? []
+        var attachmentsByMsg: [String: [Attachment]] = [:]
+        for att in allAttachments {
+            let a = Attachment(id: att.id, filename: att.filename, data: att.data, mimeType: att.mimeType)
+            attachmentsByMsg[att.messageId, default: []].append(a)
+        }
+
+        // Batch-fetch contact display names
+        let senderHashes = Set(entities.map { $0.senderHash })
+        let nameCache = batchContactDisplayNames(hashes: senderHashes)
+
+        // Reverse back to chronological order for display
+        return entities.reversed().map { entity in
+            let attachments = attachmentsByMsg[entity.id] ?? []
+            var progress: Float? = nil
+            if entity.isOutgoing && entity.nativeHandle != 0 && !attachments.isEmpty
+               && entity.deliveryState != DeliveryState.delivered
+               && entity.deliveryState != DeliveryState.failed {
+                let p = LxmfClient.messageProgress(entity.nativeHandle)
+                if p >= 0 && p < 1.0 {
+                    progress = p
+                }
+            }
+            return ChatMessage(
+                id: entity.id,
+                senderHash: entity.senderHash,
+                senderName: nameCache[entity.senderHash] ?? shortHash(entity.senderHash),
+                content: entity.content,
+                timestamp: entity.timestamp,
+                isOutgoing: entity.isOutgoing,
+                deliveryState: entity.deliveryState,
+                attachments: attachments,
+                uploadProgress: progress,
+                nativeHandle: entity.nativeHandle
+            )
+        }
+    }
+
+    /// Lightweight query returning only (id, deliveryState) pairs — no
+    /// attachment blobs, no FFI calls.  Used by the refresh timer to decide
+    /// whether a full reload is needed.
+    func messagesSummary(forChatId chatId: String, limit: Int = 50) -> [(String, Int)] {
+        guard let ctx = modelContext else { return [] }
+        var descriptor = FetchDescriptor<MessageEntity>(
+            predicate: #Predicate { $0.chatId == chatId },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = limit
+        guard let entities = try? ctx.fetch(descriptor) else { return [] }
+        return entities.reversed().map { ($0.id, $0.deliveryState) }
+    }
+
+    func contacts() -> [Contact] {
+        guard let ctx = modelContext else { return [] }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            sortBy: [SortDescriptor(\.displayName)]
+        )
+        guard let entities = try? ctx.fetch(descriptor) else { return [] }
+        // Only surface contacts the user explicitly added (allowlisted)
+        return entities
+            .filter { $0.isAllowlisted == true }
+            .map { Contact(id: $0.destHash, displayName: $0.displayName, lastSeen: $0.lastSeen) }
+    }
+
+    /// Remove a contact from the allowlist.  The ContactEntity is deleted
+    /// entirely; any matching chat is NOT automatically archived so the user
+    /// can still see the conversation history.
+    func removeContact(destHash: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        if let contact = try? ctx.fetch(descriptor).first {
+            ctx.delete(contact)
+            try? ctx.save()
+        }
+    }
+
+    func refreshChats() {
+        guard let ctx = modelContext else { return }
+
+        let descriptor = FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.isArchived == false },
+            sortBy: [SortDescriptor(\.lastMessageTime, order: .reverse)]
+        )
+
+        guard let chatEntities = try? ctx.fetch(descriptor) else { return }
+
+        // Batch-fetch the latest message per chat in ONE query instead of N
+        let chatIds = chatEntities.map { $0.id }
+        var lastMsgByChat: [String: MessageEntity] = [:]
+        if !chatIds.isEmpty {
+            // Fetch the most recent messages; we only need the newest per chat
+            var msgDesc = FetchDescriptor<MessageEntity>(
+                sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+            )
+            // Reasonable limit: one msg per chat × 2 margin
+            msgDesc.fetchLimit = chatIds.count * 2
+            if let msgs = try? ctx.fetch(msgDesc) {
+                let idSet = Set(chatIds)
+                for m in msgs where idSet.contains(m.chatId) {
+                    if lastMsgByChat[m.chatId] == nil {
+                        lastMsgByChat[m.chatId] = m
+                    }
+                }
+            }
+        }
+
+        // Batch-fetch contact display names for non-group chats
+        let peerHashes = Set(chatEntities.compactMap { $0.isGroup ? nil : $0.peerHash })
+        let nameCache = batchContactDisplayNames(hashes: peerHashes)
+
+        chats = chatEntities.map { entity in
+            let lastMsg = lastMsgByChat[entity.id]
+            let displayName: String
+            if entity.isGroup {
+                displayName = entity.groupName ?? "Group"
+            } else {
+                displayName = nameCache[entity.peerHash] ?? shortHash(entity.peerHash)
+            }
+
+            return Chat(
+                id: entity.id,
+                peerHash: entity.peerHash,
+                displayName: displayName,
+                lastMessage: lastMsg?.content ?? "",
+                lastMessageTime: entity.lastMessageTime,
+                unreadCount: 0,
+                isArchived: entity.isArchived,
+                isGroup: entity.isGroup,
+                groupName: entity.groupName,
+                groupStatus: entity.groupStatus
+            )
+        }
+
+        // Sync chat names to App Group so the NSE can use them in notification titles
+        var chatNameMap: [String: String] = [:]
+        for chat in chats where !chat.displayName.isEmpty {
+            chatNameMap[chat.peerHash] = chat.displayName
+        }
+        PendingNotification.writeChatNames(chatNameMap)
+    }
+
+    // MARK: - Helpers
+
+    private func ensureChat(id: String, peerHash: String, isGroup: Bool = false, groupName: String? = nil) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.id == id }
+        )
+        if let existing = try? ctx.fetch(descriptor), existing.isEmpty {
+            let chat = ChatEntity(
+                id: id, peerHash: peerHash, isGroup: isGroup, groupName: groupName
+            )
+            ctx.insert(chat)
+            try? ctx.save()
+        }
+    }
+
+    private func ensureContact(destHash: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        if let existing = try? ctx.fetch(descriptor), existing.isEmpty {
+            let contact = ContactEntity(destHash: destHash)
+            ctx.insert(contact)
+            try? ctx.save()
+        }
+    }
+
+    /// Mark an existing contact as allowlisted, or create an allowlisted one if absent.
+    private func ensureAllowlistedContact(destHash: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        if let contact = try? ctx.fetch(descriptor).first {
+            if contact.isAllowlisted != true {
+                contact.isAllowlisted = true
+                try? ctx.save()
+            }
+        } else {
+            let contact = ContactEntity(destHash: destHash, isAllowlisted: true)
+            ctx.insert(contact)
+            try? ctx.save()
+        }
+    }
+
+    /// Returns true if the given hash is in the contact allowlist.
+    private func isAllowlisted(destHash: String) -> Bool {
+        guard prefs.filterStrangers else { return true }  // filter off → allow all
+        guard let ctx = modelContext else { return false }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        return (try? ctx.fetch(descriptor).first?.isAllowlisted) == true
+    }
+
+    func contactDisplayName(for destHash: String) -> String {
+        if destHash == ownHashHex { return "You" }
+        guard let ctx = modelContext else { return shortHash(destHash) }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        if let contact = try? ctx.fetch(descriptor).first, !contact.displayName.isEmpty {
+            return contact.displayName
+        }
+        return shortHash(destHash)
+    }
+
+    /// Batch-fetch display names for a set of hashes in one SwiftData query.
+    private func batchContactDisplayNames(hashes: Set<String>) -> [String: String] {
+        var result: [String: String] = [:]
+        for h in hashes where h == ownHashHex { result[h] = "You" }
+        guard let ctx = modelContext else {
+            for h in hashes where result[h] == nil { result[h] = shortHash(h) }
+            return result
+        }
+        // Fetch all contacts (typically <100) and filter in-memory
+        let descriptor = FetchDescriptor<ContactEntity>()
+        if let contacts = try? ctx.fetch(descriptor) {
+            for c in contacts where hashes.contains(c.destHash) && !c.displayName.isEmpty {
+                result[c.destHash] = c.displayName
+            }
+        }
+        for h in hashes where result[h] == nil { result[h] = shortHash(h) }
+        return result
+    }
+
+    func renameContact(destHash: String, newName: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        if let contact = try? ctx.fetch(descriptor).first {
+            contact.displayName = newName
+            try? ctx.save()
+            refreshChats()
+        }
+    }
+
+    func renameGroup(chatId: String, newName: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.id == chatId }
+        )
+        if let chat = try? ctx.fetch(descriptor).first {
+            chat.groupName = newName
+            try? ctx.save()
+            refreshChats()
+        }
+    }
+
+    /// Set the contact's display name only when it is currently empty.
+    /// Preserves any name the user has entered manually.
+    private func updateContactNameIfEmpty(destHash: String, name: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        if let contact = try? ctx.fetch(descriptor).first, contact.displayName.isEmpty {
+            contact.displayName = name
+            try? ctx.save()
+        }
+    }
+
+    private func shortHash(_ hex: String) -> String {
+        String(hex.prefix(8)) + "…"
+    }
+
+    private func updateChatTimestamp(chatId: String, timestamp: Double) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.id == chatId }
+        )
+        if let chat = try? ctx.fetch(descriptor).first {
+            chat.lastMessageTime = max(chat.lastMessageTime, timestamp)
+        }
+    }
+
+    private func lastMessage(forChatId chatId: String) -> MessageEntity? {
+        guard let ctx = modelContext else { return nil }
+        var descriptor = FetchDescriptor<MessageEntity>(
+            predicate: #Predicate { $0.chatId == chatId },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = 1
+        return try? ctx.fetch(descriptor).first
+    }
+
+    private func unreadCount(forChatId chatId: String) -> Int {
+        guard modelContext != nil else { return 0 }
+        // Simple heuristic: count recent inbound messages
+        // TODO: Track read state properly
+        return 0
+    }
+
+    private func fetchAttachments(messageId: String) -> [Attachment] {
+        guard let ctx = modelContext else { return [] }
+        let descriptor = FetchDescriptor<AttachmentEntity>(
+            predicate: #Predicate { $0.messageId == messageId }
+        )
+        guard let entities = try? ctx.fetch(descriptor) else { return [] }
+        return entities.map {
+            Attachment(id: $0.id, filename: $0.filename, data: $0.data, mimeType: $0.mimeType)
+        }
+    }
+
+    func groupMembers(groupId: String) -> [String]? {
+        guard let ctx = modelContext else { return nil }
+        let descriptor = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == groupId }
+        )
+        guard let members = try? ctx.fetch(descriptor) else { return nil }
+        return members.map { $0.memberHash }
+    }
+
+    /// Returns full `GroupMemberEntity` objects so callers can inspect status.
+    func groupMembersWithStatus(groupId: String) -> [GroupMemberEntity]? {
+        guard let ctx = modelContext else { return nil }
+        let descriptor = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == groupId }
+        )
+        return try? ctx.fetch(descriptor)
+    }
+
+    // MARK: - Interface management
+
+    func interfaces() -> [InterfaceConfigEntity] {
+        guard let ctx = modelContext else { return [] }
+        let descriptor = FetchDescriptor<InterfaceConfigEntity>()
+        return (try? ctx.fetch(descriptor)) ?? []
+    }
+
+    func addInterface(_ iface: InterfaceConfigEntity) {
+        guard let ctx = modelContext else { return }
+        ctx.insert(iface)
+        try? ctx.save()
+    }
+
+    func deleteInterface(id: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<InterfaceConfigEntity>(
+            predicate: #Predicate { $0.id == id }
+        )
+        if let iface = try? ctx.fetch(descriptor).first {
+            ctx.delete(iface)
+            try? ctx.save()
+        }
+    }
+
+    // MARK: - Announce
+
+    func announce() {
+        lxmfClient?.announce()
+    }
+}
