@@ -2,8 +2,8 @@
 
 A decentralized, end-to-end encrypted messenger for iOS built on
 [Reticulum](https://reticulum.network) and [LXMF](https://github.com/markqvist/LXMF).
-Works over the internet, local WiFi, and LoRa radio mesh — no phone number or
-account required.
+Today it is focused on direct messaging over internet and local Reticulum
+connectivity — no phone number or account required.
 
 The networking stack is written in Rust and compiled to a static library via
 a C FFI bridge. The UI is pure SwiftUI with SwiftData persistence.
@@ -20,7 +20,7 @@ Retichat-ios/
 ├── Retichat/                  # Swift/SwiftUI iOS app
 │   ├── Bridge/                # C header + Swift FFI wrappers
 │   ├── Models/                # SwiftData entities
-│   ├── Services/              # Networking, chat, groups, notifications
+│   ├── Services/              # Networking, direct chat, notifications
 │   ├── Theme/                 # Colors and glass background
 │   └── Views/                 # SwiftUI views + view models
 ├── NotificationService/       # Push notification extension
@@ -105,7 +105,15 @@ gitignored and will be bundled only in your local build.
 | Persistence | SwiftData |
 | Networking & Crypto | Rust (via C FFI → XCFramework) |
 | Push Notifications | APNs via Notification Service Extension |
-| Transport | TCP, Local Network (Bonjour), Bluetooth (RNode), LoRa |
+| Current transport | TCP, Local Network (Bonjour) |
+
+## Roadmap
+
+The following features are planned but are not ready for public use yet:
+
+- LoRa / RNode transport support
+- Group messaging
+- Channels
 
 ### Key Design Decisions
 
