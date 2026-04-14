@@ -8,6 +8,11 @@ connectivity — no phone number or account required.
 The networking stack is written in Rust and compiled to a static library via
 a C FFI bridge. The UI is pure SwiftUI with SwiftData persistence.
 
+## Development Note
+
+This project was created with substantial AI assistance during design,
+implementation, refactoring, and documentation.
+
 ## Repository Layout
 
 ```
