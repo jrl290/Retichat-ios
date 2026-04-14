@@ -85,6 +85,18 @@ open Retichat.xcodeproj
 Select a signing team under **Signing & Capabilities**, pick a device or
 simulator, and build.
 
+### Optional: private push bridge configuration
+
+Public builds compile and run without push-bridge registration configured.
+If you want APNs bridge registration enabled for local/private builds, create:
+
+```bash
+cp PushBridgeConfig.plist.example Retichat/PushBridgeConfig.plist
+```
+
+Then fill in the two destination hashes in the copied plist. That file is
+gitignored and will be bundled only in your local build.
+
 ## Architecture
 
 | Layer | Technology |

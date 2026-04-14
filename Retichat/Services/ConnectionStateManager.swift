@@ -142,7 +142,7 @@ final class ConnectionStateManager {
     /// configured RFed notify node.
     private func requestEssentialPaths() {
         let bridge = RetichatBridge.shared
-        for dest in [ApnsBridgeHashes.apnsRegistration, ApnsBridgeHashes.notifyRelay] {
+        for dest in [ApnsBridgeHashes.apnsRegistration, ApnsBridgeHashes.notifyRelay].compactMap({ $0 }) {
             if !bridge.transportHasPath(destHash: dest) {
                 _ = bridge.transportRequestPath(destHash: dest)
             }

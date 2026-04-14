@@ -23,6 +23,7 @@ retichat.log
 
 # === Local artifacts ===
 ~/
+Retichat/PushBridgeConfig.plist
 
 # === IDE ===
 .vscode/

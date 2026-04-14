@@ -13,8 +13,8 @@
 //  Required UserPreferences:
 //    rfedNotifyHash  — rfed's rfed.notify destination hash (Link target)
 //
-//  The relay hash (apns_bridge's rfed.notify dest) is hardcoded in
-//  ApnsBridgeHashes.
+//  The relay hash (apns_bridge's rfed.notify dest) is loaded from
+//  PushBridgeConfig.plist when available.
 //
 
 import Foundation
@@ -41,9 +41,12 @@ final class RfedNotifyRegistrar {
             print("[RfedNotify] Invalid rfedNotifyHash — not 32 hex chars")
             return
         }
+        guard let relayHex = ApnsBridgeHashes.notifyRelayHex else {
+            print("[RfedNotify] PushBridgeConfig.plist missing or invalid; skipping relay registration")
+            return
+        }
 
         // Payload: the relay hash as a msgpack-encoded string.
-        let relayHex = ApnsBridgeHashes.notifyRelayHex
         let payload = encodeMsgpackString(relayHex)
 
         Task.detached(priority: .background) { [weak self] in
@@ -61,8 +64,8 @@ final class RfedNotifyRegistrar {
     func deregisterFrom(oldNotifyHashHex: String, identityHandle: UInt64) {
         guard !oldNotifyHashHex.isEmpty,
               let rfedHash = Data(hexString: oldNotifyHashHex) else { return }
+        guard let relayHex = ApnsBridgeHashes.notifyRelayHex else { return }
 
-        let relayHex = ApnsBridgeHashes.notifyRelayHex
         let payload = encodeMsgpackString(relayHex)
 
         let bridge = self.bridge

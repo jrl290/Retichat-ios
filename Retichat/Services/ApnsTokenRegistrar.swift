@@ -9,7 +9,8 @@
 //      register:   {"subscriber_hash": bin(16), "apns_token": str(64 hex)}
 //      unregister: {"subscriber_hash": bin(16)}
 //
-//  The rfed.apns destination hash is hardcoded (ApnsBridgeHashes).
+//  The rfed.apns destination hash is loaded from PushBridgeConfig.plist when
+//  available. Without it, APNs bridge registration is disabled.
 //  Registration is attempted on service start and whenever the APNs token
 //  changes.  Retried with exponential backoff if the path is not yet known.
 //
@@ -21,7 +22,6 @@ final class ApnsTokenRegistrar {
 
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
-    private let apnsDestHash = ApnsBridgeHashes.apnsRegistration
 
     // Number of times to poll for path availability before giving up.
     private let maxAttempts  = 8
@@ -36,7 +36,10 @@ final class ApnsTokenRegistrar {
     func registerIfNeeded(subscriberHash: Data) {
         let apnsToken = prefs.apnsDeviceToken
         guard !apnsToken.isEmpty else { return }
-        let destHash = apnsDestHash
+        guard let destHash = ApnsBridgeHashes.apnsRegistration else {
+            print("[APNsRegistrar] PushBridgeConfig.plist missing or invalid; skipping APNs registration")
+            return
+        }
 
         let payload: Data
         do {
