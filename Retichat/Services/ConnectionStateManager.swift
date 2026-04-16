@@ -81,17 +81,39 @@ final class ConnectionStateManager {
 
     // MARK: - Delivery method selection
 
+    /// How recently a peer must have announced to justify a DIRECT attempt
+    /// when no active link exists yet.  Keeps us from sending on stale paths
+    /// where link establishment or receipt proof will time out.
+    private static let directAnnounceWindow: TimeInterval = 120  // 2 minutes
+
     /// Returns the LXMF delivery method to use when sending to a peer.
-    /// Uses live link status — instant, no I/O.
+    /// Uses live link status and recent announce data — instant, no I/O.
+    ///
+    /// Strategy: only attempt DIRECT when we have strong evidence the peer
+    /// is reachable right now.  Otherwise fall back to PROPAGATED immediately
+    /// rather than blocking on link establishment + receipt timeouts.
+    /// If DIRECT fails once, handleMessageState retries via the prop node.
     func deliveryMethod(for destHash: Data) -> UInt8 {
         let hex = destHash.hexString
-        // Peer's direct link recently failed and they haven't re-announced → use prop.
+
+        // Peer's direct link recently failed and they haven't re-announced.
         if degradedPeers.contains(hex) { return LxmfMethod.propagated }
-        // A path exists in the routing table (peer has announced, route is known) → send direct.
-        // Rust will establish a link on demand.  If direct delivery fails, onMessageState
-        // catches 0xFF/0xFE/0xFD and retries via the propagation node.
-        if RetichatBridge.shared.transportHasPath(destHash: destHash) { return LxmfMethod.direct }
-        // No known path → use prop node and wait for peer to come online.
+
+        // An ACTIVE direct/backchannel link exists — use it.
+        if let client = lxmfClient, client.peerLinkStatus(destHash) == 2 {
+            return LxmfMethod.direct
+        }
+
+        // No active link.  Only try DIRECT if the peer announced very recently
+        // AND we still have a routing path — high confidence they're online and
+        // the library can establish a link on demand.
+        if let lastSeen = peerLastSeen[hex],
+           Date().timeIntervalSince(lastSeen) < Self.directAnnounceWindow,
+           RetichatBridge.shared.transportHasPath(destHash: destHash) {
+            return LxmfMethod.direct
+        }
+
+        // Default: propagation node.  Avoids long timeout / retry loops.
         return LxmfMethod.propagated
     }
 

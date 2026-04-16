@@ -54,6 +54,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     private var pendingOutbound: [String: PendingOutbound] = [:]
 
+    /// Serial queue for all FFI calls into the Rust LXMF library.
+    /// Keeps the main thread responsive while crypto, link establishment,
+    /// and outbound processing run in the background.
+    private let ffiQueue = DispatchQueue(label: "chat.retichat.ffi", qos: .userInitiated)
+
     // MARK: - Init
 
     func configure(modelContext: ModelContext) {
@@ -307,9 +312,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let configDir = reticulumConfigDir()
         let client = lxmfClient
         let hashSnapshot = hashes
+        let queue = ffiQueue
         Task.detached(priority: .utility) {
             PendingNotification.writePropagationNodes(hashSnapshot)
-            client?.persist()
+            queue.async { client?.persist() }
             PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
             PendingNotification.syncRatchetsToAppGroup(from: configDir + "/lxmf_storage")
         }
@@ -317,7 +323,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// Flush in-memory path table and ratchets to disk so they survive app suspension.
     func persist() {
-        lxmfClient?.persist()
+        guard let client = lxmfClient else { return }
+        ffiQueue.async {
+            client.persist()
+        }
     }
 
     // MARK: - NSE message import
@@ -406,8 +415,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         propManager.setUserConfiguredNode(prefs.lxmfPropagationHash)
 
         if let nodeHash = propManager.currentNode() {
-            if !client.sync(nodeHash: nodeHash) {
-                propManager.rotateToNext()
+            ffiQueue.async { [weak self] in
+                let ok = client.sync(nodeHash: nodeHash)
+                if !ok {
+                    Task { @MainActor in
+                        self?.propManager.rotateToNext()
+                    }
+                }
             }
         }
     }
@@ -454,79 +468,84 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let methodName = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
         print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
 
-        let msgHandle = client.createMessage(
-            to: destData,
-            content: content,
-            title: "",
-            method: method
-        )
-        guard msgHandle != 0 else {
-            print("[Retichat] Failed to create message: \(LxmfClient.lastError ?? "")")
-            return
-        }
+        // Capture values for the background closure
+        let ownHex = ownHashHex
+        let attachmentsCopy = attachments
 
-        // Add attachments
-        for (filename, data) in attachments {
-            _ = LxmfClient.messageAddAttachment(msgHandle, filename: filename, data: data)
-        }
-
-        // Send first — pack() runs synchronously inside sendMessage and
-        // computes the hash, so messageHash() is only valid after this call.
-        guard client.sendMessage(msgHandle) else {
-            print("[Retichat] Failed to send message: \(LxmfClient.lastError ?? "")")
-            LxmfClient.messageDestroy(msgHandle)
-            return
-        }
-
-        // Hash is now available after pack().
-        guard let msgHashData = LxmfClient.messageHash(msgHandle), !msgHashData.isEmpty else {
-            print("[Retichat] Failed to get message hash after send")
-            LxmfClient.messageDestroy(msgHandle)
-            return
-        }
-        let msgHashHex = msgHashData.hexString
-
-        // Insert into database (optimistic — state callbacks dispatch async
-        // via Task { @MainActor in ... } so this always runs first).
-        let msgEntity = MessageEntity(
-            id: msgHashHex,
-            chatId: chatId,
-            senderHash: ownHashHex,
-            content: content,
-            timestamp: Date().timeIntervalSince1970,
-            isOutgoing: true,
-            deliveryState: DeliveryState.pending,
-            nativeHandle: msgHandle
-        )
-        ctx.insert(msgEntity)
-
-        // Save attachments
-        for (filename, data) in attachments {
-            let att = AttachmentEntity(
-                id: UUID().uuidString,
-                messageId: msgHashHex,
-                filename: filename,
-                data: data
+        // Run FFI calls (create, pack, send) off the main thread.
+        ffiQueue.async { [weak self] in
+            let msgHandle = client.createMessage(
+                to: destData,
+                content: content,
+                title: "",
+                method: method
             )
-            ctx.insert(att)
+            guard msgHandle != 0 else {
+                print("[Retichat] Failed to create message: \(LxmfClient.lastError ?? "")")
+                return
+            }
+
+            for (filename, data) in attachmentsCopy {
+                _ = LxmfClient.messageAddAttachment(msgHandle, filename: filename, data: data)
+            }
+
+            // pack() + process_outbound() run here, off the main thread.
+            guard client.sendMessage(msgHandle) else {
+                print("[Retichat] Failed to send message: \(LxmfClient.lastError ?? "")")
+                LxmfClient.messageDestroy(msgHandle)
+                return
+            }
+
+            guard let msgHashData = LxmfClient.messageHash(msgHandle), !msgHashData.isEmpty else {
+                print("[Retichat] Failed to get message hash after send")
+                LxmfClient.messageDestroy(msgHandle)
+                return
+            }
+            let msgHashHex = msgHashData.hexString
+
+            // Hop back to @MainActor for database writes and UI updates.
+            Task { @MainActor [weak self] in
+                guard let self, let ctx = self.modelContext else { return }
+
+                let msgEntity = MessageEntity(
+                    id: msgHashHex,
+                    chatId: chatId,
+                    senderHash: ownHex,
+                    content: content,
+                    timestamp: Date().timeIntervalSince1970,
+                    isOutgoing: true,
+                    deliveryState: DeliveryState.pending,
+                    nativeHandle: msgHandle
+                )
+                ctx.insert(msgEntity)
+
+                for (filename, data) in attachmentsCopy {
+                    let att = AttachmentEntity(
+                        id: UUID().uuidString,
+                        messageId: msgHashHex,
+                        filename: filename,
+                        data: data
+                    )
+                    ctx.insert(att)
+                }
+
+                chat.lastMessageTime = msgEntity.timestamp
+                try? ctx.save()
+
+                self.pendingOutbound[msgHashHex] = PendingOutbound(
+                    messageId: msgHashHex,
+                    chatId: chatId,
+                    peerHash: destData,
+                    method: method,
+                    msgHandle: msgHandle,
+                    content: content,
+                    title: "",
+                    hasAttachments: !attachmentsCopy.isEmpty
+                )
+
+                self.refreshChats()
+            }
         }
-
-        // Update chat timestamp
-        chat.lastMessageTime = msgEntity.timestamp
-        try? ctx.save()
-
-        pendingOutbound[msgHashHex] = PendingOutbound(
-            messageId: msgHashHex,
-            chatId: chatId,
-            peerHash: destData,
-            method: method,
-            msgHandle: msgHandle,
-            content: content,
-            title: "",
-            hasAttachments: !attachments.isEmpty
-        )
-
-        refreshChats()
     }
 
     // MARK: - Group message send (fanout to all accepted members)
@@ -569,16 +588,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         chat.lastMessageTime = msgEntity.timestamp
         try? ctx.save()
 
-        // Fan out to accepted members
-        GroupChatManager.shared.fanoutMessage(
-            groupId: chatId,
-            groupName: chat.groupName ?? "Group",
-            content: content,
-            attachments: attachments,
-            to: targets,
-            from: ownHashHex,
-            via: client
-        )
+        // Fan out to accepted members — FFI calls run off the main thread.
+        let groupName = chat.groupName ?? "Group"
+        let selfHash = ownHashHex
+        ffiQueue.async {
+            GroupChatManager.shared.fanoutMessage(
+                groupId: chatId,
+                groupName: groupName,
+                content: content,
+                attachments: attachments,
+                to: targets,
+                from: selfHash,
+                via: client
+            )
+        }
 
         refreshChats()
     }
@@ -622,11 +645,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         try? ctx.save()
 
-        // Broadcast acceptance to everyone else
+        // Broadcast acceptance to everyone else — FFI off main thread
         let targets = allHashes.filter { $0 != ownHashHex }
-        GroupChatManager.shared.sendAccept(
-            groupId: groupId, to: targets, from: ownHashHex, via: client
-        )
+        let selfHash = ownHashHex
+        ffiQueue.async {
+            GroupChatManager.shared.sendAccept(
+                groupId: groupId, to: targets, from: selfHash, via: client
+            )
+        }
 
         refreshChats()
     }
@@ -647,9 +673,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             .filter { $0.inviteStatus == MemberStatus.accepted && $0.memberHash != ownHashHex }
             .map { $0.memberHash }
 
-        GroupChatManager.shared.sendLeave(
-            groupId: chatId, to: acceptedMembers, from: ownHashHex, via: client
-        )
+        let selfHash = ownHashHex
+        ffiQueue.async {
+            GroupChatManager.shared.sendLeave(
+                groupId: chatId, to: acceptedMembers, from: selfHash, via: client
+            )
+        }
         deleteChat(chatId: chatId)
     }
 
@@ -729,41 +758,51 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
-        let msgHandle = client.createMessage(
-            to: original.peerHash,
-            content: original.content,
-            title: original.title,
-            method: LxmfMethod.propagated
-        )
-        guard msgHandle != 0 else {
-            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
-            return
-        }
+        // Run FFI calls off the main thread.
+        ffiQueue.async { [weak self] in
+            let msgHandle = client.createMessage(
+                to: original.peerHash,
+                content: original.content,
+                title: original.title,
+                method: LxmfMethod.propagated
+            )
+            guard msgHandle != 0 else {
+                Task { @MainActor in
+                    self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+                }
+                return
+            }
 
-        // Send first so pack() runs and computes the hash.
-        guard client.sendMessage(msgHandle) else {
-            LxmfClient.messageDestroy(msgHandle)
-            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
-            return
-        }
+            guard client.sendMessage(msgHandle) else {
+                LxmfClient.messageDestroy(msgHandle)
+                Task { @MainActor in
+                    self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+                }
+                return
+            }
 
-        guard let hashData = LxmfClient.messageHash(msgHandle), !hashData.isEmpty else {
-            LxmfClient.messageDestroy(msgHandle)
-            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
-            return
-        }
+            guard let hashData = LxmfClient.messageHash(msgHandle), !hashData.isEmpty else {
+                LxmfClient.messageDestroy(msgHandle)
+                Task { @MainActor in
+                    self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+                }
+                return
+            }
 
-        let newHashHex = hashData.hexString
-        pendingOutbound[newHashHex] = PendingOutbound(
-            messageId: original.messageId,     // same DB row
-            chatId: original.chatId,
-            peerHash: original.peerHash,
-            method: LxmfMethod.propagated,
-            msgHandle: msgHandle,
-            content: original.content,
-            title: original.title,
-            hasAttachments: false
-        )
+            let newHashHex = hashData.hexString
+            Task { @MainActor [weak self] in
+                self?.pendingOutbound[newHashHex] = PendingOutbound(
+                    messageId: original.messageId,
+                    chatId: original.chatId,
+                    peerHash: original.peerHash,
+                    method: LxmfMethod.propagated,
+                    msgHandle: msgHandle,
+                    content: original.content,
+                    title: original.title,
+                    hasAttachments: false
+                )
+            }
+        }
     }
 
     private func updateDeliveryState(messageId: String, state: Int) {
@@ -780,7 +819,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - Flush pending
 
     func flushPendingMessages() {
-        lxmfClient?.processOutbound()
+        guard let client = lxmfClient else { return }
+        ffiQueue.async {
+            client.processOutbound()
+        }
     }
 
     // MARK: - MessageCallback
@@ -1074,17 +1116,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
         let groupName = (try? ctx.fetch(chatDesc).first)?.groupName ?? "Group"
 
-        GroupChatManager.shared.performRelay(
-            groupId: groupId,
-            groupName: groupName,
-            content: content,
-            originalSender: originalSender,
-            alreadySeen: alreadySeen,
-            requester: srcHex,
-            allAcceptedMembers: accepted,
-            selfHash: ownHashHex,
-            via: client
-        )
+        let selfHash = ownHashHex
+        ffiQueue.async {
+            GroupChatManager.shared.performRelay(
+                groupId: groupId,
+                groupName: groupName,
+                content: content,
+                originalSender: originalSender,
+                alreadySeen: alreadySeen,
+                requester: srcHex,
+                allAcceptedMembers: accepted,
+                selfHash: selfHash,
+                via: client
+            )
+        }
     }
 
     /// Regular group content message.
@@ -1246,13 +1291,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Send invites to everyone except self (fire-and-forget)
         if let client = lxmfClient {
-            GroupChatManager.shared.sendInvites(
-                groupId: groupId,
-                groupName: name,
-                allMembers: allMembers,
-                from: ownHashHex,
-                via: client
-            )
+            let selfHash = ownHashHex
+            ffiQueue.async {
+                GroupChatManager.shared.sendInvites(
+                    groupId: groupId,
+                    groupName: name,
+                    allMembers: allMembers,
+                    from: selfHash,
+                    via: client
+                )
+            }
         }
 
         refreshChats()
@@ -1763,6 +1811,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - Announce
 
     func announce() {
-        lxmfClient?.announce()
+        guard let client = lxmfClient else { return }
+        ffiQueue.async {
+            client.announce()
+        }
     }
 }
