@@ -112,15 +112,23 @@ struct ConversationView: View {
             )
         }
         .onAppear {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            print("[DIAG][onAppear] start chatId=\(chatId.prefix(8))")
             viewModel.loadChat(chatId: chatId, repository: repository)
+            print("[DIAG][onAppear] loadChat done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
             NotificationManager.shared.activeChatId = chatId
             NotificationManager.shared.clearNotifications(forChatId: chatId)
+            print("[DIAG][onAppear] clearNotifications done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
             repository.openConversation(chatId: chatId)
+            print("[DIAG][onAppear] openConversation done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
             isTextFieldFocused = true
+            print("[DIAG][onAppear] focus set done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
         }
         .onDisappear {
+            print("[DIAG][onDisappear] chatId=\(chatId.prefix(8))")
             NotificationManager.shared.activeChatId = nil
             repository.closeConversation(chatId: chatId)
+            print("[DIAG][onDisappear] closeConversation done")
         }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
             viewModel.refreshMessages(chatId: chatId, repository: repository)
@@ -275,6 +283,8 @@ struct ConversationView: View {
                 .focused($isTextFieldFocused)
                 .foregroundColor(.retichatOnSurface)
                 .lineLimit(1...5)
+                .textContentType(.none)
+                .autocorrectionDisabled(false)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .glassBackground(cornerRadius: 20)

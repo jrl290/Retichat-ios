@@ -54,6 +54,7 @@ struct ChatListView: View {
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
+                .padding(.bottom, 8)
 
                 // Chat list
                 if filteredChats.isEmpty {
@@ -213,6 +214,7 @@ struct ChatRow: View {
         .padding(.vertical, 10)
         .glassBackground(cornerRadius: 12)
         .padding(.horizontal, 8)
+        .padding(.bottom, 6)
     }
 
     private func formatRelativeTime(_ timestamp: Double) -> String {

@@ -33,8 +33,8 @@ final class ConnectionStateManager {
     /// Cleared when the peer announces again.
     private var degradedPeers: Set<String> = []
 
-    /// Destination hash of the currently-open conversation (nil when no chat is on screen).
-    private(set) var activeConversationHash: Data? = nil
+    /// Hex hashes of all peers in the currently-open conversation (empty when no chat is on screen).
+    private var activeConversationHexes: Set<String> = []
 
     /// Weak reference to the LXMF client, set after startup.
     private weak var lxmfClient: LxmfClient? = nil
@@ -99,9 +99,10 @@ final class ConnectionStateManager {
         // Peer's direct link recently failed and they haven't re-announced.
         if degradedPeers.contains(hex) { return LxmfMethod.propagated }
 
-        // An ACTIVE direct/backchannel link exists — use it.
-        if let client = lxmfClient, client.peerLinkStatus(destHash) == 2 {
-            return LxmfMethod.direct
+        // An ACTIVE app link or direct/backchannel link exists — use it.
+        if let client = lxmfClient {
+            if client.appLinkStatus(destHash) == 3 { return LxmfMethod.direct }  // ACTIVE app link
+            if client.peerLinkStatus(destHash) == 2 { return LxmfMethod.direct }
         }
 
         // No active link.  Only try DIRECT if the peer announced very recently
@@ -119,60 +120,107 @@ final class ConnectionStateManager {
 
     // MARK: - Conversation lifecycle
 
-    /// Call when a conversation screen appears for a direct (non-group) chat.
-    /// Triggers path discovery and watches for peer announces so we know
-    /// when they come online.  Does nothing for group chats (pass nil).
+    /// Call when a conversation screen appears for a peer (direct or group member).
+    /// Opens an app link: watches announces, requests path, and establishes a
+    /// direct link proactively while the user is on screen.
     func openConversation(peerHash: Data) {
-        activeConversationHash = peerHash
-        RetichatBridge.shared.watchAnnounce(destHash: peerHash)
-        lxmfClient?.watch(destHash: peerHash)
-        let bridge = RetichatBridge.shared
-        if !bridge.transportHasPath(destHash: peerHash) {
-            _ = bridge.transportRequestPath(destHash: peerHash)
+        activeConversationHexes.insert(peerHash.hexString)
+        let client = lxmfClient
+        let hex = peerHash.hexString
+        Task.detached(priority: .userInitiated) {
+            let t = CFAbsoluteTimeGetCurrent()
+            print("[DIAG][appLinkOpen] start dest=\(hex.prefix(8))")
+            client?.appLinkOpen(peerHash)
+            let took = String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t)
+            print("[DIAG][appLinkOpen] done dest=\(hex.prefix(8)) took=\(took)s")
         }
     }
 
     /// Call when a conversation screen disappears.
     func closeConversation(peerHash: Data) {
-        if activeConversationHash == peerHash {
-            activeConversationHash = nil
+        activeConversationHexes.remove(peerHash.hexString)
+        let client = lxmfClient
+        let hex = peerHash.hexString
+        Task.detached(priority: .userInitiated) {
+            let t = CFAbsoluteTimeGetCurrent()
+            print("[DIAG][appLinkClose] start dest=\(hex.prefix(8))")
+            client?.appLinkClose(peerHash)
+            let took = String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t)
+            print("[DIAG][appLinkClose] done dest=\(hex.prefix(8)) took=\(took)s")
         }
     }
 
     // MARK: - App lifecycle events
 
     /// Call when the app returns to foreground.
-    /// Re-triggers path discovery for the active conversation peer (if any).
+    /// Re-requests paths to infrastructure nodes and re-opens app links for
+    /// any active conversation peers.
     func onAppForeground() {
-        guard let peerHash = activeConversationHash else { return }
-        openConversation(peerHash: peerHash)
+        requestEssentialPaths()
+        let client = lxmfClient
+        // Pre-compute Data values on @MainActor before going off-thread
+        let peerDatas = activeConversationHexes.compactMap { Data(hexString: $0) }
+        Task.detached(priority: .userInitiated) {
+            for peerData in peerDatas {
+                client?.appLinkOpen(peerData)
+            }
+        }
     }
 
     /// Call when NWPathMonitor reports network connectivity restored.
-    /// Re-requests paths to always-needed destinations and the active peer.
+    /// Re-requests paths to always-needed destinations and re-opens active links.
     func onNetworkReconnect() {
         requestEssentialPaths()
-        if let peerHash = activeConversationHash {
-            _ = RetichatBridge.shared.transportRequestPath(destHash: peerHash)
+        let peers = activeConversationHexes.compactMap { Data(hexString: $0) }
+        let bridge = RetichatBridge.shared
+        Task.detached(priority: .userInitiated) {
+            for peerHash in peers {
+                _ = bridge.transportRequestPath(destHash: peerHash)
+            }
         }
     }
 
     // MARK: - Private
 
     /// Request Reticulum paths to destinations that the app always needs:
-    /// the APNs bridge registration endpoint, its notify relay, and the
+    /// the current propagation node, the APNs bridge endpoints, and the
     /// configured RFed notify node.
+    ///
+    /// Snapshot all destination Data values on the main actor (fast reads),
+    /// then dispatch the actual Rust FFI calls to a detached task so the
+    /// transport mutex is never contended on the main thread.
     private func requestEssentialPaths() {
-        let bridge = RetichatBridge.shared
+        // Collect destinations synchronously — all trivial property reads.
+        var destinations: [Data] = []
+        if let propNode = PropagationNodeManager.shared.currentNode() {
+            destinations.append(propNode)
+        }
         for dest in [ApnsBridgeHashes.apnsRegistration, ApnsBridgeHashes.notifyRelay].compactMap({ $0 }) {
-            if !bridge.transportHasPath(destHash: dest) {
-                _ = bridge.transportRequestPath(destHash: dest)
-            }
+            destinations.append(dest)
         }
         let rfedHex = UserPreferences.shared.rfedNotifyHash
-        if !rfedHex.isEmpty, let rfedHash = Data(hexString: rfedHex),
-           !bridge.transportHasPath(destHash: rfedHash) {
-            _ = bridge.transportRequestPath(destHash: rfedHash)
+        if !rfedHex.isEmpty, let rfedHash = Data(hexString: rfedHex) {
+            destinations.append(rfedHash)
+        }
+
+        // Pre-compute hex labels on the main actor before going off-thread.
+        let destPairs: [(Data, String)] = destinations.map { ($0, String($0.hexString.prefix(8))) }
+        let bridge = RetichatBridge.shared
+
+        // All FFI work off the main thread.
+        Task.detached(priority: .userInitiated) {
+            let t = CFAbsoluteTimeGetCurrent()
+            print("[DIAG][requestEssentialPaths] task start count=\(destPairs.count)")
+            for (dest, label) in destPairs {
+                let hasPath = bridge.transportHasPath(destHash: dest)
+                print("[DIAG][requestEssentialPaths] dest=\(label) hasPath=\(hasPath)")
+                if !hasPath {
+                    _ = bridge.transportRequestPath(destHash: dest)
+                    print("[DIAG][requestEssentialPaths] requestPath done dest=\(label)")
+                }
+            }
+            let took = String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t)
+            print("[DIAG][requestEssentialPaths] task done took=\(took)s")
         }
     }
 }

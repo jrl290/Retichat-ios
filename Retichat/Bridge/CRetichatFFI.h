@@ -176,6 +176,30 @@ int32_t lxmf_client_cancel_propagation(uint64_t client);
 /// Returns: 0 = no link / closed, 1 = pending (establishing), 2 = active, -1 on error.
 int32_t lxmf_peer_link_status(uint64_t client, const uint8_t *dest_hash, uint32_t dest_len);
 
+#pragma mark - LXMF App Links
+
+/// Open an app link.  Watches dest, requests path, establishes link
+/// when path arrives.  Push-driven (no polling).  Link kept alive
+/// automatically and exempt from inactivity cleanup.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_open(uint64_t client,
+                            const uint8_t *dest_hash, uint32_t dest_len);
+
+/// Close an app link.  Tears down the direct link.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_close(uint64_t client,
+                             const uint8_t *dest_hash, uint32_t dest_len);
+
+/// Query app link status.
+///   0 = not tracked (NONE)
+///   1 = path requested (PATH_REQUESTED)
+///   2 = link establishing (ESTABLISHING)
+///   3 = link active, ready to send (ACTIVE)
+///   4 = disconnected, will reconnect on next announce (DISCONNECTED)
+///  -1 = parameter error
+int32_t lxmf_app_link_status(uint64_t client,
+                              const uint8_t *dest_hash, uint32_t dest_len);
+
 #pragma mark - LXMF Announce
 
 int32_t lxmf_client_announce(uint64_t client);

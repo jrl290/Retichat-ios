@@ -133,7 +133,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Leaf-node mode: drop unsolicited network-wide announces; only PATH_RESPONSE
         // replies to our own transportRequestPath calls pass through.
+        let t_drop = CFAbsoluteTimeGetCurrent()
         bridge.setDropAnnounces(enabled: prefs.dropAnnounces)
+        print("[DIAG][finishStart] setDropAnnounces took=\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t_drop))s")
 
         // Register with the connection state manager (path requests, peer tracking).
         ConnectionStateManager.shared.register(lxmfClient: client)
@@ -144,7 +146,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Announce our delivery destination immediately, then every 30 minutes
         announce()
         announceTimer = Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.announce()
             }
         }
@@ -284,7 +286,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         syncPropagationNodesToAppGroup()
 
         pollTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.pollPropagationNode()
             }
         }
@@ -418,7 +420,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             ffiQueue.async { [weak self] in
                 let ok = client.sync(nodeHash: nodeHash)
                 if !ok {
-                    Task { @MainActor in
+                    Task { @MainActor [weak self] in
                         self?.propManager.rotateToNext()
                     }
                 }
@@ -429,6 +431,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - Send message
 
     func sendMessage(chatId: String, content: String, attachments: [(String, Data)] = []) {
+        let content = content.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[Retichat] sendMessage called chatId=\(chatId.prefix(8)) content=\(content.prefix(20))")
         guard let ctx = modelContext else {
             print("[Retichat] sendMessage: ABORT - modelContext is nil")
@@ -457,7 +460,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
-        // Create message via LxmfClient
         guard let client = lxmfClient else {
             print("[Retichat] sendMessage: ABORT - lxmfClient is nil")
             return
@@ -467,6 +469,31 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let method = ConnectionStateManager.shared.deliveryMethod(for: destData)
         let methodName = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
         print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
+
+        // --- Optimistic bubble: insert immediately so the UI responds without waiting for FFI ---
+        let tempId = "pending_\(UUID().uuidString)"
+        let optimisticTimestamp = Date().timeIntervalSince1970
+        let msgEntity = MessageEntity(
+            id: tempId,
+            chatId: chatId,
+            senderHash: ownHashHex,
+            content: content,
+            timestamp: optimisticTimestamp,
+            isOutgoing: true,
+            deliveryState: DeliveryState.pending
+        )
+        ctx.insert(msgEntity)
+        for (filename, data) in attachments {
+            ctx.insert(AttachmentEntity(
+                id: UUID().uuidString,
+                messageId: tempId,
+                filename: filename,
+                data: data
+            ))
+        }
+        chat.lastMessageTime = optimisticTimestamp
+        try? ctx.save()
+        refreshChats()
 
         // Capture values for the background closure
         let ownHex = ownHashHex
@@ -482,6 +509,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             )
             guard msgHandle != 0 else {
                 print("[Retichat] Failed to create message: \(LxmfClient.lastError ?? "")")
+                Task { @MainActor [weak self] in
+                    guard let ctx = self?.modelContext else { return }
+                    let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == tempId })
+                    if let temp = try? ctx.fetch(desc).first {
+                        temp.deliveryState = DeliveryState.failed
+                        try? ctx.save()
+                    }
+                    self?.refreshChats()
+                }
                 return
             }
 
@@ -493,12 +529,30 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             guard client.sendMessage(msgHandle) else {
                 print("[Retichat] Failed to send message: \(LxmfClient.lastError ?? "")")
                 LxmfClient.messageDestroy(msgHandle)
+                Task { @MainActor [weak self] in
+                    guard let ctx = self?.modelContext else { return }
+                    let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == tempId })
+                    if let temp = try? ctx.fetch(desc).first {
+                        temp.deliveryState = DeliveryState.failed
+                        try? ctx.save()
+                    }
+                    self?.refreshChats()
+                }
                 return
             }
 
             guard let msgHashData = LxmfClient.messageHash(msgHandle), !msgHashData.isEmpty else {
                 print("[Retichat] Failed to get message hash after send")
                 LxmfClient.messageDestroy(msgHandle)
+                Task { @MainActor [weak self] in
+                    guard let ctx = self?.modelContext else { return }
+                    let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == tempId })
+                    if let temp = try? ctx.fetch(desc).first {
+                        temp.deliveryState = DeliveryState.failed
+                        try? ctx.save()
+                    }
+                    self?.refreshChats()
+                }
                 return
             }
             let msgHashHex = msgHashData.hexString
@@ -507,29 +561,40 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             Task { @MainActor [weak self] in
                 guard let self, let ctx = self.modelContext else { return }
 
-                let msgEntity = MessageEntity(
-                    id: msgHashHex,
-                    chatId: chatId,
-                    senderHash: ownHex,
-                    content: content,
-                    timestamp: Date().timeIntervalSince1970,
-                    isOutgoing: true,
-                    deliveryState: DeliveryState.pending,
-                    nativeHandle: msgHandle
-                )
-                ctx.insert(msgEntity)
-
-                for (filename, data) in attachmentsCopy {
-                    let att = AttachmentEntity(
-                        id: UUID().uuidString,
-                        messageId: msgHashHex,
-                        filename: filename,
-                        data: data
+                // Update the optimistic entity in-place with the real hash and handle.
+                let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == tempId })
+                if let temp = try? ctx.fetch(desc).first {
+                    temp.id = msgHashHex
+                    temp.nativeHandle = msgHandle
+                    // Update attachment foreign keys to point to the real message id.
+                    let attDesc = FetchDescriptor<AttachmentEntity>(
+                        predicate: #Predicate { $0.messageId == tempId }
                     )
-                    ctx.insert(att)
+                    for att in (try? ctx.fetch(attDesc)) ?? [] {
+                        att.messageId = msgHashHex
+                    }
+                } else {
+                    // Fallback: optimistic entity was lost — insert fresh.
+                    ctx.insert(MessageEntity(
+                        id: msgHashHex,
+                        chatId: chatId,
+                        senderHash: ownHex,
+                        content: content,
+                        timestamp: optimisticTimestamp,
+                        isOutgoing: true,
+                        deliveryState: DeliveryState.pending,
+                        nativeHandle: msgHandle
+                    ))
+                    for (filename, data) in attachmentsCopy {
+                        ctx.insert(AttachmentEntity(
+                            id: UUID().uuidString,
+                            messageId: msgHashHex,
+                            filename: filename,
+                            data: data
+                        ))
+                    }
                 }
 
-                chat.lastMessageTime = msgEntity.timestamp
                 try? ctx.save()
 
                 self.pendingOutbound[msgHashHex] = PendingOutbound(
@@ -684,32 +749,57 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     // MARK: - Conversation lifecycle (delegates to ConnectionStateManager)
 
-    /// Call when a direct-chat conversation screen appears.
+    /// Call when a conversation screen appears.  Opens app links for the peer
+    /// (direct chat) or all accepted members (group chat) so links are
+    /// pre-established before the user taps send.
     func openConversation(chatId: String) {
         guard let ctx = modelContext else { return }
         let desc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
-        guard let chat = try? ctx.fetch(desc).first,
-              !chat.isGroup,
-              let peerHash = Data(hexString: chat.peerHash) else { return }
-        ConnectionStateManager.shared.openConversation(peerHash: peerHash)
+        guard let chat = try? ctx.fetch(desc).first else { return }
+
+        if chat.isGroup {
+            let memberDesc = FetchDescriptor<GroupMemberEntity>(
+                predicate: #Predicate { $0.groupId == chatId }
+            )
+            let members = (try? ctx.fetch(memberDesc)) ?? []
+            for member in members where member.memberHash != ownHashHex {
+                if let peerHash = Data(hexString: member.memberHash) {
+                    ConnectionStateManager.shared.openConversation(peerHash: peerHash)
+                }
+            }
+        } else {
+            guard let peerHash = Data(hexString: chat.peerHash) else { return }
+            ConnectionStateManager.shared.openConversation(peerHash: peerHash)
+        }
     }
 
-    /// Call when a conversation screen disappears.
+    /// Call when a conversation screen disappears.  Closes app links for
+    /// all peers that were opened by openConversation.
     func closeConversation(chatId: String) {
         guard let ctx = modelContext else { return }
         let desc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
-        guard let chat = try? ctx.fetch(desc).first,
-              !chat.isGroup,
-              let peerHash = Data(hexString: chat.peerHash) else { return }
-        ConnectionStateManager.shared.closeConversation(peerHash: peerHash)
+        guard let chat = try? ctx.fetch(desc).first else { return }
+
+        if chat.isGroup {
+            let memberDesc = FetchDescriptor<GroupMemberEntity>(
+                predicate: #Predicate { $0.groupId == chatId }
+            )
+            let members = (try? ctx.fetch(memberDesc)) ?? []
+            for member in members where member.memberHash != ownHashHex {
+                if let peerHash = Data(hexString: member.memberHash) {
+                    ConnectionStateManager.shared.closeConversation(peerHash: peerHash)
+                }
+            }
+        } else {
+            guard let peerHash = Data(hexString: chat.peerHash) else { return }
+            ConnectionStateManager.shared.closeConversation(peerHash: peerHash)
+        }
     }
 
     // MARK: - MessageStateCallback
 
-    nonisolated func onMessageState(hash: Data, state: UInt8) {
-        Task { @MainActor in
-            self.handleMessageState(hash: hash, state: state)
-        }
+    @MainActor func onMessageState(hash: Data, state: UInt8) {
+        handleMessageState(hash: hash, state: state)
     }
 
     private func handleMessageState(hash: Data, state: UInt8) {
@@ -767,7 +857,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 method: LxmfMethod.propagated
             )
             guard msgHandle != 0 else {
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
                 }
                 return
@@ -775,7 +865,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
             guard client.sendMessage(msgHandle) else {
                 LxmfClient.messageDestroy(msgHandle)
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
                 }
                 return
@@ -783,7 +873,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
             guard let hashData = LxmfClient.messageHash(msgHandle), !hashData.isEmpty else {
                 LxmfClient.messageDestroy(msgHandle)
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
                 }
                 return
@@ -827,21 +917,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     // MARK: - MessageCallback
 
-    nonisolated func onMessage(hash: Data, srcHash: Data, destHash: Data,
+    @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
                                title: String, content: String, timestamp: Double,
                                signatureValid: Bool, fieldsRaw: Data) {
-        Task { @MainActor in
-            self.handleIncomingMessage(
-                hash: hash, srcHash: srcHash, destHash: destHash,
-                title: title, content: content, timestamp: timestamp,
-                signatureValid: signatureValid, fieldsRaw: fieldsRaw
-            )
-        }
+        handleIncomingMessage(
+            hash: hash, srcHash: srcHash, destHash: destHash,
+            title: title, content: content, timestamp: timestamp,
+            signatureValid: signatureValid, fieldsRaw: fieldsRaw
+        )
     }
 
     private func handleIncomingMessage(hash: Data, srcHash: Data, destHash: Data,
                                         title: String, content: String, timestamp: Double,
                                         signatureValid: Bool, fieldsRaw: Data) {
+        let content = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let srcHexForLog = srcHash.hexString
         let msgHashHexForLog = hash.hexString
         print("[Retichat] handleIncomingMessage: hash=\(msgHashHexForLog.prefix(8)) src=\(srcHexForLog.prefix(8)) dest=\(destHash.hexString.prefix(8)) len=\(content.count)")
@@ -1192,10 +1281,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     // MARK: - AnnounceCallback
 
-    nonisolated func onAnnounce(destHash: Data, displayName: String?) {
-        Task { @MainActor in
-            self.handleAnnounce(destHash: destHash, displayName: displayName)
-        }
+    @MainActor func onAnnounce(destHash: Data, displayName: String?) {
+        handleAnnounce(destHash: destHash, displayName: displayName)
     }
 
     private func handleAnnounce(destHash: Data, displayName: String?) {
@@ -1215,7 +1302,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
             contact.lastSeen = Date().timeIntervalSince1970
             try? ctx.save()
-            refreshChats()
+            scheduleRefreshChats()  // debounced: coalesces announce bursts
         } else if let name = displayName, !name.isEmpty, !prefs.filterStrangers {
             // Only auto-create a contact stub from announces when the stranger
             // filter is off — otherwise we'd be storing data for unknown senders.
@@ -1591,15 +1678,35 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             )
         }
 
-        // Sync chat names to App Group so the NSE can use them in notification titles
+        // Sync chat names to App Group so the NSE can use them in notification titles.
+        // Do this off the main actor — it's file I/O and not time-critical for UI.
         var chatNameMap: [String: String] = [:]
         for chat in chats where !chat.displayName.isEmpty {
             chatNameMap[chat.peerHash] = chat.displayName
         }
-        PendingNotification.writeChatNames(chatNameMap)
+        let snapshot = chatNameMap
+        Task.detached(priority: .utility) {
+            PendingNotification.writeChatNames(snapshot)
+        }
     }
 
     // MARK: - Helpers
+
+    /// Debounced refresh: coalesces rapid back-to-back calls (e.g. announce bursts,
+    /// delivery proofs) into a single SwiftData query + SwiftUI publish after 50 ms.
+    /// User-action paths (sendMessage, createChat, etc.) call refreshChats() directly
+    /// for immediate feedback.
+    private var pendingRefresh = false
+
+    private func scheduleRefreshChats() {
+        guard !pendingRefresh else { return }
+        pendingRefresh = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 50_000_000)  // 50 ms window
+            self?.pendingRefresh = false
+            self?.refreshChats()
+        }
+    }
 
     private func ensureChat(id: String, peerHash: String, isGroup: Bool = false, groupName: String? = nil) {
         guard let ctx = modelContext else { return }

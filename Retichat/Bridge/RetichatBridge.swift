@@ -12,19 +12,19 @@ import Foundation
 // MARK: - Callback protocols
 
 protocol MessageCallback: AnyObject {
-    func onMessage(hash: Data, srcHash: Data, destHash: Data,
-                   title: String, content: String, timestamp: Double,
-                   signatureValid: Bool, fieldsRaw: Data)
+    @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
+                              title: String, content: String, timestamp: Double,
+                              signatureValid: Bool, fieldsRaw: Data)
 }
 
 protocol AnnounceCallback: AnyObject {
-    func onAnnounce(destHash: Data, displayName: String?)
+    @MainActor func onAnnounce(destHash: Data, displayName: String?)
 }
 
 /// Receives outbound message state transitions from Rust.
 /// Fired at: SENT (0x04), DELIVERED (0x08), REJECTED (0xFD), CANCELLED (0xFE), FAILED (0xFF).
 protocol MessageStateCallback: AnyObject {
-    func onMessageState(hash: Data, state: UInt8)
+    @MainActor func onMessageState(hash: Data, state: UInt8)
 }
 
 // MARK: - Message delivery method constants
@@ -82,21 +82,21 @@ final class RetichatBridge: @unchecked Sendable {
 
     // MARK: - Transport
 
-    func transportHasPath(destHash: Data) -> Bool {
+    nonisolated func transportHasPath(destHash: Data) -> Bool {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return retichat_transport_has_path(ptr, UInt32(destHash.count)) == 1
         }
     }
 
-    func transportRequestPath(destHash: Data) -> Bool {
+    nonisolated func transportRequestPath(destHash: Data) -> Bool {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return retichat_transport_request_path(ptr, UInt32(destHash.count)) == 0
         }
     }
 
-    func transportHopsTo(destHash: Data) -> Int32 {
+    nonisolated func transportHopsTo(destHash: Data) -> Int32 {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return retichat_transport_hops_to(ptr, UInt32(destHash.count))
@@ -161,7 +161,7 @@ final class RetichatBridge: @unchecked Sendable {
 
     // MARK: - Link request
 
-    func linkRequest(destHash: Data, appName: String, aspects: String,
+    nonisolated func linkRequest(destHash: Data, appName: String, aspects: String,
                      identityHandle: UInt64, path: String,
                      payload: Data, timeoutSecs: Double = 15.0) -> Data? {
         return destHash.withUnsafeBytes { hashBuf in
@@ -198,12 +198,10 @@ final class RetichatBridge: @unchecked Sendable {
     func handleDelivery(hash: Data, srcHash: Data, destHash: Data,
                         title: String, content: String, timestamp: Double,
                         signatureValid: Bool, fieldsRaw: Data) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else {
-                print("[RetichatBridge] handleDelivery: DROPPED - bridge deallocated")
-                return
-            }
-            guard let cb = self.messageCallback else {
+        // Single hop: schedule directly on the main actor (no intermediate GCD dispatch).
+        let bridge = self
+        Task { @MainActor in
+            guard let cb = bridge.messageCallback else {
                 print("[RetichatBridge] handleDelivery: DROPPED - messageCallback is nil (ChatRepository deallocated?)")
                 return
             }
@@ -216,14 +214,16 @@ final class RetichatBridge: @unchecked Sendable {
     }
 
     func handleAnnounce(destHash: Data, displayName: String?) {
-        DispatchQueue.main.async { [weak self] in
-            self?.announceCallback?.onAnnounce(destHash: destHash, displayName: displayName)
+        let bridge = self
+        Task { @MainActor in
+            bridge.announceCallback?.onAnnounce(destHash: destHash, displayName: displayName)
         }
     }
 
     func handleMessageState(hash: Data, state: UInt8) {
-        DispatchQueue.main.async { [weak self] in
-            self?.messageStateCallback?.onMessageState(hash: hash, state: state)
+        let bridge = self
+        Task { @MainActor in
+            bridge.messageStateCallback?.onMessageState(hash: hash, state: state)
         }
     }
 }

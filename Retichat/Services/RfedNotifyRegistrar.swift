@@ -89,8 +89,8 @@ final class RfedNotifyRegistrar {
 
     // MARK: - Private
 
-    private func requestWithRetry(rfedHash: Data, identityHandle: UInt64,
-                                   payload: Data) async {
+    nonisolated private func requestWithRetry(rfedHash: Data, identityHandle: UInt64,
+                                              payload: Data) async {
         var delay = baseDelaySec
         for attempt in 1...maxAttempts {
             // Ensure path to rfed is known.

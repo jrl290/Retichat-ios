@@ -62,7 +62,7 @@ final class LxmfClient: @unchecked Sendable {
         lxmf_client_identity_handle(handle)
     }
 
-    private init(handle: UInt64, identityHash: Data, destHash: Data) {
+    nonisolated private init(handle: UInt64, identityHash: Data, destHash: Data) {
         self.handle = handle
         self.identityHash = identityHash
         self.destHash = destHash
@@ -72,7 +72,7 @@ final class LxmfClient: @unchecked Sendable {
     ///
     /// After this returns the network interfaces are connecting and the
     /// router is ready to receive messages once callbacks are wired.
-    static func start(config: LxmfClientConfig) throws -> LxmfClient {
+    nonisolated static func start(config: LxmfClientConfig) throws -> LxmfClient {
         let h = config.configDir.withCString { dir in
             config.storagePath.withCString { store in
                 config.identityPath.withCString { id in
@@ -182,6 +182,37 @@ final class LxmfClient: @unchecked Sendable {
         destHash.withUnsafeBytes { buf -> Int32 in
             let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return lxmf_peer_link_status(handle, p, UInt32(destHash.count))
+        }
+    }
+
+    // MARK: - App Links
+
+    /// Open an app link for the given destination.  Internally watches the announce,
+    /// requests a path, and establishes a direct link when the path arrives.
+    /// The link is kept alive and exempt from inactivity cleanup.
+    @discardableResult
+    nonisolated func appLinkOpen(_ destHash: Data) -> Bool {
+        destHash.withUnsafeBytes { buf -> Bool in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_app_link_open(handle, p, UInt32(destHash.count)) == 0
+        }
+    }
+
+    /// Close an app link for the given destination and tear down the direct link.
+    @discardableResult
+    nonisolated func appLinkClose(_ destHash: Data) -> Bool {
+        destHash.withUnsafeBytes { buf -> Bool in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_app_link_close(handle, p, UInt32(destHash.count)) == 0
+        }
+    }
+
+    /// Query the app link status for a destination.
+    /// Returns: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED, -1=error.
+    func appLinkStatus(_ destHash: Data) -> Int32 {
+        destHash.withUnsafeBytes { buf -> Int32 in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_app_link_status(handle, p, UInt32(destHash.count))
         }
     }
 
@@ -328,7 +359,7 @@ final class LxmfClient: @unchecked Sendable {
         return String(cString: buf)
     }
 
-    private static func fetchLastError() -> String {
+    nonisolated private static func fetchLastError() -> String {
         guard let ptr = lxmf_last_error() else { return "unknown" }
         let str = String(cString: ptr)
         lxmf_free_string(ptr)

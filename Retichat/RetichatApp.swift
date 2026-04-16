@@ -61,7 +61,6 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         let oldToken = UserPreferences.shared.apnsDeviceToken
         UserPreferences.shared.apnsDeviceToken = hex
-        print("[APNs] device token: \(hex)")
 
         // If the token changed (or is new), re-register with the rfed APNs bridge.
         if hex != oldToken, !repository.ownHash.isEmpty {
