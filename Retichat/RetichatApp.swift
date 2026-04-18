@@ -63,7 +63,8 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         UserPreferences.shared.apnsDeviceToken = hex
 
         // If the token changed (or is new), re-register with the rfed APNs bridge.
-        if hex != oldToken, !repository.ownHash.isEmpty {
+        if hex != oldToken, !repository.ownHash.isEmpty,
+           !UserPreferences.shared.rfedNodeIdentityHash.isEmpty {
             ApnsTokenRegistrar.shared.registerIfNeeded(subscriberHash: repository.ownHash)
         }
     }
@@ -156,7 +157,7 @@ struct RetichatApp: App {
     private var modelContainer: ModelContainer { appDelegate.modelContainer }
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("") {
             ContentView()
                 .environmentObject(repository)
                 .modelContainer(modelContainer)

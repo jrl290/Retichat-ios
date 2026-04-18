@@ -89,32 +89,26 @@ final class ConnectionStateManager {
     /// Returns the LXMF delivery method to use when sending to a peer.
     /// Uses live link status and recent announce data — instant, no I/O.
     ///
-    /// Strategy: only attempt DIRECT when we have strong evidence the peer
-    /// is reachable right now.  Otherwise fall back to PROPAGATED immediately
-    /// rather than blocking on link establishment + receipt timeouts.
-    /// If DIRECT fails once, handleMessageState retries via the prop node.
+    /// Strategy: prefer DIRECT whenever there is any routing path.  The
+    /// app-level 5-second fallback in ChatRepository will send a parallel
+    /// PROPAGATED copy if the direct attempt doesn't deliver in time.
+    /// This avoids the old problem where degradedPeers forced PROPAGATED
+    /// before even attempting DIRECT.
     func deliveryMethod(for destHash: Data) -> UInt8 {
-        let hex = destHash.hexString
-
-        // Peer's direct link recently failed and they haven't re-announced.
-        if degradedPeers.contains(hex) { return LxmfMethod.propagated }
-
         // An ACTIVE app link or direct/backchannel link exists — use it.
         if let client = lxmfClient {
             if client.appLinkStatus(destHash) == 3 { return LxmfMethod.direct }  // ACTIVE app link
             if client.peerLinkStatus(destHash) == 2 { return LxmfMethod.direct }
         }
 
-        // No active link.  Only try DIRECT if the peer announced very recently
-        // AND we still have a routing path — high confidence they're online and
-        // the library can establish a link on demand.
-        if let lastSeen = peerLastSeen[hex],
-           Date().timeIntervalSince(lastSeen) < Self.directAnnounceWindow,
-           RetichatBridge.shared.transportHasPath(destHash: destHash) {
+        // If we have any routing path to the peer, try DIRECT.
+        // The 5-second prop fallback will cover the case where
+        // the peer is unreachable.
+        if RetichatBridge.shared.transportHasPath(destHash: destHash) {
             return LxmfMethod.direct
         }
 
-        // Default: propagation node.  Avoids long timeout / retry loops.
+        // No path at all — propagation node is the only option.
         return LxmfMethod.propagated
     }
 

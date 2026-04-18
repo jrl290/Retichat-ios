@@ -54,6 +54,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     private var pendingOutbound: [String: PendingOutbound] = [:]
 
+    /// Timers for the 5-second propagation fallback. Keyed by direct msg hash hex.
+    private var propFallbackTimers: [String: DispatchWorkItem] = [:]
+    /// Message IDs that already had a propagation fallback dispatched.
+    private var propFallbackSent: Set<String> = []
+
     /// Serial queue for all FFI calls into the Rust LXMF library.
     /// Keeps the main thread responsive while crypto, link establishment,
     /// and outbound processing run in the background.
@@ -608,6 +613,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     hasAttachments: !attachmentsCopy.isEmpty
                 )
 
+                // Schedule a 5-second fallback: if direct doesn't deliver in
+                // time, proactively send via propagation too.  LXMF dedup on
+                // the receiver handles a possible double-delivery.
+                if method == LxmfMethod.direct && attachmentsCopy.isEmpty {
+                    self.schedulePropFallback(directHashHex: msgHashHex)
+                }
+
                 self.refreshChats()
             }
         }
@@ -809,24 +821,39 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         switch state {
 
         case 0x04:  // SENT — propagated message accepted by the prop node.
+            cancelPropFallback(directHashHex: hashHex)
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.sent)
             completePending(hashHex: hashHex, pending: pending)
 
         case 0x08:  // DELIVERED — recipient downloaded and decrypted the message.
+            cancelPropFallback(directHashHex: hashHex)
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.delivered)
             completePending(hashHex: hashHex, pending: pending)
 
         case 0xFD, 0xFE, 0xFF:  // REJECTED, CANCELLED, FAILED.
+            cancelPropFallback(directHashHex: hashHex)
             if pending.method == LxmfMethod.direct && !pending.hasAttachments {
-                // Direct link failed.  Mark peer as degraded and retry via prop node.
-                ConnectionStateManager.shared.markPeerDegraded(
-                    destHex: pending.peerHash.hexString
-                )
-                pendingOutbound.removeValue(forKey: hashHex)
-                LxmfClient.messageDestroy(pending.msgHandle)
-                retrySendViaPropNode(pending)
+                if propFallbackSent.contains(pending.messageId) {
+                    // Prop fallback already dispatched — just clean up this direct entry.
+                    print("[Retichat] Direct FAILED but prop fallback already in flight for \(pending.messageId.prefix(8))")
+                    completePending(hashHex: hashHex, pending: pending)
+                } else {
+                    // No fallback yet — retry now via prop node.
+                    ConnectionStateManager.shared.markPeerDegraded(
+                        destHex: pending.peerHash.hexString
+                    )
+                    propFallbackSent.insert(pending.messageId)
+                    pendingOutbound.removeValue(forKey: hashHex)
+                    LxmfClient.messageDestroy(pending.msgHandle)
+                    retrySendViaPropNode(pending)
+                }
+            } else if pending.method == LxmfMethod.propagated {
+                // Propagated terminal failure — clean up fallback tracking.
+                propFallbackSent.remove(pending.messageId)
+                updateDeliveryState(messageId: pending.messageId, state: DeliveryState.failed)
+                completePending(hashHex: hashHex, pending: pending)
             } else {
-                // Propagated failed (or had attachments) — final failure.
+                // Has attachments or other — final failure.
                 updateDeliveryState(messageId: pending.messageId, state: DeliveryState.failed)
                 completePending(hashHex: hashHex, pending: pending)
             }
@@ -839,6 +866,36 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private func completePending(hashHex: String, pending: PendingOutbound) {
         pendingOutbound.removeValue(forKey: hashHex)
         LxmfClient.messageDestroy(pending.msgHandle)
+        // Clean up fallback tracking when a propagated message reaches terminal state.
+        if pending.method == LxmfMethod.propagated {
+            propFallbackSent.remove(pending.messageId)
+        }
+    }
+
+    // MARK: - 5-second propagation fallback
+
+    private static let propFallbackDelay: TimeInterval = 5.0
+
+    private func schedulePropFallback(directHashHex: String) {
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let pending = self.pendingOutbound[directHashHex],
+                      pending.method == LxmfMethod.direct,
+                      !self.propFallbackSent.contains(pending.messageId) else { return }
+
+                print("[Retichat] 5s fallback: direct msg \(directHashHex.prefix(8)) not delivered, sending via propagation")
+                self.propFallbackSent.insert(pending.messageId)
+                self.updateDeliveryState(messageId: pending.messageId, state: DeliveryState.propagating)
+                self.retrySendViaPropNode(pending)
+            }
+        }
+        propFallbackTimers[directHashHex] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.propFallbackDelay, execute: work)
+    }
+
+    private func cancelPropFallback(directHashHex: String) {
+        propFallbackTimers.removeValue(forKey: directHashHex)?.cancel()
     }
 
     /// Retry a failed direct-mode message via the propagation node.

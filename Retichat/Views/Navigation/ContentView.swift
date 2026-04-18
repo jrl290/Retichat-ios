@@ -8,6 +8,19 @@
 import SwiftUI
 import SwiftData
 
+// MARK: - Environment key for layout mode
+
+private struct IsWideLayoutKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var isWideLayout: Bool {
+        get { self[IsWideLayoutKey.self] }
+        set { self[IsWideLayoutKey.self] = newValue }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var repository: ChatRepository
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -15,13 +28,32 @@ struct ContentView: View {
     @State private var showNewChat = false
     @State private var showSettings = false
     @State private var showQRCode = false
+    @State private var windowWidth: CGFloat = 0
+
+    private var useWideLayout: Bool {
+        #if targetEnvironment(macCatalyst)
+        return windowWidth >= 800
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
 
     var body: some View {
-        Group {
-            if horizontalSizeClass == .regular {
-                wideLayout
-            } else {
-                stackLayout
+        GeometryReader { geo in
+            Group {
+                if useWideLayout {
+                    wideLayout
+                } else {
+                    stackLayout
+                }
+            }
+            .environment(\.isWideLayout, useWideLayout)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onChange(of: geo.size.width) { _, newWidth in
+                windowWidth = newWidth
+            }
+            .onAppear {
+                windowWidth = geo.size.width
             }
         }
         .preferredColorScheme(.dark)

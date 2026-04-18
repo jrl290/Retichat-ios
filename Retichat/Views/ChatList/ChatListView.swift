@@ -91,6 +91,7 @@ struct ChatListView: View {
                         ChatRow(chat: chat)
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                             .contentShape(Rectangle())
                             .onTapGesture {
                                 selectedChatId = chat.id
@@ -151,6 +152,11 @@ struct ChatListView: View {
 
 struct ChatRow: View {
     let chat: Chat
+    @Environment(\.isWideLayout) private var isWideLayout
+
+    private var outerHorizontalPadding: CGFloat {
+        isWideLayout ? 16 : 12
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -213,7 +219,7 @@ struct ChatRow: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .glassBackground(cornerRadius: 12)
-        .padding(.horizontal, 8)
+        .padding(.horizontal, outerHorizontalPadding)
         .padding(.bottom, 6)
     }
 

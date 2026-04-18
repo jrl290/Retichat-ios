@@ -34,6 +34,10 @@ final class ApnsTokenRegistrar {
     /// Call after service starts (and identity is known) whenever the APNs token
     /// or the rfed.apns hash changes.
     func registerIfNeeded(subscriberHash: Data) {
+        guard !prefs.rfedNodeIdentityHash.isEmpty else {
+            print("[APNsRegistrar] No RFed node configured; skipping APNs registration")
+            return
+        }
         let apnsToken = prefs.apnsDeviceToken
         guard !apnsToken.isEmpty else { return }
         guard let destHash = ApnsBridgeHashes.apnsRegistration else {
