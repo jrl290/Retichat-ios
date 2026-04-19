@@ -22,8 +22,13 @@ pub use lxmf_rust::cffi::*;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use reticulum_rust::ffi as rns;
+use reticulum_rust::destination::{Destination, DestinationType};
+use reticulum_rust::identity::Identity;
+use reticulum_rust::packet::Packet;
+use reticulum_rust::transport::Transport;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -277,4 +282,121 @@ pub extern "C" fn retichat_link_request(
             std::ptr::null_mut()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFed Delivery — inbound channel blob endpoint
+// ---------------------------------------------------------------------------
+
+/// C callback fired when a blob arrives at the local rfed.delivery destination.
+///
+/// `data`/`len` — raw inner blob bytes.
+/// `ctx`        — pointer passed to `retichat_rfed_delivery_start`.
+pub type RfedBlobCallback = extern "C" fn(data: *const u8, len: u32, ctx: *mut std::ffi::c_void);
+
+/// Wraps a raw `*mut c_void` so it can be sent across threads.
+/// The C caller is responsible for lifetime management of the pointed object.
+struct SendableCtx(usize);
+unsafe impl Send for SendableCtx {}
+unsafe impl Sync for SendableCtx {}
+
+struct RfedDeliveryState {
+    dest: Destination,
+    callback: Option<RfedBlobCallback>,
+    ctx: SendableCtx,
+}
+
+static RFED_DELIVERY: OnceLock<Mutex<Option<RfedDeliveryState>>> = OnceLock::new();
+
+fn rfed_delivery_storage() -> &'static Mutex<Option<RfedDeliveryState>> {
+    RFED_DELIVERY.get_or_init(|| Mutex::new(None))
+}
+
+/// Register an inbound `rfed.delivery` destination so the rfed server can
+/// push channel blobs to this device.
+///
+/// * `identity_handle` — LXMF client identity handle (from `lxmf_client_identity_handle`).
+/// * `callback`        — called on a background thread whenever a blob arrives.
+/// * `ctx`             — opaque context pointer forwarded to every `callback` call.
+///
+/// Returns 0 on success, -1 on error (check `lxmf_last_error`).
+/// Call `retichat_rfed_delivery_announce` afterwards to flush deferred blobs.
+#[no_mangle]
+pub extern "C" fn retichat_rfed_delivery_start(
+    identity_handle: u64,
+    callback: Option<RfedBlobCallback>,
+    ctx: *mut std::ffi::c_void,
+) -> i32 {
+    let identity: Identity = match rns::get_handle(identity_handle) {
+        Some(id) => id,
+        None => {
+            rns::set_error("invalid identity handle".into());
+            return -1;
+        }
+    };
+
+    // Build inbound rfed.delivery destination from this identity.
+    let mut dest = match Destination::new_inbound(
+        Some(identity),
+        DestinationType::Single,
+        "rfed".to_string(),
+        vec!["delivery".to_string()],
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            rns::set_error(e);
+            return -1;
+        }
+    };
+
+    // Register packet callback — fires on the Reticulum worker thread.
+    let cb = callback;
+    let ctx_usize = ctx as usize;
+    let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> =
+        Arc::new(move |data: &[u8], _pkt: &Packet| {
+            if let Some(f) = cb {
+                f(data.as_ptr(), data.len() as u32, ctx_usize as *mut std::ffi::c_void);
+            }
+        });
+    dest.set_packet_callback(Some(packet_cb));
+    Transport::register_destination(dest.clone());
+
+    let mut guard = rfed_delivery_storage().lock().unwrap();
+    *guard = Some(RfedDeliveryState {
+        dest,
+        callback: cb,
+        ctx: SendableCtx(ctx_usize),
+    });
+    0
+}
+
+/// Announce the local `rfed.delivery` destination so the rfed server flushes
+/// any deferred blobs queued for this subscriber.
+///
+/// Call this at startup, on foreground transitions, and after reconnecting.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn retichat_rfed_delivery_announce() -> i32 {
+    let mut guard = rfed_delivery_storage().lock().unwrap();
+    if let Some(ref mut state) = *guard {
+        if let Err(e) = state.dest.announce(None, false, None, None, true) {
+            rns::set_error(e);
+            return -1;
+        }
+        return 0;
+    }
+    rns::set_error("rfed delivery not started — call retichat_rfed_delivery_start first".into());
+    -1
+}
+
+/// Tear down the local `rfed.delivery` endpoint.
+/// The destination is deregistered from the Reticulum transport.
+/// Returns 0 always.
+#[no_mangle]
+pub extern "C" fn retichat_rfed_delivery_stop() -> i32 {
+    let mut guard = rfed_delivery_storage().lock().unwrap();
+    if let Some(state) = guard.take() {
+        Transport::deregister_destination(&state.dest.hash);
+    }
+    0
 }

@@ -23,12 +23,15 @@ extension EnvironmentValues {
 
 struct ContentView: View {
     @EnvironmentObject var repository: ChatRepository
+    @EnvironmentObject var channelClient: RfedChannelClient
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var selectedChatId: String?
     @State private var showNewChat = false
+    @State private var showNewGroup = false
     @State private var showSettings = false
     @State private var showQRCode = false
     @State private var windowWidth: CGFloat = 0
+    @State private var selectedTab = 0
 
     private var useWideLayout: Bool {
         #if targetEnvironment(macCatalyst)
@@ -39,22 +42,36 @@ struct ContentView: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
-            Group {
-                if useWideLayout {
-                    wideLayout
-                } else {
-                    stackLayout
+        TabView(selection: $selectedTab) {
+            // MARK: Tab 1 — Messages
+            GeometryReader { geo in
+                Group {
+                    if useWideLayout {
+                        wideLayout
+                    } else {
+                        stackLayout
+                    }
+                }
+                .environment(\.isWideLayout, useWideLayout)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onChange(of: geo.size.width) { _, newWidth in
+                    windowWidth = newWidth
+                }
+                .onAppear {
+                    windowWidth = geo.size.width
                 }
             }
-            .environment(\.isWideLayout, useWideLayout)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onChange(of: geo.size.width) { _, newWidth in
-                windowWidth = newWidth
+            .tabItem {
+                Label("Messages", systemImage: "bubble.left.and.bubble.right")
             }
-            .onAppear {
-                windowWidth = geo.size.width
-            }
+            .tag(0)
+
+            // MARK: Tab 2 — Channels
+            ChannelListView()
+                .tabItem {
+                    Label("Channels", systemImage: "antenna.radiowaves.left.and.right")
+                }
+                .tag(1)
         }
         .preferredColorScheme(.dark)
         .tint(.retichatPrimary)
@@ -63,6 +80,7 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openChatFromNotification)) { notif in
             if let chatId = notif.object as? String {
+                selectedTab = 0
                 showNewChat = false
                 showSettings = false
                 showQRCode = false
@@ -84,6 +102,7 @@ struct ContentView: View {
             ChatListView(
                 selectedChatId: $selectedChatId,
                 showNewChat: $showNewChat,
+                showNewGroup: $showNewGroup,
                 showSettings: $showSettings,
                 showQRCode: $showQRCode
             )
@@ -94,6 +113,9 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showNewChat) {
                 NewChatView(selectedChatId: $selectedChatId)
+            }
+            .sheet(isPresented: $showNewGroup) {
+                NewGroupView(selectedChatId: $selectedChatId, onDismissParent: { showNewGroup = false })
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
@@ -111,6 +133,7 @@ struct ContentView: View {
             ChatListView(
                 selectedChatId: $selectedChatId,
                 showNewChat: $showNewChat,
+                showNewGroup: $showNewGroup,
                 showSettings: $showSettings,
                 showQRCode: $showQRCode
             )
@@ -118,6 +141,9 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.25), value: showSettings || showNewChat)
             .sheet(isPresented: $showNewChat) {
                 NewChatView(selectedChatId: $selectedChatId)
+            }
+            .sheet(isPresented: $showNewGroup) {
+                NewGroupView(selectedChatId: $selectedChatId, onDismissParent: { showNewGroup = false })
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
@@ -156,16 +182,17 @@ struct ContentView: View {
     // MARK: - Deep link
 
     private func handleDeepLink(_ url: URL) {
-        guard url.scheme == "lxmf" else { return }
-        var hash = url.host ?? ""
-        if hash.isEmpty {
-            hash = url.absoluteString
-                .replacingOccurrences(of: "lxmf://", with: "")
-                .replacingOccurrences(of: "lxmf:", with: "")
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "lxma" || scheme == "lxmf" else { return }
+        // host contains <hash> or <hash>.<pubkey> — take only the hash part
+        var raw = (url.host ?? "").lowercased()
+        if raw.isEmpty {
+            raw = url.absoluteString
+                .replacingOccurrences(of: "\(scheme)://", with: "")
         }
-        hash = hash.trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "[^a-f0-9]", with: "", options: .regularExpression)
+        // Strip optional .<pubkey> suffix
+        let hashPart = raw.components(separatedBy: ".").first ?? raw
+        let hash = hashPart.filter { "0123456789abcdef".contains($0) }
 
         if hash.count == 32 {
             let chatId = repository.createDirectChat(destHash: hash)

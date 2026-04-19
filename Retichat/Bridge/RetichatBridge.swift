@@ -27,6 +27,12 @@ protocol MessageStateCallback: AnyObject {
     @MainActor func onMessageState(hash: Data, state: UInt8)
 }
 
+/// Receives raw inner blobs arriving at the local rfed.delivery destination.
+/// Called on a background thread — implementations must dispatch to main thread if needed.
+protocol RfedBlobCallback: AnyObject {
+    func onRfedBlob(_ blob: Data)
+}
+
 // MARK: - Message delivery method constants
 
 enum LxmfMethod {
@@ -53,6 +59,7 @@ final class RetichatBridge: @unchecked Sendable {
     private weak var messageCallback: MessageCallback?
     private weak var announceCallback: AnnounceCallback?
     private weak var messageStateCallback: (any MessageStateCallback)?
+    private weak var rfedBlobCallback: (any RfedBlobCallback)?
 
     private init() {}
 
@@ -193,6 +200,29 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    // MARK: - RFed Delivery
+
+    /// Start the local rfed.delivery inbound endpoint.
+    /// `callback` fires on a background thread whenever a blob arrives.
+    @discardableResult
+    func startRfedDelivery(identityHandle: UInt64, callback: any RfedBlobCallback) -> Bool {
+        self.rfedBlobCallback = callback
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        return retichat_rfed_delivery_start(identityHandle, rfedBlobTrampoline, ctx) == 0
+    }
+
+    /// Announce the local rfed.delivery destination to trigger flush of deferred blobs.
+    @discardableResult
+    func rfedDeliveryAnnounce() -> Bool {
+        return retichat_rfed_delivery_announce() == 0
+    }
+
+    /// Stop the rfed.delivery endpoint.
+    func stopRfedDelivery() {
+        _ = retichat_rfed_delivery_stop()
+        rfedBlobCallback = nil
+    }
+
     // MARK: - Internal callback dispatch
 
     func handleDelivery(hash: Data, srcHash: Data, destHash: Data,
@@ -225,6 +255,10 @@ final class RetichatBridge: @unchecked Sendable {
         Task { @MainActor in
             bridge.messageStateCallback?.onMessageState(hash: hash, state: state)
         }
+    }
+
+    func handleRfedBlob(_ blob: Data) {
+        rfedBlobCallback?.onRfedBlob(blob)
     }
 }
 
@@ -285,4 +319,16 @@ private func messageStateTrampoline(
 
     let hashData = msgHash.map { Data(bytes: $0, count: Int(hashLen)) } ?? Data()
     bridge.handleMessageState(hash: hashData, state: state)
+}
+
+/// Called from Rust on a background thread when a blob arrives at rfed.delivery.
+private func rfedBlobTrampoline(
+    data: UnsafePointer<UInt8>?,
+    len: UInt32,
+    context: UnsafeMutableRawPointer?
+) {
+    guard let context = context, let data = data else { return }
+    let bridge = Unmanaged<RetichatBridge>.fromOpaque(context).takeUnretainedValue()
+    let blob = Data(bytes: data, count: Int(len))
+    bridge.handleRfedBlob(blob)
 }

@@ -199,3 +199,62 @@ enum DeliveryState {
     /// for store-and-forward delivery.
     static let propagating = 4
 }
+
+// MARK: - Channel SwiftData Models
+
+@Model
+final class ChannelEntity {
+    @Attribute(.unique) var channelHash: String  // 32-char hex (16 bytes)
+    var channelName: String
+    var rfedNodeHash: String                      // 32-char hex of rfed.channel dest
+    var lastMessageTime: Double
+    var isSubscribed: Bool
+
+    init(channelHash: String, channelName: String, rfedNodeHash: String,
+         lastMessageTime: Double = 0, isSubscribed: Bool = true) {
+        self.channelHash = channelHash
+        self.channelName = channelName
+        self.rfedNodeHash = rfedNodeHash
+        self.lastMessageTime = lastMessageTime
+        self.isSubscribed = isSubscribed
+    }
+}
+
+@Model
+final class ChannelMessageEntity {
+    @Attribute(.unique) var id: String           // sender_hex+timestamp hex
+    var channelHash: String
+    var senderHash: String                        // 32-char hex (16 bytes)
+    var content: String
+    var timestamp: Double                         // Unix ms
+    var isOutgoing: Bool
+
+    init(id: String, channelHash: String, senderHash: String, content: String,
+         timestamp: Double, isOutgoing: Bool = false) {
+        self.id = id
+        self.channelHash = channelHash
+        self.senderHash = senderHash
+        self.content = content
+        self.timestamp = timestamp
+        self.isOutgoing = isOutgoing
+    }
+}
+
+// MARK: - Channel View Models
+
+struct Channel: Identifiable {
+    let id: String          // channelHash hex
+    var channelName: String
+    var rfedNodeHash: String
+    var lastMessageTime: Double
+    var isSubscribed: Bool
+}
+
+struct ChannelMessage: Identifiable {
+    let id: String
+    var channelHash: String
+    var senderHash: String
+    var content: String
+    var timestamp: Double
+    var isOutgoing: Bool
+}

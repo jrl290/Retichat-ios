@@ -282,4 +282,25 @@ uint8_t *retichat_link_request(const uint8_t *dest_hash, uint32_t dest_hash_len,
                                 double timeout_secs,
                                 uint32_t *out_len);
 
+#pragma mark - RFed Delivery (inbound channel blobs)
+
+/// Callback type fired when a channel blob arrives at the local rfed.delivery endpoint.
+/// Called on a Reticulum worker thread — dispatch to main thread if needed.
+typedef void (*rfed_blob_callback_t)(const uint8_t *data, uint32_t len, void *ctx);
+
+/// Register an inbound rfed.delivery destination so the rfed server can push
+/// channel blobs to this device.  identity_handle must come from
+/// lxmf_client_identity_handle().  Returns 0 on success, -1 on error.
+int32_t retichat_rfed_delivery_start(uint64_t identity_handle,
+                                      rfed_blob_callback_t callback,
+                                      void *ctx);
+
+/// Announce the local rfed.delivery destination.  Call at startup and on
+/// foreground transitions to trigger flush of deferred blobs from the server.
+/// Returns 0 on success, -1 on error.
+int32_t retichat_rfed_delivery_announce(void);
+
+/// Stop the local rfed.delivery endpoint and deregister from transport.
+int32_t retichat_rfed_delivery_stop(void);
+
 #endif /* CRetichatFFI_h */
