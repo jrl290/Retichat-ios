@@ -129,8 +129,10 @@ The following features are planned but are not ready for public use yet:
 
 ## URL Scheme
 
-The app registers the `lxmf://` URL scheme. Scanning or tapping
-`lxmf://<32-char-hex-hash>` opens a conversation with that destination.
+The app registers the `lxma://` URL scheme. Scanning or tapping
+`lxma://<32-char-hex-hash>` or `lxma://<32-char-hex-hash>.<128-char-hex-pubkey>`
+opens a conversation with that destination. The older `lxmf://` scheme is also
+accepted for backwards compatibility.
 
 ## Interoperability
 
@@ -140,7 +142,7 @@ Retichat uses the standard LXMF protocol and is interoperable with
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.
 
 ## Default Endpoints
 
