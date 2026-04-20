@@ -38,6 +38,10 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     private var identityHandle: UInt64 = 0
     private var ownHashHex: String = ""
 
+    /// Blobs that failed decryption — keyed by a cheap hash to avoid
+    /// reprocessing the same undecryptable stored message on every delivery cycle.
+    private var failedBlobKeys: Set<Int> = []
+
     // MARK: - Configuration
 
     func configure(modelContext: ModelContext, identityHandle: UInt64, ownHashHex: String) {
@@ -60,6 +64,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
         loadPersistedChannels()
         loadPersistedMessages()
+        resubscribePersistedChannels()
     }
 
     func stop() {
@@ -310,7 +315,12 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         print("[RfedChannel] dispatchBlob MATCHED channel=\(channelHashHex.prefix(16)) name=\(channel.channelName) blob_bytes=\(blob.count)")
 
         guard let inner = bridge.channelDecrypt(name: channel.channelName, ciphertext: blob) else {
-            print("[RfedChannel] dispatchBlob decrypt FAILED")
+            // Suppress repeated log spam for the same undecryptable blob (e.g. old-format stored messages).
+            let blobKey = channelHashHex.hashValue &+ blob.hashValue
+            if !failedBlobKeys.contains(blobKey) {
+                failedBlobKeys.insert(blobKey)
+                print("[RfedChannel] dispatchBlob decrypt FAILED (blob_bytes=\(blob.count), suppressing repeats)")
+            }
             return
         }
         print("[RfedChannel] dispatchBlob decrypt OK inner_bytes=\(inner.count)")
@@ -461,6 +471,34 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             Channel(id: $0.channelHash, channelName: $0.channelName,
                     rfedNodeHash: $0.rfedNodeHash, lastMessageTime: $0.lastMessageTime,
                     isSubscribed: $0.isSubscribed, stampCost: $0.stampCost)
+        }
+    }
+
+    /// Re-subscribe to all channels that were subscribed before the app was killed.
+    /// Called on start() so the rfed node delivers real-time blobs after a restart.
+    private func resubscribePersistedChannels() {
+        let toResub = channels.filter { $0.isSubscribed }
+        guard !toResub.isEmpty else { return }
+        print("[RfedChannel] Re-subscribing to \(toResub.count) persisted channel(s) after restart")
+        Task {
+            for channel in toResub {
+                guard let channelHashData = Data(hexString: channel.id),
+                      let rfedChannelDest  = Data(hexString: channel.rfedNodeHash) else { continue }
+                do {
+                    let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
+                                                               rfedChannelDest: rfedChannelDest)
+                    // Update in-memory stamp cost if the server returns a different value.
+                    if let idx = channels.firstIndex(where: { $0.id == channel.id }) {
+                        channels[idx] = Channel(id: channel.id, channelName: channel.channelName,
+                                                rfedNodeHash: channel.rfedNodeHash,
+                                                lastMessageTime: channel.lastMessageTime,
+                                                isSubscribed: true, stampCost: stampCost)
+                    }
+                    print("[RfedChannel] Re-subscribed to \(channel.channelName) (stampCost=\(stampCost.map { "\($0)" } ?? "nil"))")
+                } catch {
+                    print("[RfedChannel] Re-subscribe failed for \(channel.channelName): \(error)")
+                }
+            }
         }
     }
 
