@@ -200,6 +200,49 @@ struct ChatBubble: View {
     }
 }
 
+// MARK: - Channel message bubble
+
+/// Isolated bubble component for RFed channel messages.
+/// The caller resolves `senderDisplayName` from the contact store so this view
+/// stays free of service dependencies. If no name is known, the caller passes
+/// the truncated identity hash instead.
+struct ChannelBubble: View {
+    let message: ChannelMessage
+    let senderDisplayName: String
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 0) {
+            if message.isOutgoing { Spacer(minLength: 60) }
+
+            VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 2) {
+                if !message.isOutgoing {
+                    Text(senderDisplayName)
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.retichatPrimary)
+                }
+
+                Text(message.content)
+                    .font(.body)
+                    .foregroundColor(.retichatOnSurface)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(message.isOutgoing ? Color.outgoingBubble : Color.incomingBubble)
+                    )
+
+                Text(Date(timeIntervalSince1970: message.timestamp / 1000), style: .time)
+                    .font(.caption2)
+                    .foregroundColor(.retichatOnSurfaceVariant.opacity(0.7))
+            }
+
+            if !message.isOutgoing { Spacer(minLength: 60) }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 // MARK: - Status dot
 
 struct StatusDot: View {

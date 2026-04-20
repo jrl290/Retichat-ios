@@ -24,6 +24,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use sha2::{Digest, Sha256};
 use reticulum_rust::ffi as rns;
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
@@ -86,6 +87,33 @@ pub extern "C" fn retichat_identity_public_key(
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
             }
             bytes.len() as i32
+        }
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// Sign `data` with the identity's Ed25519 signing key.
+/// Writes 64-byte signature to `out_sig`. Returns 64 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn retichat_identity_sign(
+    handle: u64,
+    data: *const u8,
+    data_len: u32,
+    out_sig: *mut u8,
+    sig_buf_len: u32,
+) -> i32 {
+    if sig_buf_len < 64 {
+        rns::set_error("signature buffer too small (need 64)".into());
+        return -1;
+    }
+    let d = slice_from_raw(data, data_len);
+    match rns::identity_sign(handle, &d) {
+        Ok(sig) => {
+            unsafe { std::ptr::copy_nonoverlapping(sig.as_ptr(), out_sig, 64); }
+            64
         }
         Err(e) => {
             rns::set_error(e);
@@ -399,4 +427,122 @@ pub extern "C" fn retichat_rfed_delivery_stop() -> i32 {
         Transport::deregister_destination(&state.dest.hash);
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// Channel crypto
+// ---------------------------------------------------------------------------
+
+/// Derive a channel keypair from `name` (e.g. "public.general") and use the
+/// channel's X25519 public key to encrypt `plaintext`.
+///
+/// Returns a heap-allocated ciphertext (free with `lxmf_free_bytes`) or NULL
+/// on error.  Wire format: `ephemeral_x25519_pub(32) | iv(16) | aes_cbc_ct | hmac(32)`.
+fn channel_private_key_bytes(name: &str) -> [u8; 64] {
+    let seed: [u8; 32] = Sha256::digest(name.as_bytes()).into();
+    // Same seed used for both X25519 (encryption) and Ed25519 (signing),
+    // mirroring ChannelKeypair::from_name in RFed-rust/rfed/src/channel.rs.
+    let mut prv = [0u8; 64];
+    prv[..32].copy_from_slice(&seed);
+    prv[32..].copy_from_slice(&seed);
+    prv
+}
+
+#[no_mangle]
+pub extern "C" fn retichat_channel_encrypt(
+    name_ptr: *const c_char,
+    plaintext: *const u8,
+    plaintext_len: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let name = unsafe { cstr_to_string(name_ptr) };
+    let pt = slice_from_raw(plaintext, plaintext_len);
+    let prv = channel_private_key_bytes(&name);
+    let identity = match Identity::from_bytes(&prv) {
+        Ok(id) => id,
+        Err(e) => {
+            rns::set_error(e);
+            unsafe { *out_len = 0; }
+            return std::ptr::null_mut();
+        }
+    };
+    match identity.encrypt(&pt) {
+        Ok(ct) => {
+            let len = ct.len() as u32;
+            let mut boxed = ct.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            unsafe { *out_len = len; }
+            ptr
+        }
+        Err(e) => {
+            rns::set_error(e);
+            unsafe { *out_len = 0; }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn retichat_channel_decrypt(
+    name_ptr: *const c_char,
+    ciphertext: *const u8,
+    ciphertext_len: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let name = unsafe { cstr_to_string(name_ptr) };
+    let ct = slice_from_raw(ciphertext, ciphertext_len);
+    let prv = channel_private_key_bytes(&name);
+    let mut identity = match Identity::from_bytes(&prv) {
+        Ok(id) => id,
+        Err(e) => {
+            rns::set_error(e);
+            unsafe { *out_len = 0; }
+            return std::ptr::null_mut();
+        }
+    };
+    match identity.decrypt(&ct) {
+        Ok(pt) => {
+            let len = pt.len() as u32;
+            let mut boxed = pt.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            unsafe { *out_len = len; }
+            ptr
+        }
+        Err(e) => {
+            rns::set_error(e);
+            unsafe { *out_len = 0; }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Compute a PoW stamp for a channel SEND packet.
+///
+/// `payload` is `channel_hash(16) | ciphertext` (everything before the stamp).
+/// `cost` is the required leading-zero bits from the rfed node's `stamp_cost`.
+///
+/// Returns a heap-allocated 32-byte stamp (free with `lxmf_free_bytes`), or
+/// NULL when cost == 0.  Algorithm matches rfed's STAMP_EXPAND_ROUNDS=16.
+#[no_mangle]
+pub extern "C" fn retichat_compute_channel_stamp(
+    payload: *const u8,
+    payload_len: u32,
+    cost: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    if cost == 0 {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    }
+    let data = slice_from_raw(payload, payload_len);
+    let transient_id = reticulum_rust::identity::full_hash(&data);
+    let (stamp, _) = reticulum_rust::lxstamper::LXStamper::generate_stamp(&transient_id, cost, 16);
+    let len = stamp.len() as u32;
+    let mut boxed = stamp.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    unsafe { *out_len = len; }
+    ptr
 }

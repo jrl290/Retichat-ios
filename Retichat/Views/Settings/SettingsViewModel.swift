@@ -24,6 +24,7 @@ struct PendingInterface: Identifiable, Equatable {
 @MainActor
 class SettingsViewModel: ObservableObject {
     @Published var displayName: String
+    @Published var channelDisplayName: String
     @Published var rfedNodeIdentityHash: String
     @Published var rfedLxmfPropOverride: String
     @Published var filterStrangers: Bool
@@ -31,6 +32,7 @@ class SettingsViewModel: ObservableObject {
 
     // Baseline captured at init; updated after Apply so hasChanges resets.
     private var originalDisplayName: String
+    private var originalChannelDisplayName: String
     private var originalRfedNodeIdentityHash: String
     private var originalRfedLxmfPropOverride: String
     private var originalFilterStrangers: Bool
@@ -39,6 +41,7 @@ class SettingsViewModel: ObservableObject {
     /// True when any setting differs from the values present when the screen opened (or last Apply).
     var hasChanges: Bool {
         displayName != originalDisplayName ||
+        channelDisplayName != originalChannelDisplayName ||
         rfedNodeIdentityHash != originalRfedNodeIdentityHash ||
         rfedLxmfPropOverride != originalRfedLxmfPropOverride ||
         filterStrangers != originalFilterStrangers ||
@@ -48,10 +51,12 @@ class SettingsViewModel: ObservableObject {
     init() {
         let prefs = UserPreferences.shared
         self.displayName = prefs.displayName
+        self.channelDisplayName = prefs.channelDisplayName
         self.rfedNodeIdentityHash = prefs.rfedNodeIdentityHash
         self.rfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.filterStrangers = prefs.filterStrangers
         self.originalDisplayName = prefs.displayName
+        self.originalChannelDisplayName = prefs.channelDisplayName
         self.originalRfedNodeIdentityHash = prefs.rfedNodeIdentityHash
         self.originalRfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.originalFilterStrangers = prefs.filterStrangers
@@ -74,6 +79,7 @@ class SettingsViewModel: ObservableObject {
     func apply() {
         let prefs = UserPreferences.shared
         prefs.displayName = displayName
+        prefs.channelDisplayName = channelDisplayName
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
         prefs.rfedNotifyHash = Self.rnsDestHash(
             identityHashHex: rfedNodeIdentityHash, app: "rfed", aspects: ["notify"]

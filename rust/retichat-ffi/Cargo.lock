@@ -1241,6 +1241,7 @@ dependencies = [
  "hex",
  "lxmf_rust",
  "reticulum_rust",
+ "sha2 0.10.9",
  "tempfile",
 ]
 

@@ -246,6 +246,9 @@ uint64_t retichat_identity_from_bytes(const uint8_t *bytes, uint32_t len);
 /// Get identity public key. Writes to out_buf (>= 64 bytes). Returns count or -1.
 int32_t retichat_identity_public_key(uint64_t handle, uint8_t *out_buf, uint32_t buf_len);
 
+/// Sign data with the identity's Ed25519 signing key. Writes 64-byte sig to out_sig. Returns 64 or -1.
+int32_t retichat_identity_sign(uint64_t handle, const uint8_t *data, uint32_t data_len, uint8_t *out_sig, uint32_t sig_buf_len);
+
 /// Destroy a standalone identity handle. Do NOT call for identities owned by lxmf_client.
 int32_t retichat_identity_destroy(uint64_t handle);
 
@@ -302,5 +305,29 @@ int32_t retichat_rfed_delivery_announce(void);
 
 /// Stop the local rfed.delivery endpoint and deregister from transport.
 int32_t retichat_rfed_delivery_stop(void);
+
+#pragma mark - Channel Crypto
+
+/// Encrypt `plaintext` for the named channel.
+/// Derives the channel keypair deterministically from `name` (e.g. "public.general").
+/// Returns heap-allocated ciphertext (free with lxmf_free_bytes), or NULL on error.
+uint8_t *retichat_channel_encrypt(const char *name,
+                                   const uint8_t *plaintext, uint32_t plaintext_len,
+                                   uint32_t *out_len);
+
+/// Decrypt ciphertext for the named channel.
+/// Derives the channel keypair deterministically from `name`.
+/// Returns heap-allocated plaintext (free with lxmf_free_bytes), or NULL on error.
+uint8_t *retichat_channel_decrypt(const char *name,
+                                   const uint8_t *ciphertext, uint32_t ciphertext_len,
+                                   uint32_t *out_len);
+
+/// Compute a PoW stamp for a channel SEND packet.
+/// `payload` = channel_hash(16) | ciphertext (everything before the stamp).
+/// `cost` = required leading-zero bits (must match rfed's stamp_cost). Pass 0 for no stamp.
+/// Returns heap-allocated 32-byte stamp (free with lxmf_free_bytes), or NULL when cost == 0.
+uint8_t *retichat_compute_channel_stamp(const uint8_t *payload, uint32_t payload_len,
+                                         uint32_t cost,
+                                         uint32_t *out_len);
 
 #endif /* CRetichatFFI_h */

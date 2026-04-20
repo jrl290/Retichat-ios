@@ -46,8 +46,12 @@ final class RfedNotifyRegistrar {
             return
         }
 
-        // Payload: the relay hash as a msgpack-encoded string.
-        let payload = encodeMsgpackString(relayHex)
+        // Payload: fixarray-3 [str(relayHex), bin(64) pubkey, bin(64) sig_over_utf8(relayHex)]
+        // Subscriber identity is derived from pubkey on the server — no timing dependency.
+        guard let payload = buildSignedPayload(relayHex: relayHex, identityHandle: identityHandle) else {
+            print("[RfedNotify] Failed to sign payload")
+            return
+        }
 
         Task.detached(priority: .background) { [weak self] in
             await self?.requestWithRetry(
@@ -66,7 +70,7 @@ final class RfedNotifyRegistrar {
               let rfedHash = Data(hexString: oldNotifyHashHex) else { return }
         guard let relayHex = ApnsBridgeHashes.notifyRelayHex else { return }
 
-        let payload = encodeMsgpackString(relayHex)
+        guard let payload = buildSignedPayload(relayHex: relayHex, identityHandle: identityHandle) else { return }
 
         let bridge = self.bridge
         Task.detached(priority: .background) {
@@ -133,6 +137,24 @@ final class RfedNotifyRegistrar {
     }
 
     // MARK: - msgpack encoding
+
+    /// Build the signed payload: fixarray-3 [str(relayHex), bin(64) pubkey, bin(64) sig]
+    private func buildSignedPayload(relayHex: String, identityHandle: UInt64) -> Data? {
+        let valueData = Data(relayHex.utf8)
+        guard let pubkey = bridge.identityPublicKey(handle: identityHandle),
+              let sig    = bridge.identitySign(handle: identityHandle, data: valueData) else { return nil }
+        var out = Data([0x93])    // fixarray of 3
+        out.append(encodeMsgpackString(relayHex))
+        out.append(msgpackBin(pubkey))
+        out.append(msgpackBin(sig))
+        return out
+    }
+
+    private func msgpackBin(_ data: Data) -> Data {
+        var out = Data([0xc4, UInt8(data.count)])
+        out.append(data)
+        return out
+    }
 
     /// Encode a UTF-8 string in msgpack format.
     private func encodeMsgpackString(_ s: String) -> Data {

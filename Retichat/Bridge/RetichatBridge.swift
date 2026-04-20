@@ -166,6 +166,91 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    // MARK: - Identity signing
+
+    /// Return the 64-byte public key (32 X25519 enc + 32 Ed25519 sign) for the identity.
+    nonisolated func identityPublicKey(handle: UInt64) -> Data? {
+        var buf = Data(count: 64)
+        let rc = buf.withUnsafeMutableBytes { p in
+            retichat_identity_public_key(handle, p.baseAddress?.assumingMemoryBound(to: UInt8.self), 64)
+        }
+        return rc == 64 ? buf : nil
+    }
+
+    /// Sign `data` with the identity's Ed25519 key. Returns 64-byte signature, or nil on error.
+    nonisolated func identitySign(handle: UInt64, data: Data) -> Data? {
+        var sig = Data(count: 64)
+        let rc = data.withUnsafeBytes { dataBuf in
+            sig.withUnsafeMutableBytes { sigBuf in
+                retichat_identity_sign(
+                    handle,
+                    dataBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt32(data.count),
+                    sigBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    64
+                )
+            }
+        }
+        return rc == 64 ? sig : nil
+    }
+
+    // MARK: - Channel crypto
+
+    /// Encrypt `plaintext` for the named channel. Channel keypair is derived deterministically
+    /// from the channel name — any subscriber holding the name can encrypt and decrypt.
+    nonisolated func channelEncrypt(name: String, plaintext: Data) -> Data? {
+        var outLen: UInt32 = 0
+        guard let ptr = name.withCString({ cName in
+            plaintext.withUnsafeBytes { buf in
+                retichat_channel_encrypt(
+                    cName,
+                    buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt32(plaintext.count),
+                    &outLen
+                )
+            }
+        }) else { return nil }
+        let data = Data(bytes: ptr, count: Int(outLen))
+        lxmf_free_bytes(ptr, outLen)
+        return data
+    }
+
+    /// Decrypt a channel ciphertext. Returns nil if decryption fails (wrong channel name or corrupt data).
+    nonisolated func channelDecrypt(name: String, ciphertext: Data) -> Data? {
+        var outLen: UInt32 = 0
+        guard let ptr = name.withCString({ cName in
+            ciphertext.withUnsafeBytes { buf in
+                retichat_channel_decrypt(
+                    cName,
+                    buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt32(ciphertext.count),
+                    &outLen
+                )
+            }
+        }) else { return nil }
+        let data = Data(bytes: ptr, count: Int(outLen))
+        lxmf_free_bytes(ptr, outLen)
+        return data
+    }
+
+    /// Compute a PoW stamp for `payload` (channel_hash || ciphertext) using the given cost.
+    /// Returns nil when cost == 0 (no stamp needed). Blocks until the nonce is found.
+    nonisolated func channelComputeStamp(payload: Data, cost: Int32) -> Data? {
+        guard cost > 0 else { return nil }
+        var outLen: UInt32 = 0
+        guard let ptr = payload.withUnsafeBytes({ buf in
+            retichat_compute_channel_stamp(
+                buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                UInt32(payload.count),
+                UInt32(cost),
+                &outLen
+            )
+        }) else { return nil }
+        let data = Data(bytes: ptr, count: Int(outLen))
+        lxmf_free_bytes(ptr, outLen)
+        return data
+    }
+
     // MARK: - Link request
 
     nonisolated func linkRequest(destHash: Data, appName: String, aspects: String,

@@ -2,7 +2,7 @@
 //  ConversationView.swift
 //  Retichat
 //
-//  Chat conversation screen. Mirrors Android ConversationScreen.kt.
+//  Unified chat screen for DM/group conversations (LXMF) and RFed channels.
 //
 
 import SwiftUI
@@ -10,40 +10,95 @@ import PhotosUI
 import Combine
 import GameController
 
+// MARK: - Conversation mode
+
+/// Selects between a DM/group conversation backed by LXMF and a pub-sub channel
+/// backed by RFed. ConversationView renders the same chrome for both; only the
+/// data source and a few affordances (attachments, chat-info) differ.
+enum ConversationMode: Hashable {
+    case dm(chatId: String)
+    case channel(Channel)
+}
+
+// MARK: - View
+
 struct ConversationView: View {
     @EnvironmentObject var repository: ChatRepository
+    @EnvironmentObject var channelClient: RfedChannelClient
     @StateObject private var viewModel: ConversationViewModel
     @Environment(\.dismiss) private var dismiss
 
-    let chatId: String
+    let mode: ConversationMode
 
+    // Shared compose state
     @State private var messageText = ""
+    @State private var scrollProxy: ScrollViewProxy?
+    @FocusState private var isTextFieldFocused: Bool
+
+    // DM-only state
     @State private var showAttachmentPicker = false
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var pendingAttachments: [(String, Data)] = []
     @State private var showChatInfo = false
-    @State private var scrollProxy: ScrollViewProxy?
-    @FocusState private var isTextFieldFocused: Bool
+
+    // MARK: - Convenience
+
+    private var chatId: String {
+        if case .dm(let id) = mode { return id }
+        return ""
+    }
+
+    private var channel: Channel? {
+        if case .channel(let ch) = mode { return ch }
+        return nil
+    }
+
+    private var isChannelMode: Bool {
+        if case .channel = mode { return true }
+        return false
+    }
 
     private var isGroupPending: Bool {
-        repository.chats.first(where: { $0.id == chatId })?.isPendingInvite ?? false
+        guard !isChannelMode else { return false }
+        return repository.chats.first(where: { $0.id == chatId })?.isPendingInvite ?? false
     }
 
-    init(chatId: String) {
-        self.chatId = chatId
+    private var navigationTitle: String {
+        switch mode {
+        case .dm:              return viewModel.chatTitle
+        case .channel(let ch): return "#\(ch.channelName)"
+        }
+    }
+
+    private var inputBarPlaceholder: String {
+        if let ch = channel { return "Message #\(ch.channelName)..." }
+        return "Message..."
+    }
+
+    // MARK: - Init
+
+    init(mode: ConversationMode) {
+        self.mode = mode
         _viewModel = StateObject(wrappedValue: ConversationViewModel())
     }
+
+    // MARK: - Body
 
     var body: some View {
         ZStack {
             Color.retichatBackground.ignoresSafeArea()
 
             VStack(spacing: 0) {
-                messagesList
+                if let ch = channel {
+                    channelMessagesList(channel: ch)
+                } else {
+                    messagesList
+                }
 
-                attachmentPreview
+                if !isChannelMode {
+                    attachmentPreview
+                }
 
-                // Input bar / invite overlay
                 if viewModel.isGroup && isGroupPending {
                     inviteOverlay
                 } else {
@@ -53,35 +108,37 @@ struct ConversationView: View {
             .blur(radius: showChatInfo ? 8 : 0)
             .animation(.easeInOut(duration: 0.25), value: showChatInfo)
         }
-        .navigationTitle(viewModel.chatTitle)
+        .navigationTitle(navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if isGroupPending {
-                    Menu {
-                        Button("Accept Invite") {
-                            repository.acceptGroupInvite(groupId: chatId)
+            if !isChannelMode {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if isGroupPending {
+                        Menu {
+                            Button("Accept Invite") {
+                                repository.acceptGroupInvite(groupId: chatId)
+                            }
+                            Button("Decline Invite", role: .destructive) {
+                                repository.declineGroupInvite(groupId: chatId)
+                                dismiss()
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .foregroundColor(.retichatPrimary)
                         }
-                        Button("Decline Invite", role: .destructive) {
-                            repository.declineGroupInvite(groupId: chatId)
-                            dismiss()
+                    } else {
+                        Button {
+                            showChatInfo = true
+                        } label: {
+                            Image(systemName: "info.circle")
+                                .foregroundColor(.retichatPrimary)
                         }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                            .foregroundColor(.retichatPrimary)
-                    }
-                } else {
-                    Button {
-                        showChatInfo = true
-                    } label: {
-                        Image(systemName: "info.circle")
-                            .foregroundColor(.retichatPrimary)
                     }
                 }
             }
         }
         .photosPicker(isPresented: $showAttachmentPicker, selection: $selectedPhotos,
-                       maxSelectionCount: 5, matching: .any(of: [.images, .videos]))
+                      maxSelectionCount: 5, matching: .any(of: [.images, .videos]))
         .onChange(of: selectedPhotos) { _, newItems in
             Task {
                 for item in newItems {
@@ -112,36 +169,40 @@ struct ConversationView: View {
             )
         }
         .onAppear {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            print("[DIAG][onAppear] start chatId=\(chatId.prefix(8))")
-            viewModel.loadChat(chatId: chatId, repository: repository)
-            print("[DIAG][onAppear] loadChat done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
-            NotificationManager.shared.activeChatId = chatId
-            NotificationManager.shared.clearNotifications(forChatId: chatId)
-            print("[DIAG][onAppear] clearNotifications done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
-            repository.openConversation(chatId: chatId)
-            print("[DIAG][onAppear] openConversation done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+            if case .dm(let id) = mode {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                print("[DIAG][onAppear] start chatId=\(id.prefix(8))")
+                viewModel.loadChat(chatId: id, repository: repository)
+                print("[DIAG][onAppear] loadChat done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+                NotificationManager.shared.activeChatId = id
+                NotificationManager.shared.clearNotifications(forChatId: id)
+                print("[DIAG][onAppear] clearNotifications done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+                repository.openConversation(chatId: id)
+                print("[DIAG][onAppear] openConversation done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+            }
             isTextFieldFocused = true
-            print("[DIAG][onAppear] focus set done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
         }
         .onDisappear {
-            print("[DIAG][onDisappear] chatId=\(chatId.prefix(8))")
-            NotificationManager.shared.activeChatId = nil
-            repository.closeConversation(chatId: chatId)
-            print("[DIAG][onDisappear] closeConversation done")
+            if case .dm(let id) = mode {
+                print("[DIAG][onDisappear] chatId=\(id.prefix(8))")
+                NotificationManager.shared.activeChatId = nil
+                repository.closeConversation(chatId: id)
+                print("[DIAG][onDisappear] closeConversation done")
+            }
         }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
-            viewModel.refreshMessages(chatId: chatId, repository: repository)
+            if case .dm(let id) = mode {
+                viewModel.refreshMessages(chatId: id, repository: repository)
+            }
         }
     }
 
-    // MARK: - Sub-views
+    // MARK: - DM message list
 
     private var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    // Load more button at top
                     if viewModel.canLoadMore {
                         Button {
                             let firstId = viewModel.messages.first?.id
@@ -194,6 +255,44 @@ struct ConversationView: View {
         }
     }
 
+    // MARK: - Channel message list
+
+    private func channelMessagesList(channel: Channel) -> some View {
+        let msgs = channelClient.messages[channel.id] ?? []
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(msgs) { msg in
+                        ChannelBubble(
+                            message: msg,
+                            senderDisplayName: msg.isOutgoing
+                                ? "You"
+                                : (!msg.senderDisplayName.isEmpty
+                                    ? msg.senderDisplayName
+                                    : repository.contactDisplayName(for: msg.senderHash))
+                        )
+                        .id(msg.id)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .onChange(of: msgs.count) { _, _ in
+                if let last = msgs.last {
+                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
+            }
+            .onAppear {
+                if let last = msgs.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
+                scrollProxy = proxy
+            }
+        }
+    }
+
+    // MARK: - Attachment preview (DM only)
+
     @ViewBuilder
     private var attachmentPreview: some View {
         if !pendingAttachments.isEmpty {
@@ -233,6 +332,8 @@ struct ConversationView: View {
         }
     }
 
+    // MARK: - Group invite overlay (DM only)
+
     private var inviteOverlay: some View {
         VStack(spacing: 0) {
             Divider()
@@ -269,17 +370,21 @@ struct ConversationView: View {
         }
     }
 
+    // MARK: - Input bar (attachment button hidden for channels)
+
     private var inputBar: some View {
         HStack(spacing: 8) {
-            Button {
-                showAttachmentPicker = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(.title3)
-                    .foregroundColor(.retichatPrimary)
+            if !isChannelMode {
+                Button {
+                    showAttachmentPicker = true
+                } label: {
+                    Image(systemName: "paperclip")
+                        .font(.title3)
+                        .foregroundColor(.retichatPrimary)
+                }
             }
 
-            TextField("Message…", text: $messageText, axis: .vertical)
+            TextField(inputBarPlaceholder, text: $messageText, axis: .vertical)
                 .focused($isTextFieldFocused)
                 .foregroundColor(.retichatOnSurface)
                 .lineLimit(1...5)
@@ -321,6 +426,8 @@ struct ConversationView: View {
         .background(Color.retichatSurface)
     }
 
+    // MARK: - Send
+
     private func sendMessage() {
         let content = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
         let atts = pendingAttachments
@@ -329,12 +436,20 @@ struct ConversationView: View {
         messageText = ""
         pendingAttachments = []
 
-        repository.sendMessage(chatId: chatId, content: content, attachments: atts)
-        viewModel.refreshMessages(chatId: chatId, repository: repository)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            if let lastId = viewModel.messages.last?.id {
-                withAnimation {
-                    scrollProxy?.scrollTo(lastId, anchor: .bottom)
+        switch mode {
+        case .dm(let id):
+            repository.sendMessage(chatId: id, content: content, attachments: atts)
+            viewModel.refreshMessages(chatId: id, repository: repository)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                if let lastId = viewModel.messages.last?.id {
+                    withAnimation { scrollProxy?.scrollTo(lastId, anchor: .bottom) }
+                }
+            }
+        case .channel(let ch):
+            channelClient.sendMessage(content: content, toChannel: ch)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                if let lastId = channelClient.messages[ch.id]?.last?.id {
+                    withAnimation { scrollProxy?.scrollTo(lastId, anchor: .bottom) }
                 }
             }
         }

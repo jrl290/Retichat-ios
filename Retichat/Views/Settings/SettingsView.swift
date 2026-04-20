@@ -169,15 +169,34 @@ struct SettingsView: View {
 
     private var profileSection: some View {
         GlassCard {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 12) {
                 Text("Profile")
                     .font(.headline)
                     .foregroundColor(.retichatOnSurface)
 
-                TextField("Display Name", text: $vm.displayName)
-                    .foregroundColor(.retichatOnSurface)
-                    .padding(10)
-                    .glassBackground(cornerRadius: 8)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Display Name")
+                        .font(.caption)
+                        .foregroundColor(.retichatOnSurfaceVariant)
+                    TextField("Your name in DMs", text: $vm.displayName)
+                        .foregroundColor(.retichatOnSurface)
+                        .padding(10)
+                        .glassBackground(cornerRadius: 8)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Channel Display Name")
+                        .font(.caption)
+                        .foregroundColor(.retichatOnSurfaceVariant)
+                    TextField(vm.displayName.isEmpty ? "Same as Display Name" : vm.displayName,
+                              text: $vm.channelDisplayName)
+                        .foregroundColor(.retichatOnSurface)
+                        .padding(10)
+                        .glassBackground(cornerRadius: 8)
+                    Text("Shown to others in channels. If blank, uses your Display Name.")
+                        .font(.caption2)
+                        .foregroundColor(.retichatOnSurfaceVariant)
+                }
             }
         }
     }

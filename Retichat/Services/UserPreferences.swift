@@ -14,6 +14,7 @@ final class UserPreferences {
 
     private enum Keys {
         static let displayName = "display_name"
+        static let channelDisplayName = "channel_display_name"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
         static let rfedNotifyHash = "rfed_notify_hash"
@@ -28,6 +29,14 @@ final class UserPreferences {
     var displayName: String {
         get { defaults.string(forKey: Keys.displayName) ?? "" }
         set { defaults.set(newValue, forKey: Keys.displayName) }
+    }
+
+    /// Display name embedded in outgoing channel messages.
+    /// If empty, falls back to `displayName`. Stored once by the sender;
+    /// receivers see whatever name was in the message when it arrived.
+    var channelDisplayName: String {
+        get { defaults.string(forKey: Keys.channelDisplayName) ?? "" }
+        set { defaults.set(newValue, forKey: Keys.channelDisplayName) }
     }
 
     var dropAnnounces: Bool {

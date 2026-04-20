@@ -246,7 +246,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         lines.append("")
         lines.append("[interfaces]")
 
-        // Get user-configured interfaces from database
+        // Explicitly disable AutoInterface so the app never does local network
+        // discovery (IPv6 multicast). Without this, when running on a simulator
+        // the app can discover and directly connect to local Reticulum nodes
+        // (hops=0), bypassing the configured remote node at 192.168.2.107.
+        lines.append("")
+        lines.append("  [[AutoInterface]]")
+        lines.append("    type = AutoInterface")
+        lines.append("    enabled = No")
+
+        // Get user-configured interfaces from database (TCP client only)
         var addedInterfaces = false
         if let ctx = modelContext {
             let descriptor = FetchDescriptor<InterfaceConfigEntity>(
@@ -266,15 +275,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
 
         if !addedInterfaces {
-            // Use a single random default endpoint when no user-configured interfaces exist
-            if let ep = DefaultEndpointManager.endpoints.randomElement() {
-                lines.append("")
-                lines.append("  [[Default 1]]")
-                lines.append("    type = TCPClientInterface")
-                lines.append("    target_host = \(ep.host)")
-                lines.append("    target_port = \(ep.port)")
-                lines.append("    enabled = yes")
-            }
+            // Default: connect only to the known rfed node
+            lines.append("")
+            lines.append("  [[Default]]")
+            lines.append("    type = TCPClientInterface")
+            lines.append("    target_host = 192.168.2.107")
+            lines.append("    target_port = 4242")
+            lines.append("    enabled = yes")
         }
 
         let config = lines.joined(separator: "\n") + "\n"

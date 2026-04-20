@@ -209,14 +209,16 @@ final class ChannelEntity {
     var rfedNodeHash: String                      // 32-char hex of rfed.channel dest
     var lastMessageTime: Double
     var isSubscribed: Bool
+    var stampCost: Int?                           // PoW bits required by rfed; nil = disabled
 
     init(channelHash: String, channelName: String, rfedNodeHash: String,
-         lastMessageTime: Double = 0, isSubscribed: Bool = true) {
+         lastMessageTime: Double = 0, isSubscribed: Bool = true, stampCost: Int? = nil) {
         self.channelHash = channelHash
         self.channelName = channelName
         self.rfedNodeHash = rfedNodeHash
         self.lastMessageTime = lastMessageTime
         self.isSubscribed = isSubscribed
+        self.stampCost = stampCost
     }
 }
 
@@ -225,15 +227,17 @@ final class ChannelMessageEntity {
     @Attribute(.unique) var id: String           // sender_hex+timestamp hex
     var channelHash: String
     var senderHash: String                        // 32-char hex (16 bytes)
+    var senderDisplayName: String = ""            // display name embedded by sender in blob
     var content: String
     var timestamp: Double                         // Unix ms
     var isOutgoing: Bool
 
-    init(id: String, channelHash: String, senderHash: String, content: String,
-         timestamp: Double, isOutgoing: Bool = false) {
+    init(id: String, channelHash: String, senderHash: String, senderDisplayName: String = "",
+         content: String, timestamp: Double, isOutgoing: Bool = false) {
         self.id = id
         self.channelHash = channelHash
         self.senderHash = senderHash
+        self.senderDisplayName = senderDisplayName
         self.content = content
         self.timestamp = timestamp
         self.isOutgoing = isOutgoing
@@ -242,18 +246,20 @@ final class ChannelMessageEntity {
 
 // MARK: - Channel View Models
 
-struct Channel: Identifiable {
+struct Channel: Identifiable, Hashable {
     let id: String          // channelHash hex
     var channelName: String
     var rfedNodeHash: String
     var lastMessageTime: Double
     var isSubscribed: Bool
+    var stampCost: Int?     // nil = no stamp required
 }
 
 struct ChannelMessage: Identifiable {
     let id: String
     var channelHash: String
     var senderHash: String
+    var senderDisplayName: String  // embedded in blob at send time; stored once on receive
     var content: String
     var timestamp: Double
     var isOutgoing: Bool

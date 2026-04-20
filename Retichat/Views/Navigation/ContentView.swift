@@ -26,12 +26,11 @@ struct ContentView: View {
     @EnvironmentObject var channelClient: RfedChannelClient
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var selectedChatId: String?
-    @State private var showNewChat = false
-    @State private var showNewGroup = false
+    @State private var selectedChannel: Channel?
+    @State private var showNewConversation = false
     @State private var showSettings = false
     @State private var showQRCode = false
     @State private var windowWidth: CGFloat = 0
-    @State private var selectedTab = 0
 
     private var useWideLayout: Bool {
         #if targetEnvironment(macCatalyst)
@@ -42,36 +41,22 @@ struct ContentView: View {
     }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            // MARK: Tab 1 — Messages
-            GeometryReader { geo in
-                Group {
-                    if useWideLayout {
-                        wideLayout
-                    } else {
-                        stackLayout
-                    }
-                }
-                .environment(\.isWideLayout, useWideLayout)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .onChange(of: geo.size.width) { _, newWidth in
-                    windowWidth = newWidth
-                }
-                .onAppear {
-                    windowWidth = geo.size.width
+        GeometryReader { geo in
+            Group {
+                if useWideLayout {
+                    wideLayout
+                } else {
+                    stackLayout
                 }
             }
-            .tabItem {
-                Label("Messages", systemImage: "bubble.left.and.bubble.right")
+            .environment(\.isWideLayout, useWideLayout)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onChange(of: geo.size.width) { _, newWidth in
+                windowWidth = newWidth
             }
-            .tag(0)
-
-            // MARK: Tab 2 — Channels
-            ChannelListView()
-                .tabItem {
-                    Label("Channels", systemImage: "antenna.radiowaves.left.and.right")
-                }
-                .tag(1)
+            .onAppear {
+                windowWidth = geo.size.width
+            }
         }
         .preferredColorScheme(.dark)
         .tint(.retichatPrimary)
@@ -80,10 +65,10 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openChatFromNotification)) { notif in
             if let chatId = notif.object as? String {
-                selectedTab = 0
-                showNewChat = false
+                showNewConversation = false
                 showSettings = false
                 showQRCode = false
+                selectedChannel = nil
                 selectedChatId = chatId
             }
         }
@@ -101,21 +86,21 @@ struct ContentView: View {
         NavigationStack {
             ChatListView(
                 selectedChatId: $selectedChatId,
-                showNewChat: $showNewChat,
-                showNewGroup: $showNewGroup,
+                selectedChannel: $selectedChannel,
+                showNewConversation: $showNewConversation,
                 showSettings: $showSettings,
                 showQRCode: $showQRCode
             )
-            .blur(radius: (showSettings || showNewChat) ? 8 : 0)
-            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewChat)
+            .blur(radius: (showSettings || showNewConversation) ? 8 : 0)
+            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewConversation)
             .navigationDestination(item: $selectedChatId) { chatId in
-                ConversationView(chatId: chatId)
+                ConversationView(mode: .dm(chatId: chatId))
             }
-            .sheet(isPresented: $showNewChat) {
-                NewChatView(selectedChatId: $selectedChatId)
+            .navigationDestination(item: $selectedChannel) { channel in
+                ConversationView(mode: .channel(channel))
             }
-            .sheet(isPresented: $showNewGroup) {
-                NewGroupView(selectedChatId: $selectedChatId, onDismissParent: { showNewGroup = false })
+            .sheet(isPresented: $showNewConversation) {
+                NewConversationView(selectedChatId: $selectedChatId, selectedChannel: $selectedChannel)
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
@@ -132,18 +117,15 @@ struct ContentView: View {
         NavigationSplitView {
             ChatListView(
                 selectedChatId: $selectedChatId,
-                showNewChat: $showNewChat,
-                showNewGroup: $showNewGroup,
+                selectedChannel: $selectedChannel,
+                showNewConversation: $showNewConversation,
                 showSettings: $showSettings,
                 showQRCode: $showQRCode
             )
-            .blur(radius: (showSettings || showNewChat) ? 8 : 0)
-            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewChat)
-            .sheet(isPresented: $showNewChat) {
-                NewChatView(selectedChatId: $selectedChatId)
-            }
-            .sheet(isPresented: $showNewGroup) {
-                NewGroupView(selectedChatId: $selectedChatId, onDismissParent: { showNewGroup = false })
+            .blur(radius: (showSettings || showNewConversation) ? 8 : 0)
+            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewConversation)
+            .sheet(isPresented: $showNewConversation) {
+                NewConversationView(selectedChatId: $selectedChatId, selectedChannel: $selectedChannel)
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
@@ -153,8 +135,11 @@ struct ContentView: View {
             }
         } detail: {
             if let chatId = selectedChatId {
-                ConversationView(chatId: chatId)
+                ConversationView(mode: .dm(chatId: chatId))
                     .id(chatId)
+            } else if let channel = selectedChannel {
+                ConversationView(mode: .channel(channel))
+                    .id(channel.id)
             } else {
                 noSelectionPlaceholder
             }
