@@ -1415,8 +1415,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         _ = SecRandomCopyBytes(kSecRandomDefault, 16, &randomBytes)
         let groupId = randomBytes.map { String(format: "%02x", $0) }.joined()
 
+        let nowMs = Date().timeIntervalSince1970 * 1000
         let chat = ChatEntity(
-            id: groupId, peerHash: "", isGroup: true, groupName: name, groupStatus: "active"
+            id: groupId, peerHash: "", lastMessageTime: nowMs,
+            isGroup: true, groupName: name, groupStatus: "active"
         )
         ctx.insert(chat)
 
@@ -1778,8 +1780,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             predicate: #Predicate { $0.id == id }
         )
         if let existing = try? ctx.fetch(descriptor), existing.isEmpty {
+            let nowMs = Date().timeIntervalSince1970 * 1000
             let chat = ChatEntity(
-                id: id, peerHash: peerHash, isGroup: isGroup, groupName: groupName
+                id: id, peerHash: peerHash, lastMessageTime: nowMs,
+                isGroup: isGroup, groupName: groupName
             )
             ctx.insert(chat)
             try? ctx.save()

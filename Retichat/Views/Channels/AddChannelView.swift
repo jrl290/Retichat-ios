@@ -16,12 +16,21 @@ struct AddChannelView: View {
     @State private var isJoining = false
     @State private var errorMessage: String?
 
+    private var rfedAddressConfigured: Bool {
+        !UserPreferences.shared.rfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 Color.retichatBackground.ignoresSafeArea()
 
                 VStack(alignment: .leading, spacing: 24) {
+                    if !rfedAddressConfigured {
+                        Text("Joining a channel requires an RFed node address. Set one in Settings first.")
+                            .font(.subheadline)
+                            .foregroundColor(.retichatOnSurfaceVariant)
+                    } else {
                     // Channel name
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Channel name")
@@ -82,6 +91,8 @@ struct AddChannelView: View {
                         .foregroundColor(.white)
                     }
                     .disabled(!canJoin || isJoining)
+
+                    } // end if rfedAddressConfigured
 
                     Spacer()
                 }

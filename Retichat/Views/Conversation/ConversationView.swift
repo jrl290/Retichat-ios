@@ -111,28 +111,33 @@ struct ConversationView: View {
         .navigationTitle(navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            if !isChannelMode {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    if isGroupPending {
-                        Menu {
-                            Button("Accept Invite") {
-                                repository.acceptGroupInvite(groupId: chatId)
-                            }
-                            Button("Decline Invite", role: .destructive) {
-                                repository.declineGroupInvite(groupId: chatId)
-                                dismiss()
-                            }
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
-                                .foregroundColor(.retichatPrimary)
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if isChannelMode {
+                    Button {
+                        showChatInfo = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.retichatPrimary)
+                    }
+                } else if isGroupPending {
+                    Menu {
+                        Button("Accept Invite") {
+                            repository.acceptGroupInvite(groupId: chatId)
                         }
-                    } else {
-                        Button {
-                            showChatInfo = true
-                        } label: {
-                            Image(systemName: "info.circle")
-                                .foregroundColor(.retichatPrimary)
+                        Button("Decline Invite", role: .destructive) {
+                            repository.declineGroupInvite(groupId: chatId)
+                            dismiss()
                         }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .foregroundColor(.retichatPrimary)
+                    }
+                } else {
+                    Button {
+                        showChatInfo = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.retichatPrimary)
                     }
                 }
             }
@@ -151,22 +156,27 @@ struct ConversationView: View {
             }
         }
         .sheet(isPresented: $showChatInfo) {
-            ChatInfoSheet(
-                chatId: chatId,
-                isGroup: viewModel.isGroup,
-                onArchive: {
-                    repository.archiveChat(chatId: chatId)
-                    dismiss()
-                },
-                onDelete: {
-                    repository.deleteChat(chatId: chatId)
-                    dismiss()
-                },
-                onLeave: {
-                    repository.leaveGroup(chatId: chatId)
-                    dismiss()
-                }
-            )
+            if let ch = channel {
+                ChannelInfoSheet(channel: ch, onLeave: { dismiss() })
+                    .environmentObject(channelClient)
+            } else {
+                ChatInfoSheet(
+                    chatId: chatId,
+                    isGroup: viewModel.isGroup,
+                    onArchive: {
+                        repository.archiveChat(chatId: chatId)
+                        dismiss()
+                    },
+                    onDelete: {
+                        repository.deleteChat(chatId: chatId)
+                        dismiss()
+                    },
+                    onLeave: {
+                        repository.leaveGroup(chatId: chatId)
+                        dismiss()
+                    }
+                )
+            }
         }
         .onAppear {
             if case .dm(let id) = mode {

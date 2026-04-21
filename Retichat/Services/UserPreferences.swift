@@ -24,6 +24,7 @@ final class UserPreferences {
         static let rfedLxmfPropOverride = "rfed_lxmf_prop_override"
         static let filterStrangers = "filter_strangers"
         static let mutedChatIds = "muted_chat_ids"
+        static let channelNotificationsOn = "channel_notifications_on"
     }
 
     var displayName: String {
@@ -119,5 +120,31 @@ final class UserPreferences {
 
     func isChatMuted(_ chatId: String) -> Bool {
         mutedChatIds.contains(chatId)
+    }
+
+    /// Set of channel IDs for which notifications are enabled.
+    /// Channels are opt-in (default off); add a channel ID here to enable notifications.
+    var channelNotificationsOn: Set<String> {
+        get {
+            let arr = defaults.stringArray(forKey: Keys.channelNotificationsOn) ?? []
+            return Set(arr)
+        }
+        set { defaults.set(Array(newValue), forKey: Keys.channelNotificationsOn) }
+    }
+
+    func enableChannelNotifications(_ channelId: String) {
+        var ids = channelNotificationsOn
+        ids.insert(channelId)
+        channelNotificationsOn = ids
+    }
+
+    func disableChannelNotifications(_ channelId: String) {
+        var ids = channelNotificationsOn
+        ids.remove(channelId)
+        channelNotificationsOn = ids
+    }
+
+    func isChannelNotificationsEnabled(_ channelId: String) -> Bool {
+        channelNotificationsOn.contains(channelId)
     }
 }

@@ -114,14 +114,22 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
                                                     rfedChannelDest: rfedChannelDest)
 
+        // Register for per-channel push notification wakeups.
+        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
+                                                  app: "rfed", aspects: ["notify"])
+        RfedNotifyRegistrar.shared.registerForChannel(channelHash: channelHashData,
+                                                      rfedNotifyHashHex: rfedNotifyHashHex,
+                                                      identityHandle: identityHandle)
+
         // Persist (only insert if not already in DB — update case handled above)
         if let ctx = modelContext,
            (try? ctx.fetch(FetchDescriptor<ChannelEntity>(
                predicate: #Predicate { $0.channelHash == channelHashHex }
            )).isEmpty) == true {
+            let nowMs = Date().timeIntervalSince1970 * 1000
             let entity = ChannelEntity(channelHash: channelHashHex, channelName: name,
-                                       rfedNodeHash: rfedChannelDestHex, isSubscribed: true,
-                                       stampCost: stampCost)
+                                       rfedNodeHash: rfedChannelDestHex, lastMessageTime: nowMs,
+                                       isSubscribed: true, stampCost: stampCost)
             ctx.insert(entity)
             try ctx.save()
         } else if let ctx = modelContext,
@@ -139,7 +147,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
         let channel = Channel(id: channelHashHex, channelName: name,
                               rfedNodeHash: rfedChannelDestHex,
-                              lastMessageTime: 0, isSubscribed: true, stampCost: stampCost)
+                              lastMessageTime: Date().timeIntervalSince1970 * 1000,
+                              isSubscribed: true, stampCost: stampCost)
         channels.append(channel)
         return channel
     }
@@ -162,6 +171,15 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             _ = bridge.linkRequest(destHash: rfedDest, appName: "rfed", aspects: "channel",
                                    identityHandle: handle, path: "/rfed/unsubscribe",
                                    payload: payload, timeoutSecs: 10.0)
+        }
+
+        // Deregister per-channel push notification wakeup.
+        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
+                                                  app: "rfed", aspects: ["notify"])
+        if let channelHashForNotify = Data(hexString: channelHashHex), !rfedNotifyHashHex.isEmpty {
+            RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashForNotify,
+                                                            rfedNotifyHashHex: rfedNotifyHashHex,
+                                                            identityHandle: identityHandle)
         }
 
         // Remove from DB
@@ -368,6 +386,16 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                                   timestamp: Double(tsMs), isOutgoing: isOutgoing)
         appendMessage(msg, toChannelHash: channelHashHex)
         updateChannelLastMessage(channelHashHex: channelHashHex, time: Double(tsMs))
+
+        if !isOutgoing, let channel = channels.first(where: { $0.id == channelHashHex }),
+           UserPreferences.shared.isChannelNotificationsEnabled(channelHashHex) {
+            let senderLabel = senderHashHex.prefix(8) + "…"
+            NotificationManager.shared.postMessageNotification(
+                chatId: channelHashHex,
+                senderName: "#\(channel.channelName) (\(senderLabel))",
+                content: content
+            )
+        }
     }
 
     private func appendMessage(_ msg: ChannelMessage, toChannelHash hash: String) {
@@ -495,6 +523,14 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                                                 isSubscribed: true, stampCost: stampCost)
                     }
                     print("[RfedChannel] Re-subscribed to \(channel.channelName) (stampCost=\(stampCost.map { "\($0)" } ?? "nil"))")
+                    // Re-register per-channel notify so wakeups resume after app restart.
+                    let rfedNotifyHashHex = Self.rfedDestHash(
+                        identityHashHex: prefs.rfedNodeIdentityHash,
+                        app: "rfed", aspects: ["notify"])
+                    RfedNotifyRegistrar.shared.registerForChannel(
+                        channelHash: channelHashData,
+                        rfedNotifyHashHex: rfedNotifyHashHex,
+                        identityHandle: identityHandle)
                 } catch {
                     print("[RfedChannel] Re-subscribe failed for \(channel.channelName): \(error)")
                 }
