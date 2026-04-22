@@ -114,13 +114,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
                                                     rfedChannelDest: rfedChannelDest)
 
-        // Register for per-channel push notification wakeups (default ON for newly joined channels).
-        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
-                                                  app: "rfed", aspects: ["notify"])
-        UserPreferences.shared.enableChannelPush(channelHashHex)
-        RfedNotifyRegistrar.shared.registerForChannel(channelHash: channelHashData,
-                                                      rfedNotifyHashHex: rfedNotifyHashHex,
-                                                      identityHandle: identityHandle)
+        // Push wakeups are opt-in — do not register on join; user enables via Channel Info.
+        // (No-op: channelPushEnabled defaults to absent/false for new channels.)
 
         // Persist (only insert if not already in DB — update case handled above)
         if let ctx = modelContext,
