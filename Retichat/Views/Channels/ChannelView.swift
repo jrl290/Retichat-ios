@@ -16,6 +16,7 @@ struct ChannelInfoSheet: View {
     let channel: Channel
     /// Called after leaving so the presenting view can also dismiss (e.g. pop the nav stack).
     var onLeave: (() -> Void)? = nil
+    @State private var pushEnabled = false
     @State private var notificationsEnabled = false
 
     var body: some View {
@@ -38,23 +39,56 @@ struct ChannelInfoSheet: View {
                         }
                         .padding(.top, 8)
 
-                        // Notifications
+                        // Push & notification settings
                         GlassCard {
-                            Toggle(isOn: $notificationsEnabled) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Notifications")
-                                        .foregroundColor(.retichatOnSurface)
-                                    Text(notificationsEnabled ? "You'll be notified of new messages" : "Notifications are off")
-                                        .font(.caption)
-                                        .foregroundColor(.retichatOnSurfaceVariant)
+                            VStack(spacing: 0) {
+                                Toggle(isOn: $pushEnabled) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Push All Messages")
+                                            .foregroundColor(.retichatOnSurface)
+                                        Text(pushEnabled
+                                             ? "Device is woken up for every new message"
+                                             : "No push wakeups for this channel")
+                                            .font(.caption)
+                                            .foregroundColor(.retichatOnSurfaceVariant)
+                                    }
                                 }
-                            }
-                            .tint(.retichatPrimary)
-                            .onChange(of: notificationsEnabled) { _, enabled in
-                                if enabled {
-                                    UserPreferences.shared.enableChannelNotifications(channel.id)
-                                } else {
-                                    UserPreferences.shared.disableChannelNotifications(channel.id)
+                                .tint(.retichatPrimary)
+                                .onChange(of: pushEnabled) { _, enabled in
+                                    if enabled {
+                                        channelClient.enableChannelPush(channelHashHex: channel.id)
+                                    } else {
+                                        channelClient.disableChannelPush(channelHashHex: channel.id)
+                                    }
+                                }
+
+                                Divider()
+                                    .background(Color.retichatOnSurfaceVariant.opacity(0.2))
+                                    .padding(.vertical, 10)
+
+                                Toggle(isOn: $notificationsEnabled) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Notifications")
+                                            .foregroundColor(pushEnabled
+                                                             ? .retichatOnSurface
+                                                             : .retichatOnSurfaceVariant)
+                                        Text(pushEnabled && notificationsEnabled
+                                             ? "You'll be notified of new messages"
+                                             : pushEnabled
+                                               ? "Notifications are off"
+                                               : "Enable Push All Messages first")
+                                            .font(.caption)
+                                            .foregroundColor(.retichatOnSurfaceVariant)
+                                    }
+                                }
+                                .tint(.retichatPrimary)
+                                .disabled(!pushEnabled)
+                                .onChange(of: notificationsEnabled) { _, enabled in
+                                    if enabled {
+                                        UserPreferences.shared.enableChannelNotifications(channel.id)
+                                    } else {
+                                        UserPreferences.shared.disableChannelNotifications(channel.id)
+                                    }
                                 }
                             }
                         }
@@ -85,6 +119,7 @@ struct ChannelInfoSheet: View {
                 }
             }
             .onAppear {
+                pushEnabled = UserPreferences.shared.isChannelPushEnabled(channel.id)
                 notificationsEnabled = UserPreferences.shared.isChannelNotificationsEnabled(channel.id)
             }
         }

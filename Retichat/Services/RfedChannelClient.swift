@@ -114,9 +114,10 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
                                                     rfedChannelDest: rfedChannelDest)
 
-        // Register for per-channel push notification wakeups.
+        // Register for per-channel push notification wakeups (default ON for newly joined channels).
         let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
                                                   app: "rfed", aspects: ["notify"])
+        UserPreferences.shared.enableChannelPush(channelHashHex)
         RfedNotifyRegistrar.shared.registerForChannel(channelHash: channelHashData,
                                                       rfedNotifyHashHex: rfedNotifyHashHex,
                                                       identityHandle: identityHandle)
@@ -201,6 +202,32 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
         channels.removeAll { $0.id == channelHashHex }
         messages[channelHashHex] = nil
+    }
+
+    // MARK: - Per-channel push toggle
+
+    /// Enable push wakeups for a channel: saves the pref and registers with rfed.notify.
+    func enableChannelPush(channelHashHex: String) {
+        UserPreferences.shared.enableChannelPush(channelHashHex)
+        guard let channelHashData = Data(hexString: channelHashHex) else { return }
+        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
+                                                   app: "rfed", aspects: ["notify"])
+        guard !rfedNotifyHashHex.isEmpty else { return }
+        RfedNotifyRegistrar.shared.registerForChannel(channelHash: channelHashData,
+                                                       rfedNotifyHashHex: rfedNotifyHashHex,
+                                                       identityHandle: identityHandle)
+    }
+
+    /// Disable push wakeups for a channel: saves the pref and deregisters from rfed.notify.
+    func disableChannelPush(channelHashHex: String) {
+        UserPreferences.shared.disableChannelPush(channelHashHex)
+        guard let channelHashData = Data(hexString: channelHashHex) else { return }
+        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
+                                                   app: "rfed", aspects: ["notify"])
+        guard !rfedNotifyHashHex.isEmpty else { return }
+        RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashData,
+                                                         rfedNotifyHashHex: rfedNotifyHashHex,
+                                                         identityHandle: identityHandle)
     }
 
     // MARK: - Send
@@ -523,14 +550,17 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                                                 isSubscribed: true, stampCost: stampCost)
                     }
                     print("[RfedChannel] Re-subscribed to \(channel.channelName) (stampCost=\(stampCost.map { "\($0)" } ?? "nil"))")
-                    // Re-register per-channel notify so wakeups resume after app restart.
-                    let rfedNotifyHashHex = Self.rfedDestHash(
-                        identityHashHex: prefs.rfedNodeIdentityHash,
-                        app: "rfed", aspects: ["notify"])
-                    RfedNotifyRegistrar.shared.registerForChannel(
-                        channelHash: channelHashData,
-                        rfedNotifyHashHex: rfedNotifyHashHex,
-                        identityHandle: identityHandle)
+                    // Re-register per-channel notify so wakeups resume after app restart,
+                    // but only if the user has push enabled for this channel.
+                    if UserPreferences.shared.isChannelPushEnabled(channel.id) {
+                        let rfedNotifyHashHex = Self.rfedDestHash(
+                            identityHashHex: prefs.rfedNodeIdentityHash,
+                            app: "rfed", aspects: ["notify"])
+                        RfedNotifyRegistrar.shared.registerForChannel(
+                            channelHash: channelHashData,
+                            rfedNotifyHashHex: rfedNotifyHashHex,
+                            identityHandle: identityHandle)
+                    }
                 } catch {
                     print("[RfedChannel] Re-subscribe failed for \(channel.channelName): \(error)")
                 }

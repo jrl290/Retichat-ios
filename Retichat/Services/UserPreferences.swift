@@ -25,6 +25,7 @@ final class UserPreferences {
         static let filterStrangers = "filter_strangers"
         static let mutedChatIds = "muted_chat_ids"
         static let channelNotificationsOn = "channel_notifications_on"
+        static let channelPushEnabled = "channel_push_enabled"
     }
 
     var displayName: String {
@@ -146,5 +147,33 @@ final class UserPreferences {
 
     func isChannelNotificationsEnabled(_ channelId: String) -> Bool {
         channelNotificationsOn.contains(channelId)
+    }
+
+    /// Set of channel IDs for which push wakeups are enabled.
+    /// When enabled, the device registers with rfed.notify so a silent push is fired
+    /// for every new channel message (waking the app to pull it).
+    /// Defaults to ON when a channel is joined.
+    var channelPushEnabled: Set<String> {
+        get {
+            let arr = defaults.stringArray(forKey: Keys.channelPushEnabled) ?? []
+            return Set(arr)
+        }
+        set { defaults.set(Array(newValue), forKey: Keys.channelPushEnabled) }
+    }
+
+    func enableChannelPush(_ channelId: String) {
+        var ids = channelPushEnabled
+        ids.insert(channelId)
+        channelPushEnabled = ids
+    }
+
+    func disableChannelPush(_ channelId: String) {
+        var ids = channelPushEnabled
+        ids.remove(channelId)
+        channelPushEnabled = ids
+    }
+
+    func isChannelPushEnabled(_ channelId: String) -> Bool {
+        channelPushEnabled.contains(channelId)
     }
 }
