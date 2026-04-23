@@ -168,6 +168,11 @@ final class RfedNotifyRegistrar {
             } else {
                 let err = bridge.lastError() ?? "unknown"
                 print("[RfedNotify] Link request failed (attempt \(attempt)): \(err)")
+                // Request a fresh path — the stored path may be stale (e.g. old rfed
+                // instance at many hops whose route is now broken).  A fresh PATH_REQUEST
+                // forces rmap.world to update its routing table entry for this destination,
+                // so the next attempt uses the current best route.
+                _ = bridge.transportRequestPath(destHash: rfedHash)
             }
 
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))

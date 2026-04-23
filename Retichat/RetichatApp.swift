@@ -202,10 +202,14 @@ struct RetichatApp: App {
                     repository.pollPropagationNode()
                     // Re-establish path discovery for the active conversation (if any).
                     ConnectionStateManager.shared.onAppForeground()
+                    // Re-open the persistent rfed node link.
+                    ConnectionStateManager.shared.openRfedNodeLink()
                     // Re-announce rfed delivery to flush deferred channel blobs
                     channelClient.announceDelivery()
                 }
             case .background:
+                // Close the rfed node link to free up resources.
+                ConnectionStateManager.shared.closeRfedNodeLink()
                 // Request immediate background time (~30s) to flush outbound and poll.
                 appDelegate.beginBackgroundExecution(repository: repository)
             default:

@@ -36,6 +36,9 @@ final class ConnectionStateManager {
     /// Hex hashes of all peers in the currently-open conversation (empty when no chat is on screen).
     private var activeConversationHexes: Set<String> = []
 
+    /// Cached rfed.channel destination kept open while the app is in the foreground.
+    private var rfedLinkDestData: Data? = nil
+
     /// Weak reference to the LXMF client, set after startup.
     private weak var lxmfClient: LxmfClient? = nil
 
@@ -46,6 +49,13 @@ final class ConnectionStateManager {
     /// Call once after the LXMF stack has started.
     func register(lxmfClient: LxmfClient) {
         self.lxmfClient = lxmfClient
+
+        // Register reconnect handlers for rfed.channel and rfed.notify so the
+        // LXMF router re-establishes app-links to those destinations on announce.
+        // (The built-in delivery_announce_handler only covers lxmf.delivery.)
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify")
+
         requestEssentialPaths()
     }
 
@@ -161,8 +171,49 @@ final class ConnectionStateManager {
         }
     }
 
-    /// Call when NWPathMonitor reports network connectivity restored.
+    // MARK: - RFed node link
+
+    /// Open (or re-open) an app link to the configured rfed.channel destination.
+    /// Call on app foreground; the link is kept alive until `closeRfedNodeLink()`.
+    func openRfedNodeLink() {
+        guard let destData = rfedChannelDestData() else { return }
+        rfedLinkDestData = destData
+        let client = lxmfClient
+        Task.detached(priority: .userInitiated) {
+            client?.appLinkOpen(destData)
+        }
+    }
+
+    /// Tear down the app link to the rfed node. Call on app background.
+    func closeRfedNodeLink() {
+        guard let destData = rfedLinkDestData else { return }
+        rfedLinkDestData = nil
+        let client = lxmfClient
+        Task.detached(priority: .userInitiated) {
+            client?.appLinkClose(destData)
+        }
+    }
+
+    /// Current app-link status for the rfed node.
+    /// Returns: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
+    func rfedNodeLinkStatus() -> Int32 {
+        guard let destData = rfedLinkDestData ?? rfedChannelDestData(),
+              let client = lxmfClient else { return 0 }
+        return client.appLinkStatus(destData)
+    }
+
+    /// Derives the rfed.channel 16-byte dest from current prefs.
+    private func rfedChannelDestData() -> Data? {
+        let identityHex = UserPreferences.shared.rfedNodeIdentityHash
+        guard !identityHex.isEmpty else { return nil }
+        let destHex = RfedChannelClient.rfedDestHash(
+            identityHashHex: identityHex, app: "rfed", aspects: ["channel"])
+        guard !destHex.isEmpty else { return nil }
+        return Data(hexString: destHex)
+    }
+
     /// Re-requests paths to always-needed destinations and re-opens active links.
+    /// Call when NWPathMonitor reports network connectivity restored.
     func onNetworkReconnect() {
         requestEssentialPaths()
         let peers = activeConversationHexes.compactMap { Data(hexString: $0) }

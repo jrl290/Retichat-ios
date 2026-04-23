@@ -216,6 +216,17 @@ final class LxmfClient: @unchecked Sendable {
         }
     }
 
+    /// Register an app-link reconnect handler for a non-LXMF destination aspect.
+    ///
+    /// Call once per extra aspect (e.g. `"rfed.channel"`, `"rfed.notify"`) during
+    /// startup so the router reconnects app-links to those destinations on announce.
+    @discardableResult
+    nonisolated func appLinkRegisterReconnect(aspect: String) -> Bool {
+        aspect.withCString { cAspect in
+            lxmf_app_link_register_reconnect(handle, cAspect) == 0
+        }
+    }
+
     // MARK: - Announce
 
     /// Announce this client's delivery destination.

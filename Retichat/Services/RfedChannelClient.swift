@@ -24,10 +24,22 @@ import CryptoKit
 @MainActor
 final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
+    // MARK: - Node link status (shown in SettingsView)
+
+    enum NodeStatus: Equatable {
+        case unknown
+        case establishing
+        case connected
+        case unreachable
+    }
+
     // MARK: - Published state
 
     @Published var channels: [Channel] = []
     @Published var messages: [String: [ChannelMessage]] = [:]   // keyed by channelHash hex
+    @Published var rfedNodeStatus: NodeStatus = .unknown
+
+    private var linkStatusTimer: AnyCancellable?
 
     // MARK: - Dependencies
 
@@ -69,10 +81,39 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
     func stop() {
         bridge.stopRfedDelivery()
+        stopRfedLinkMonitor()
     }
 
     func announceDelivery() {
         _ = bridge.rfedDeliveryAnnounce()
+    }
+
+    // MARK: - RFed node link status monitor
+
+    /// Start polling the app-link status every 3 s (while SettingsView is visible).
+    /// The actual link is managed by ConnectionStateManager (opened/closed with app foreground).
+    func startRfedLinkMonitor() {
+        refreshRfedNodeStatus()
+        linkStatusTimer?.cancel()
+        linkStatusTimer = Timer.publish(every: 3, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.refreshRfedNodeStatus() }
+    }
+
+    /// Stop polling (SettingsView disappeared).
+    func stopRfedLinkMonitor() {
+        linkStatusTimer?.cancel()
+        linkStatusTimer = nil
+    }
+
+    private func refreshRfedNodeStatus() {
+        // appLinkStatus: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED
+        switch ConnectionStateManager.shared.rfedNodeLinkStatus() {
+        case 3:    rfedNodeStatus = .connected
+        case 1, 2: rfedNodeStatus = .establishing
+        case 4:    rfedNodeStatus = .unreachable
+        default:   rfedNodeStatus = .unknown
+        }
     }
 
     // MARK: - Channel management

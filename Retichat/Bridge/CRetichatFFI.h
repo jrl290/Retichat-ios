@@ -200,6 +200,16 @@ int32_t lxmf_app_link_close(uint64_t client,
 int32_t lxmf_app_link_status(uint64_t client,
                               const uint8_t *dest_hash, uint32_t dest_len);
 
+/// Register an app-link reconnect handler for a non-LXMF destination aspect.
+///
+/// The built-in announce handler only fires for `lxmf.delivery`; call this for
+/// every extra aspect (e.g. "rfed.channel", "rfed.notify") so that when that
+/// destination announces the router re-establishes any open app-link to it.
+/// Call once per aspect during startup.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_register_reconnect(uint64_t client,
+                                          const char *aspect_filter);
+
 #pragma mark - LXMF Announce
 
 int32_t lxmf_client_announce(uint64_t client);

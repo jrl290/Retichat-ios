@@ -12,6 +12,7 @@ import SwiftData
 
 struct SettingsView: View {
     @EnvironmentObject var repository: ChatRepository
+    @EnvironmentObject var channelClient: RfedChannelClient
     @StateObject private var vm = SettingsViewModel()
     @Environment(\.dismiss) private var dismiss
 
@@ -89,6 +90,10 @@ struct SettingsView: View {
             .onAppear {
                 vm.loadInterfaces(from: repository)
                 refreshNotificationStatus()
+                channelClient.startRfedLinkMonitor()
+            }
+            .onDisappear {
+                channelClient.stopRfedLinkMonitor()
             }
         }
     }
@@ -229,9 +234,13 @@ struct SettingsView: View {
     private var rfedSection: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 12) {
-                Text("RFed Node")
-                    .font(.headline)
-                    .foregroundColor(.retichatOnSurface)
+                HStack {
+                    Text("RFed Node")
+                        .font(.headline)
+                        .foregroundColor(.retichatOnSurface)
+                    Spacer()
+                    rfedNodeStatusIndicator
+                }
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Node Identity Hash")
@@ -265,6 +274,27 @@ struct SettingsView: View {
                 Text("Enter the RFed Node's public identity hash. Notify, channel, delivery, and LXMF propagation hashes are derived automatically. Leave the propagation field empty to use the derived address, or enter a different one to override it. Changes take effect on next service restart.")
                     .font(.caption)
                     .foregroundColor(.retichatOnSurfaceVariant)
+            }
+        }
+    }
+
+    private var rfedNodeStatusIndicator: some View {
+        let (color, label): (Color, String) = {
+            switch channelClient.rfedNodeStatus {
+            case .connected:    return (.green, "Linked")
+            case .establishing: return (.orange, "Linking…")
+            case .unreachable:  return (.red, "No path")
+            case .unknown:      return (.gray, "")
+            }
+        }()
+        return HStack(spacing: 5) {
+            if channelClient.rfedNodeStatus != .unknown {
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                Text(label)
+                    .font(.caption)
+                    .foregroundColor(color)
             }
         }
     }
