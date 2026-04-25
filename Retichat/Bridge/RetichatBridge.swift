@@ -261,14 +261,24 @@ final class RetichatBridge: @unchecked Sendable {
         let content: Data
     }
 
-    /// Build an LXMF channel message and return the on-wire `lxmf_data`
-    /// (already prefixed with the 16-byte channel_hash). The caller appends
-    /// the optional PoW stamp suffix and ships it as the rfed.channel SEND
-    /// payload.
+    /// Result of packing a channel LXMF message.
+    struct ChannelLxmPackResult {
+        /// LXMF timestamp baked into the signed payload, in milliseconds.
+        /// Use this for local persistence so the echo back from RFed
+        /// dedupes against the optimistic local message.
+        let timestampMs: UInt64
+        /// On-wire payload to send to RFed.channel:
+        ///     [ channel_id_hash(16) | EC_encrypted(source_hash || sig || payload) ]
+        /// Optionally append a PoW stamp.
+        let wirePayload: Data
+    }
+
+    /// Build an LXMF channel message and return the on-wire payload plus
+    /// the LXMF timestamp the sender baked into the signed body.
     nonisolated func channelLxmPack(name: String,
                                     senderIdentityHandle: UInt64,
                                     content: Data,
-                                    title: Data) -> Data? {
+                                    title: Data) -> ChannelLxmPackResult? {
         var outLen: UInt32 = 0
         guard let ptr = name.withCString({ cName in
             content.withUnsafeBytes { cBuf in
@@ -285,9 +295,13 @@ final class RetichatBridge: @unchecked Sendable {
                 }
             }
         }) else { return nil }
-        let data = Data(bytes: ptr, count: Int(outLen))
+        let raw = Data(bytes: ptr, count: Int(outLen))
         lxmf_free_bytes(ptr, outLen)
-        return data
+        // Layout: 8-byte ts_ms_be | wire_payload
+        guard raw.count >= 8 + 16 else { return nil }
+        let ts = raw.subdata(in: 0..<8).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
+        let wire = raw.subdata(in: 8..<raw.count)
+        return ChannelLxmPackResult(timestampMs: ts, wirePayload: wire)
     }
 
     /// Unpack an LXMF channel message received from RFed. `lxmfData` MUST

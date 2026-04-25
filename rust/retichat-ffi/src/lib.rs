@@ -554,33 +554,42 @@ pub extern "C" fn retichat_compute_channel_stamp(
 // CHANNEL MESSAGES ARE LXMF PACKAGES.  THEY ARE LXMF PACKAGES.
 //
 // On the wire, the payload going to RFed (and what RFed forwards to each
-// subscriber) is an LXMF message in the EXACT SAME FORMAT used by an LXMF
-// propagation node.  i.e. it is:
+// subscriber) carries the EXACT same authentication payload an LXMF
+// propagation node carries — i.e. the EC-encrypted tail produced by
+// `LXMessage::pack(PROPAGATED)`:
 //
-//     lxmf_data = [ destination_hash (16) | EC_encrypted(
-//                       source_hash (16) || signature (64) || msgpack_payload
-//                   ) ]
+//     wire_payload = [ channel_id_hash(16) | EC_encrypted(
+//                          source_hash (16) || signature (64) || msgpack_payload
+//                      ) ]
 //
-// where `destination_hash` is the channel's deterministic identity hash
-// (= the channel_hash RFed already routes on), and the encrypted portion
-// is decryptable by anyone who knows the channel name (since the channel
-// identity is derived deterministically from the name).
+// `channel_id_hash` is the channel identity hash — the same 16-byte routing
+// label that subscribers registered with RFed via `/rfed/subscribe` and
+// that RFed uses as the `subscription_table` key.  The encrypted tail is
+// byte-identical to what an LXMF propagation node carries.
 //
-// The full bytes hand-off model:
-//   sender → RFed:    [ lxmf_data | optional_PoW_stamp ]
-//                     (this is identical to the legacy
-//                      [channel_hash | inner_blob | stamp] layout —
-//                      lxmf_data starts with channel_hash by definition)
-//   RFed → receiver:  [ lxmf_data ]                                 ← opaque to RFed
+// The receiver:
+//   1. EC-decrypts the encrypted tail using the channel identity (derived
+//      deterministically from the channel name).
+//   2. Reconstructs the canonical LXMF block:
+//          [ lxmf_dest_hash(16) | source_hash(16) | signature(64) | payload ]
+//      where `lxmf_dest_hash` is the `lxmf.delivery` destination hash for
+//      the channel identity — i.e. exactly the dest_hash the sender used
+//      inside `LXMessage::pack(PROPAGATED)` when it computed the signature.
+//   3. Calls `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which
+//      parses dest/source/sig/payload (timestamp, title, content, fields),
+//      recalls the source identity from Reticulum's known-destinations
+//      table, and validates the Ed25519 signature → `signature_validated`.
+//      Emits `unverified_reason = SOURCE_UNKNOWN` if the sender hasn't
+//      been seen via an announce yet (i.e. you cannot prove who the
+//      message is from).
 //
-// The receiver simply EC-decrypts the tail with the channel identity, then
-// hands the reconstructed [dest|src|sig|payload] block to
-// `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`.  That call:
-//   • parses dest_hash, source_hash, signature, payload (timestamp/title/content)
-//   • recalls the source identity from Reticulum's known-destinations
-//   • validates the Ed25519 signature → `signature_validated` boolean
-//   • emits `unverified_reason = SOURCE_UNKNOWN` if the sender hasn't been
-//     seen via an announce yet (i.e. you cannot prove who the message is from)
+// Why the wire prefix is `channel_id_hash` and not the LXMF
+// `lxmf.delivery` destination hash: RFed routes channel messages by the
+// channel identity hash (subscribers signed it during `/rfed/subscribe`).
+// Wrapping the LXMF authentication payload behind that label keeps the
+// RFed routing model intact while still requiring an LXMF-valid signature
+// from a known sender to deliver — i.e. you cannot prove who the message
+// is from unless the sender's identity is in the cache.
 //
 // The legacy custom plaintext layout (sender_hash | ts_be | pubkey | sig |
 // content_utf8 inside `channel_encrypt`) is GONE.  Do not reintroduce it.
@@ -606,8 +615,7 @@ fn channel_destination(name: &str) -> Result<Destination, String> {
 }
 
 /// Build an LXMF message addressed to the channel destination and pack it
-/// into `lxmf_data` — the exact same byte format an LXMF propagation node
-/// would store and deliver.  The caller is responsible for appending the
+/// into the on-wire payload.  The caller is responsible for appending the
 /// optional PoW stamp suffix and sending the result as the `rfed.channel`
 /// SEND payload.
 ///
@@ -617,9 +625,21 @@ fn channel_destination(name: &str) -> Result<Destination, String> {
 ///   * `content_ptr/_len`   — message body bytes (UTF-8)
 ///   * `title_ptr/_len`     — optional title bytes (UTF-8); pass NULL/0 for none
 ///
-/// Returns a heap-allocated buffer (free with `lxmf_free_bytes`) containing:
-///     [ channel_hash(16) | EC_encrypted(source_hash || signature || payload) ]
-/// or NULL on error (call `lxmf_last_error`).
+/// Returns a heap-allocated buffer (free with `lxmf_free_bytes`) in the
+/// following layout, or NULL on error (call `lxmf_last_error`):
+///
+///     offset  size  field
+///     ------  ----  -----
+///     0       8     timestamp_ms_be    (u64 BE) — the LXMF timestamp the
+///                                       sender baked into the signed
+///                                       payload, returned out-of-band so
+///                                       the caller can match it against
+///                                       the echo for local-persist dedup.
+///     8       16    channel_id_hash    (the routing label for RFed)
+///     24      *     EC_encrypted(source_hash || signature || msgpack_payload)
+///
+/// The wire payload is `output[8..]` — the 8-byte timestamp prefix is
+/// stripped before sending.
 #[no_mangle]
 pub extern "C" fn retichat_channel_lxm_pack(
     name_ptr: *const c_char,
@@ -696,10 +716,17 @@ pub extern "C" fn retichat_channel_lxm_pack(
         return std::ptr::null_mut();
     }
 
-    // Reconstruct lxmf_data = packed[..16] || EC_encrypted(packed[16..])
-    // This matches what LXMessage::pack(PROPAGATED) computes internally
-    // (its `pn_encrypted_data` field is private, so we re-encrypt the
-    // post-destination section ourselves using the same channel destination.)
+    // Build wire payload = [ channel_id_hash(16) | EC_encrypted(packed[16..]) ].
+    //
+    // packed[..16] is the LXMF `lxmf.delivery` destination_hash, used by
+    // pack() when computing the signature.  We replace it on the wire with
+    // the channel IDENTITY hash so RFed's `subscription_table` lookup
+    // (which is keyed by the identity hash subscribers registered with
+    // /rfed/subscribe) finds the right subscribers.  The receiver
+    // reconstructs the canonical LXMF block by deriving the same
+    // `lxmf.delivery` destination hash from the channel name before
+    // calling LXMessage::unpack_from_bytes — so the signature still
+    // validates against the original signed dest_hash.
     let packed = match msg.packed.as_ref() {
         Some(p) => p,
         None => {
@@ -722,12 +749,38 @@ pub extern "C" fn retichat_channel_lxm_pack(
         }
     };
 
-    let mut lxmf_data = Vec::with_capacity(LXMessage::DESTINATION_LENGTH + pn_enc.len());
-    lxmf_data.extend_from_slice(&packed[..LXMessage::DESTINATION_LENGTH]);
-    lxmf_data.extend_from_slice(&pn_enc);
+    // The channel identity hash is the routing label RFed expects.
+    let id_hash: Vec<u8> = match channel_identity(&name) {
+        Ok(id) => match id.hash.clone() {
+            Some(h) => h,
+            None => {
+                rns::set_error("channel identity has no hash".into());
+                unsafe { *out_len = 0; }
+                return std::ptr::null_mut();
+            }
+        },
+        Err(e) => {
+            rns::set_error(format!("channel identity: {}", e));
+            unsafe { *out_len = 0; }
+            return std::ptr::null_mut();
+        }
+    };
+    if id_hash.len() != LXMessage::DESTINATION_LENGTH {
+        rns::set_error("channel identity hash wrong length".into());
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    }
 
-    let len = lxmf_data.len() as u32;
-    let mut boxed = lxmf_data.into_boxed_slice();
+    let mut wire = Vec::with_capacity(8 + LXMessage::DESTINATION_LENGTH + pn_enc.len());
+    // Out-of-band: 8-byte LXMF timestamp prefix so the caller can use the
+    // same tsMs for local persistence and echo dedup.
+    let ts_ms: u64 = (msg.timestamp.unwrap_or(0.0) * 1000.0) as u64;
+    wire.extend_from_slice(&ts_ms.to_be_bytes());
+    wire.extend_from_slice(&id_hash);
+    wire.extend_from_slice(&pn_enc);
+
+    let len = wire.len() as u32;
+    let mut boxed = wire.into_boxed_slice();
     let ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
     unsafe { *out_len = len; }
@@ -736,8 +789,10 @@ pub extern "C" fn retichat_channel_lxm_pack(
 
 /// Unpack an LXMF channel message received via RFed.
 ///
-/// Input is the `lxmf_data` block as defined in `retichat_channel_lxm_pack`:
-///     [ channel_hash(16) | EC_encrypted(source_hash || signature || payload) ]
+/// Input is the wire payload as defined in `retichat_channel_lxm_pack`:
+///     [ channel_id_hash(16) | EC_encrypted(source_hash || signature || payload) ]
+/// (channel_id_hash = channel identity hash, the routing label RFed uses;
+///  the EC-encrypted tail carries the LXMF authentication payload.)
 ///
 /// Returns a heap-allocated buffer (free with `lxmf_free_bytes`) containing
 /// a flat parsed-message struct in the following layout, or NULL on error:
@@ -784,7 +839,6 @@ pub extern "C" fn retichat_channel_lxm_unpack(
             return std::ptr::null_mut();
         }
     };
-    let dest_hash = data[..LXMessage::DESTINATION_LENGTH].to_vec();
     let encrypted = &data[LXMessage::DESTINATION_LENGTH..];
     let decrypted = match id.decrypt(encrypted) {
         Ok(p) => p,
@@ -795,11 +849,28 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         }
     };
 
-    // Reassemble [dest_hash | source_hash | signature | packed_payload]
-    // and feed it to the standard LXMF unpacker, which validates the
-    // Ed25519 signature against the source identity from the cache.
-    let mut full = Vec::with_capacity(dest_hash.len() + decrypted.len());
-    full.extend_from_slice(&dest_hash);
+    // Reconstruct the LXMF canonical block [lxmf_dest | source | sig | payload]
+    // using the lxmf.delivery destination_hash for the channel identity —
+    // i.e. the same dest_hash the sender used inside LXMessage::pack when
+    // it computed the signature.  (The wire prefix `data[..16]` is the
+    // channel identity hash for RFed routing; it is NOT what the LXMF
+    // signature was computed over.)
+    let lxmf_dest = match channel_destination(&name) {
+        Ok(d) => d.hash.clone(),
+        Err(e) => {
+            rns::set_error(format!("channel destination: {}", e));
+            unsafe { *out_len = 0; }
+            return std::ptr::null_mut();
+        }
+    };
+    if lxmf_dest.len() != LXMessage::DESTINATION_LENGTH {
+        rns::set_error("lxmf dest hash wrong length".into());
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    }
+
+    let mut full = Vec::with_capacity(lxmf_dest.len() + decrypted.len());
+    full.extend_from_slice(&lxmf_dest);
     full.extend_from_slice(&decrypted);
 
     let msg = match LXMessage::unpack_from_bytes(&full, Some(LXMessage::PROPAGATED)) {

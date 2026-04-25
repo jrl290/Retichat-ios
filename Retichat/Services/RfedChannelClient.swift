@@ -290,20 +290,25 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     // MARK: - Send
 
     func sendMessage(content: String, toChannel channel: Channel) {
-        // Build the payload as an LXMF propagation-format package.
-        // bridge.channelLxmPack returns lxmf_data which ALREADY starts with
-        // the 16-byte channel_hash, so it is the wire payload (sans stamp).
+        // Build the wire payload as an LXMF-authenticated channel message.
+        // The FFI returns both the on-wire bytes AND the LXMF timestamp it
+        // baked into the signed body — we use the same timestamp for the
+        // local optimistic insert so the echo back from RFed dedupes
+        // cleanly against it.
         let contentData = Data(content.utf8)
-        guard let lxmfData = bridge.channelLxmPack(name: channel.channelName,
-                                                    senderIdentityHandle: identityHandle,
-                                                    content: contentData,
-                                                    title: Data()) else {
+        guard let packed = bridge.channelLxmPack(name: channel.channelName,
+                                                  senderIdentityHandle: identityHandle,
+                                                  content: contentData,
+                                                  title: Data()) else {
             print("[RfedChannel] LXMF pack failed: \(bridge.lastError() ?? "unknown")")
             return
         }
+        let lxmfData = packed.wirePayload
+        let tsMs = packed.timestampMs
+
         guard lxmfData.count >= 16,
               lxmfData.prefix(16).hexString.lowercased() == channel.id.lowercased() else {
-            print("[RfedChannel] LXMF pack produced wrong dest_hash prefix")
+            print("[RfedChannel] LXMF pack produced wrong channel_id_hash prefix")
             return
         }
 
@@ -326,7 +331,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
 
         // Persist outgoing message locally — we know the plaintext directly.
-        let tsMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        // Use the LXMF timestamp so the echo from RFed dedupes against this.
         let msgId = (Data(hexString: ownHashHex) ?? Data()).hexString + String(format: "%016llx", tsMs)
         let entity = ChannelMessageEntity(id: msgId, channelHash: channel.id,
                                           senderHash: ownHashHex, senderDisplayName: "",
