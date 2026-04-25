@@ -632,6 +632,53 @@ use lxmf_rust::lx_message::LXMessage;
 const LXMF_APP_NAME: &str = "lxmf";
 const LXMF_DELIVERY_ASPECT: &str = "delivery";
 
+// ---------------------------------------------------------------------------
+// SOURCE-IDENTITY PRELUDE — DO NOT BREAK
+// ---------------------------------------------------------------------------
+//
+// LXMF PROPAGATED unpack requires the source identity to be present in
+// Reticulum's known-destinations cache so the Ed25519 signature can be
+// validated.  In normal Sideband-style use that cache is populated by
+// LXMF announces, but Retichat clients do NOT (yet) periodically
+// announce their lxmf.delivery destination, so the receiver would
+// reject every channel message as `SOURCE_UNKNOWN` until/unless the
+// sender happened to also announce.
+//
+// To make channel delivery work without depending on lossy/timed
+// announces, the sender embeds its own identity public bytes inside the
+// EC-encrypted channel payload, immediately before the LXMF tail.  The
+// receiver detects the magic, registers the identity for the source
+// hash via `Identity::remember_destination`, then unpacks the LXMF
+// canonical block normally — at which point `recall_identity` finds the
+// just-registered identity and the signature validates.
+//
+// Layout of the *plaintext* of the EC-encrypted payload:
+//
+//   if first 4 bytes == "RTID":
+//       [ b"RTID" (4) | sender_identity_pub(64) | source_hash(16) | sig(64) | msgpack_payload ]
+//   else (legacy):
+//       [ source_hash(16) | sig(64) | msgpack_payload ]   // requires prior announce
+//
+// The 64 bytes of identity_pub are exactly the format produced by
+// `Identity::get_public_key()` (32 X25519 enc pub || 32 Ed25519 sign
+// pub) and consumed by `Identity::from_public_key` /
+// `Identity::remember_destination`.
+//
+// The prelude is INSIDE the EC envelope so it is not visible to anyone
+// who does not already hold the channel key — i.e. it leaks no more
+// than the message body itself does, which is exactly the threat model
+// of channel pub/sub.
+//
+// HISTORICAL FAILURE: prior to this prelude, two Retichat clients on
+// the same channel could connect, subscribe, and even deliver one
+// message that happened to coincide with an LXMF announce window, but
+// every subsequent message would be rejected as SOURCE_UNKNOWN until
+// each side independently observed the other's announce.  The cure was
+// to stop relying on announce timing for channel-message authentication
+// and to ship the proof inline.
+const CHANNEL_IDENTITY_PRELUDE_MAGIC: &[u8; 4] = b"RTID";
+const CHANNEL_IDENTITY_PRELUDE_LEN: usize = 4 + 64; // magic + Identity::get_public_key()
+
 fn channel_identity(name: &str) -> Result<Identity, String> {
     let prv = channel_private_key_bytes(name);
     Identity::from_bytes(&prv)
@@ -700,6 +747,27 @@ pub extern "C" fn retichat_channel_lxm_pack(
             return std::ptr::null_mut();
         }
     };
+
+    // Snapshot the sender's identity public bytes BEFORE we move the
+    // identity into Destination::new_outbound — the receiver needs these
+    // 64 bytes to register the source identity locally without waiting
+    // for an LXMF announce (see CHANNEL_IDENTITY_PRELUDE_MAGIC docs).
+    let sender_pub_bytes: Vec<u8> = match sender_identity.get_public_key() {
+        Ok(b) => b,
+        Err(e) => {
+            rns::set_error(format!("sender identity has no public key: {}", e));
+            unsafe { *out_len = 0; }
+            return std::ptr::null_mut();
+        }
+    };
+    if sender_pub_bytes.len() != 64 {
+        rns::set_error(format!(
+            "sender identity public key wrong length: expected 64, got {}",
+            sender_pub_bytes.len()
+        ));
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    }
 
     let mut channel_dest = match channel_destination(&name) {
         Ok(d) => d,
@@ -773,7 +841,18 @@ pub extern "C" fn retichat_channel_lxm_pack(
         unsafe { *out_len = 0; }
         return std::ptr::null_mut();
     }
-    let pn_enc = match channel_dest.encrypt(&packed[LXMessage::DESTINATION_LENGTH..]) {
+    // Prepend the SOURCE-IDENTITY PRELUDE to the LXMF tail before
+    // encryption.  Receivers detect the magic and register the source
+    // identity locally so signature validation succeeds without
+    // requiring a prior announce.  Old receivers (pre-prelude) will not
+    // recognise the magic and will fail to parse — they need to be on
+    // the same FFI version, which they always are inside Retichat.
+    let lxmf_tail = &packed[LXMessage::DESTINATION_LENGTH..];
+    let mut prelude_plus_tail = Vec::with_capacity(CHANNEL_IDENTITY_PRELUDE_LEN + lxmf_tail.len());
+    prelude_plus_tail.extend_from_slice(CHANNEL_IDENTITY_PRELUDE_MAGIC);
+    prelude_plus_tail.extend_from_slice(&sender_pub_bytes);
+    prelude_plus_tail.extend_from_slice(lxmf_tail);
+    let pn_enc = match channel_dest.encrypt(&prelude_plus_tail) {
         Ok(d) => d,
         Err(e) => {
             rns::set_error(format!("channel encrypt: {}", e));
@@ -882,6 +961,51 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         }
     };
 
+    // Detect and consume the SOURCE-IDENTITY PRELUDE if present.  When
+    // present, register the sender's identity in Reticulum's known-
+    // destinations cache so that LXMessage::unpack_from_bytes' internal
+    // recall_identity(source_hash) lookup succeeds and the Ed25519
+    // signature is validated — without depending on a prior LXMF
+    // announce window.  When absent, fall through to the legacy path
+    // (will yield SOURCE_UNKNOWN unless the sender announced).
+    let lxmf_tail: &[u8] = if decrypted.len() >= CHANNEL_IDENTITY_PRELUDE_LEN
+        && &decrypted[..4] == CHANNEL_IDENTITY_PRELUDE_MAGIC
+    {
+        let identity_pub = &decrypted[4..CHANNEL_IDENTITY_PRELUDE_LEN];
+        // The first 16 bytes of the LXMF tail are the source_hash that
+        // recall_identity will look up.  Register identity_pub under
+        // that hash so LXMF signature validation finds it.  The hash
+        // MUST equal truncated_hash(identity_pub); if not, the sender
+        // is lying about its identity and we should let the LXMF unpack
+        // fall through to SOURCE_UNKNOWN (do not poison the cache).
+        let tail = &decrypted[CHANNEL_IDENTITY_PRELUDE_LEN..];
+        if tail.len() >= LXMessage::DESTINATION_LENGTH {
+            let claimed_source_hash = &tail[..LXMessage::DESTINATION_LENGTH];
+            let actual_hash = reticulum_rust::identity::truncated_hash(identity_pub);
+            if actual_hash == claimed_source_hash {
+                if let Err(e) = Identity::remember_destination(
+                    claimed_source_hash,
+                    identity_pub,
+                    None,
+                ) {
+                    // Non-fatal: log and proceed to unpack; receiver may
+                    // still validate via a prior cache entry.
+                    rns::set_error(format!(
+                        "channel: failed to register sender identity (will fall back to recall): {}",
+                        e
+                    ));
+                }
+            } else {
+                rns::set_error(
+                    "channel: sender identity prelude does not match source_hash — refusing to register (signature will fail SOURCE_UNKNOWN)".into()
+                );
+            }
+        }
+        tail
+    } else {
+        &decrypted[..]
+    };
+
     // Reconstruct the LXMF canonical block [lxmf_dest | source | sig | payload]
     // using the lxmf.delivery destination_hash for the channel identity —
     // i.e. the same dest_hash the sender used inside LXMessage::pack when
@@ -902,9 +1026,9 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         return std::ptr::null_mut();
     }
 
-    let mut full = Vec::with_capacity(lxmf_dest.len() + decrypted.len());
+    let mut full = Vec::with_capacity(lxmf_dest.len() + lxmf_tail.len());
     full.extend_from_slice(&lxmf_dest);
-    full.extend_from_slice(&decrypted);
+    full.extend_from_slice(lxmf_tail);
 
     let msg = match LXMessage::unpack_from_bytes(&full, Some(LXMessage::PROPAGATED)) {
         Ok(m) => m,
