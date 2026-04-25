@@ -273,18 +273,32 @@ struct ConversationView: View {
             ScrollView {
                 LazyVStack(spacing: 4) {
                     ForEach(msgs) { msg in
-                        ChannelBubble(
-                            message: msg,
-                            senderDisplayName: msg.isOutgoing
-                                ? "You"
-                                : (!msg.senderDisplayName.isEmpty
-                                    ? msg.senderDisplayName
-                                    : repository.contactDisplayName(for: msg.senderHash))
+                        // Reuse the direct/group ChatBubble so channels share
+                        // the exact same visual layout. Channel timestamps
+                        // are Unix-ms; ChatMessage expects seconds. Channels
+                        // never carry attachments or upload progress.
+                        ChatBubble(
+                            message: ChatMessage(
+                                id: msg.id,
+                                senderHash: msg.senderHash,
+                                senderName: msg.isOutgoing
+                                    ? "You"
+                                    : (!msg.senderDisplayName.isEmpty
+                                        ? msg.senderDisplayName
+                                        : repository.contactDisplayName(for: msg.senderHash)),
+                                content: msg.content,
+                                timestamp: msg.timestamp / 1000.0,
+                                isOutgoing: msg.isOutgoing,
+                                deliveryState: msg.deliveryState,
+                                attachments: [],
+                                uploadProgress: nil
+                            ),
+                            isGroup: true
                         )
                         .id(msg.id)
                     }
                 }
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 8)
                 .padding(.vertical, 8)
             }
             .onChange(of: msgs.count) { _, _ in
