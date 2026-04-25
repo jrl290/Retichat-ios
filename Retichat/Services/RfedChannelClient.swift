@@ -347,6 +347,30 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     }
 
     private func sendMessageAsync(content: String, toChannel channel: Channel) async {
+        // --- Optimistic bubble: insert IMMEDIATELY in `pending` so the user
+        // sees the message and a “sending” indicator without waiting on the
+        // PoW stamp + FFI hop. We update its state in place once trySend
+        // resolves. The id is a synthetic placeholder; on success it’s
+        // replaced with the canonical sender_hex+lxmf_ts id so the echo
+        // from RFed dedupes against it.
+        let optimisticId = "pending_\(UUID().uuidString)"
+        let optimisticTs = Date().timeIntervalSince1970 * 1000.0
+        let optimisticEntity = ChannelMessageEntity(
+            id: optimisticId, channelHash: channel.id,
+            senderHash: ownHashHex, senderDisplayName: "",
+            content: content, timestamp: optimisticTs, isOutgoing: true,
+            deliveryState: DeliveryState.pending
+        )
+        modelContext?.insert(optimisticEntity)
+        try? modelContext?.save()
+        appendMessage(
+            ChannelMessage(id: optimisticId, channelHash: channel.id,
+                           senderHash: ownHashHex, senderDisplayName: "",
+                           content: content, timestamp: optimisticTs, isOutgoing: true,
+                           deliveryState: DeliveryState.pending),
+            toChannelHash: channel.id
+        )
+
         // Step 1: ensure stampCost is fresh for this session.  No persisted
         // stampCost is trusted across an app launch — operator may have
         // changed the node config.
@@ -363,8 +387,9 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             }
         }
 
-        let sendOk = await trySend(content: content, toChannel: liveChannel)
-        if sendOk { return }
+        if await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId) {
+            return
+        }
 
         // Step 2: a single retry after forcing a stampCost refresh.  This
         // covers the edge case where the operator changed the cost mid-session.
@@ -377,21 +402,46 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             }
         } catch {
             print("[RfedChannel] stampCost refresh on retry failed: \(error)")
+            markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
             return
         }
-        _ = await trySend(content: content, toChannel: liveChannel)
+        if !(await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId)) {
+            markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
+        }
+    }
+
+    /// Mark the optimistic entity (and its in-memory copy) as `failed`.
+    /// Called from any terminal SEND error path so the user sees the red
+    /// xmark indicator instead of an indefinite “sending” clock.
+    private func markOptimisticFailed(optimisticId: String, channelHash: String) {
+        if let ctx = modelContext,
+           let temp = try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
+               predicate: { let oid = optimisticId; return #Predicate { $0.id == oid } }()
+           )).first {
+            temp.deliveryState = DeliveryState.failed
+            try? ctx.save()
+        }
+        if var list = messages[channelHash],
+           let idx = list.firstIndex(where: { $0.id == optimisticId }) {
+            list[idx].deliveryState = DeliveryState.failed
+            messages[channelHash] = list
+        }
     }
 
     /// Build the wire payload, compute the stamp, and ship it.  Returns
     /// false if any step that would produce a server-rejected packet fails
-    /// (so the caller can refresh stampCost and retry).  A successful
-    /// transmission also persists the local optimistic message.
-    private func trySend(content: String, toChannel channel: Channel) async -> Bool {
+    /// (so the caller can refresh stampCost and retry).  On a successful
+    /// transmission the optimistic entity identified by `optimisticId` is
+    /// upgraded in place to the canonical `sender_hex+lxmf_ts` id with
+    /// `deliveryState = sent` (so the echo from RFed dedupes against it
+    /// in `dispatchVerifiedLxmf`).
+    private func trySend(content: String, toChannel channel: Channel,
+                          optimisticId: String) async -> Bool {
         // Build the wire payload as an LXMF-authenticated channel message.
         // The FFI returns both the on-wire bytes AND the LXMF timestamp it
-        // baked into the signed body — we use the same timestamp for the
-        // local optimistic insert so the echo back from RFed dedupes
-        // cleanly against it.
+        // baked into the signed body — we use the same timestamp as the
+        // canonical id so the echo back from RFed dedupes cleanly against
+        // the optimistic entity (after we rename it).
         let contentData = Data(content.utf8)
         guard let packed = bridge.channelLxmPack(name: channel.channelName,
                                                   senderIdentityHandle: identityHandle,
@@ -430,26 +480,59 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             return false
         }
 
-        // Persist outgoing message locally — we know the plaintext directly.
-        // Use the LXMF timestamp so the echo from RFed dedupes against this.
-        let msgId = (Data(hexString: ownHashHex) ?? Data()).hexString + String(format: "%016llx", tsMs)
-        // Avoid duplicating the local insert when retrying a previously-failed send.
-        if let ctx = modelContext,
-           let existing = try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
-               predicate: { let mid = msgId; return #Predicate { $0.id == mid } }()
-           )), !existing.isEmpty {
-            return true
+        // SEND succeeded — upgrade the optimistic entity in place to the
+        // canonical id (sender_hex+lxmf_ts) and mark it `sent` (= published
+        // to RFed). Using the same id format as `dispatchVerifiedLxmf` so
+        // the inevitable echo from RFed is suppressed by dedup.
+        let canonicalId = (Data(hexString: ownHashHex) ?? Data()).hexString
+            + String(format: "%016llx", tsMs)
+        if let ctx = modelContext {
+            // If a previous trySend attempt already promoted this entity,
+            // or if the echo from a prior send beat us here, just leave the
+            // existing canonical entity alone.
+            let existing = (try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
+                predicate: { let cid = canonicalId; return #Predicate { $0.id == cid } }()
+            )))?.first
+            if existing == nil,
+               let temp = try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
+                   predicate: { let oid = optimisticId; return #Predicate { $0.id == oid } }()
+               )).first {
+                temp.id = canonicalId
+                temp.timestamp = Double(tsMs)
+                temp.deliveryState = DeliveryState.sent
+                try? ctx.save()
+            } else if let existing {
+                existing.deliveryState = DeliveryState.sent
+                if let temp = try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
+                    predicate: { let oid = optimisticId; return #Predicate { $0.id == oid } }()
+                )).first {
+                    ctx.delete(temp)
+                }
+                try? ctx.save()
+            }
         }
-        let entity = ChannelMessageEntity(id: msgId, channelHash: channel.id,
-                                          senderHash: ownHashHex, senderDisplayName: "",
-                                          content: content, timestamp: Double(tsMs), isOutgoing: true)
-        modelContext?.insert(entity)
-        try? modelContext?.save()
-
-        let msg = ChannelMessage(id: msgId, channelHash: channel.id,
-                                  senderHash: ownHashHex, senderDisplayName: "", content: content,
-                                  timestamp: Double(tsMs), isOutgoing: true)
-        appendMessage(msg, toChannelHash: channel.id)
+        if var list = messages[channel.id] {
+            if let idx = list.firstIndex(where: { $0.id == optimisticId }) {
+                if list.contains(where: { $0.id == canonicalId }) {
+                    // Echo already arrived; drop optimistic placeholder.
+                    list.remove(at: idx)
+                } else {
+                    var upgraded = list[idx]
+                    list.remove(at: idx)
+                    list.append(ChannelMessage(
+                        id: canonicalId, channelHash: upgraded.channelHash,
+                        senderHash: upgraded.senderHash,
+                        senderDisplayName: upgraded.senderDisplayName,
+                        content: upgraded.content, timestamp: Double(tsMs),
+                        isOutgoing: true,
+                        deliveryState: DeliveryState.sent
+                    ))
+                    list.sort { $0.timestamp < $1.timestamp }
+                    _ = upgraded
+                }
+                messages[channel.id] = list
+            }
+        }
         updateChannelLastMessage(channelHashHex: channel.id, time: Double(tsMs))
         return true
     }
@@ -783,7 +866,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             let msg = ChannelMessage(id: e.id, channelHash: e.channelHash,
                                      senderHash: e.senderHash, senderDisplayName: e.senderDisplayName,
                                      content: e.content,
-                                     timestamp: e.timestamp, isOutgoing: e.isOutgoing)
+                                     timestamp: e.timestamp, isOutgoing: e.isOutgoing,
+                                     deliveryState: e.deliveryState)
             grouped[e.channelHash, default: []].append(msg)
         }
         for key in grouped.keys {

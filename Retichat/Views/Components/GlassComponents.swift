@@ -232,14 +232,44 @@ struct ChannelBubble: View {
                             .fill(message.isOutgoing ? Color.outgoingBubble : Color.incomingBubble)
                     )
 
-                Text(Date(timeIntervalSince1970: message.timestamp / 1000), style: .time)
-                    .font(.caption2)
-                    .foregroundColor(.retichatOnSurfaceVariant.opacity(0.7))
+                HStack(spacing: 4) {
+                    Text(Date(timeIntervalSince1970: message.timestamp / 1000), style: .time)
+                        .font(.caption2)
+                        .foregroundColor(.retichatOnSurfaceVariant.opacity(0.7))
+                    if message.isOutgoing {
+                        deliveryIcon
+                    }
+                }
             }
 
             if !message.isOutgoing { Spacer(minLength: 60) }
         }
         .padding(.vertical, 2)
+    }
+
+    /// Same vocabulary as the direct/group `MessageBubble.deliveryIcon`:
+    /// clock = pending (PoW + FFI in flight), single check = sent
+    /// (= published to RFed), red xmark = failed (every retry exhausted).
+    /// Channel messages have no per-recipient ACK so we never emit the
+    /// double-check `delivered` state for outgoing bubbles.
+    @ViewBuilder
+    private var deliveryIcon: some View {
+        switch message.deliveryState {
+        case DeliveryState.pending:
+            Image(systemName: "clock")
+                .font(.caption2)
+                .foregroundColor(.retichatOnSurfaceVariant)
+        case DeliveryState.sent:
+            Text("\u{2713}")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(.retichatOnSurfaceVariant)
+        case DeliveryState.failed:
+            Image(systemName: "xmark.circle")
+                .font(.caption2)
+                .foregroundColor(.retichatError)
+        default:
+            EmptyView()
+        }
     }
 }
 

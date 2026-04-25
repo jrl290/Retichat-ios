@@ -231,9 +231,15 @@ final class ChannelMessageEntity {
     var content: String
     var timestamp: Double                         // Unix ms
     var isOutgoing: Bool
+    /// Same `DeliveryState` numeric values used by direct/group chat:
+    /// 0=pending, 1=sent (= published to RFed), 3=failed.
+    /// Default 1 (sent) so existing rows from before this column existed
+    /// render with the previous “no indicator needed” behaviour.
+    var deliveryState: Int = DeliveryState.sent
 
     init(id: String, channelHash: String, senderHash: String, senderDisplayName: String = "",
-         content: String, timestamp: Double, isOutgoing: Bool = false) {
+         content: String, timestamp: Double, isOutgoing: Bool = false,
+         deliveryState: Int = DeliveryState.sent) {
         self.id = id
         self.channelHash = channelHash
         self.senderHash = senderHash
@@ -241,6 +247,7 @@ final class ChannelMessageEntity {
         self.content = content
         self.timestamp = timestamp
         self.isOutgoing = isOutgoing
+        self.deliveryState = deliveryState
     }
 }
 
@@ -263,4 +270,9 @@ struct ChannelMessage: Identifiable {
     var content: String
     var timestamp: Double
     var isOutgoing: Bool
+    /// Mirrors the direct/group `DeliveryState` ints. For incoming
+    /// messages this is always `delivered`; outgoing messages start at
+    /// `pending`, transition to `sent` once RFed accepts the packet,
+    /// and to `failed` if every retry path is exhausted.
+    var deliveryState: Int = DeliveryState.delivered
 }
