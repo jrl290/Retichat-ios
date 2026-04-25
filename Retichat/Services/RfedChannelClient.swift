@@ -60,6 +60,18 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     @Published var messages: [String: [ChannelMessage]] = [:]   // keyed by channelHash hex
     @Published var rfedNodeStatus: NodeStatus = .unknown
 
+    /// Whether the rfed node *might* still have pending deferred blobs queued
+    /// for this subscriber.  Keyed by the rfed node hash hex (since `/rfed/pull`
+    /// is per-node, not per-channel).  `nil` (or `true`) means "user may try a
+    /// PULL"; `false` means the last PULL returned `more_pending=false` so the
+    /// UI hides the page-load action until something happens to suggest more
+    /// blobs may have arrived (channel re-open, app foreground, etc.).
+    @Published var canPullMore: [String: Bool] = [:]
+
+    /// True while a `/rfed/pull` request is in flight for the given node.
+    /// UI uses this to disable the page-load button to prevent double taps.
+    @Published var pullInFlight: [String: Bool] = [:]
+
     private var linkStatusTimer: AnyCancellable?
 
     // MARK: - Dependencies
@@ -537,13 +549,32 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         return true
     }
 
-    // MARK: - Pull deferred blobs
-
-    func pullDeferred(channel: Channel) async {
+    // MARK: - Pull deferred blobs (user-initiated paging)
+    //
+    // PULL is the page-loaded counterpart to chat-history "Load earlier
+    // messages": the user taps a button, we drain one page from the rfed
+    // node's deferred queue, dispatch the blobs, and update `canPullMore`
+    // from the server's `more_pending` flag so the UI knows whether to
+    // keep offering the action.
+    //
+    // Server wire format: msgpack 2-fixarray
+    //     [ Array([ [bin(16) channel_hash, bin(*) blob], ... ]),
+    //       Bool more_pending ]
+    //
+    // Returns `true` if the server reports more entries remain, `false`
+    // otherwise (or on error — caller can retry the next page-load).
+    @discardableResult
+    func pullDeferred(channel: Channel) async -> Bool {
+        let nodeKey = channel.rfedNodeHash
         guard let rfedDeliveryDest = Data(hexString: Self.rfedDestHash(
-            identityHashHex: rfedIdentityHashFromChannelDest(channel.rfedNodeHash),
+            identityHashHex: rfedIdentityHashFromChannelDest(nodeKey),
             app: "rfed", aspects: ["delivery"]
-        )) else { return }
+        )) else { return false }
+
+        await MainActor.run { self.pullInFlight[nodeKey] = true }
+        defer {
+            Task { @MainActor in self.pullInFlight[nodeKey] = false }
+        }
 
         let handle = identityHandle
         let bridge = self.bridge
@@ -556,15 +587,24 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
         guard let data = response else {
             print("[RfedChannel] PULL: no response or error")
-            return
+            return false
         }
 
-        let pairs = Self.decodePullResponse(data)
+        guard let decoded = Self.decodePullResponse(data) else {
+            print("[RfedChannel] PULL: malformed response (\(data.count) bytes)")
+            return false
+        }
+        let (pairs, morePending) = decoded
+        print("[RfedChannel] PULL: drained \(pairs.count) blob(s), more_pending=\(morePending)")
+
         for (channelHashData, blob) in pairs {
             await MainActor.run {
                 self.dispatchBlob(channelHashHex: channelHashData.hexString, blob: blob)
             }
         }
+
+        await MainActor.run { self.canPullMore[nodeKey] = morePending }
+        return morePending
     }
 
     // MARK: - RfedBlobCallback
@@ -944,53 +984,112 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         return out
     }
 
-    /// Decode a msgpack PULL response: array of [bin(16), bin(*)] pairs.
-    /// Simple hand-rolled decoder supporting only the format rfed emits.
-    nonisolated static func decodePullResponse(_ data: Data) -> [(Data, Data)] {
-        var result: [(Data, Data)] = []
-        var i = data.startIndex
+    /// Decode a paged PULL response from `/rfed/pull`.
+    ///
+    /// Wire format: msgpack 2-element fixarray
+    ///     `[ Array([ [bin(16), bin(*)], ... ]), Bool more_pending ]`
+    ///
+    /// Returns `nil` if the envelope is malformed.  Returns
+    /// `(pairs, morePending)` on success.  Hand-rolled to avoid pulling in
+    /// a full msgpack dependency for one decode.
+    nonisolated static func decodePullResponse(_ data: Data) -> (pairs: [(Data, Data)], morePending: Bool)? {
+        // Fixed-length read helpers.  `available(_:from:n:)` returns the slice
+        // start..<start+n only if all `n` bytes lie within `data`; otherwise
+        // nil.  This avoids the previous `limitedBy: endIndex` confusion where
+        // the result was compared against `endIndex` instead of `nil`.
+        func available(_ d: Data, from idx: Data.Index, n: Int) -> Range<Data.Index>? {
+            guard n >= 0,
+                  let end = d.index(idx, offsetBy: n, limitedBy: d.endIndex)
+            else { return nil }
+            return idx..<end
+        }
 
         func readBin(_ d: Data, _ idx: inout Data.Index) -> Data? {
             guard idx < d.endIndex else { return nil }
             let tag = d[idx]
             idx = d.index(after: idx)
             let len: Int
-            if tag == 0xc4 {                          // bin8
-                guard idx < d.endIndex else { return nil }
-                len = Int(d[idx]); idx = d.index(after: idx)
-            } else if tag == 0xc5 {                   // bin16
-                guard d.index(idx, offsetBy: 2, limitedBy: d.endIndex) != d.endIndex else { return nil }
-                len = Int(d[idx]) << 8 | Int(d[d.index(after: idx)])
-                idx = d.index(idx, offsetBy: 2)
-            } else { return nil }
-            guard let end = d.index(idx, offsetBy: len, limitedBy: d.endIndex) else { return nil }
-            let bytes = d[idx..<end]
-            idx = end
-            return Data(bytes)
+            switch tag {
+            case 0xc4:                                  // bin8
+                guard let r = available(d, from: idx, n: 1) else { return nil }
+                len = Int(d[r.lowerBound])
+                idx = r.upperBound
+            case 0xc5:                                  // bin16
+                guard let r = available(d, from: idx, n: 2) else { return nil }
+                len = (Int(d[r.lowerBound]) << 8) | Int(d[d.index(after: r.lowerBound)])
+                idx = r.upperBound
+            case 0xc6:                                  // bin32
+                guard let r = available(d, from: idx, n: 4) else { return nil }
+                len = (Int(d[r.lowerBound]) << 24)
+                    | (Int(d[d.index(r.lowerBound, offsetBy: 1)]) << 16)
+                    | (Int(d[d.index(r.lowerBound, offsetBy: 2)]) << 8)
+                    |  Int(d[d.index(r.lowerBound, offsetBy: 3)])
+                idx = r.upperBound
+            default: return nil
+            }
+            guard let body = available(d, from: idx, n: len) else { return nil }
+            idx = body.upperBound
+            return Data(d[body])
         }
 
-        // Skip outer array header (fixarray 0x9x or array16 0xdc / array32 0xdd)
-        guard i < data.endIndex else { return result }
-        let arrayTag = data[i]
-        i = data.index(after: i)
-        let count: Int
-        if arrayTag & 0xf0 == 0x90 {                 // fixarray
-            count = Int(arrayTag & 0x0f)
-        } else if arrayTag == 0xdc {                  // array16
-            guard data.index(i, offsetBy: 2, limitedBy: data.endIndex) != data.endIndex else { return result }
-            count = Int(data[i]) << 8 | Int(data[data.index(after: i)])
-            i = data.index(i, offsetBy: 2)
-        } else { return result }
+        /// Read a msgpack array header at `idx` and return its element count.
+        func readArrayCount(_ d: Data, _ idx: inout Data.Index) -> Int? {
+            guard idx < d.endIndex else { return nil }
+            let tag = d[idx]
+            idx = d.index(after: idx)
+            if tag & 0xf0 == 0x90 {                     // fixarray
+                return Int(tag & 0x0f)
+            } else if tag == 0xdc {                     // array16
+                guard let r = available(d, from: idx, n: 2) else { return nil }
+                let n = (Int(d[r.lowerBound]) << 8) | Int(d[d.index(after: r.lowerBound)])
+                idx = r.upperBound
+                return n
+            } else if tag == 0xdd {                     // array32
+                guard let r = available(d, from: idx, n: 4) else { return nil }
+                let n = (Int(d[r.lowerBound]) << 24)
+                      | (Int(d[d.index(r.lowerBound, offsetBy: 1)]) << 16)
+                      | (Int(d[d.index(r.lowerBound, offsetBy: 2)]) << 8)
+                      |  Int(d[d.index(r.lowerBound, offsetBy: 3)])
+                idx = r.upperBound
+                return n
+            }
+            return nil
+        }
 
-        for _ in 0..<count {
-            // Each element is a 2-element fixarray
-            guard i < data.endIndex, (data[i] & 0xf0) == 0x90 else { break }
-            i = data.index(after: i)
+        var i = data.startIndex
+
+        // Outer envelope: 2-element array [pairs, more_pending].
+        guard let outerCount = readArrayCount(data, &i), outerCount == 2 else {
+            return nil
+        }
+
+        // Inner array of [channel_hash, blob] pairs.
+        guard let pairsCount = readArrayCount(data, &i) else { return nil }
+
+        var pairs: [(Data, Data)] = []
+        pairs.reserveCapacity(pairsCount)
+        for _ in 0..<pairsCount {
+            // Each element is a 2-element fixarray.
+            guard let innerCount = readArrayCount(data, &i), innerCount == 2 else {
+                return nil
+            }
             guard let channelHash = readBin(data, &i),
-                  let blob = readBin(data, &i) else { break }
-            result.append((channelHash, blob))
+                  let blob = readBin(data, &i) else { return nil }
+            pairs.append((channelHash, blob))
         }
-        return result
+
+        // Trailing bool: msgpack `false` = 0xc2, `true` = 0xc3.
+        guard i < data.endIndex else { return nil }
+        let boolTag = data[i]
+        i = data.index(after: i)
+        let morePending: Bool
+        switch boolTag {
+        case 0xc2: morePending = false
+        case 0xc3: morePending = true
+        default:   return nil
+        }
+
+        return (pairs, morePending)
     }
 }
 

@@ -269,9 +269,45 @@ struct ConversationView: View {
 
     private func channelMessagesList(channel: Channel) -> some View {
         let msgs = channelClient.messages[channel.id] ?? []
+        let nodeKey = channel.rfedNodeHash
+        // Treat "unknown" (nil) as "more might be pending" so the user is
+        // always offered an initial pull when entering a channel; a previous
+        // pull that returned more_pending=false explicitly sets it to false.
+        let canPull = channelClient.canPullMore[nodeKey] ?? true
+        let pulling = channelClient.pullInFlight[nodeKey] ?? false
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 4) {
+                    // Mirrors the DM "Load earlier messages" UX: a button at
+                    // the top of the list that the user taps to drain the
+                    // next page of pending blobs from the rfed node's
+                    // deferred queue.  Hidden once the server reports
+                    // more_pending=false on the most recent pull.
+                    if canPull {
+                        Button {
+                            let firstId = msgs.first?.id
+                            Task {
+                                await channelClient.pullDeferred(channel: channel)
+                                if let fid = firstId {
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                        proxy.scrollTo(fid, anchor: .top)
+                                    }
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if pulling {
+                                    ProgressView().scaleEffect(0.7)
+                                }
+                                Text(pulling ? "Pulling…" : "Pull pending messages")
+                                    .font(.caption)
+                                    .foregroundColor(.retichatPrimary)
+                            }
+                            .padding(.vertical, 8)
+                        }
+                        .disabled(pulling)
+                    }
+
                     ForEach(msgs) { msg in
                         // Reuse the direct/group ChatBubble so channels share
                         // the exact same visual layout. Channel timestamps
@@ -324,7 +360,13 @@ struct ConversationView: View {
                     }
                 }
             }
-            .onAppear { scrollProxy = proxy }
+            .onAppear {
+                scrollProxy = proxy
+                // Re-enable the page-load action whenever the user re-enters
+                // the channel: the server may have queued more blobs since
+                // the last visit.
+                channelClient.canPullMore[nodeKey] = nil
+            }
         }
     }
 
