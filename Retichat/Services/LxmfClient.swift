@@ -227,6 +227,40 @@ final class LxmfClient: @unchecked Sendable {
         }
     }
 
+    /// Send a blocking request on an existing app-link.
+    ///
+    /// Reuses the persistent app-link opened by `appLinkOpen` instead of
+    /// opening a fresh outbound link per request.  The link must already be
+    /// `ACTIVE` (status == 3); call `appLinkStatus` first.
+    ///
+    /// Blocking — must be called from a background thread.
+    /// Returns response bytes, or `nil` on timeout / error / link not active.
+    nonisolated func appLinkRequest(destHash: Data, path: String,
+                                    payload: Data, timeoutSecs: Double) -> Data?
+    {
+        destHash.withUnsafeBytes { destBuf -> Data? in
+            let destPtr = destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return path.withCString { cPath -> Data? in
+                payload.withUnsafeBytes { payBuf -> Data? in
+                    let payPtr = payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                    var outLen: UInt32 = 0
+                    let ptr = lxmf_app_link_request(
+                        handle,
+                        destPtr, UInt32(destHash.count),
+                        cPath,
+                        payPtr, UInt32(payload.count),
+                        timeoutSecs,
+                        &outLen
+                    )
+                    guard let raw = ptr, outLen > 0 else { return nil }
+                    let result = Data(bytes: raw, count: Int(outLen))
+                    lxmf_free_bytes(raw, outLen)
+                    return result
+                }
+            }
+        }
+    }
+
     // MARK: - Announce
 
     /// Announce this client's delivery destination.

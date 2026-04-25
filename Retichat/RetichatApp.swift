@@ -182,6 +182,10 @@ struct RetichatApp: App {
                         ownHashHex: repository.ownHashHex
                     )
                     channelClient.start()
+                    // Open the rfed.channel app-link on first start so it is
+                    // established immediately rather than waiting for the first
+                    // background→active transition.
+                    ConnectionStateManager.shared.openRfedNodeLink()
                 }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -208,8 +212,12 @@ struct RetichatApp: App {
                     channelClient.announceDelivery()
                 }
             case .background:
-                // Close the rfed node link to free up resources.
-                ConnectionStateManager.shared.closeRfedNodeLink()
+                // Do NOT close the rfed link here — rapid app-switching would
+                // destroy an active link unnecessarily and force a slow
+                // re-establishment on every return to foreground.  The link will
+                // go STALE naturally after the keepalive timeout if the app stays
+                // backgrounded long enough, and the reconnect handler will
+                // re-establish it on the next rfed.channel announce.
                 // Request immediate background time (~30s) to flush outbound and poll.
                 appDelegate.beginBackgroundExecution(repository: repository)
             default:

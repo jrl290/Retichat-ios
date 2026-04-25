@@ -51,6 +51,10 @@ int32_t rns_transport_has_path(const uint8_t *dest_hash, uint32_t len);
 int32_t rns_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t rns_transport_hops_to(const uint8_t *dest_hash, uint32_t len);
 
+/// Query whether a configured interface is currently online.
+/// Returns: 1 = online, 0 = offline, -1 = unknown / no such interface.
+int32_t rns_interface_online(const char *name);
+
 #pragma mark - RNS Settings
 
 void    rns_set_drop_announces(int32_t enabled);
@@ -210,6 +214,23 @@ int32_t lxmf_app_link_status(uint64_t client,
 int32_t lxmf_app_link_register_reconnect(uint64_t client,
                                           const char *aspect_filter);
 
+/// Send a blocking request on an existing app-link.
+///
+/// Reuses the persistent app-link opened by `lxmf_app_link_open` instead of
+/// opening a fresh outbound link per request.  The link must already be in
+/// the ACTIVE state (call `lxmf_app_link_status` first) — returns NULL with
+/// `lxmf_last_error` describing the reason if not.
+///
+/// Blocking call — invoke from a background thread.
+/// Returns response bytes (free with `lxmf_free_bytes`) or NULL on error
+/// / timeout / link not active.
+uint8_t *lxmf_app_link_request(uint64_t client,
+                                const uint8_t *dest_hash, uint32_t dest_len,
+                                const char *path,
+                                const uint8_t *payload, uint32_t payload_len,
+                                double timeout_secs,
+                                uint32_t *out_len);
+
 #pragma mark - LXMF Announce
 
 int32_t lxmf_client_announce(uint64_t client);
@@ -339,5 +360,44 @@ uint8_t *retichat_channel_decrypt(const char *name,
 uint8_t *retichat_compute_channel_stamp(const uint8_t *payload, uint32_t payload_len,
                                          uint32_t cost,
                                          uint32_t *out_len);
+
+#pragma mark - Channel LXMF Pack / Unpack
+//
+// CHANNEL MESSAGES ARE LXMF PACKAGES.  Wire format is identical to what an
+// LXMF propagation node stores and delivers:
+//     [ channel_hash(16) | EC_encrypted(source_hash || signature || msgpack_payload) ]
+//
+
+/// Build an LXMF message addressed to the channel destination and pack it
+/// into `lxmf_data` (the bytes RFed routes opaquely).
+///
+/// `name`           — channel name (e.g. "public.general")
+/// `sender_handle`  — local user identity handle
+/// `content`        — message body (UTF-8)
+/// `title`          — optional title (UTF-8); pass NULL/0 for none
+///
+/// Returns heap-allocated lxmf_data (free with lxmf_free_bytes) starting with
+/// the 16-byte channel_hash, or NULL on error.
+uint8_t *retichat_channel_lxm_pack(const char *name,
+                                    uint64_t sender_handle,
+                                    const uint8_t *content, uint32_t content_len,
+                                    const uint8_t *title,   uint32_t title_len,
+                                    uint32_t *out_len);
+
+/// Unpack an LXMF channel message.
+/// Input is `lxmf_data` (16-byte channel_hash + EC_encrypted tail).
+///
+/// Returns a heap-allocated buffer (free with lxmf_free_bytes) with layout:
+///     [0..16]   source_hash
+///     [16..24]  timestamp_ms_be (u64)
+///     [24]      signature_validated (1=ok, 0=not)
+///     [25]      unverified_reason   (0=ok, 1=SOURCE_UNKNOWN, 2=SIGNATURE_INVALID)
+///     [26..28]  title_len_be   (u16)
+///     [28..32]  content_len_be (u32)
+///     [32..32+t]   title bytes
+///     [32+t..]     content bytes
+uint8_t *retichat_channel_lxm_unpack(const char *name,
+                                      const uint8_t *lxmf_data, uint32_t lxmf_data_len,
+                                      uint32_t *out_len);
 
 #endif /* CRetichatFFI_h */

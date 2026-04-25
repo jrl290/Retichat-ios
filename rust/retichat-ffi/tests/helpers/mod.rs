@@ -14,6 +14,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io::{BufRead, BufReader};
+use std::net::{SocketAddr, TcpStream};
 use std::os::raw::{c_char, c_void};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -59,6 +60,16 @@ pub fn rnsd_port() -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4242)
+}
+
+/// Best-effort check that rnsd is reachable on the configured host:port.
+pub fn can_reach_rnsd(timeout_ms: u64) -> bool {
+    let addr_str = format!("{}:{}", rnsd_host(), rnsd_port());
+    let addr: SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms)).is_ok()
 }
 
 /// 16-byte propagation node destination hash.

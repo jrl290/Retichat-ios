@@ -22,6 +22,15 @@ fn test_announce_callback_fires_for_python_peer() {
     let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_announce_callback_fires_for_python_peer");
 
+    if !helpers::can_reach_rnsd(1500) {
+        eprintln!(
+            "  ⚠ skipping announce integration test: rnsd unreachable at {}:{}",
+            helpers::rnsd_host(),
+            helpers::rnsd_port()
+        );
+        return;
+    }
+
     let s = "Start Rust LXMF client";
     helpers::step(s);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -44,6 +53,9 @@ fn test_announce_callback_fires_for_python_peer() {
 
     let s = "Announce Rust client and register dest watch";
     helpers::step(s);
+    // Integration tests depend on hearing remote announces from the network.
+    // Ensure global announce filtering is disabled for this process.
+    retichat_ffi::retichat_set_drop_announces(0);
     let rc = retichat_ffi::lxmf_client_announce(client);
     assert_eq!(rc, 0, "lxmf_client_announce failed: {:?}", helpers::last_error_str());
     let our_dest = helpers::client_dest_hash(client);
@@ -58,6 +70,10 @@ fn test_announce_callback_fires_for_python_peer() {
     helpers::write_rns_config(py_dir.path(), &helpers::rnsd_host(), helpers::rnsd_port());
     let (_py_proc, py_dest_hash) = helpers::spawn_python_announcer(py_dir.path());
     eprintln!("    python dest: {}", hex::encode(&py_dest_hash));
+    // Also watch the exact Python destination so callback delivery still
+    // works even if announce filtering is enabled elsewhere in process state.
+    let rc = retichat_ffi::lxmf_client_watch(client, py_dest_hash.as_ptr(), py_dest_hash.len() as u32);
+    assert_eq!(rc, 0, "lxmf_client_watch(py) failed: {:?}", helpers::last_error_str());
     helpers::done(s);
 
     let wait_label = format!(

@@ -110,6 +110,20 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    /// Query whether a configured Reticulum interface is currently online.
+    /// Returns: .some(true) if online, .some(false) if offline, nil if unknown
+    /// (interface not registered, e.g. not yet configured or wrong name).
+    nonisolated func interfaceOnline(name: String) -> Bool? {
+        let result = name.withCString { cName in
+            rns_interface_online(cName)
+        }
+        switch result {
+        case 1:  return true
+        case 0:  return false
+        default: return nil
+        }
+    }
+
     // MARK: - Settings
 
     func setDropAnnounces(enabled: Bool) {
@@ -195,43 +209,12 @@ final class RetichatBridge: @unchecked Sendable {
     }
 
     // MARK: - Channel crypto
-
-    /// Encrypt `plaintext` for the named channel. Channel keypair is derived deterministically
-    /// from the channel name — any subscriber holding the name can encrypt and decrypt.
-    nonisolated func channelEncrypt(name: String, plaintext: Data) -> Data? {
-        var outLen: UInt32 = 0
-        guard let ptr = name.withCString({ cName in
-            plaintext.withUnsafeBytes { buf in
-                retichat_channel_encrypt(
-                    cName,
-                    buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                    UInt32(plaintext.count),
-                    &outLen
-                )
-            }
-        }) else { return nil }
-        let data = Data(bytes: ptr, count: Int(outLen))
-        lxmf_free_bytes(ptr, outLen)
-        return data
-    }
-
-    /// Decrypt a channel ciphertext. Returns nil if decryption fails (wrong channel name or corrupt data).
-    nonisolated func channelDecrypt(name: String, ciphertext: Data) -> Data? {
-        var outLen: UInt32 = 0
-        guard let ptr = name.withCString({ cName in
-            ciphertext.withUnsafeBytes { buf in
-                retichat_channel_decrypt(
-                    cName,
-                    buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                    UInt32(ciphertext.count),
-                    &outLen
-                )
-            }
-        }) else { return nil }
-        let data = Data(bytes: ptr, count: Int(outLen))
-        lxmf_free_bytes(ptr, outLen)
-        return data
-    }
+    //
+    // CHANNEL MESSAGES ARE LXMF PACKAGES. Use `channelLxmPack` /
+    // `channelLxmUnpack` (below) — they wrap the LXMF propagation format
+    // (signature-validated against the cached source identity).
+    // Raw `channelEncrypt`/`channelDecrypt` of an arbitrary plaintext
+    // bypasses signature verification and is intentionally NOT exposed.
 
     /// Compute a PoW stamp for `payload` (channel_hash || ciphertext) using the given cost.
     /// Returns nil when cost == 0 (no stamp needed). Blocks until the nonce is found.
@@ -249,6 +232,102 @@ final class RetichatBridge: @unchecked Sendable {
         let data = Data(bytes: ptr, count: Int(outLen))
         lxmf_free_bytes(ptr, outLen)
         return data
+    }
+
+    // MARK: - Channel LXMF pack / unpack
+    //
+    // CHANNEL MESSAGES ARE LXMF PACKAGES. The `lxmfData` blob produced here
+    // is the EXACT SAME byte format an LXMF propagation node stores and
+    // delivers: [channel_hash(16) | EC_encrypted(source_hash || signature ||
+    // msgpack_payload)]. RFed routes it opaquely. Receivers feed it back to
+    // `channelLxmUnpack` which uses LXMessage::unpack_from_bytes(PROPAGATED)
+    // and validates the Ed25519 signature against the cached source identity.
+
+    /// Result of unpacking a channel LXMF message.
+    struct ChannelLxmUnpackResult {
+        /// 16-byte source (sender) destination hash.
+        let sourceHash: Data
+        /// Sender timestamp in milliseconds (LXMF carries it as f64 seconds).
+        let timestampMs: UInt64
+        /// True iff the Ed25519 signature was verified against the cached
+        /// source identity. False means the sender hasn't been seen via an
+        /// announce yet, OR the signature didn't match — see `unverifiedReason`.
+        let signatureValidated: Bool
+        /// 0 = ok, 1 = SOURCE_UNKNOWN, 2 = SIGNATURE_INVALID.
+        let unverifiedReason: UInt8
+        /// Title bytes (may be empty).
+        let title: Data
+        /// Content bytes (UTF-8 message body).
+        let content: Data
+    }
+
+    /// Build an LXMF channel message and return the on-wire `lxmf_data`
+    /// (already prefixed with the 16-byte channel_hash). The caller appends
+    /// the optional PoW stamp suffix and ships it as the rfed.channel SEND
+    /// payload.
+    nonisolated func channelLxmPack(name: String,
+                                    senderIdentityHandle: UInt64,
+                                    content: Data,
+                                    title: Data) -> Data? {
+        var outLen: UInt32 = 0
+        guard let ptr = name.withCString({ cName in
+            content.withUnsafeBytes { cBuf in
+                title.withUnsafeBytes { tBuf in
+                    retichat_channel_lxm_pack(
+                        cName,
+                        senderIdentityHandle,
+                        cBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt32(content.count),
+                        tBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt32(title.count),
+                        &outLen
+                    )
+                }
+            }
+        }) else { return nil }
+        let data = Data(bytes: ptr, count: Int(outLen))
+        lxmf_free_bytes(ptr, outLen)
+        return data
+    }
+
+    /// Unpack an LXMF channel message received from RFed. `lxmfData` MUST
+    /// start with the 16-byte channel_hash. Returns parsed fields including
+    /// signature-validation status. Returns nil on hard failure (corrupt or
+    /// undecryptable bytes).
+    nonisolated func channelLxmUnpack(name: String, lxmfData: Data) -> ChannelLxmUnpackResult? {
+        var outLen: UInt32 = 0
+        guard let ptr = name.withCString({ cName in
+            lxmfData.withUnsafeBytes { buf in
+                retichat_channel_lxm_unpack(
+                    cName,
+                    buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt32(lxmfData.count),
+                    &outLen
+                )
+            }
+        }) else { return nil }
+        let raw = Data(bytes: ptr, count: Int(outLen))
+        lxmf_free_bytes(ptr, outLen)
+
+        // Layout: 16 src_hash | 8 ts_ms_be | 1 sig_ok | 1 reason | 2 title_len_be | 4 content_len_be | title | content
+        guard raw.count >= 32 else { return nil }
+        let sourceHash = raw.subdata(in: 0..<16)
+        let timestampMs = raw.subdata(in: 16..<24).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
+        let sigOk = raw[24] == 1
+        let reason = raw[25]
+        let titleLen = Int(raw.subdata(in: 26..<28).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian })
+        let contentLen = Int(raw.subdata(in: 28..<32).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+        guard raw.count >= 32 + titleLen + contentLen else { return nil }
+        let title = raw.subdata(in: 32..<(32 + titleLen))
+        let content = raw.subdata(in: (32 + titleLen)..<(32 + titleLen + contentLen))
+        return ChannelLxmUnpackResult(
+            sourceHash: sourceHash,
+            timestampMs: timestampMs,
+            signatureValidated: sigOk,
+            unverifiedReason: reason,
+            title: title,
+            content: content
+        )
     }
 
     // MARK: - Link request

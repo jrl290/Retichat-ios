@@ -26,6 +26,13 @@ struct SettingsView: View {
     @State private var showEditInterface = false
     @State private var notificationStatus: String = "Checking…"
 
+    /// Per-interface online status, keyed by interface name.  Refreshed by
+    /// `interfaceStatusTimer` while the Settings screen is visible.  `nil`
+    /// means the interface isn't known to the running transport (e.g. service
+    /// not started, or pending interfaces that haven't been Applied yet).
+    @State private var interfaceOnlineStatus: [String: Bool] = [:]
+    @State private var interfaceStatusTimer: Timer?
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -91,9 +98,16 @@ struct SettingsView: View {
                 vm.loadInterfaces(from: repository)
                 refreshNotificationStatus()
                 channelClient.startRfedLinkMonitor()
+                refreshInterfaceStatus()
+                interfaceStatusTimer?.invalidate()
+                interfaceStatusTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+                    refreshInterfaceStatus()
+                }
             }
             .onDisappear {
                 channelClient.stopRfedLinkMonitor()
+                interfaceStatusTimer?.invalidate()
+                interfaceStatusTimer = nil
             }
         }
     }
@@ -442,7 +456,40 @@ struct SettingsView: View {
         if !iface.enabled {
             return .retichatOnSurfaceVariant
         }
-        return repository.serviceRunning ? .retichatSuccess : .retichatError
+        // The transport reports per-interface TCP connectivity.  An interface
+        // is only green when it's been registered with transport AND its
+        // socket is currently connected — a fake/unreachable host stays red.
+        guard repository.serviceRunning else {
+            return .retichatError
+        }
+        switch interfaceOnlineStatus[iface.name] {
+        case .some(true):  return .retichatSuccess
+        case .some(false): return .retichatError
+        case .none:
+            // Unknown to transport (config not yet applied / service starting):
+            // show red so an unconnected interface never appears green.
+            return .retichatError
+        }
+    }
+
+    /// Poll the running Reticulum transport for the current online status of
+    /// each pending interface and update `interfaceOnlineStatus`.
+    private func refreshInterfaceStatus() {
+        let names = vm.pendingInterfaces.map(\.name)
+        guard repository.serviceRunning else {
+            if !interfaceOnlineStatus.isEmpty { interfaceOnlineStatus = [:] }
+            return
+        }
+        let bridge = RetichatBridge.shared
+        var next: [String: Bool] = [:]
+        for name in names {
+            if let online = bridge.interfaceOnline(name: name) {
+                next[name] = online
+            }
+        }
+        if next != interfaceOnlineStatus {
+            interfaceOnlineStatus = next
+        }
     }
 
     // MARK: - About

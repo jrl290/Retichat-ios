@@ -4,16 +4,37 @@
 //
 //  Pub-sub channel messaging via the RFed federation server.
 //
+//  ============================================================================
+//  CHANNEL MESSAGES ARE LXMF PACKAGES.
+//  ============================================================================
+//  The `inner_blob` for a channel message is the EXACT SAME byte format an
+//  LXMF propagation node stores and delivers — i.e. the output of
+//  `LXMessage::pack(PROPAGATED)` starting at the destination_hash:
+//
+//      lxmf_data = [ channel_hash(16) | EC_encrypted(
+//                        source_hash (16) || signature (64) || msgpack_payload
+//                    ) ]
+//
+//  Decode it with `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))` (exposed
+//  via `RetichatBridge.channelLxmUnpack`). That call EC-decrypts using the
+//  channel identity (derived deterministically from the channel name) and
+//  validates the Ed25519 signature against the sender's identity from
+//  Reticulum's known-destinations cache. If you can't prove who the message
+//  is from, `signatureValidated == false` and the message is rejected.
+//
 //  Architecture:
 //    SEND   → fire-and-forget DATA packet to rfed.channel dest
-//             payload: channel_hash(16) | inner_blob(*)
+//             payload: lxmf_data [| pow_stamp(32)]
+//             (lxmf_data already begins with the channel_hash; no extra
+//              channel_hash prefix is added — the legacy
+//              [channel_hash | inner_blob | stamp] layout is byte-equivalent.)
 //    SUB    → link request /rfed/subscribe on rfed.channel, payload: msgpack bin(16)
 //    UNSUB  → link request /rfed/unsubscribe on rfed.channel, payload: msgpack bin(16)
-//    RECV   → inbound DATA at local rfed.delivery dest (set up via FFI)
+//    RECV   → inbound DATA at local rfed.delivery dest. Server hands us
+//             [channel_hash(16) | inner_blob] — concatenate them and feed
+//             the result to channelLxmUnpack as a complete lxmf_data.
 //    PULL   → link request /rfed/pull on rfed.delivery, response: [[bin16, blob], ...]
-//
-//  Inner blob format:
-//    0x01 | senderIdentityHash(16) | timestampMS_BE(8) | utf8content(*)
+//  ============================================================================
 //
 
 import Foundation
@@ -269,39 +290,24 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     // MARK: - Send
 
     func sendMessage(content: String, toChannel channel: Channel) {
-        guard let channelHashData = Data(hexString: channel.id) else { return }
-
-        let senderHashData: Data = {
-            let d = Data(hexString: ownHashHex) ?? Data()
-            if d.count >= 16 { return d.prefix(16) }
-            return d + Data(repeating: 0, count: 16 - d.count)
-        }()
-
-        let tsMs = UInt64(Date().timeIntervalSince1970 * 1000)
-        var tsBE = tsMs.bigEndian
-        let tsData = withUnsafeBytes(of: &tsBE) { Data($0) }
-
+        // Build the payload as an LXMF propagation-format package.
+        // bridge.channelLxmPack returns lxmf_data which ALREADY starts with
+        // the 16-byte channel_hash, so it is the wire payload (sans stamp).
         let contentData = Data(content.utf8)
-
-        // Signable: sender_hash(16) | timestamp_ms_be(8) | content_utf8
-        let signable = senderHashData + tsData + contentData
-
-        guard let pubkey = bridge.identityPublicKey(handle: identityHandle),
-              let sig    = bridge.identitySign(handle: identityHandle, data: signable) else {
-            print("[RfedChannel] Cannot sign message — identity not ready")
+        guard let lxmfData = bridge.channelLxmPack(name: channel.channelName,
+                                                    senderIdentityHandle: identityHandle,
+                                                    content: contentData,
+                                                    title: Data()) else {
+            print("[RfedChannel] LXMF pack failed: \(bridge.lastError() ?? "unknown")")
+            return
+        }
+        guard lxmfData.count >= 16,
+              lxmfData.prefix(16).hexString.lowercased() == channel.id.lowercased() else {
+            print("[RfedChannel] LXMF pack produced wrong dest_hash prefix")
             return
         }
 
-        // Inner plaintext: sender_hash(16) | ts(8) | pubkey(64) | sig(64) | content_utf8
-        let innerPlaintext = senderHashData + tsData + pubkey + sig + contentData
-
-        guard let ciphertext = bridge.channelEncrypt(name: channel.channelName, plaintext: innerPlaintext) else {
-            print("[RfedChannel] Channel encrypt failed: \(bridge.lastError() ?? "unknown")")
-            return
-        }
-
-        // Packet payload: channel_hash(16) | ciphertext [| stamp(32) if stampCost != nil]
-        var payload = channelHashData + ciphertext
+        var payload = lxmfData
         if let cost = channel.stampCost, cost > 0 {
             if let stamp = bridge.channelComputeStamp(payload: payload, cost: Int32(cost)) {
                 payload += stamp
@@ -319,7 +325,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             return
         }
 
-        // Persist outgoing message locally (already know plaintext — no need to decrypt)
+        // Persist outgoing message locally — we know the plaintext directly.
+        let tsMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let msgId = (Data(hexString: ownHashHex) ?? Data()).hexString + String(format: "%016llx", tsMs)
         let entity = ChannelMessageEntity(id: msgId, channelHash: channel.id,
                                           senderHash: ownHashHex, senderDisplayName: "",
@@ -395,46 +402,55 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
         print("[RfedChannel] dispatchBlob MATCHED channel=\(channelHashHex.prefix(16)) name=\(channel.channelName) blob_bytes=\(blob.count)")
 
-        guard let inner = bridge.channelDecrypt(name: channel.channelName, ciphertext: blob) else {
-            // Suppress repeated log spam for the same undecryptable blob (e.g. old-format stored messages).
+        // Reconstruct the full LXMF lxmf_data: [channel_hash(16) | inner_blob]
+        // and feed it through the LXMF unpacker. This validates the Ed25519
+        // signature against the sender identity from Reticulum's known-
+        // destinations cache. If the sender hasn't been seen via an announce
+        // (signatureValidated == false, reason == SOURCE_UNKNOWN) we drop the
+        // message — we cannot prove who it's from.
+        guard let channelHashData = Data(hexString: channelHashHex) else { return }
+        let lxmfData = channelHashData + blob
+
+        guard let result = bridge.channelLxmUnpack(name: channel.channelName, lxmfData: lxmfData) else {
             let blobKey = channelHashHex.hashValue &+ blob.hashValue
             if !failedBlobKeys.contains(blobKey) {
                 failedBlobKeys.insert(blobKey)
-                print("[RfedChannel] dispatchBlob decrypt FAILED (blob_bytes=\(blob.count), suppressing repeats)")
+                print("[RfedChannel] dispatchBlob LXMF unpack FAILED (lxmf_bytes=\(lxmfData.count), err=\(bridge.lastError() ?? "?"), suppressing repeats)")
             }
             return
         }
-        print("[RfedChannel] dispatchBlob decrypt OK inner_bytes=\(inner.count)")
-        dispatchDecryptedInner(channelHashHex: channelHashHex, inner: inner)
+
+        guard result.signatureValidated else {
+            let reasonStr: String
+            switch result.unverifiedReason {
+            case 1: reasonStr = "SOURCE_UNKNOWN (sender not yet announced)"
+            case 2: reasonStr = "SIGNATURE_INVALID"
+            default: reasonStr = "code=\(result.unverifiedReason)"
+            }
+            print("[RfedChannel] dispatchBlob REJECTED unsigned message: \(reasonStr) sender=\(result.sourceHash.hexString.prefix(8))")
+            return
+        }
+
+        print("[RfedChannel] dispatchBlob unpack OK source=\(result.sourceHash.hexString.prefix(8)) ts_ms=\(result.timestampMs) content_bytes=\(result.content.count) sig_ok=true")
+        dispatchVerifiedLxmf(channelHashHex: channelHashHex, result: result)
     }
 
-    /// Parse and dispatch an inner plaintext:
-    /// sender_hash(16) | timestamp_ms_be(8) | sender_pubkey(64) | ed25519_sig(64) | content_utf8(*)
-    private func dispatchDecryptedInner(channelHashHex: String, inner: Data) {
-        // Minimum: 16 + 8 + 64 + 64 = 152 bytes header + at least 1 byte content
-        let headerLen = 16 + 8 + 64 + 64
-        guard inner.count >= headerLen else {
-            print("[RfedChannel] dispatchDecryptedInner DROPPED: inner too short (\(inner.count) < \(headerLen))")
+    /// Dispatch a successfully signature-verified LXMF channel message.
+    private func dispatchVerifiedLxmf(channelHashHex: String, result: RetichatBridge.ChannelLxmUnpackResult) {
+        let senderHashHex = result.sourceHash.hexString
+        let tsMs = result.timestampMs
+        guard let content = String(data: result.content, encoding: .utf8) else {
+            print("[RfedChannel] dispatchVerifiedLxmf DROPPED: content not valid UTF-8")
             return
         }
 
-        let senderHashHex = inner[0..<16].hexString
-        let tsBE = inner[16..<24].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
-        let tsMs = UInt64(bigEndian: tsBE)
-        // pubkey: [24..<88], sig: [88..<152], content: [152...]
-        guard let content = String(data: inner[headerLen...], encoding: .utf8) else {
-            print("[RfedChannel] dispatchDecryptedInner DROPPED: content not valid UTF-8")
-            return
-        }
-
-        // Deduplicate
         let msgId = senderHashHex + String(format: "%016llx", tsMs)
         let existingForChannel = messages[channelHashHex]?.contains(where: { $0.id == msgId }) ?? false
         guard !existingForChannel else {
-            print("[RfedChannel] dispatchDecryptedInner DEDUP: msgId=\(msgId.prefix(16))")
+            print("[RfedChannel] dispatchVerifiedLxmf DEDUP: msgId=\(msgId.prefix(16))")
             return
         }
-        print("[RfedChannel] dispatchDecryptedInner DELIVERING sender=\(senderHashHex.prefix(8)) content='\(content.prefix(40))'")
+        print("[RfedChannel] dispatchVerifiedLxmf DELIVERING sender=\(senderHashHex.prefix(8)) content='\(content.prefix(40))'")
 
         let isOutgoing = senderHashHex == ownHashHex
         let entity = ChannelMessageEntity(id: msgId, channelHash: channelHashHex,
@@ -489,7 +505,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     @discardableResult
     private func subscribeOnServer(channelHashData: Data,
                                    rfedChannelDest: Data) async throws -> Int? {
-        // Payload: msgpack fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig]
+        // Payload: fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig]
         // sig = Ed25519(channel_hash). Server derives subscriber_hash from pubkey and
         // verifies the signature — no timing dependency on IDENTIFY.
         guard let pubkey = bridge.identityPublicKey(handle: identityHandle),
@@ -500,9 +516,45 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         let handle = identityHandle
         let bridge = self.bridge
 
+        // ---- Preferred path: multiplex onto the persistent rfed.channel APP_LINK ----
+        //
+        // Make sure the APP_LINK is opening, then wait up to 30 s for it to
+        // become ACTIVE.  All channel subscribes share this single link
+        // instead of opening one fresh outbound link per subscribe — this
+        // eliminates the cold-start "thundering herd" of parallel link
+        // establishments competing for the same long path.
+        ConnectionStateManager.shared.openRfedNodeLink()
+        let appLinkActive = await ConnectionStateManager.shared
+            .waitForRfedAppLinkActive(timeoutSecs: 30.0)
+
+        if appLinkActive,
+           let snap = ConnectionStateManager.shared.rfedAppLinkSnapshot(),
+           snap.1 == rfedChannelDest
+        {
+            let client = snap.0
+            let response = await Task.detached(priority: .background) {
+                client.appLinkRequest(destHash: rfedChannelDest,
+                                      path: "/rfed/subscribe",
+                                      payload: payload,
+                                      timeoutSecs: 20.0)
+            }.value
+            if let resp = response {
+                let stampCost: Int? = Self.parseSubscribeResponse(resp)
+                guard stampCost != nil || resp.first == 0xc3
+                        || resp.first == 0x92 || resp.first == 0x91 else {
+                    throw ChannelError.subscribeFailed("unexpected response: \(resp.hexString)")
+                }
+                print("[RfedChannel] subscribe: used persistent APP_LINK")
+                return stampCost
+            }
+            // Fall through to legacy path on failure.
+            print("[RfedChannel] subscribe: APP_LINK request returned nil — falling back to one-shot link")
+        } else {
+            print("[RfedChannel] subscribe: APP_LINK not ACTIVE within timeout — using one-shot link")
+        }
+
+        // ---- Fallback: legacy one-shot link request ----
         // Ensure the rfed.channel destination is known before opening a link.
-        // If we don't have a path yet, request one and wait up to 20 s for
-        // the node's announce to arrive.
         let pathKnown = await Task.detached(priority: .background) { () -> Bool in
             if bridge.transportHasPath(destHash: rfedChannelDest) { return true }
             _ = bridge.transportRequestPath(destHash: rfedChannelDest)
@@ -527,8 +579,6 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         guard let resp = response else {
             throw ChannelError.subscribeFailed("link request timed out or failed")
         }
-        // Response: [bool, stamp_cost_or_nil]  (or legacy 0xc3)
-        // Parse stamp_cost from the second element if present.
         let stampCost: Int? = Self.parseSubscribeResponse(resp)
         guard stampCost != nil || resp.first == 0xc3 || resp.first == 0x92 || resp.first == 0x91 else {
             throw ChannelError.subscribeFailed("unexpected response: \(resp.hexString)")
@@ -539,18 +589,26 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     /// Parse the subscribe response: `[bool, stamp_cost_or_nil]` or legacy `true`.
     /// Returns nil on failure or when stamp is disabled (nil in msgpack).
     private static func parseSubscribeResponse(_ data: Data) -> Int? {
-        // Legacy: 0xc3 = msgpack true (no stamp info)
-        if data.first == 0xc3 { return nil }
-        // New format: fixarray of 2 elements (0x92)
-        guard data.count >= 2, data[0] == 0x92 else { return nil }
-        // [1] is stamp_cost: nil (0xc0) or uint
-        if data[1] == 0xc0 { return nil } // msgpack nil
+        // Legacy: bare 0xc3 = msgpack true (no stamp info, server pre-stamp_cost feature)
+        if data.count == 1, data.first == 0xc3 { return nil }
+        // New format: fixarray of 2 elements [bool, stamp_cost_or_nil]
+        //   byte 0 = 0x92 (fixarray-2)
+        //   byte 1 = bool (0xc3 true / 0xc2 false)
+        //   byte 2+ = stamp_cost (msgpack int or nil)
+        guard data.count >= 3, data[0] == 0x92 else { return nil }
+        let costByte = data[2]
+        // msgpack nil
+        if costByte == 0xc0 { return nil }
         // Positive fixint: 0x00..0x7f
-        if data[1] & 0x80 == 0 { return Int(data[1]) }
+        if costByte & 0x80 == 0 { return Int(costByte) }
         // uint8: 0xcc <value>
-        if data[1] == 0xcc, data.count >= 3 { return Int(data[2]) }
+        if costByte == 0xcc, data.count >= 4 { return Int(data[3]) }
         // uint16: 0xcd <hi> <lo>
-        if data[1] == 0xcd, data.count >= 4 { return Int(data[2]) << 8 | Int(data[3]) }
+        if costByte == 0xcd, data.count >= 5 { return Int(data[3]) << 8 | Int(data[4]) }
+        // uint32: 0xce <b0> <b1> <b2> <b3>
+        if costByte == 0xce, data.count >= 7 {
+            return Int(data[3]) << 24 | Int(data[4]) << 16 | Int(data[5]) << 8 | Int(data[6])
+        }
         return nil
     }
 

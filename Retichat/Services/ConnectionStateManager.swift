@@ -202,6 +202,26 @@ final class ConnectionStateManager {
         return client.appLinkStatus(destData)
     }
 
+    /// Snapshot the (LxmfClient, rfed.channel destData) pair for use from a
+    /// background thread.  Returns nil if either is unavailable.
+    func rfedAppLinkSnapshot() -> (LxmfClient, Data)? {
+        guard let destData = rfedLinkDestData ?? rfedChannelDestData(),
+              let client = lxmfClient else { return nil }
+        return (client, destData)
+    }
+
+    /// Wait for the rfed.channel app-link to reach ACTIVE (status == 3).
+    /// Polls every 250 ms.  Safe to call from any context (re-enters MainActor
+    /// for each status check).
+    func waitForRfedAppLinkActive(timeoutSecs: Double) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSecs)
+        while Date() < deadline {
+            if rfedNodeLinkStatus() == 3 { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
+    }
+
     /// Derives the rfed.channel 16-byte dest from current prefs.
     private func rfedChannelDestData() -> Data? {
         let identityHex = UserPreferences.shared.rfedNodeIdentityHash
@@ -216,6 +236,8 @@ final class ConnectionStateManager {
     /// Call when NWPathMonitor reports network connectivity restored.
     func onNetworkReconnect() {
         requestEssentialPaths()
+        // Re-open the rfed node link — path may have been purged when TCP dropped.
+        openRfedNodeLink()
         let peers = activeConversationHexes.compactMap { Data(hexString: $0) }
         let bridge = RetichatBridge.shared
         Task.detached(priority: .userInitiated) {
@@ -246,6 +268,19 @@ final class ConnectionStateManager {
         let rfedHex = UserPreferences.shared.rfedNotifyHash
         if !rfedHex.isEmpty, let rfedHash = Data(hexString: rfedHex) {
             destinations.append(rfedHash)
+        }
+        // Also request paths to rfed.channel and rfed.delivery so the app
+        // link has a fresh route immediately after network reconnect.
+        if let rfedChannel = rfedChannelDestData() {
+            destinations.append(rfedChannel)
+        }
+        let identityHex = UserPreferences.shared.rfedNodeIdentityHash
+        if !identityHex.isEmpty {
+            let deliveryHex = RfedChannelClient.rfedDestHash(
+                identityHashHex: identityHex, app: "rfed", aspects: ["delivery"])
+            if !deliveryHex.isEmpty, let deliveryHash = Data(hexString: deliveryHex) {
+                destinations.append(deliveryHash)
+            }
         }
 
         // Pre-compute hex labels on the main actor before going off-thread.
