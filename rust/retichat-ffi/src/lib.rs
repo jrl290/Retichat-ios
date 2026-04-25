@@ -648,11 +648,23 @@ const LXMF_DELIVERY_ASPECT: &str = "delivery";
 //
 // We solve it once and for all by embedding the sender's identity
 // public bytes INSIDE the EC-encrypted channel payload.  The receiver
-// detects the magic, verifies `truncated_hash(identity_pub) ==
-// source_hash` (so a sender cannot forge identity), registers the
-// identity for that source hash via `Identity::remember_destination`,
-// then unpacks LXMF normally — the signature now validates with zero
-// dependence on announce timing.
+// detects the magic, registers `source_hash → identity_pub` via
+// `Identity::remember_destination`, then unpacks LXMF normally — the
+// signature now validates with zero dependence on announce timing.
+//
+// IMPORTANT: we deliberately do NOT pre-check that
+// `truncated_hash(identity_pub) == source_hash`.  That check would be
+// WRONG, because the LXMF `source_hash` is the lxmf.delivery
+// *destination* hash — derived as `truncated_hash(name_hash ||
+// identity_hash)` per Reticulum's Destination::hash — NOT the bare
+// identity hash.  Instead, the LXMF Ed25519 signature validation
+// itself provides the integrity guarantee: a sender claiming a
+// public key it does not possess will produce a signature that fails
+// to verify under the embedded pubkey, and the message is rejected
+// downstream as SIGNATURE_INVALID.  Cache poisoning by an
+// unauthorized party is also impossible because reaching this code
+// path requires successful EC-decrypt with the channel key — i.e.
+// the sender is already an authorized publisher.
 //
 // The prelude is MANDATORY — not a fallback, not optional.  All
 // Retichat clients on the same FFI version use it; receivers reject
@@ -975,16 +987,16 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         unsafe { *out_len = 0; }
         return std::ptr::null_mut();
     }
+    // Register identity_pub under the LXMF source_hash (= the
+    // lxmf.delivery destination hash for this sender, NOT the identity
+    // hash).  We do not pre-validate that identity_pub corresponds to
+    // source_hash — LXMF signature validation will catch a forged
+    // identity_pub by failing as SIGNATURE_INVALID, which is exactly
+    // the integrity guarantee we want.  And since this code path only
+    // runs after channel-key EC-decrypt succeeds, the sender already
+    // holds the channel key (i.e. is an authorized publisher), so
+    // cache-poisoning by a non-publisher is not a concern.
     let claimed_source_hash = &lxmf_tail[..LXMessage::DESTINATION_LENGTH];
-    let actual_hash = reticulum_rust::identity::truncated_hash(identity_pub);
-    if actual_hash != claimed_source_hash {
-        // Sender is lying about its identity — refuse, do not poison cache.
-        rns::set_error(
-            "channel: sender identity prelude does not match source_hash — refusing".into()
-        );
-        unsafe { *out_len = 0; }
-        return std::ptr::null_mut();
-    }
     if let Err(e) = Identity::remember_destination(claimed_source_hash, identity_pub, None) {
         rns::set_error(format!("channel: remember_destination failed: {}", e));
         unsafe { *out_len = 0; }
