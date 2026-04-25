@@ -301,17 +301,30 @@ struct ConversationView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 8)
             }
-            .onChange(of: msgs.count) { _, _ in
-                if let last = msgs.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+            .defaultScrollAnchor(.bottom)
+            .onChange(of: msgs.count) { oldCount, newCount in
+                if let lastId = msgs.last?.id {
+                    if oldCount == 0 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            proxy.scrollTo(lastId, anchor: .bottom)
+                        }
+                    } else if newCount > oldCount {
+                        withAnimation {
+                            proxy.scrollTo(lastId, anchor: .bottom)
+                        }
+                    }
                 }
             }
-            .onAppear {
-                if let last = msgs.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                if let lastId = msgs.last?.id {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        withAnimation {
+                            proxy.scrollTo(lastId, anchor: .bottom)
+                        }
+                    }
                 }
-                scrollProxy = proxy
             }
+            .onAppear { scrollProxy = proxy }
         }
     }
 
