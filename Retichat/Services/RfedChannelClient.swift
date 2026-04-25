@@ -58,6 +58,12 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
     @Published var channels: [Channel] = []
     @Published var messages: [String: [ChannelMessage]] = [:]   // keyed by channelHash hex
+    /// Monotonically increments each time the rfed link transitions INTO
+    /// `.connected` from any other state.  Channel-view code uses this as
+    /// the dedup key for the automatic first-open PULL: it pulls once per
+    /// link establishment per channel, not once per chat-screen open.
+    @Published var rfedLinkGeneration: Int = 0
+
     @Published var rfedNodeStatus: NodeStatus = .unknown
 
     /// Whether the rfed node *might* still have pending deferred blobs queued
@@ -123,9 +129,28 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
     // MARK: - RFed node link status monitor
 
+    /// Refcount: how many UI surfaces currently want live link-status updates.
+    /// `retainRfedLinkMonitor` increments and starts the timer if needed;
+    /// `releaseRfedLinkMonitor` decrements and stops the timer when it falls
+    /// to zero.  This lets multiple views (Settings + channel chat) request
+    /// monitoring concurrently without one cancelling the other's updates.
+    private var linkMonitorRetainCount: Int = 0
+
     /// Start polling the app-link status every 3 s (while SettingsView is visible).
     /// The actual link is managed by ConnectionStateManager (opened/closed with app foreground).
     func startRfedLinkMonitor() {
+        retainRfedLinkMonitor()
+    }
+
+    /// Stop polling (SettingsView disappeared).
+    func stopRfedLinkMonitor() {
+        releaseRfedLinkMonitor()
+    }
+
+    /// Increment the monitor refcount, starting the timer on the first retain.
+    func retainRfedLinkMonitor() {
+        linkMonitorRetainCount += 1
+        guard linkMonitorRetainCount == 1 else { return }
         refreshRfedNodeStatus()
         linkStatusTimer?.cancel()
         linkStatusTimer = Timer.publish(every: 3, on: .main, in: .common)
@@ -133,19 +158,32 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             .sink { [weak self] _ in self?.refreshRfedNodeStatus() }
     }
 
-    /// Stop polling (SettingsView disappeared).
-    func stopRfedLinkMonitor() {
-        linkStatusTimer?.cancel()
-        linkStatusTimer = nil
+    /// Decrement the monitor refcount, stopping the timer on the final release.
+    func releaseRfedLinkMonitor() {
+        guard linkMonitorRetainCount > 0 else { return }
+        linkMonitorRetainCount -= 1
+        if linkMonitorRetainCount == 0 {
+            linkStatusTimer?.cancel()
+            linkStatusTimer = nil
+        }
     }
 
     private func refreshRfedNodeStatus() {
         // appLinkStatus: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED
+        let next: NodeStatus
         switch ConnectionStateManager.shared.rfedNodeLinkStatus() {
-        case 3:    rfedNodeStatus = .connected
-        case 1, 2: rfedNodeStatus = .establishing
-        case 4:    rfedNodeStatus = .unreachable
-        default:   rfedNodeStatus = .unknown
+        case 3:    next = .connected
+        case 1, 2: next = .establishing
+        case 4:    next = .unreachable
+        default:   next = .unknown
+        }
+        let wasConnected = rfedNodeStatus == .connected
+        rfedNodeStatus = next
+        // Bump the generation only on a fresh transition into .connected so
+        // observers can fire link-establishment side effects (e.g. PULL)
+        // exactly once per link.
+        if next == .connected && !wasConnected {
+            rfedLinkGeneration &+= 1
         }
     }
 

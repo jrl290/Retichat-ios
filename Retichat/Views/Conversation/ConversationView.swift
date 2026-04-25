@@ -33,10 +33,13 @@ struct ConversationView: View {
     // Shared compose state
     @State private var messageText = ""
     @State private var scrollProxy: ScrollViewProxy?
-    /// Per-channel guard: ensures the automatic first-open PULL fires at most
-    /// once per `ConversationView` lifetime, even if the rfed node status
-    /// flickers between connected and other states.
-    @State private var didAutoPullChannelId: String?
+    /// Per-channel guard for the automatic first-open PULL: stores the
+    /// `RfedChannelClient.rfedLinkGeneration` value at the time of the last
+    /// auto-pull for the channel currently on screen.  The view auto-pulls
+    /// when the live generation differs from this stored value, i.e. once
+    /// per link establishment per channel.  `nil` means "never auto-pulled
+    /// while this view was on screen".
+    @State private var lastAutoPullGeneration: Int?
     @FocusState private var isTextFieldFocused: Bool
 
     // DM-only state
@@ -194,6 +197,12 @@ struct ConversationView: View {
                 repository.openConversation(chatId: id)
                 print("[DIAG][onAppear] openConversation done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
             }
+            // Channel chats need live link-status updates so the auto-PULL
+            // can fire on each fresh link establishment.  Refcounted so it
+            // composes with SettingsView's own monitor retain.
+            if case .channel = mode {
+                channelClient.retainRfedLinkMonitor()
+            }
             isTextFieldFocused = true
         }
         .onDisappear {
@@ -202,6 +211,9 @@ struct ConversationView: View {
                 NotificationManager.shared.activeChatId = nil
                 repository.closeConversation(chatId: id)
                 print("[DIAG][onDisappear] closeConversation done")
+            }
+            if case .channel = mode {
+                channelClient.releaseRfedLinkMonitor()
             }
         }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
@@ -371,15 +383,20 @@ struct ConversationView: View {
                 // the last visit.
                 channelClient.canPullMore[nodeKey] = nil
             }
-            // Automatic first-open PULL: as soon as the rfed link is
-            // established (status .connected), fire one pull to drain any
-            // blobs queued while the app was offline. The `didAutoPullChannelId`
-            // guard ensures it happens at most once per channel-view
-            // lifetime, even if the status republishes.
-            .task(id: channelClient.rfedNodeStatus) {
-                guard channelClient.rfedNodeStatus == .connected,
-                      didAutoPullChannelId != channel.id else { return }
-                didAutoPullChannelId = channel.id
+            // Automatic PULL on each fresh rfed link establishment, scoped
+            // to the channel chat being open. The `.task(id:)` re-runs
+            // whenever `rfedLinkGeneration` changes; we only fire a pull if
+            // the link is currently `.connected` AND we haven't already
+            // pulled for this generation. This means:
+            //   - Re-opening the same channel without a link bounce: no pull.
+            //   - Link drops and re-establishes while viewing a channel: pull.
+            //   - First open after a link establishment that happened before
+            //     the screen was shown: pull (generation differs from nil).
+            .task(id: channelClient.rfedLinkGeneration) {
+                guard channelClient.rfedNodeStatus == .connected else { return }
+                let gen = channelClient.rfedLinkGeneration
+                guard lastAutoPullGeneration != gen else { return }
+                lastAutoPullGeneration = gen
                 await channelClient.pullDeferred(channel: channel)
             }
         }
