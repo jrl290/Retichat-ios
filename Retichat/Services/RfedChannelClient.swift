@@ -289,7 +289,104 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
     // MARK: - Send
 
+    // ── PoW STAMP CONTRACT (DO NOT BREAK — see config.rs HISTORICAL FAILURE MODES) ──
+    //
+    // Wire payload sent to rfed.channel:
+    //     [ channel_id_hash(16) | EC_encrypted_tail | stamp(32) ]
+    //
+    // The rfed node validates the stamp as:
+    //     transient_id = sha256(channel_id_hash || EC_encrypted_tail)
+    //     workblock    = full_hash · expand(16)
+    //     stamp_value(workblock, stamp) >= (stamp_cost - stamp_flexibility)
+    //
+    // The cost we pass to the FFI MUST equal the `stamp_cost` returned by
+    // the rfed node's `/rfed/subscribe` response — that is the only
+    // authoritative value. The cached `Channel.stampCost` may be stale
+    // if the operator changed the node config, so we ALWAYS refresh it
+    // from the server before the first send of a session, and ALWAYS
+    // refresh + retry on a stamp-rejection failure. There is no other
+    // way to learn the cost — rfed announces do not currently carry it.
+
+    /// Refresh `stampCost` from the server by re-issuing /rfed/subscribe.
+    /// Updates the in-memory `channels` array AND the persisted entity.
+    /// Returns the freshly-fetched value (nil = no stamp required).
+    @discardableResult
+    private func refreshStampCost(for channel: Channel) async throws -> Int? {
+        guard let channelHashData = Data(hexString: channel.id),
+              let rfedChannelDest = Data(hexString: channel.rfedNodeHash) else {
+            throw ChannelError.invalidRfedNode
+        }
+        let fresh = try await subscribeOnServer(channelHashData: channelHashData,
+                                                 rfedChannelDest: rfedChannelDest)
+        if fresh != channel.stampCost {
+            print("[RfedChannel] stampCost refreshed for \(channel.channelName): \(channel.stampCost.map(String.init) ?? "nil") → \(fresh.map(String.init) ?? "nil")")
+        }
+        if let ctx = modelContext,
+           let entity = try? ctx.fetch(FetchDescriptor<ChannelEntity>(
+               predicate: { let cid = channel.id; return #Predicate { $0.channelHash == cid } }()
+           )).first {
+            entity.stampCost = fresh
+            try? ctx.save()
+        }
+        channels = channels.map { ch in
+            ch.id == channel.id ? Channel(id: ch.id, channelName: ch.channelName,
+                rfedNodeHash: ch.rfedNodeHash, lastMessageTime: ch.lastMessageTime,
+                isSubscribed: ch.isSubscribed, stampCost: fresh) : ch
+        }
+        return fresh
+    }
+
+    /// Channel IDs whose stampCost has been refreshed at least once this
+    /// app session. Ensures the first SEND on a channel always carries a
+    /// stamp built against the live node config rather than a stale value
+    /// from disk (e.g. operator bumped stamp_cost while the app was off).
+    private var stampCostRefreshedThisSession: Set<String> = []
+
     func sendMessage(content: String, toChannel channel: Channel) {
+        Task { await self.sendMessageAsync(content: content, toChannel: channel) }
+    }
+
+    private func sendMessageAsync(content: String, toChannel channel: Channel) async {
+        // Step 1: ensure stampCost is fresh for this session.  No persisted
+        // stampCost is trusted across an app launch — operator may have
+        // changed the node config.
+        var liveChannel = channel
+        if !stampCostRefreshedThisSession.contains(channel.id) {
+            do {
+                _ = try await refreshStampCost(for: channel)
+                stampCostRefreshedThisSession.insert(channel.id)
+                if let updated = channels.first(where: { $0.id == channel.id }) {
+                    liveChannel = updated
+                }
+            } catch {
+                print("[RfedChannel] stampCost refresh failed (\(error)) — sending with cached value \(channel.stampCost.map(String.init) ?? "nil")")
+            }
+        }
+
+        let sendOk = await trySend(content: content, toChannel: liveChannel)
+        if sendOk { return }
+
+        // Step 2: a single retry after forcing a stampCost refresh.  This
+        // covers the edge case where the operator changed the cost mid-session.
+        print("[RfedChannel] SEND failed once — refreshing stampCost and retrying")
+        do {
+            _ = try await refreshStampCost(for: liveChannel)
+            stampCostRefreshedThisSession.insert(liveChannel.id)
+            if let updated = channels.first(where: { $0.id == liveChannel.id }) {
+                liveChannel = updated
+            }
+        } catch {
+            print("[RfedChannel] stampCost refresh on retry failed: \(error)")
+            return
+        }
+        _ = await trySend(content: content, toChannel: liveChannel)
+    }
+
+    /// Build the wire payload, compute the stamp, and ship it.  Returns
+    /// false if any step that would produce a server-rejected packet fails
+    /// (so the caller can refresh stampCost and retry).  A successful
+    /// transmission also persists the local optimistic message.
+    private func trySend(content: String, toChannel channel: Channel) async -> Bool {
         // Build the wire payload as an LXMF-authenticated channel message.
         // The FFI returns both the on-wire bytes AND the LXMF timestamp it
         // baked into the signed body — we use the same timestamp for the
@@ -301,7 +398,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                                                   content: contentData,
                                                   title: Data()) else {
             print("[RfedChannel] LXMF pack failed: \(bridge.lastError() ?? "unknown")")
-            return
+            return false
         }
         let lxmfData = packed.wirePayload
         let tsMs = packed.timestampMs
@@ -309,17 +406,20 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         guard lxmfData.count >= 16,
               lxmfData.prefix(16).hexString.lowercased() == channel.id.lowercased() else {
             print("[RfedChannel] LXMF pack produced wrong channel_id_hash prefix")
-            return
+            return false
         }
 
         var payload = lxmfData
         if let cost = channel.stampCost, cost > 0 {
-            if let stamp = bridge.channelComputeStamp(payload: payload, cost: Int32(cost)) {
-                payload += stamp
-                print("[RfedChannel] stamp computed (cost=\(cost), stamp_bytes=\(stamp.count))")
-            } else {
-                print("[RfedChannel] WARNING: stamp computation failed — sending without stamp")
+            // The rfed node REQUIRES a stamp at this cost. If FFI returns
+            // nil it means the PoW search exhausted its iteration cap — we
+            // refuse to ship a packet we know will be rejected.
+            guard let stamp = bridge.channelComputeStamp(payload: payload, cost: Int32(cost)) else {
+                print("[RfedChannel] STAMP COMPUTE FAILED for cost=\(cost): \(bridge.lastError() ?? "unknown") — aborting send")
+                return false
             }
+            payload += stamp
+            print("[RfedChannel] stamp computed (cost=\(cost), stamp_bytes=\(stamp.count), payload_bytes=\(payload.count))")
         }
 
         let ok = bridge.packetSendToHash(destHash: Data(hexString: channel.rfedNodeHash)!,
@@ -327,12 +427,19 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                                           payload: payload)
         if !ok {
             print("[RfedChannel] Send failed: \(bridge.lastError() ?? "unknown")")
-            return
+            return false
         }
 
         // Persist outgoing message locally — we know the plaintext directly.
         // Use the LXMF timestamp so the echo from RFed dedupes against this.
         let msgId = (Data(hexString: ownHashHex) ?? Data()).hexString + String(format: "%016llx", tsMs)
+        // Avoid duplicating the local insert when retrying a previously-failed send.
+        if let ctx = modelContext,
+           let existing = try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
+               predicate: { let mid = msgId; return #Predicate { $0.id == mid } }()
+           )), !existing.isEmpty {
+            return true
+        }
         let entity = ChannelMessageEntity(id: msgId, channelHash: channel.id,
                                           senderHash: ownHashHex, senderDisplayName: "",
                                           content: content, timestamp: Double(tsMs), isOutgoing: true)
@@ -344,6 +451,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                                   timestamp: Double(tsMs), isOutgoing: true)
         appendMessage(msg, toChannelHash: channel.id)
         updateChannelLastMessage(channelHashHex: channel.id, time: Double(tsMs))
+        return true
     }
 
     // MARK: - Pull deferred blobs

@@ -520,11 +520,30 @@ pub extern "C" fn retichat_channel_decrypt(
 
 /// Compute a PoW stamp for a channel SEND packet.
 ///
-/// `payload` is `channel_hash(16) | ciphertext` (everything before the stamp).
-/// `cost` is the required leading-zero bits from the rfed node's `stamp_cost`.
+/// `payload` is the entire wire payload that will be sent BEFORE the stamp
+/// is appended — i.e. `channel_id_hash(16) | EC_encrypted_tail`.
+/// `cost` is the `stamp_cost` value the rfed node returned in its
+/// `/rfed/subscribe` response.
 ///
-/// Returns a heap-allocated 32-byte stamp (free with `lxmf_free_bytes`), or
-/// NULL when cost == 0.  Algorithm matches rfed's STAMP_EXPAND_ROUNDS=16.
+/// Returns a heap-allocated 32-byte stamp (free with `lxmf_free_bytes`).
+/// Returns NULL when `cost == 0` (no stamp required) — `*out_len` set to 0.
+/// Returns NULL on failure (e.g. the PoW search ran out of iterations
+/// without finding a stamp meeting `cost`); call `lxmf_last_error` for
+/// the reason.
+///
+/// ─── STAMP CONTRACT — DO NOT BREAK ─────────────────────────────────────
+///   * `transient_id = identity::full_hash(payload)`
+///   * `workblock    = LXStamper::stamp_workblock(transient_id, 16)`
+///   * `stamp_value(workblock, stamp) >= cost`
+///   * `STAMP_EXPAND_ROUNDS = 16` MUST match
+///     `RFed-rust/rfed/src/destinations.rs::STAMP_EXPAND_ROUNDS`.
+///   * `payload` MUST be byte-identical to what the rfed SEND handler
+///     sees as `data[..data.len() - LXStamper::STAMP_SIZE]`.  Any change
+///     to wire format → both sides must change in lock-step.
+///
+/// See `RFed-rust/rfed/src/config.rs` (TierPolicy section) and
+/// `/memories/repo/retichat-rfed-channel-integration.md` for the full
+/// contract and historical regressions.
 #[no_mangle]
 pub extern "C" fn retichat_compute_channel_stamp(
     payload: *const u8,
@@ -532,13 +551,27 @@ pub extern "C" fn retichat_compute_channel_stamp(
     cost: u32,
     out_len: *mut u32,
 ) -> *mut u8 {
+    use reticulum_rust::lxstamper::LXStamper;
     if cost == 0 {
         unsafe { *out_len = 0; }
         return std::ptr::null_mut();
     }
     let data = slice_from_raw(payload, payload_len);
     let transient_id = reticulum_rust::identity::full_hash(&data);
-    let (stamp, _) = reticulum_rust::lxstamper::LXStamper::generate_stamp(&transient_id, cost, 16);
+    let workblock = LXStamper::stamp_workblock(&transient_id, 16);
+    let (stamp, value) = LXStamper::generate_stamp(&transient_id, cost, 16);
+    // generate_stamp may silently return a sub-cost stamp if it exhausts
+    // its internal iteration cap.  Verify against the SAME workblock the
+    // rfed node uses, so we never ship a stamp that will be rejected.
+    if value < cost || !LXStamper::stamp_valid(&stamp, cost, &workblock) {
+        rns::set_error(format!(
+            "stamp PoW failed: required cost={} but achieved value={} (payload_len={}). \
+             Either iteration cap exceeded or workblock mismatch.",
+            cost, value, data.len()
+        ));
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    }
     let len = stamp.len() as u32;
     let mut boxed = stamp.into_boxed_slice();
     let ptr = boxed.as_mut_ptr();
