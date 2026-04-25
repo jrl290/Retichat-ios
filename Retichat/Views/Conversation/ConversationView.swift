@@ -33,6 +33,10 @@ struct ConversationView: View {
     // Shared compose state
     @State private var messageText = ""
     @State private var scrollProxy: ScrollViewProxy?
+    /// Per-channel guard: ensures the automatic first-open PULL fires at most
+    /// once per `ConversationView` lifetime, even if the rfed node status
+    /// flickers between connected and other states.
+    @State private var didAutoPullChannelId: String?
     @FocusState private var isTextFieldFocused: Bool
 
     // DM-only state
@@ -299,7 +303,7 @@ struct ConversationView: View {
                                 if pulling {
                                     ProgressView().scaleEffect(0.7)
                                 }
-                                Text(pulling ? "Pulling…" : "Pull pending messages")
+                                Text(pulling ? "Loading…" : "Load earlier messages")
                                     .font(.caption)
                                     .foregroundColor(.retichatPrimary)
                             }
@@ -366,6 +370,17 @@ struct ConversationView: View {
                 // the channel: the server may have queued more blobs since
                 // the last visit.
                 channelClient.canPullMore[nodeKey] = nil
+            }
+            // Automatic first-open PULL: as soon as the rfed link is
+            // established (status .connected), fire one pull to drain any
+            // blobs queued while the app was offline. The `didAutoPullChannelId`
+            // guard ensures it happens at most once per channel-view
+            // lifetime, even if the status republishes.
+            .task(id: channelClient.rfedNodeStatus) {
+                guard channelClient.rfedNodeStatus == .connected,
+                      didAutoPullChannelId != channel.id else { return }
+                didAutoPullChannelId = channel.id
+                await channelClient.pullDeferred(channel: channel)
             }
         }
     }
