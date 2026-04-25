@@ -633,48 +633,42 @@ const LXMF_APP_NAME: &str = "lxmf";
 const LXMF_DELIVERY_ASPECT: &str = "delivery";
 
 // ---------------------------------------------------------------------------
-// SOURCE-IDENTITY PRELUDE — REQUIRED for LXMF channel messages
+// SOURCE-IDENTITY PRELUDE — DO NOT BREAK
 // ---------------------------------------------------------------------------
 //
 // LXMF PROPAGATED unpack requires the source identity to be present in
 // Reticulum's known-destinations cache so the Ed25519 signature can be
-// validated.  In normal Sideband-style use that cache is populated by
-// LXMF announces, but Retichat clients do NOT periodically announce
-// their lxmf.delivery destination, so the receiver would reject every
-// channel message as `SOURCE_UNKNOWN` until/unless the sender happened
-// to also announce.
+// validated.  Normally that cache is populated by LXMF announces — but
+// announces are timing-dependent and lossy: the receiver might not
+// have heard the sender's announce yet, in which case every channel
+// message would be rejected as `SOURCE_UNKNOWN` until/unless the
+// sender re-announces while the receiver is online.  This is the same
+// failure mode that plagues regular LXMF ("have to be around at the
+// right time to receive anything").
 //
-// To make channel delivery deterministic and announce-independent, the
-// sender embeds its own identity public bytes inside the EC-encrypted
-// channel payload, immediately before the LXMF tail.  The receiver
-// detects the magic, registers the identity for the source hash via
-// `Identity::remember_destination`, then unpacks the LXMF canonical
-// block normally — at which point `recall_identity` finds the
-// just-registered identity and the signature validates.
+// We solve it once and for all by embedding the sender's identity
+// public bytes INSIDE the EC-encrypted channel payload.  The receiver
+// detects the magic, verifies `truncated_hash(identity_pub) ==
+// source_hash` (so a sender cannot forge identity), registers the
+// identity for that source hash via `Identity::remember_destination`,
+// then unpacks LXMF normally — the signature now validates with zero
+// dependence on announce timing.
 //
-// Layout of the *plaintext* of the EC-encrypted payload (REQUIRED for
-// every LXMF channel message — there is no legacy/non-prelude form):
+// The prelude is MANDATORY — not a fallback, not optional.  All
+// Retichat clients on the same FFI version use it; receivers reject
+// blobs that lack the magic.
 //
-//   [ b"RTID" (4) | sender_identity_pub(64) | source_hash(16) | sig(64) | msgpack_payload ]
+// Layout of the *plaintext* of the EC-encrypted payload:
 //
-// The 64 bytes of identity_pub are exactly the format produced by
-// `Identity::get_public_key()` (32 X25519 enc pub || 32 Ed25519 sign
-// pub) and consumed by `Identity::from_public_key` /
-// `Identity::remember_destination`.
+//     [ b"RTID" (4) | sender_identity_pub (64) | source_hash (16) | sig (64) | msgpack_payload ]
 //
-// The prelude is INSIDE the EC envelope so it is not visible to anyone
-// who does not already hold the channel key — it leaks no more than
-// the message body itself, which is exactly the threat model of
-// channel pub/sub.
+// The 64 bytes of identity_pub are exactly what
+// `Identity::get_public_key()` returns (32 X25519 enc pub || 32 Ed25519
+// sign pub) and what `Identity::from_public_key` /
+// `Identity::remember_destination` consume.
 //
-// The prelude is a Retichat (LXMF channel) extension only — RFed never
-// sees or parses it (it is inside the EC envelope) and the PoW stamp
-// contract still binds over `channel_id_hash || EC_blob` exactly as
-// before, so this is fully RFed-transparent.
-//
-// Receivers MUST verify `truncated_hash(identity_pub) == source_hash`
-// before registering — otherwise a sender could poison the cache by
-// claiming someone else's source_hash.  Mismatch → reject the message.
+// The prelude is INSIDE the EC envelope so it leaks no more than the
+// message body itself does — only channel-key holders ever see it.
 const CHANNEL_IDENTITY_PRELUDE_MAGIC: &[u8; 4] = b"RTID";
 const CHANNEL_IDENTITY_PRELUDE_LEN: usize = 4 + 64; // magic + Identity::get_public_key()
 
@@ -841,8 +835,10 @@ pub extern "C" fn retichat_channel_lxm_pack(
         return std::ptr::null_mut();
     }
     // Prepend the SOURCE-IDENTITY PRELUDE to the LXMF tail before
-    // encryption.  REQUIRED — this is the only accepted plaintext
-    // layout for LXMF channel messages.
+    // encryption.  Receivers detect the magic and register the source
+    // identity locally so signature validation succeeds without
+    // requiring a prior announce.  This is mandatory — every Retichat
+    // client on the network speaks this format.
     let lxmf_tail = &packed[LXMessage::DESTINATION_LENGTH..];
     let mut prelude_plus_tail = Vec::with_capacity(CHANNEL_IDENTITY_PRELUDE_LEN + lxmf_tail.len());
     prelude_plus_tail.extend_from_slice(CHANNEL_IDENTITY_PRELUDE_MAGIC);
@@ -957,43 +953,40 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         }
     };
 
-    // The decrypted plaintext MUST start with the SOURCE-IDENTITY
-    // PRELUDE — there is no legacy/non-prelude form. Verify the magic,
-    // verify truncated_hash(identity_pub) == source_hash (refuse forged
-    // identities — never poison the cache), register the sender's
-    // identity in Reticulum's known-destinations cache so
-    // LXMessage::unpack_from_bytes' internal recall_identity(source_hash)
-    // lookup succeeds, then hand the LXMF tail to unpack.
-    if decrypted.len() < CHANNEL_IDENTITY_PRELUDE_LEN + LXMessage::DESTINATION_LENGTH {
+    // The decrypted plaintext MUST start with the SOURCE-IDENTITY PRELUDE
+    // (magic "RTID" + 64-byte sender public key).  No legacy fallback —
+    // every Retichat client embeds its identity inline so signature
+    // validation is independent of LXMF announce timing.  If the magic
+    // is absent, the sender is on an incompatible build (or the message
+    // is malformed); reject loudly.
+    if decrypted.len() < CHANNEL_IDENTITY_PRELUDE_LEN
+        || &decrypted[..4] != CHANNEL_IDENTITY_PRELUDE_MAGIC
+    {
         rns::set_error(
-            "channel: decrypted payload too short for SOURCE-IDENTITY PRELUDE + LXMF tail".into(),
-        );
-        unsafe { *out_len = 0; }
-        return std::ptr::null_mut();
-    }
-    if &decrypted[..4] != CHANNEL_IDENTITY_PRELUDE_MAGIC {
-        rns::set_error(
-            "channel: missing SOURCE-IDENTITY PRELUDE magic 'RTID' — sender is on an incompatible build".into(),
+            "channel: missing SOURCE-IDENTITY PRELUDE — sender on incompatible build or payload malformed".into()
         );
         unsafe { *out_len = 0; }
         return std::ptr::null_mut();
     }
     let identity_pub = &decrypted[4..CHANNEL_IDENTITY_PRELUDE_LEN];
-    let lxmf_tail: &[u8] = &decrypted[CHANNEL_IDENTITY_PRELUDE_LEN..];
+    let lxmf_tail = &decrypted[CHANNEL_IDENTITY_PRELUDE_LEN..];
+    if lxmf_tail.len() < LXMessage::DESTINATION_LENGTH {
+        rns::set_error("channel: LXMF tail after prelude too short".into());
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    }
     let claimed_source_hash = &lxmf_tail[..LXMessage::DESTINATION_LENGTH];
     let actual_hash = reticulum_rust::identity::truncated_hash(identity_pub);
     if actual_hash != claimed_source_hash {
+        // Sender is lying about its identity — refuse, do not poison cache.
         rns::set_error(
-            "channel: SOURCE-IDENTITY PRELUDE identity does not match source_hash — rejecting".into(),
+            "channel: sender identity prelude does not match source_hash — refusing".into()
         );
         unsafe { *out_len = 0; }
         return std::ptr::null_mut();
     }
     if let Err(e) = Identity::remember_destination(claimed_source_hash, identity_pub, None) {
-        rns::set_error(format!(
-            "channel: failed to register sender identity: {}",
-            e
-        ));
+        rns::set_error(format!("channel: remember_destination failed: {}", e));
         unsafe { *out_len = 0; }
         return std::ptr::null_mut();
     }
