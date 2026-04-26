@@ -382,6 +382,20 @@ struct ConversationView: View {
                 // the channel: the server may have queued more blobs since
                 // the last visit.
                 channelClient.canPullMore[nodeKey] = nil
+                // Force-scroll to the latest bubble on open. `.defaultScrollAnchor(.bottom)`
+                // only positions on the very first layout pass; if the
+                // channel was previously visited (so msgs is already
+                // populated), SwiftUI may render anchored to the top.
+                // Two-phase scroll handles the case where the LazyVStack
+                // hasn't materialized the trailing rows yet on first tick.
+                if let lastId = (channelClient.messages[channel.id] ?? []).last?.id {
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(lastId, anchor: .bottom)
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        proxy.scrollTo(lastId, anchor: .bottom)
+                    }
+                }
             }
             // Automatic PULL on each fresh rfed link establishment, scoped
             // to the channel chat being open. The `.task(id:)` re-runs
