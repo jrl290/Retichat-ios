@@ -216,6 +216,22 @@ final class ConnectionStateManager {
         return (client, destData)
     }
 
+    /// Public access to the rfed.channel destination derived from current
+    /// preferences.  Used by the SettingsView status indicator to tell
+    /// "no config" apart from "config present but no link".
+    func rfedChannelDestDataPublic() -> Data? {
+        return rfedChannelDestData()
+    }
+
+    /// True if the routing table currently has a path to the configured
+    /// rfed.channel destination.  Used by the SettingsView status indicator
+    /// to distinguish a transient "link not active yet" from a genuine
+    /// "no path" failure.
+    func rfedChannelHasPath() -> Bool {
+        guard let destData = rfedChannelDestData() else { return false }
+        return RetichatBridge.shared.transportHasPath(destHash: destData)
+    }
+
     /// Wait for the rfed.channel app-link to reach ACTIVE (status == 3).
     /// Polls every 250 ms.  Safe to call from any context (re-enters MainActor
     /// for each status check).

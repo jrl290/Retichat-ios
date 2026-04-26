@@ -169,13 +169,32 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     }
 
     private func refreshRfedNodeStatus() {
-        // appLinkStatus: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED
+        // appLinkStatus: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
+        //
+        // Semantics for the SettingsView pill:
+        //   .unknown      → no rfed node configured (pill hidden)
+        //   .establishing → config present, link not active (pill: "Linking…")
+        //   .connected    → link ACTIVE (pill: "Linked")
+        //   .unreachable  → config present but no path AND not currently
+        //                   trying — i.e. genuine "No path" (pill: "No path")
+        //
+        // We collapse 0/1/2/4 onto .establishing when config exists because
+        // appLinkStatus does not distinguish "trying" from "last attempt
+        // failed" — DISCONNECTED reliably resolves once the next announce
+        // arrives.  True .unreachable is reserved for the case where the
+        // configured destination has no path in the routing table at all.
+        let csm = ConnectionStateManager.shared
+        let raw = csm.rfedNodeLinkStatus()
+        let configured = csm.rfedChannelDestDataPublic() != nil
         let next: NodeStatus
-        switch ConnectionStateManager.shared.rfedNodeLinkStatus() {
-        case 3:    next = .connected
-        case 1, 2: next = .establishing
-        case 4:    next = .unreachable
-        default:   next = .unknown
+        if !configured {
+            next = .unknown
+        } else if raw == 3 {
+            next = .connected
+        } else if !csm.rfedChannelHasPath() {
+            next = .unreachable
+        } else {
+            next = .establishing
         }
         let wasConnected = rfedNodeStatus == .connected
         rfedNodeStatus = next
