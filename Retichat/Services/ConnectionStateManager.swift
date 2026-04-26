@@ -57,6 +57,12 @@ final class ConnectionStateManager {
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify")
 
         requestEssentialPaths()
+        // Open the rfed.channel app-link immediately so the SettingsView
+        // "RFed Node" status pill (which polls appLinkStatus on the
+        // rfed.channel destination) reflects reality on first launch.
+        // Without this the pill stayed at "No path" indefinitely on cold
+        // start because openRfedNodeLink() only ran on onNetworkRecover.
+        openRfedNodeLink()
     }
 
     // MARK: - Announce-driven reachability
