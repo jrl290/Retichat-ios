@@ -120,20 +120,58 @@ final class GroupMemberEntity {
 @Model
 final class InterfaceConfigEntity {
     @Attribute(.unique) var id: String
-    var type: String  // "TCPClient", "TCPServer", "UDP", "Auto", "I2P"
+    /// One of `InterfaceKind.rawValue`: "TCPClient", "RNode", etc.
+    var type: String
     var name: String
     var targetHost: String
     var targetPort: Int
     var enabled: Bool
+    /// Optional JSON blob holding type-specific config (e.g. RNode radio
+    /// parameters + remembered BLE peripheral). nil for plain TCP rows.
+    /// Stored as a string so SwiftData can auto-migrate by adding a NULL
+    /// column for existing records.
+    var configJSON: String?
 
     init(id: String = UUID().uuidString, type: String, name: String,
-         targetHost: String = "", targetPort: Int = 0, enabled: Bool = true) {
+         targetHost: String = "", targetPort: Int = 0, enabled: Bool = true,
+         configJSON: String? = nil) {
         self.id = id
         self.type = type
         self.name = name
         self.targetHost = targetHost
         self.targetPort = targetPort
         self.enabled = enabled
+        self.configJSON = configJSON
+    }
+}
+
+/// Supported network interface kinds. Stored as the `type` column on
+/// `InterfaceConfigEntity`.
+enum InterfaceKind: String, CaseIterable, Identifiable {
+    case tcpClient = "TCPClient"
+    case rnode     = "RNode"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .tcpClient: return "TCP Client"
+        case .rnode:     return "RNode (Bluetooth)"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .tcpClient: return "network"
+        case .rnode:     return "antenna.radiowaves.left.and.right"
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .tcpClient: return "Connect to a Reticulum node over the internet."
+        case .rnode:     return "Connect a LoRa radio over Bluetooth."
+        }
     }
 }
 

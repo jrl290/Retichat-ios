@@ -48,6 +48,17 @@ struct ConversationView: View {
     @State private var pendingAttachments: [(String, Data)] = []
     @State private var showChatInfo = false
 
+    /// Raw direct-link status to the DM peer, refreshed on the 3 s timer.
+    /// Encoding: high byte = appLinkStatus (0..4, 0xFF = unknown),
+    /// low byte = peerLinkStatus (0..2, 0xFF = unknown).  Stored as a
+    /// single Int so SwiftUI only diffs one value per tick.
+    @State private var peerLinkRawStatus: Int = -1
+
+    /// Master switch for the title-bar direct-link status dot.  Set to
+    /// `false` to hide the indicator while keeping the supporting code in
+    /// place for easy re-enable.
+    private static let showPeerLinkDot: Bool = false
+
     // MARK: - Convenience
 
     private var chatId: String {
@@ -80,6 +91,63 @@ struct ConversationView: View {
     private var inputBarPlaceholder: String {
         if let ch = channel { return "Message #\(ch.channelName)..." }
         return "Message..."
+    }
+
+    /// Color of the direct-link status dot shown next to the title in DM mode.
+    /// Follows the project's UI conventions:
+    ///   grey   — idle / not yet attempted
+    ///   yellow — in progress (path requested or link establishing)
+    ///   green  — direct link active
+    ///   red    — last attempt failed (DISCONNECTED)
+    /// Returns nil for groups / channels / before peerHash is known.
+    private var peerLinkDotColor: Color? {
+        guard !isChannelMode, !viewModel.isGroup else { return nil }
+        let appRaw = (peerLinkRawStatus >> 8) & 0xFF
+        let peerRaw = peerLinkRawStatus & 0xFF
+        if appRaw == 0xFF && peerRaw == 0xFF { return nil }
+        if appRaw == 3 || peerRaw == 2 { return .green }
+        if appRaw == 1 || appRaw == 2 || peerRaw == 1 { return .yellow }
+        if appRaw == 4 { return .red }
+        return .gray
+    }
+
+    /// Refresh `peerLinkRawStatus` from the LXMF client for the current peer.
+    private func refreshPeerLinkStatus() {
+        guard !isChannelMode, !viewModel.isGroup,
+              !viewModel.peerHash.isEmpty,
+              let destData = Data(hexString: viewModel.peerHash),
+              let client = repository.lxmfClient
+        else {
+            peerLinkRawStatus = -1
+            return
+        }
+        let app = client.appLinkStatus(destData)
+        let peer = client.peerLinkStatus(destData)
+        let appByte = app < 0 ? 0xFF : Int(app) & 0xFF
+        let peerByte = peer < 0 ? 0xFF : Int(peer) & 0xFF
+        peerLinkRawStatus = (appByte << 8) | peerByte
+    }
+
+    /// Scroll the channel message list to the bottom sentinel with several
+    /// staggered retries.  A single `proxy.scrollTo` race-condition'd with
+    /// the `LazyVStack` materializing trailing rows is what produces the
+    /// "open the channel and the screen is blank until I scroll up" bug.
+    /// The retries cover (a) the initial layout pass, (b) the pass after
+    /// the first batch of cells materialise, and (c) any final reflow once
+    /// every bubble's text has settled at its final wrapped height.
+    private func scrollChannelToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        let target = "CHANNEL_LIST_BOTTOM"
+        let scroll = {
+            if animated {
+                withAnimation { proxy.scrollTo(target, anchor: .bottom) }
+            } else {
+                proxy.scrollTo(target, anchor: .bottom)
+            }
+        }
+        DispatchQueue.main.async(execute: scroll)
+        for delay in [0.05, 0.15, 0.35, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: scroll)
+        }
     }
 
     // MARK: - Init
@@ -118,6 +186,22 @@ struct ConversationView: View {
         .navigationTitle(navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    // Direct-link status dot — temporarily hidden but kept in
+                    // place so it can be re-enabled by flipping this flag.
+                    if Self.showPeerLinkDot, let dot = peerLinkDotColor {
+                        Circle()
+                            .fill(dot)
+                            .frame(width: 8, height: 8)
+                            .accessibilityLabel("Direct link status")
+                    }
+                    Text(navigationTitle)
+                        .font(.headline)
+                        .foregroundColor(.retichatOnSurface)
+                        .lineLimit(1)
+                }
+            }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if isChannelMode {
                     Button {
@@ -196,6 +280,7 @@ struct ConversationView: View {
                 print("[DIAG][onAppear] clearNotifications done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
                 repository.openConversation(chatId: id)
                 print("[DIAG][onAppear] openConversation done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+                refreshPeerLinkStatus()
             }
             // Channel chats need live link-status updates so the auto-PULL
             // can fire on each fresh link establishment.  Refcounted so it
@@ -219,6 +304,7 @@ struct ConversationView: View {
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
             if case .dm(let id) = mode {
                 viewModel.refreshMessages(chatId: id, repository: repository)
+                refreshPeerLinkStatus()
             }
         }
     }
@@ -349,30 +435,42 @@ struct ConversationView: View {
                         )
                         .id(msg.id)
                     }
+
+                    // Zero-height sentinel pinned to the very end of the
+                    // stack. Scrolling to this anchor (rather than the last
+                    // bubble's id) keeps us correctly pinned to the bottom
+                    // even when bubble heights re-measure during async
+                    // layout — which would otherwise leave the viewport
+                    // scrolled past the actual content end and show a blank
+                    // screen.
+                    Color.clear
+                        .frame(height: 1)
+                        .id("CHANNEL_LIST_BOTTOM")
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 8)
             }
-            .defaultScrollAnchor(.bottom)
+            // NOTE: deliberately NOT using `.defaultScrollAnchor(.bottom)`.
+            // It races with our explicit `proxy.scrollTo` while the
+            // `LazyVStack` materializes rows, and once SwiftUI commits a
+            // bottom offset based on partially-realized content, later
+            // bubble remeasures can strand the viewport below the actual
+            // content end (showing a blank screen until the user scrolls
+            // back up).  We anchor explicitly to a zero-height sentinel
+            // pinned to the very last position with multiple retries.
             .onChange(of: msgs.count) { oldCount, newCount in
-                if let lastId = msgs.last?.id {
-                    if oldCount == 0 {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
-                    } else if newCount > oldCount {
-                        withAnimation {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
-                    }
+                guard !msgs.isEmpty else { return }
+                if oldCount == 0 {
+                    scrollChannelToBottom(proxy: proxy, animated: false)
+                } else if newCount > oldCount {
+                    scrollChannelToBottom(proxy: proxy, animated: true)
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-                if let lastId = msgs.last?.id {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        withAnimation {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                guard !msgs.isEmpty else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    withAnimation {
+                        proxy.scrollTo("CHANNEL_LIST_BOTTOM", anchor: .bottom)
                     }
                 }
             }
@@ -382,19 +480,8 @@ struct ConversationView: View {
                 // the channel: the server may have queued more blobs since
                 // the last visit.
                 channelClient.canPullMore[nodeKey] = nil
-                // Force-scroll to the latest bubble on open. `.defaultScrollAnchor(.bottom)`
-                // only positions on the very first layout pass; if the
-                // channel was previously visited (so msgs is already
-                // populated), SwiftUI may render anchored to the top.
-                // Two-phase scroll handles the case where the LazyVStack
-                // hasn't materialized the trailing rows yet on first tick.
-                if let lastId = (channelClient.messages[channel.id] ?? []).last?.id {
-                    DispatchQueue.main.async {
-                        proxy.scrollTo(lastId, anchor: .bottom)
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        proxy.scrollTo(lastId, anchor: .bottom)
-                    }
+                if !(channelClient.messages[channel.id] ?? []).isEmpty {
+                    scrollChannelToBottom(proxy: proxy, animated: false)
                 }
             }
             // Automatic PULL on each fresh rfed link establishment, scoped

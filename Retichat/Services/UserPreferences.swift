@@ -26,6 +26,7 @@ final class UserPreferences {
         static let mutedChatIds = "muted_chat_ids"
         static let channelNotificationsOn = "channel_notifications_on"
         static let channelPushEnabled = "channel_push_enabled"
+        static let channelLastOpened = "channel_last_opened"
     }
 
     var displayName: String {
@@ -175,5 +176,39 @@ final class UserPreferences {
 
     func isChannelPushEnabled(_ channelId: String) -> Bool {
         channelPushEnabled.contains(channelId)
+    }
+
+    /// Per-channel "last opened" timestamp in **seconds** (Apple epoch).
+    /// Used by `ChatListView` as the channel sort key so channels only
+    /// bubble to the top when the user actually opens them — incoming
+    /// channel traffic does *not* reorder the list.  Channels never
+    /// opened on this device sit at the bottom (timestamp 0).
+    var channelLastOpened: [String: Double] {
+        get {
+            let raw = defaults.dictionary(forKey: Keys.channelLastOpened) as? [String: Double] ?? [:]
+            // Migrate legacy ms-encoded values written before the unit switch.
+            // Anything > 1e11 cannot be a seconds-epoch value (year 5138+).
+            var migrated = raw
+            var changed = false
+            for (k, v) in raw where v > 1e11 {
+                migrated[k] = v / 1000.0
+                changed = true
+            }
+            if changed {
+                defaults.set(migrated, forKey: Keys.channelLastOpened)
+            }
+            return migrated
+        }
+        set { defaults.set(newValue, forKey: Keys.channelLastOpened) }
+    }
+
+    func channelLastOpenedTime(_ channelId: String) -> Double {
+        channelLastOpened[channelId] ?? 0
+    }
+
+    func markChannelOpened(_ channelId: String, at time: Double = Date().timeIntervalSince1970) {
+        var map = channelLastOpened
+        map[channelId] = time
+        channelLastOpened = map
     }
 }

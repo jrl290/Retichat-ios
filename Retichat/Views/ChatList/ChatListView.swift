@@ -20,10 +20,24 @@ private enum ListEntry: Identifiable {
         }
     }
 
-    var lastMessageTime: Double {
+    /// Sort key for the unified chat list.  DM/group chats sort by their
+    /// real `lastMessageTime`.  Channels sort by the user's own "last
+    /// opened" timestamp so incoming channel traffic does not keep
+    /// bouncing them to the top of the list — they only bubble up when
+    /// the user actively opens them.  Channels that have never been
+    /// opened on this device fall back to `lastMessageTime` so they
+    /// still take a sensible time-based slot interleaved with chats
+    /// instead of clumping at the bottom at timestamp 0.
+    ///
+    /// All timestamps are seconds (Apple epoch) so chats and channels
+    /// sort directly against each other.
+    var sortTime: Double {
         switch self {
-        case .chat(let c): return c.lastMessageTime
-        case .channel(let ch): return ch.lastMessageTime
+        case .chat(let c):
+            return c.lastMessageTime
+        case .channel(let ch):
+            let opened = UserPreferences.shared.channelLastOpenedTime(ch.id)
+            return opened > 0 ? opened : ch.lastMessageTime
         }
     }
 }
@@ -50,7 +64,17 @@ struct ChatListView: View {
             .map { .channel($0) }
 
         return (chatEntries + channelEntries)
-            .sorted { $0.lastMessageTime > $1.lastMessageTime }
+            .sorted { $0.sortTime > $1.sortTime }
+    }
+
+    /// True when the given list entry corresponds to the conversation
+    /// currently displayed in the detail pane (DM/group chat or channel).
+    /// Used to render a light tint on the selected row.
+    private func isSelected(_ entry: ListEntry) -> Bool {
+        switch entry {
+        case .chat(let c):     return selectedChatId == c.id
+        case .channel(let ch): return selectedChannel?.id == ch.id
+        }
     }
 
     var body: some View {
@@ -121,7 +145,7 @@ struct ChatListView: View {
                         Group {
                             switch entry {
                             case .chat(let chat):
-                                ChatRow(chat: chat)
+                                ChatRow(chat: chat, isSelected: isSelected(entry))
                                     .contentShape(Rectangle())
                                     .onTapGesture {
                                         selectedChannel = nil
@@ -149,11 +173,12 @@ struct ChatListView: View {
                                         }
                                     }
                             case .channel(let channel):
-                                ChannelRow(channel: channel)
+                                ChannelRow(channel: channel, isSelected: isSelected(entry))
                                     .contentShape(Rectangle())
                                     .onTapGesture {
                                         selectedChatId = nil
                                         selectedChannel = channel
+                                        UserPreferences.shared.markChannelOpened(channel.id)
                                     }
                                     .swipeActions(edge: .trailing) {
                                         Button(role: .destructive) {
@@ -205,6 +230,7 @@ struct ChatListView: View {
 
 struct ChatRow: View {
     let chat: Chat
+    var isSelected: Bool = false
     @Environment(\.isWideLayout) private var isWideLayout
 
     private var outerHorizontalPadding: CGFloat {
@@ -221,6 +247,10 @@ struct ChatRow: View {
                         Image(systemName: "person.3.fill")
                             .font(.caption)
                             .foregroundColor(.retichatPrimary)
+                    } else {
+                        Image(systemName: "person.fill")
+                            .font(.caption)
+                            .foregroundColor(.orange)
                     }
                     Text(chat.displayName)
                         .font(.headline)
@@ -271,6 +301,10 @@ struct ChatRow: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.retichatPrimary.opacity(isSelected ? 0.15 : 0))
+        )
         .glassBackground(cornerRadius: 12)
         .padding(.horizontal, outerHorizontalPadding)
         .padding(.bottom, 6)
@@ -299,6 +333,7 @@ struct ChatRow: View {
 
 struct ChannelRow: View {
     let channel: Channel
+    var isSelected: Bool = false
     @Environment(\.isWideLayout) private var isWideLayout
 
     private var outerHorizontalPadding: CGFloat { isWideLayout ? 16 : 12 }
@@ -347,6 +382,10 @@ struct ChannelRow: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.retichatPrimary.opacity(isSelected ? 0.15 : 0))
+        )
         .glassBackground(cornerRadius: 12)
         .padding(.horizontal, outerHorizontalPadding)
         .padding(.bottom, 6)

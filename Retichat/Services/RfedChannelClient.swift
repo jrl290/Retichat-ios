@@ -253,9 +253,11 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
            (try? ctx.fetch(FetchDescriptor<ChannelEntity>(
                predicate: #Predicate { $0.channelHash == channelHashHex }
            )).isEmpty) == true {
-            let nowMs = Date().timeIntervalSince1970 * 1000
+            // Channel.lastMessageTime is stored in seconds (Apple epoch) so it
+            // sorts directly against Chat.lastMessageTime.
+            let now = Date().timeIntervalSince1970
             let entity = ChannelEntity(channelHash: channelHashHex, channelName: name,
-                                       rfedNodeHash: rfedChannelDestHex, lastMessageTime: nowMs,
+                                       rfedNodeHash: rfedChannelDestHex, lastMessageTime: now,
                                        isSubscribed: true, stampCost: stampCost)
             ctx.insert(entity)
             try ctx.save()
@@ -274,7 +276,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
         let channel = Channel(id: channelHashHex, channelName: name,
                               rfedNodeHash: rfedChannelDestHex,
-                              lastMessageTime: Date().timeIntervalSince1970 * 1000,
+                              lastMessageTime: Date().timeIntervalSince1970,
                               isSubscribed: true, stampCost: stampCost)
         channels.append(channel)
         return channel
@@ -757,7 +759,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                                   senderHash: senderHashHex, senderDisplayName: "", content: content,
                                   timestamp: Double(tsMs), isOutgoing: isOutgoing)
         appendMessage(msg, toChannelHash: channelHashHex)
-        updateChannelLastMessage(channelHashHex: channelHashHex, time: Double(tsMs))
+        // updateChannelLastMessage takes seconds; tsMs is wire-format ms.
+        updateChannelLastMessage(channelHashHex: channelHashHex, time: Double(tsMs) / 1000.0)
 
         if !isOutgoing, let channel = channels.first(where: { $0.id == channelHashHex }),
            UserPreferences.shared.isChannelNotificationsEnabled(channelHashHex) {
@@ -910,10 +913,17 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         guard let ctx = modelContext else { return }
         let entities = (try? ctx.fetch(FetchDescriptor<ChannelEntity>())) ?? []
         channels = entities.map {
-            Channel(id: $0.channelHash, channelName: $0.channelName,
-                    rfedNodeHash: $0.rfedNodeHash, lastMessageTime: $0.lastMessageTime,
+            // Migrate legacy ms-encoded timestamps written before the unit
+            // switch to seconds.  Anything > 1e11 cannot be a seconds-epoch
+            // value within any plausible date (year 5138+) so it must be ms.
+            let raw = $0.lastMessageTime
+            let seconds = raw > 1e11 ? raw / 1000.0 : raw
+            if seconds != raw { $0.lastMessageTime = seconds }
+            return Channel(id: $0.channelHash, channelName: $0.channelName,
+                    rfedNodeHash: $0.rfedNodeHash, lastMessageTime: seconds,
                     isSubscribed: $0.isSubscribed, stampCost: $0.stampCost)
         }
+        try? ctx.save()
     }
 
     /// Re-subscribe to all channels that were subscribed before the app was killed.

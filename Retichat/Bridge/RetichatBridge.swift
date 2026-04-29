@@ -110,6 +110,13 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    /// Force-flush the in-memory destination/path table to disk so newly
+    /// resolved essential paths survive a force-quit before the next
+    /// 5-minute periodic persist tick.
+    nonisolated func transportSavePaths() {
+        _ = retichat_transport_save_paths()
+    }
+
     /// Query whether a configured Reticulum interface is currently online.
     /// Returns: .some(true) if online, .some(false) if offline, nil if unknown
     /// (interface not registered, e.g. not yet configured or wrong name).

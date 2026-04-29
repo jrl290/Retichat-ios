@@ -210,6 +210,9 @@ struct RetichatApp: App {
                     ConnectionStateManager.shared.openRfedNodeLink()
                     // Re-announce rfed delivery to flush deferred channel blobs
                     channelClient.announceDelivery()
+                    // Note: lxmf.delivery is auto-announced by Transport's
+                    // publish daemon on every interface up-edge and every
+                    // 30 minutes — no explicit foreground re-announce needed.
                 }
             case .background:
                 // Do NOT close the rfed link here — rapid app-switching would

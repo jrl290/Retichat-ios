@@ -33,7 +33,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     private var modelContext: ModelContext?
     private var pollTimer: Timer?
-    private var announceTimer: Timer?
 
     // MARK: - Outbound message state tracking
     //
@@ -148,12 +147,22 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         serviceRunning = true
         statusMessage = "Connected — \(ownHashHex.prefix(8))…"
 
-        // Announce our delivery destination immediately, then every 30 minutes
-        announce()
-        announceTimer = Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.announce()
-            }
+        // Bring up any saved RNode interfaces alongside the TCP transports
+        // configured via TOML. RNode rows are not in the TOML; they are
+        // attached via the FFI `rns_rnode_iface_register` callback transport.
+        let rnodeRows: [(id: String, name: String, configJSON: String?)] =
+            interfaces()
+                .filter { $0.enabled && $0.type == InterfaceKind.rnode.rawValue }
+                .map { ($0.id, $0.name, $0.configJSON) }
+        RNodeInterfaceCoordinator.shared.start(with: rnodeRows)
+
+        // Hand the delivery destination off to Transport's auto-announce
+        // daemon: it will announce immediately, on every interface up-edge,
+        // and every 30 minutes thereafter.  Replaces the previous Timer +
+        // onConnect re-announce + foreground re-announce pattern.
+        ffiQueue.async { [weak self] in
+            guard let client = self?.lxmfClient else { return }
+            _ = client.publish(refreshSecs: 30 * 60)
         }
 
         // Sync ratchets to App Group after announce (so the NSE can decrypt).
@@ -168,13 +177,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Register with rfed notify service so the relay can wake this device.
         registerRfedNotify()
 
-        // Network reconnect handler
+        // Network reconnect handler.  Transport now auto-re-announces on
+        // every interface up-edge, so we no longer need to explicitly call
+        // announce() here — just nudge the TCP reconnect loops awake and
+        // flush any deferred outbound traffic.
         NetworkMonitor.shared.onConnect = { [weak self] in
             // Immediately wake any TCP reconnect loops that are sleeping
             RetichatBridge.shared.nudgeReconnect()
             Task { @MainActor in
                 ConnectionStateManager.shared.onNetworkReconnect()
-                self?.announce()
                 self?.flushPendingMessages()
             }
         }
@@ -188,8 +199,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     func stopService() {
         pollTimer?.invalidate()
         pollTimer = nil
-        announceTimer?.invalidate()
-        announceTimer = nil
+
+        // Stop Transport's auto-announce of our delivery destination.
+        if let client = lxmfClient {
+            ffiQueue.async { _ = client.unpublish() }
+        }
+
+        // Tear down RNode interfaces before shutting down the LXMF client so
+        // the Rust side stops before the callback transports are dropped.
+        RNodeInterfaceCoordinator.shared.stop()
 
         // Destroy any message handles still in flight.
         for (_, pending) in pendingOutbound {
@@ -255,11 +273,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         lines.append("    type = AutoInterface")
         lines.append("    enabled = No")
 
-        // Get user-configured interfaces from database (TCP client only)
+        // Get user-configured interfaces from database (TCP client only —
+        // RNode rows are realised through the BLE bridge + rns_rnode_iface_*
+        // FFI, not the TOML config).
         var addedInterfaces = false
         if let ctx = modelContext {
+            let tcpType = InterfaceKind.tcpClient.rawValue
             let descriptor = FetchDescriptor<InterfaceConfigEntity>(
-                predicate: #Predicate { $0.enabled == true }
+                predicate: #Predicate { $0.enabled == true && $0.type == tcpType }
             )
             if let interfaces = try? ctx.fetch(descriptor), !interfaces.isEmpty {
                 for iface in interfaces {
@@ -1978,6 +1999,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             predicate: #Predicate { $0.id == id }
         )
         if let iface = try? ctx.fetch(descriptor).first {
+            // If this was a running RNode interface, drop the BLE link and
+            // deregister the Rust handle before removing the row \u2014 otherwise
+            // the coordinator would keep retrying a deleted row, and the Rust
+            // side would hold a callback context for a peripheral we no
+            // longer track.
+            if iface.type == InterfaceKind.rnode.rawValue {
+                RNodeInterfaceCoordinator.shared.stopSlot(id: id)
+            }
             ctx.delete(iface)
             try? ctx.save()
         }

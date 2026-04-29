@@ -153,7 +153,11 @@ final class RfedNotifyRegistrar {
                 identityHandle: identityHandle,
                 path: "/rfed/notify/register",
                 payload: payload,
-                timeoutSecs: 15.0
+                // Long enough to cover a worst-case ~5-hop link establishment
+                // (per-hop timeout ~6s) plus a request round-trip. Shorter
+                // values caused the first attempt to abort while the link
+                // was still handshaking, even when the network was healthy.
+                timeoutSecs: 45.0
             )
 
             if let resp = response {

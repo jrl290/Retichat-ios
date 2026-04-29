@@ -168,6 +168,15 @@ pub extern "C" fn retichat_transport_hops_to(dest_hash: *const u8, len: u32) -> 
     rns::transport_hops_to(&h)
 }
 
+/// Force-flush the in-memory destination/path table to disk so newly
+/// resolved essential paths survive a force-quit. Cheap (a few KB).
+/// Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn retichat_transport_save_paths() -> i32 {
+    Transport::save_path_table();
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Announce filtering & keepalive
 // ---------------------------------------------------------------------------
@@ -216,6 +225,14 @@ pub extern "C" fn retichat_set_keepalive_interval(secs: f64) -> i32 {
 /// The remote identity must already be in Reticulum's known-destinations table
 /// (i.e. the destination's announce has been heard).  Returns 0 on success,
 /// -1 on error (call `lxmf_last_error` for details).
+///
+/// NOTE: the actual transmission (`packet.send()`) is dispatched on a
+/// background thread so this function returns immediately — Swift may
+/// safely call it from the main thread. Synchronous errors (e.g. malformed
+/// hash, unknown destination, packet construction) still return -1; send
+/// failures discovered later are logged but cannot be surfaced to the
+/// caller. ApnsTokenRegistrar's retry loop tolerates this because it
+/// drives retries from its own state, not from this return value.
 #[no_mangle]
 pub extern "C" fn retichat_packet_send_to_hash(
     dest_hash: *const u8,
@@ -252,13 +269,21 @@ pub extern "C" fn retichat_packet_send_to_hash(
     };
     rns::destroy_handle(dest_handle);
 
-    match rns::packet_send(packet_handle) {
-        Ok(_) => 0,
-        Err(e) => {
-            rns::set_error(e);
+    // Dispatch the blocking send to a background thread so iOS Swift
+    // callers (notably ApnsTokenRegistrar) can invoke us without
+    // risking a main-thread stall if Transport::outbound is contended.
+    std::thread::Builder::new()
+        .name("retichat-packet-send".to_string())
+        .spawn(move || {
+            if let Err(e) = rns::packet_send(packet_handle) {
+                eprintln!("[retichat-ffi] packet_send dispatch failed: {}", e);
+            }
+        })
+        .map(|_| 0)
+        .unwrap_or_else(|e| {
+            rns::set_error(format!("failed to spawn send thread: {}", e));
             -1
-        }
-    }
+        })
 }
 
 // ---------------------------------------------------------------------------
