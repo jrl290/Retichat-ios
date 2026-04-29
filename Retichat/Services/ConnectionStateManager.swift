@@ -18,6 +18,7 @@
 //
 
 import Foundation
+import Network
 
 @MainActor
 final class ConnectionStateManager {
@@ -42,6 +43,18 @@ final class ConnectionStateManager {
     /// Weak reference to the LXMF client, set after startup.
     private weak var lxmfClient: LxmfClient? = nil
 
+    /// Network reachability monitor — fires `appLinkNetworkChanged()` on every
+    /// path-status transition so the router gets exactly one retry trigger per
+    /// real network event (no polling).
+    private var pathMonitor: NWPathMonitor? = nil
+    private var lastPathStatus: NWPath.Status = .requiresConnection
+    /// NWPathMonitor delivers an initial callback as soon as it starts, just
+    /// reporting current reachability — that is NOT a network change. Swallow
+    /// the first callback so we do not burn the router's single per-trigger
+    /// app-link attempt before Transport has had a chance to resolve any
+    /// paths. Real subsequent transitions still fire normally.
+    private var pathMonitorPrimed: Bool = false
+
     private init() {}
 
     // MARK: - Setup
@@ -63,6 +76,39 @@ final class ConnectionStateManager {
         // Without this the pill stayed at "No path" indefinitely on cold
         // start because openRfedNodeLink() only ran on onNetworkRecover.
         openRfedNodeLink()
+        startNetworkMonitor()
+    }
+
+    /// Spawn an NWPathMonitor and forward every reachability transition into
+    /// the LXMF router as a single network-change trigger. This is the only
+    /// signal that retries an offline app-link — there is no polling.
+    private func startNetworkMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        let queue = DispatchQueue(label: "retichat.connection.pathmonitor")
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor in
+                guard let self = self else { return }
+                let prev = self.lastPathStatus
+                self.lastPathStatus = path.status
+                // First callback after monitor.start() is the initial state
+                // report, not a transition. Record it and return without
+                // triggering an app-link attempt — paths haven't resolved yet.
+                guard self.pathMonitorPrimed else {
+                    self.pathMonitorPrimed = true
+                    print("[ConnState] network monitor primed: status=\(path.status), interfaces=\(path.availableInterfaces.map(\.name))")
+                    return
+                }
+                guard prev != path.status else { return }
+                print("[ConnState] network change: \(prev) → \(path.status), interfaces=\(path.availableInterfaces.map(\.name))")
+                let client = self.lxmfClient
+                Task.detached(priority: .userInitiated) {
+                    client?.appLinkNetworkChanged()
+                }
+            }
+        }
+        monitor.start(queue: queue)
+        pathMonitor = monitor
     }
 
     // MARK: - Announce-driven reachability
@@ -186,7 +232,10 @@ final class ConnectionStateManager {
         rfedLinkDestData = destData
         let client = lxmfClient
         Task.detached(priority: .userInitiated) {
-            client?.appLinkOpen(destData)
+            // rfed.channel — NOT lxmf.delivery. Without the right aspects the
+            // router would resolve the destination identity wrong on every
+            // (re)establishment and the link would never reach ACTIVE.
+            client?.appLinkOpen(destData, app: "rfed", aspects: ["channel"])
         }
     }
 
@@ -313,16 +362,45 @@ final class ConnectionStateManager {
         Task.detached(priority: .userInitiated) {
             let t = CFAbsoluteTimeGetCurrent()
             print("[DIAG][requestEssentialPaths] task start count=\(destPairs.count)")
+            var requested: [(Data, String)] = []
             for (dest, label) in destPairs {
                 let hasPath = bridge.transportHasPath(destHash: dest)
                 print("[DIAG][requestEssentialPaths] dest=\(label) hasPath=\(hasPath)")
                 if !hasPath {
                     _ = bridge.transportRequestPath(destHash: dest)
                     print("[DIAG][requestEssentialPaths] requestPath done dest=\(label)")
+                    requested.append((dest, label))
                 }
             }
             let took = String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t)
             print("[DIAG][requestEssentialPaths] task done took=\(took)s")
+
+            // If we asked for any paths, poll briefly for resolution and
+            // force-persist the on-disk path table once all asked-for
+            // essentials have been resolved (or after a hard timeout).
+            // This closes the cold-start "No path" gap caused by the
+            // 5-minute periodic persist cadence.
+            guard !requested.isEmpty else { return }
+            let pollDeadline = CFAbsoluteTimeGetCurrent() + 20.0
+            var resolvedAny = false
+            while CFAbsoluteTimeGetCurrent() < pollDeadline {
+                requested.removeAll { dest, label in
+                    if bridge.transportHasPath(destHash: dest) {
+                        print("[DIAG][requestEssentialPaths] resolved dest=\(label)")
+                        resolvedAny = true
+                        return true
+                    }
+                    return false
+                }
+                if requested.isEmpty { break }
+                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 s
+            }
+            if resolvedAny {
+                bridge.transportSavePaths()
+                print("[DIAG][requestEssentialPaths] persisted path table to disk")
+            } else {
+                print("[DIAG][requestEssentialPaths] no essentials resolved before timeout; skipping persist")
+            }
         }
     }
 }

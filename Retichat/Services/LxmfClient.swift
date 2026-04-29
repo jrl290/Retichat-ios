@@ -190,11 +190,23 @@ final class LxmfClient: @unchecked Sendable {
     /// Open an app link for the given destination.  Internally watches the announce,
     /// requests a path, and establishes a direct link when the path arrives.
     /// The link is kept alive and exempt from inactivity cleanup.
+    ///
+    /// `app` and `aspects` describe the destination identity. Defaults match
+    /// LXMF peer destinations; pass `app: "rfed", aspects: ["channel"]` for the
+    /// rfed channel link, etc. Without the right tuple the router cannot
+    /// resolve the destination on reconnect and the link will silently fail.
     @discardableResult
-    nonisolated func appLinkOpen(_ destHash: Data) -> Bool {
-        destHash.withUnsafeBytes { buf -> Bool in
+    nonisolated func appLinkOpen(_ destHash: Data,
+                                 app: String = "lxmf",
+                                 aspects: [String] = ["delivery"]) -> Bool {
+        let aspectsCsv = aspects.joined(separator: ".")
+        return destHash.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
             let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
-            return lxmf_app_link_open(handle, p, UInt32(destHash.count)) == 0
+            return app.withCString { (appC: UnsafePointer<CChar>) -> Bool in
+                aspectsCsv.withCString { (aspC: UnsafePointer<CChar>) -> Bool in
+                    lxmf_app_link_open(handle, p, UInt32(destHash.count), appC, aspC) == 0
+                }
+            }
         }
     }
 
@@ -225,6 +237,15 @@ final class LxmfClient: @unchecked Sendable {
         aspect.withCString { cAspect in
             lxmf_app_link_register_reconnect(handle, cAspect) == 0
         }
+    }
+
+    /// Notify the router that the host's network reachability state has
+    /// changed (interface up/down, Wi-Fi ↔ cellular, etc.).
+    /// Triggers ONE fresh attempt for every registered app-link not currently
+    /// active or establishing. The router does not retry on its own.
+    @discardableResult
+    nonisolated func appLinkNetworkChanged() -> Bool {
+        lxmf_app_link_network_changed(handle) == 0
     }
 
     /// Send a blocking request on an existing app-link.
@@ -267,6 +288,21 @@ final class LxmfClient: @unchecked Sendable {
     @discardableResult
     func announce() -> Bool {
         lxmf_client_announce(handle) == 0
+    }
+
+    /// Opt this client's delivery destination into Transport's auto-announce
+    /// daemon. Transport will then re-announce automatically on every
+    /// interface up-edge and every `refreshSecs` seconds (pass 0 for
+    /// up-edge-only).
+    @discardableResult
+    func publish(refreshSecs: TimeInterval) -> Bool {
+        lxmf_client_publish(handle, refreshSecs) == 0
+    }
+
+    /// Remove this client's delivery destination from the auto-announce daemon.
+    @discardableResult
+    func unpublish() -> Bool {
+        lxmf_client_unpublish(handle) == 0
     }
 
     /// Watch for announces from a destination hash.

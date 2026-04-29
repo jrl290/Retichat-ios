@@ -185,9 +185,18 @@ int32_t lxmf_peer_link_status(uint64_t client, const uint8_t *dest_hash, uint32_
 /// Open an app link.  Watches dest, requests path, establishes link
 /// when path arrives.  Push-driven (no polling).  Link kept alive
 /// automatically and exempt from inactivity cleanup.
+///
+/// `app_name` and `aspects_csv` describe the destination identity that the
+/// router must resolve when (re)establishing the link. Examples:
+///   app_name="lxmf", aspects_csv="delivery"  — peer chat link.
+///   app_name="rfed", aspects_csv="channel"   — rfed channel link.
+///   app_name="rfed", aspects_csv="notify"    — rfed notify link.
+/// `aspects_csv` is `.`-separated; pass "" if the app has no aspects.
 /// Returns 0 on success, -1 on error.
 int32_t lxmf_app_link_open(uint64_t client,
-                            const uint8_t *dest_hash, uint32_t dest_len);
+                            const uint8_t *dest_hash, uint32_t dest_len,
+                            const char *app_name,
+                            const char *aspects_csv);
 
 /// Close an app link.  Tears down the direct link.
 /// Returns 0 on success, -1 on error.
@@ -214,6 +223,16 @@ int32_t lxmf_app_link_status(uint64_t client,
 int32_t lxmf_app_link_register_reconnect(uint64_t client,
                                           const char *aspect_filter);
 
+/// Notify the router that the host's network reachability state has
+/// changed (interface up/down, Wi-Fi <-> cellular, VPN flipped, etc.).
+///
+/// Triggers ONE fresh app-link establishment attempt for every registered
+/// app-link that is not currently active or already establishing. The
+/// router does not retry on its own — call this from a network-state
+/// observer (NWPathMonitor on iOS, ConnectivityManager on Android).
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_network_changed(uint64_t client);
+
 /// Send a blocking request on an existing app-link.
 ///
 /// Reuses the persistent app-link opened by `lxmf_app_link_open` instead of
@@ -235,6 +254,18 @@ uint8_t *lxmf_app_link_request(uint64_t client,
 
 int32_t lxmf_client_announce(uint64_t client);
 int32_t lxmf_client_watch(uint64_t client, const uint8_t *dest_hash, uint32_t dest_len);
+
+/// Opt this client's delivery destination into Transport's auto-announce
+/// daemon. Transport will then re-announce automatically:
+///   * once on every interface false→true `online` transition, and
+///   * every `refresh_secs` seconds (pass 0.0 to disable periodic
+///     refresh and only re-announce on interface up-edges).
+/// Idempotent: a second call updates the entry. Returns 0 on success.
+int32_t lxmf_client_publish(uint64_t client, double refresh_secs);
+
+/// Remove this client's delivery destination from the auto-announce
+/// daemon. Returns 0 on success.
+int32_t lxmf_client_unpublish(uint64_t client);
 
 /// Look up the cached display name for a destination hash (from its last announce).
 /// Writes a NUL-terminated UTF-8 string into out_buf.
@@ -288,6 +319,7 @@ int32_t retichat_identity_destroy(uint64_t handle);
 int32_t retichat_transport_has_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_hops_to(const uint8_t *dest_hash, uint32_t len);
+int32_t retichat_transport_save_paths(void);
 
 #pragma mark - Settings
 
@@ -399,5 +431,93 @@ uint8_t *retichat_channel_lxm_pack(const char *name,
 uint8_t *retichat_channel_lxm_unpack(const char *name,
                                       const uint8_t *lxmf_data, uint32_t lxmf_data_len,
                                       uint32_t *out_len);
+
+#pragma mark - RNS RNode callback interface (BLE / Serial via native bridge)
+
+/// Radio configuration for an RNode interface.
+/// `_set` flags select whether the matching optional value is applied.
+typedef struct RnsRNodeRadioConfig {
+    uint64_t frequency;
+    uint32_t bandwidth;
+    uint8_t  txpower;
+    uint8_t  sf;
+    uint8_t  cr;
+    uint8_t  flow_control;       // 0 = off, non-zero = on
+    uint8_t  st_alock_set;       // 0 = none, 1 = use st_alock_pct
+    float    st_alock_pct;
+    uint8_t  lt_alock_set;
+    float    lt_alock_pct;
+    uint8_t  id_beacon_set;      // 0 = none, 1 = use id_interval_secs + id_callsign
+    uint64_t id_interval_secs;
+    const uint8_t *id_callsign;  // may be NULL when id_beacon_set == 0
+    uint32_t id_callsign_len;
+} RnsRNodeRadioConfig;
+
+/// Latest device telemetry snapshot.
+typedef struct RnsRNodeStats {
+    uint8_t  online;
+    uint8_t  detected;
+    uint8_t  frequency_set;     uint64_t frequency;
+    uint8_t  bandwidth_set;     uint32_t bandwidth;
+    uint8_t  txpower_set;       uint8_t  txpower;
+    uint8_t  sf_set;            uint8_t  sf;
+    uint8_t  cr_set;            uint8_t  cr;
+    uint8_t  rssi_set;          int16_t  rssi;
+    uint8_t  snr_set;           float    snr;
+    uint8_t  q_set;             float    q;
+    uint8_t  rx_packets_set;    uint32_t rx_packets;
+    uint8_t  tx_packets_set;    uint32_t tx_packets;
+    float    airtime_short;
+    float    airtime_long;
+    float    channel_load_short;
+    float    channel_load_long;
+    uint8_t  battery_state;
+    uint8_t  battery_percent;
+    uint8_t  temperature_set;   int8_t   temperature;
+    uint8_t  firmware_maj;
+    uint8_t  firmware_min;
+} RnsRNodeStats;
+
+/// TX callback signature: invoked from Rust when KISS-framed bytes are ready
+/// to be written to the radio. The bridge is responsible for any link-MTU
+/// chunking (e.g. 20-byte BLE writes). Return non-zero on success.
+typedef int32_t (*RnsRNodeSendFn)(void *user_data, const uint8_t *data, uint32_t len);
+
+/// Register an RNode callback interface. Spawns the read loop and runs the
+/// DETECT/init handshake (~3s while bytes are fed in).
+/// Returns a handle (>0) or 0 on error (check rns_last_error).
+uint64_t rns_rnode_iface_register(const char *name,
+                                  RnsRNodeSendFn send_fn,
+                                  void *user_data,
+                                  const RnsRNodeRadioConfig *cfg);
+
+/// Build the RNode interface and spawn its read loop, but do NOT run the
+/// DETECT/init handshake. Lets the bridge obtain the handle (and start
+/// feeding RX bytes via rns_rnode_iface_feed) BEFORE blocking inside the
+/// handshake. Call rns_rnode_iface_configure next.
+/// Returns a handle (>0) or 0 on error (check rns_last_error).
+uint64_t rns_rnode_iface_create(const char *name,
+                                RnsRNodeSendFn send_fn,
+                                void *user_data,
+                                const RnsRNodeRadioConfig *cfg);
+
+/// Run the DETECT/init handshake on a previously-created RNode handle and
+/// wire it into the Transport. Blocks for ~2-4 seconds while DETECT/setup
+/// bytes are exchanged with the device. Returns 0 on success, -1 on error.
+int32_t  rns_rnode_iface_configure(uint64_t handle);
+
+/// Push RX bytes (received from the radio) into the read loop. Returns 0 on
+/// success, -1 on error.
+int32_t  rns_rnode_iface_feed(uint64_t handle, const uint8_t *data, uint32_t len);
+
+/// Fetch the latest device telemetry into `out`. Returns 0 on success, -1 on error.
+int32_t  rns_rnode_iface_get_stats(uint64_t handle, RnsRNodeStats *out);
+
+/// Send the configured ID-beacon callsign immediately. Returns 0 on success, -1 on error.
+int32_t  rns_rnode_iface_id_beacon_now(uint64_t handle);
+
+/// Deregister and tear down the Transport binding. The bridge must stop
+/// calling rns_rnode_iface_feed before invoking this. Returns 0 on success, -1 on error.
+int32_t  rns_rnode_iface_deregister(uint64_t handle);
 
 #endif /* CRetichatFFI_h */
