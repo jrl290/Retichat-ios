@@ -14,6 +14,7 @@ final class UserPreferences {
 
     private enum Keys {
         static let displayName = "display_name"
+        static let channelDisplayName = "channel_display_name"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
         static let rfedNotifyHash = "rfed_notify_hash"
@@ -23,11 +24,22 @@ final class UserPreferences {
         static let rfedLxmfPropOverride = "rfed_lxmf_prop_override"
         static let filterStrangers = "filter_strangers"
         static let mutedChatIds = "muted_chat_ids"
+        static let channelNotificationsOn = "channel_notifications_on"
+        static let channelPushEnabled = "channel_push_enabled"
+        static let channelLastOpened = "channel_last_opened"
     }
 
     var displayName: String {
         get { defaults.string(forKey: Keys.displayName) ?? "" }
         set { defaults.set(newValue, forKey: Keys.displayName) }
+    }
+
+    /// Display name embedded in outgoing channel messages.
+    /// If empty, falls back to `displayName`. Stored once by the sender;
+    /// receivers see whatever name was in the message when it arrived.
+    var channelDisplayName: String {
+        get { defaults.string(forKey: Keys.channelDisplayName) ?? "" }
+        set { defaults.set(newValue, forKey: Keys.channelDisplayName) }
     }
 
     var dropAnnounces: Bool {
@@ -110,5 +122,93 @@ final class UserPreferences {
 
     func isChatMuted(_ chatId: String) -> Bool {
         mutedChatIds.contains(chatId)
+    }
+
+    /// Set of channel IDs for which notifications are enabled.
+    /// Channels are opt-in (default off); add a channel ID here to enable notifications.
+    var channelNotificationsOn: Set<String> {
+        get {
+            let arr = defaults.stringArray(forKey: Keys.channelNotificationsOn) ?? []
+            return Set(arr)
+        }
+        set { defaults.set(Array(newValue), forKey: Keys.channelNotificationsOn) }
+    }
+
+    func enableChannelNotifications(_ channelId: String) {
+        var ids = channelNotificationsOn
+        ids.insert(channelId)
+        channelNotificationsOn = ids
+    }
+
+    func disableChannelNotifications(_ channelId: String) {
+        var ids = channelNotificationsOn
+        ids.remove(channelId)
+        channelNotificationsOn = ids
+    }
+
+    func isChannelNotificationsEnabled(_ channelId: String) -> Bool {
+        channelNotificationsOn.contains(channelId)
+    }
+
+    /// Set of channel IDs for which push wakeups are enabled.
+    /// When enabled, the device registers with rfed.notify so a silent push is fired
+    /// for every new channel message (waking the app to pull it).
+    /// Defaults to ON when a channel is joined.
+    var channelPushEnabled: Set<String> {
+        get {
+            let arr = defaults.stringArray(forKey: Keys.channelPushEnabled) ?? []
+            return Set(arr)
+        }
+        set { defaults.set(Array(newValue), forKey: Keys.channelPushEnabled) }
+    }
+
+    func enableChannelPush(_ channelId: String) {
+        var ids = channelPushEnabled
+        ids.insert(channelId)
+        channelPushEnabled = ids
+    }
+
+    func disableChannelPush(_ channelId: String) {
+        var ids = channelPushEnabled
+        ids.remove(channelId)
+        channelPushEnabled = ids
+    }
+
+    func isChannelPushEnabled(_ channelId: String) -> Bool {
+        channelPushEnabled.contains(channelId)
+    }
+
+    /// Per-channel "last opened" timestamp in **seconds** (Apple epoch).
+    /// Used by `ChatListView` as the channel sort key so channels only
+    /// bubble to the top when the user actually opens them — incoming
+    /// channel traffic does *not* reorder the list.  Channels never
+    /// opened on this device sit at the bottom (timestamp 0).
+    var channelLastOpened: [String: Double] {
+        get {
+            let raw = defaults.dictionary(forKey: Keys.channelLastOpened) as? [String: Double] ?? [:]
+            // Migrate legacy ms-encoded values written before the unit switch.
+            // Anything > 1e11 cannot be a seconds-epoch value (year 5138+).
+            var migrated = raw
+            var changed = false
+            for (k, v) in raw where v > 1e11 {
+                migrated[k] = v / 1000.0
+                changed = true
+            }
+            if changed {
+                defaults.set(migrated, forKey: Keys.channelLastOpened)
+            }
+            return migrated
+        }
+        set { defaults.set(newValue, forKey: Keys.channelLastOpened) }
+    }
+
+    func channelLastOpenedTime(_ channelId: String) -> Double {
+        channelLastOpened[channelId] ?? 0
+    }
+
+    func markChannelOpened(_ channelId: String, at time: Double = Date().timeIntervalSince1970) {
+        var map = channelLastOpened
+        map[channelId] = time
+        channelLastOpened = map
     }
 }

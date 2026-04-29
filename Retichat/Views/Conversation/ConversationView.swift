@@ -2,7 +2,7 @@
 //  ConversationView.swift
 //  Retichat
 //
-//  Chat conversation screen. Mirrors Android ConversationScreen.kt.
+//  Unified chat screen for DM/group conversations (LXMF) and RFed channels.
 //
 
 import SwiftUI
@@ -10,40 +10,170 @@ import PhotosUI
 import Combine
 import GameController
 
+// MARK: - Conversation mode
+
+/// Selects between a DM/group conversation backed by LXMF and a pub-sub channel
+/// backed by RFed. ConversationView renders the same chrome for both; only the
+/// data source and a few affordances (attachments, chat-info) differ.
+enum ConversationMode: Hashable {
+    case dm(chatId: String)
+    case channel(Channel)
+}
+
+// MARK: - View
+
 struct ConversationView: View {
     @EnvironmentObject var repository: ChatRepository
+    @EnvironmentObject var channelClient: RfedChannelClient
     @StateObject private var viewModel: ConversationViewModel
     @Environment(\.dismiss) private var dismiss
 
-    let chatId: String
+    let mode: ConversationMode
 
+    // Shared compose state
     @State private var messageText = ""
+    @State private var scrollProxy: ScrollViewProxy?
+    /// Per-channel guard for the automatic first-open PULL: stores the
+    /// `RfedChannelClient.rfedLinkGeneration` value at the time of the last
+    /// auto-pull for the channel currently on screen.  The view auto-pulls
+    /// when the live generation differs from this stored value, i.e. once
+    /// per link establishment per channel.  `nil` means "never auto-pulled
+    /// while this view was on screen".
+    @State private var lastAutoPullGeneration: Int?
+    @FocusState private var isTextFieldFocused: Bool
+
+    // DM-only state
     @State private var showAttachmentPicker = false
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var pendingAttachments: [(String, Data)] = []
     @State private var showChatInfo = false
-    @State private var scrollProxy: ScrollViewProxy?
-    @FocusState private var isTextFieldFocused: Bool
+
+    /// Raw direct-link status to the DM peer, refreshed on the 3 s timer.
+    /// Encoding: high byte = appLinkStatus (0..4, 0xFF = unknown),
+    /// low byte = peerLinkStatus (0..2, 0xFF = unknown).  Stored as a
+    /// single Int so SwiftUI only diffs one value per tick.
+    @State private var peerLinkRawStatus: Int = -1
+
+    /// Master switch for the title-bar direct-link status dot.  Set to
+    /// `false` to hide the indicator while keeping the supporting code in
+    /// place for easy re-enable.
+    private static let showPeerLinkDot: Bool = false
+
+    // MARK: - Convenience
+
+    private var chatId: String {
+        if case .dm(let id) = mode { return id }
+        return ""
+    }
+
+    private var channel: Channel? {
+        if case .channel(let ch) = mode { return ch }
+        return nil
+    }
+
+    private var isChannelMode: Bool {
+        if case .channel = mode { return true }
+        return false
+    }
 
     private var isGroupPending: Bool {
-        repository.chats.first(where: { $0.id == chatId })?.isPendingInvite ?? false
+        guard !isChannelMode else { return false }
+        return repository.chats.first(where: { $0.id == chatId })?.isPendingInvite ?? false
     }
 
-    init(chatId: String) {
-        self.chatId = chatId
+    private var navigationTitle: String {
+        switch mode {
+        case .dm:              return viewModel.chatTitle
+        case .channel(let ch): return "#\(ch.channelName)"
+        }
+    }
+
+    private var inputBarPlaceholder: String {
+        if let ch = channel { return "Message #\(ch.channelName)..." }
+        return "Message..."
+    }
+
+    /// Color of the direct-link status dot shown next to the title in DM mode.
+    /// Follows the project's UI conventions:
+    ///   grey   — idle / not yet attempted
+    ///   yellow — in progress (path requested or link establishing)
+    ///   green  — direct link active
+    ///   red    — last attempt failed (DISCONNECTED)
+    /// Returns nil for groups / channels / before peerHash is known.
+    private var peerLinkDotColor: Color? {
+        guard !isChannelMode, !viewModel.isGroup else { return nil }
+        let appRaw = (peerLinkRawStatus >> 8) & 0xFF
+        let peerRaw = peerLinkRawStatus & 0xFF
+        if appRaw == 0xFF && peerRaw == 0xFF { return nil }
+        if appRaw == 3 || peerRaw == 2 { return .green }
+        if appRaw == 1 || appRaw == 2 || peerRaw == 1 { return .yellow }
+        if appRaw == 4 { return .red }
+        return .gray
+    }
+
+    /// Refresh `peerLinkRawStatus` from the LXMF client for the current peer.
+    private func refreshPeerLinkStatus() {
+        guard !isChannelMode, !viewModel.isGroup,
+              !viewModel.peerHash.isEmpty,
+              let destData = Data(hexString: viewModel.peerHash),
+              let client = repository.lxmfClient
+        else {
+            peerLinkRawStatus = -1
+            return
+        }
+        let app = client.appLinkStatus(destData)
+        let peer = client.peerLinkStatus(destData)
+        let appByte = app < 0 ? 0xFF : Int(app) & 0xFF
+        let peerByte = peer < 0 ? 0xFF : Int(peer) & 0xFF
+        peerLinkRawStatus = (appByte << 8) | peerByte
+    }
+
+    /// Scroll the channel message list to the bottom sentinel with several
+    /// staggered retries.  A single `proxy.scrollTo` race-condition'd with
+    /// the `LazyVStack` materializing trailing rows is what produces the
+    /// "open the channel and the screen is blank until I scroll up" bug.
+    /// The retries cover (a) the initial layout pass, (b) the pass after
+    /// the first batch of cells materialise, and (c) any final reflow once
+    /// every bubble's text has settled at its final wrapped height.
+    private func scrollChannelToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        let target = "CHANNEL_LIST_BOTTOM"
+        let scroll = {
+            if animated {
+                withAnimation { proxy.scrollTo(target, anchor: .bottom) }
+            } else {
+                proxy.scrollTo(target, anchor: .bottom)
+            }
+        }
+        DispatchQueue.main.async(execute: scroll)
+        for delay in [0.05, 0.15, 0.35, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: scroll)
+        }
+    }
+
+    // MARK: - Init
+
+    init(mode: ConversationMode) {
+        self.mode = mode
         _viewModel = StateObject(wrappedValue: ConversationViewModel())
     }
+
+    // MARK: - Body
 
     var body: some View {
         ZStack {
             Color.retichatBackground.ignoresSafeArea()
 
             VStack(spacing: 0) {
-                messagesList
+                if let ch = channel {
+                    channelMessagesList(channel: ch)
+                } else {
+                    messagesList
+                }
 
-                attachmentPreview
+                if !isChannelMode {
+                    attachmentPreview
+                }
 
-                // Input bar / invite overlay
                 if viewModel.isGroup && isGroupPending {
                     inviteOverlay
                 } else {
@@ -53,11 +183,34 @@ struct ConversationView: View {
             .blur(radius: showChatInfo ? 8 : 0)
             .animation(.easeInOut(duration: 0.25), value: showChatInfo)
         }
-        .navigationTitle(viewModel.chatTitle)
+        .navigationTitle(navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    // Direct-link status dot — temporarily hidden but kept in
+                    // place so it can be re-enabled by flipping this flag.
+                    if Self.showPeerLinkDot, let dot = peerLinkDotColor {
+                        Circle()
+                            .fill(dot)
+                            .frame(width: 8, height: 8)
+                            .accessibilityLabel("Direct link status")
+                    }
+                    Text(navigationTitle)
+                        .font(.headline)
+                        .foregroundColor(.retichatOnSurface)
+                        .lineLimit(1)
+                }
+            }
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if isGroupPending {
+                if isChannelMode {
+                    Button {
+                        showChatInfo = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.retichatPrimary)
+                    }
+                } else if isGroupPending {
                     Menu {
                         Button("Accept Invite") {
                             repository.acceptGroupInvite(groupId: chatId)
@@ -81,7 +234,7 @@ struct ConversationView: View {
             }
         }
         .photosPicker(isPresented: $showAttachmentPicker, selection: $selectedPhotos,
-                       maxSelectionCount: 5, matching: .any(of: [.images, .videos]))
+                      maxSelectionCount: 5, matching: .any(of: [.images, .videos]))
         .onChange(of: selectedPhotos) { _, newItems in
             Task {
                 for item in newItems {
@@ -94,54 +247,74 @@ struct ConversationView: View {
             }
         }
         .sheet(isPresented: $showChatInfo) {
-            ChatInfoSheet(
-                chatId: chatId,
-                isGroup: viewModel.isGroup,
-                onArchive: {
-                    repository.archiveChat(chatId: chatId)
-                    dismiss()
-                },
-                onDelete: {
-                    repository.deleteChat(chatId: chatId)
-                    dismiss()
-                },
-                onLeave: {
-                    repository.leaveGroup(chatId: chatId)
-                    dismiss()
-                }
-            )
+            if let ch = channel {
+                ChannelInfoSheet(channel: ch, onLeave: { dismiss() })
+                    .environmentObject(channelClient)
+            } else {
+                ChatInfoSheet(
+                    chatId: chatId,
+                    isGroup: viewModel.isGroup,
+                    onArchive: {
+                        repository.archiveChat(chatId: chatId)
+                        dismiss()
+                    },
+                    onDelete: {
+                        repository.deleteChat(chatId: chatId)
+                        dismiss()
+                    },
+                    onLeave: {
+                        repository.leaveGroup(chatId: chatId)
+                        dismiss()
+                    }
+                )
+            }
         }
         .onAppear {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            print("[DIAG][onAppear] start chatId=\(chatId.prefix(8))")
-            viewModel.loadChat(chatId: chatId, repository: repository)
-            print("[DIAG][onAppear] loadChat done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
-            NotificationManager.shared.activeChatId = chatId
-            NotificationManager.shared.clearNotifications(forChatId: chatId)
-            print("[DIAG][onAppear] clearNotifications done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
-            repository.openConversation(chatId: chatId)
-            print("[DIAG][onAppear] openConversation done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+            if case .dm(let id) = mode {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                print("[DIAG][onAppear] start chatId=\(id.prefix(8))")
+                viewModel.loadChat(chatId: id, repository: repository)
+                print("[DIAG][onAppear] loadChat done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+                NotificationManager.shared.activeChatId = id
+                NotificationManager.shared.clearNotifications(forChatId: id)
+                print("[DIAG][onAppear] clearNotifications done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+                repository.openConversation(chatId: id)
+                print("[DIAG][onAppear] openConversation done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
+                refreshPeerLinkStatus()
+            }
+            // Channel chats need live link-status updates so the auto-PULL
+            // can fire on each fresh link establishment.  Refcounted so it
+            // composes with SettingsView's own monitor retain.
+            if case .channel = mode {
+                channelClient.retainRfedLinkMonitor()
+            }
             isTextFieldFocused = true
-            print("[DIAG][onAppear] focus set done +\(String(format:"%.3f", CFAbsoluteTimeGetCurrent()-t0))s")
         }
         .onDisappear {
-            print("[DIAG][onDisappear] chatId=\(chatId.prefix(8))")
-            NotificationManager.shared.activeChatId = nil
-            repository.closeConversation(chatId: chatId)
-            print("[DIAG][onDisappear] closeConversation done")
+            if case .dm(let id) = mode {
+                print("[DIAG][onDisappear] chatId=\(id.prefix(8))")
+                NotificationManager.shared.activeChatId = nil
+                repository.closeConversation(chatId: id)
+                print("[DIAG][onDisappear] closeConversation done")
+            }
+            if case .channel = mode {
+                channelClient.releaseRfedLinkMonitor()
+            }
         }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
-            viewModel.refreshMessages(chatId: chatId, repository: repository)
+            if case .dm(let id) = mode {
+                viewModel.refreshMessages(chatId: id, repository: repository)
+                refreshPeerLinkStatus()
+            }
         }
     }
 
-    // MARK: - Sub-views
+    // MARK: - DM message list
 
     private var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    // Load more button at top
                     if viewModel.canLoadMore {
                         Button {
                             let firstId = viewModel.messages.first?.id
@@ -194,6 +367,144 @@ struct ConversationView: View {
         }
     }
 
+    // MARK: - Channel message list
+
+    private func channelMessagesList(channel: Channel) -> some View {
+        let msgs = channelClient.messages[channel.id] ?? []
+        let nodeKey = channel.rfedNodeHash
+        // Treat "unknown" (nil) as "more might be pending" so the user is
+        // always offered an initial pull when entering a channel; a previous
+        // pull that returned more_pending=false explicitly sets it to false.
+        let canPull = channelClient.canPullMore[nodeKey] ?? true
+        let pulling = channelClient.pullInFlight[nodeKey] ?? false
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    // Mirrors the DM "Load earlier messages" UX: a button at
+                    // the top of the list that the user taps to drain the
+                    // next page of pending blobs from the rfed node's
+                    // deferred queue.  Hidden once the server reports
+                    // more_pending=false on the most recent pull.
+                    if canPull {
+                        Button {
+                            let firstId = msgs.first?.id
+                            Task {
+                                await channelClient.pullDeferred(channel: channel)
+                                if let fid = firstId {
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                        proxy.scrollTo(fid, anchor: .top)
+                                    }
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                if pulling {
+                                    ProgressView().scaleEffect(0.7)
+                                }
+                                Text(pulling ? "Loading…" : "Load earlier messages")
+                                    .font(.caption)
+                                    .foregroundColor(.retichatPrimary)
+                            }
+                            .padding(.vertical, 8)
+                        }
+                        .disabled(pulling)
+                    }
+
+                    ForEach(msgs) { msg in
+                        // Reuse the direct/group ChatBubble so channels share
+                        // the exact same visual layout. Channel timestamps
+                        // are Unix-ms; ChatMessage expects seconds. Channels
+                        // never carry attachments or upload progress.
+                        ChatBubble(
+                            message: ChatMessage(
+                                id: msg.id,
+                                senderHash: msg.senderHash,
+                                senderName: msg.isOutgoing
+                                    ? "You"
+                                    : (!msg.senderDisplayName.isEmpty
+                                        ? msg.senderDisplayName
+                                        : repository.contactDisplayName(for: msg.senderHash)),
+                                content: msg.content,
+                                timestamp: msg.timestamp / 1000.0,
+                                isOutgoing: msg.isOutgoing,
+                                deliveryState: msg.deliveryState,
+                                attachments: [],
+                                uploadProgress: nil
+                            ),
+                            isGroup: true
+                        )
+                        .id(msg.id)
+                    }
+
+                    // Zero-height sentinel pinned to the very end of the
+                    // stack. Scrolling to this anchor (rather than the last
+                    // bubble's id) keeps us correctly pinned to the bottom
+                    // even when bubble heights re-measure during async
+                    // layout — which would otherwise leave the viewport
+                    // scrolled past the actual content end and show a blank
+                    // screen.
+                    Color.clear
+                        .frame(height: 1)
+                        .id("CHANNEL_LIST_BOTTOM")
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+            // NOTE: deliberately NOT using `.defaultScrollAnchor(.bottom)`.
+            // It races with our explicit `proxy.scrollTo` while the
+            // `LazyVStack` materializes rows, and once SwiftUI commits a
+            // bottom offset based on partially-realized content, later
+            // bubble remeasures can strand the viewport below the actual
+            // content end (showing a blank screen until the user scrolls
+            // back up).  We anchor explicitly to a zero-height sentinel
+            // pinned to the very last position with multiple retries.
+            .onChange(of: msgs.count) { oldCount, newCount in
+                guard !msgs.isEmpty else { return }
+                if oldCount == 0 {
+                    scrollChannelToBottom(proxy: proxy, animated: false)
+                } else if newCount > oldCount {
+                    scrollChannelToBottom(proxy: proxy, animated: true)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                guard !msgs.isEmpty else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    withAnimation {
+                        proxy.scrollTo("CHANNEL_LIST_BOTTOM", anchor: .bottom)
+                    }
+                }
+            }
+            .onAppear {
+                scrollProxy = proxy
+                // Re-enable the page-load action whenever the user re-enters
+                // the channel: the server may have queued more blobs since
+                // the last visit.
+                channelClient.canPullMore[nodeKey] = nil
+                if !(channelClient.messages[channel.id] ?? []).isEmpty {
+                    scrollChannelToBottom(proxy: proxy, animated: false)
+                }
+            }
+            // Automatic PULL on each fresh rfed link establishment, scoped
+            // to the channel chat being open. The `.task(id:)` re-runs
+            // whenever `rfedLinkGeneration` changes; we only fire a pull if
+            // the link is currently `.connected` AND we haven't already
+            // pulled for this generation. This means:
+            //   - Re-opening the same channel without a link bounce: no pull.
+            //   - Link drops and re-establishes while viewing a channel: pull.
+            //   - First open after a link establishment that happened before
+            //     the screen was shown: pull (generation differs from nil).
+            .task(id: channelClient.rfedLinkGeneration) {
+                guard channelClient.rfedNodeStatus == .connected else { return }
+                let gen = channelClient.rfedLinkGeneration
+                guard lastAutoPullGeneration != gen else { return }
+                lastAutoPullGeneration = gen
+                await channelClient.pullDeferred(channel: channel)
+            }
+        }
+    }
+
+    // MARK: - Attachment preview (DM only)
+
     @ViewBuilder
     private var attachmentPreview: some View {
         if !pendingAttachments.isEmpty {
@@ -233,6 +544,8 @@ struct ConversationView: View {
         }
     }
 
+    // MARK: - Group invite overlay (DM only)
+
     private var inviteOverlay: some View {
         VStack(spacing: 0) {
             Divider()
@@ -269,17 +582,21 @@ struct ConversationView: View {
         }
     }
 
+    // MARK: - Input bar (attachment button hidden for channels)
+
     private var inputBar: some View {
         HStack(spacing: 8) {
-            Button {
-                showAttachmentPicker = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(.title3)
-                    .foregroundColor(.retichatPrimary)
+            if !isChannelMode {
+                Button {
+                    showAttachmentPicker = true
+                } label: {
+                    Image(systemName: "paperclip")
+                        .font(.title3)
+                        .foregroundColor(.retichatPrimary)
+                }
             }
 
-            TextField("Message…", text: $messageText, axis: .vertical)
+            TextField(inputBarPlaceholder, text: $messageText, axis: .vertical)
                 .focused($isTextFieldFocused)
                 .foregroundColor(.retichatOnSurface)
                 .lineLimit(1...5)
@@ -321,6 +638,8 @@ struct ConversationView: View {
         .background(Color.retichatSurface)
     }
 
+    // MARK: - Send
+
     private func sendMessage() {
         let content = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
         let atts = pendingAttachments
@@ -329,12 +648,20 @@ struct ConversationView: View {
         messageText = ""
         pendingAttachments = []
 
-        repository.sendMessage(chatId: chatId, content: content, attachments: atts)
-        viewModel.refreshMessages(chatId: chatId, repository: repository)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            if let lastId = viewModel.messages.last?.id {
-                withAnimation {
-                    scrollProxy?.scrollTo(lastId, anchor: .bottom)
+        switch mode {
+        case .dm(let id):
+            repository.sendMessage(chatId: id, content: content, attachments: atts)
+            viewModel.refreshMessages(chatId: id, repository: repository)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                if let lastId = viewModel.messages.last?.id {
+                    withAnimation { scrollProxy?.scrollTo(lastId, anchor: .bottom) }
+                }
+            }
+        case .channel(let ch):
+            channelClient.sendMessage(content: content, toChannel: ch)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                if let lastId = channelClient.messages[ch.id]?.last?.id {
+                    withAnimation { scrollProxy?.scrollTo(lastId, anchor: .bottom) }
                 }
             }
         }

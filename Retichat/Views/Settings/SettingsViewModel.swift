@@ -14,16 +14,22 @@ import SwiftData
 /// Lightweight snapshot of an interface config for pending edits.
 struct PendingInterface: Identifiable, Equatable {
     var id: String
+    /// One of `InterfaceKind.rawValue`.
     var type: String
     var name: String
     var targetHost: String
     var targetPort: Int
     var enabled: Bool
+    /// Type-specific JSON config (e.g. `RNodeInterfaceProfile`). nil for TCP.
+    var configJSON: String?
+
+    var kind: InterfaceKind { InterfaceKind(rawValue: type) ?? .tcpClient }
 }
 
 @MainActor
 class SettingsViewModel: ObservableObject {
     @Published var displayName: String
+    @Published var channelDisplayName: String
     @Published var rfedNodeIdentityHash: String
     @Published var rfedLxmfPropOverride: String
     @Published var filterStrangers: Bool
@@ -31,6 +37,7 @@ class SettingsViewModel: ObservableObject {
 
     // Baseline captured at init; updated after Apply so hasChanges resets.
     private var originalDisplayName: String
+    private var originalChannelDisplayName: String
     private var originalRfedNodeIdentityHash: String
     private var originalRfedLxmfPropOverride: String
     private var originalFilterStrangers: Bool
@@ -39,19 +46,33 @@ class SettingsViewModel: ObservableObject {
     /// True when any setting differs from the values present when the screen opened (or last Apply).
     var hasChanges: Bool {
         displayName != originalDisplayName ||
+        channelDisplayName != originalChannelDisplayName ||
         rfedNodeIdentityHash != originalRfedNodeIdentityHash ||
         rfedLxmfPropOverride != originalRfedLxmfPropOverride ||
         filterStrangers != originalFilterStrangers ||
         pendingInterfaces != originalInterfaces
     }
 
+    /// True if the given pending interface row hasn't been applied yet, or
+    /// has been edited since the last Apply. Used by the settings list to
+    /// distinguish "not yet applied" from "applied but offline" so the
+    /// status dot doesn't lie about a not-yet-saved row.
+    func isUnsaved(_ iface: PendingInterface) -> Bool {
+        guard let original = originalInterfaces.first(where: { $0.id == iface.id }) else {
+            return true
+        }
+        return original != iface
+    }
+
     init() {
         let prefs = UserPreferences.shared
         self.displayName = prefs.displayName
+        self.channelDisplayName = prefs.channelDisplayName
         self.rfedNodeIdentityHash = prefs.rfedNodeIdentityHash
         self.rfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.filterStrangers = prefs.filterStrangers
         self.originalDisplayName = prefs.displayName
+        self.originalChannelDisplayName = prefs.channelDisplayName
         self.originalRfedNodeIdentityHash = prefs.rfedNodeIdentityHash
         self.originalRfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.originalFilterStrangers = prefs.filterStrangers
@@ -64,7 +85,7 @@ class SettingsViewModel: ObservableObject {
         let ifaces = repository.interfaces().map {
             PendingInterface(id: $0.id, type: $0.type, name: $0.name,
                              targetHost: $0.targetHost, targetPort: $0.targetPort,
-                             enabled: $0.enabled)
+                             enabled: $0.enabled, configJSON: $0.configJSON)
         }
         pendingInterfaces = ifaces
         originalInterfaces = ifaces
@@ -74,6 +95,7 @@ class SettingsViewModel: ObservableObject {
     func apply() {
         let prefs = UserPreferences.shared
         prefs.displayName = displayName
+        prefs.channelDisplayName = channelDisplayName
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
         prefs.rfedNotifyHash = Self.rnsDestHash(
             identityHashHex: rfedNodeIdentityHash, app: "rfed", aspects: ["notify"]
@@ -97,17 +119,19 @@ class SettingsViewModel: ObservableObject {
         for pending in pendingInterfaces {
             if let iface = existingById[pending.id] {
                 // Update existing
+                iface.type = pending.type
                 iface.name = pending.name
                 iface.targetHost = pending.targetHost
                 iface.targetPort = pending.targetPort
                 iface.enabled = pending.enabled
+                iface.configJSON = pending.configJSON
                 try? iface.modelContext?.save()
             } else {
                 // Add new
                 let newIface = InterfaceConfigEntity(
                     id: pending.id, type: pending.type, name: pending.name,
                     targetHost: pending.targetHost, targetPort: pending.targetPort,
-                    enabled: pending.enabled
+                    enabled: pending.enabled, configJSON: pending.configJSON
                 )
                 repository.addInterface(newIface)
             }

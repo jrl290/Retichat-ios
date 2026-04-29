@@ -30,12 +30,17 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 MessageEntity.self,
                 AttachmentEntity.self,
                 GroupMemberEntity.self,
-                InterfaceConfigEntity.self
+                InterfaceConfigEntity.self,
+                ChannelEntity.self,
+                ChannelMessageEntity.self
             )
         } catch {
             fatalError("Failed to create ModelContainer: \(error)")
         }
     }()
+
+    /// Channel client — shared across the app.
+    let channelClient = RfedChannelClient()
 
     func application(
         _ application: UIApplication,
@@ -155,17 +160,32 @@ struct RetichatApp: App {
     /// available during `didReceiveRemoteNotification` on cold launch.
     private var repository: ChatRepository { appDelegate.repository }
     private var modelContainer: ModelContainer { appDelegate.modelContainer }
+    private var channelClient: RfedChannelClient { appDelegate.channelClient }
 
     var body: some Scene {
         WindowGroup("") {
             ContentView()
                 .environmentObject(repository)
+                .environmentObject(channelClient)
                 .modelContainer(modelContainer)
                 .onOpenURL { url in
                     handleDeepLink(url)
                 }
                 .onAppear {
                     requestNotificationPermission()
+                }
+                .onReceive(repository.$serviceRunning) { running in
+                    guard running, let client = repository.lxmfClient else { return }
+                    channelClient.configure(
+                        modelContext: modelContainer.mainContext,
+                        identityHandle: client.identityHandle,
+                        ownHashHex: repository.ownHashHex
+                    )
+                    channelClient.start()
+                    // Open the rfed.channel app-link on first start so it is
+                    // established immediately rather than waiting for the first
+                    // background→active transition.
+                    ConnectionStateManager.shared.openRfedNodeLink()
                 }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -186,8 +206,21 @@ struct RetichatApp: App {
                     repository.pollPropagationNode()
                     // Re-establish path discovery for the active conversation (if any).
                     ConnectionStateManager.shared.onAppForeground()
+                    // Re-open the persistent rfed node link.
+                    ConnectionStateManager.shared.openRfedNodeLink()
+                    // Re-announce rfed delivery to flush deferred channel blobs
+                    channelClient.announceDelivery()
+                    // Note: lxmf.delivery is auto-announced by Transport's
+                    // publish daemon on every interface up-edge and every
+                    // 30 minutes — no explicit foreground re-announce needed.
                 }
             case .background:
+                // Do NOT close the rfed link here — rapid app-switching would
+                // destroy an active link unnecessarily and force a slow
+                // re-establishment on every return to foreground.  The link will
+                // go STALE naturally after the keepalive timeout if the app stays
+                // backgrounded long enough, and the reconnect handler will
+                // re-establish it on the next rfed.channel announce.
                 // Request immediate background time (~30s) to flush outbound and poll.
                 appDelegate.beginBackgroundExecution(repository: repository)
             default:
@@ -199,9 +232,12 @@ struct RetichatApp: App {
     // MARK: - Deep link: lxmf://<hash>
 
     private func handleDeepLink(_ url: URL) {
-        guard url.scheme == "lxmf",
-              let host = url.host else { return }
-        let hash = host.lowercased().filter { "0123456789abcdef".contains($0) }
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "lxma" || scheme == "lxmf" else { return }
+        // host may be <hash> or <hash>.<pubkey> — extract hash only
+        let raw = (url.host ?? "").lowercased()
+        let hashPart = raw.components(separatedBy: ".").first ?? raw
+        let hash = hashPart.filter { "0123456789abcdef".contains($0) }
         guard hash.count == 32 else { return }
         _ = repository.createDirectChat(destHash: hash)
         NotificationCenter.default.post(

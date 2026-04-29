@@ -7,8 +7,9 @@ edition = "2021"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-reticulum_rust = { path = "../../../Reticulum-rust", default-features = false }
+reticulum_rust = { path = "../../../Reticulum-rust", features = ["serial"] }
 lxmf_rust = { path = "../../../LXMF-rust" }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

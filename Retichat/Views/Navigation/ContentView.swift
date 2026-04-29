@@ -23,9 +23,11 @@ extension EnvironmentValues {
 
 struct ContentView: View {
     @EnvironmentObject var repository: ChatRepository
+    @EnvironmentObject var channelClient: RfedChannelClient
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var selectedChatId: String?
-    @State private var showNewChat = false
+    @State private var selectedChannel: Channel?
+    @State private var showNewConversation = false
     @State private var showSettings = false
     @State private var showQRCode = false
     @State private var windowWidth: CGFloat = 0
@@ -63,9 +65,10 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openChatFromNotification)) { notif in
             if let chatId = notif.object as? String {
-                showNewChat = false
+                showNewConversation = false
                 showSettings = false
                 showQRCode = false
+                selectedChannel = nil
                 selectedChatId = chatId
             }
         }
@@ -83,17 +86,21 @@ struct ContentView: View {
         NavigationStack {
             ChatListView(
                 selectedChatId: $selectedChatId,
-                showNewChat: $showNewChat,
+                selectedChannel: $selectedChannel,
+                showNewConversation: $showNewConversation,
                 showSettings: $showSettings,
                 showQRCode: $showQRCode
             )
-            .blur(radius: (showSettings || showNewChat) ? 8 : 0)
-            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewChat)
+            .blur(radius: (showSettings || showNewConversation) ? 8 : 0)
+            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewConversation)
             .navigationDestination(item: $selectedChatId) { chatId in
-                ConversationView(chatId: chatId)
+                ConversationView(mode: .dm(chatId: chatId))
             }
-            .sheet(isPresented: $showNewChat) {
-                NewChatView(selectedChatId: $selectedChatId)
+            .navigationDestination(item: $selectedChannel) { channel in
+                ConversationView(mode: .channel(channel))
+            }
+            .sheet(isPresented: $showNewConversation) {
+                NewConversationView(selectedChatId: $selectedChatId, selectedChannel: $selectedChannel)
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
@@ -110,14 +117,15 @@ struct ContentView: View {
         NavigationSplitView {
             ChatListView(
                 selectedChatId: $selectedChatId,
-                showNewChat: $showNewChat,
+                selectedChannel: $selectedChannel,
+                showNewConversation: $showNewConversation,
                 showSettings: $showSettings,
                 showQRCode: $showQRCode
             )
-            .blur(radius: (showSettings || showNewChat) ? 8 : 0)
-            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewChat)
-            .sheet(isPresented: $showNewChat) {
-                NewChatView(selectedChatId: $selectedChatId)
+            .blur(radius: (showSettings || showNewConversation) ? 8 : 0)
+            .animation(.easeInOut(duration: 0.25), value: showSettings || showNewConversation)
+            .sheet(isPresented: $showNewConversation) {
+                NewConversationView(selectedChatId: $selectedChatId, selectedChannel: $selectedChannel)
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView()
@@ -127,8 +135,11 @@ struct ContentView: View {
             }
         } detail: {
             if let chatId = selectedChatId {
-                ConversationView(chatId: chatId)
+                ConversationView(mode: .dm(chatId: chatId))
                     .id(chatId)
+            } else if let channel = selectedChannel {
+                ConversationView(mode: .channel(channel))
+                    .id(channel.id)
             } else {
                 noSelectionPlaceholder
             }
@@ -156,16 +167,17 @@ struct ContentView: View {
     // MARK: - Deep link
 
     private func handleDeepLink(_ url: URL) {
-        guard url.scheme == "lxmf" else { return }
-        var hash = url.host ?? ""
-        if hash.isEmpty {
-            hash = url.absoluteString
-                .replacingOccurrences(of: "lxmf://", with: "")
-                .replacingOccurrences(of: "lxmf:", with: "")
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "lxma" || scheme == "lxmf" else { return }
+        // host contains <hash> or <hash>.<pubkey> — take only the hash part
+        var raw = (url.host ?? "").lowercased()
+        if raw.isEmpty {
+            raw = url.absoluteString
+                .replacingOccurrences(of: "\(scheme)://", with: "")
         }
-        hash = hash.trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "[^a-f0-9]", with: "", options: .regularExpression)
+        // Strip optional .<pubkey> suffix
+        let hashPart = raw.components(separatedBy: ".").first ?? raw
+        let hash = hashPart.filter { "0123456789abcdef".contains($0) }
 
         if hash.count == 32 {
             let chatId = repository.createDirectChat(destHash: hash)

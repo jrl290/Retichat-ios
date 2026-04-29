@@ -19,6 +19,8 @@
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>Retichat uses the camera to scan QR codes for adding contacts.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Retichat uses Bluetooth to connect to RNode LoRa radios for off-grid messaging.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Retichat needs local network access to connect to nearby Reticulum nodes.</string>
 	<key>NSBonjourServices</key>

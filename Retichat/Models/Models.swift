@@ -120,20 +120,58 @@ final class GroupMemberEntity {
 @Model
 final class InterfaceConfigEntity {
     @Attribute(.unique) var id: String
-    var type: String  // "TCPClient", "TCPServer", "UDP", "Auto", "I2P"
+    /// One of `InterfaceKind.rawValue`: "TCPClient", "RNode", etc.
+    var type: String
     var name: String
     var targetHost: String
     var targetPort: Int
     var enabled: Bool
+    /// Optional JSON blob holding type-specific config (e.g. RNode radio
+    /// parameters + remembered BLE peripheral). nil for plain TCP rows.
+    /// Stored as a string so SwiftData can auto-migrate by adding a NULL
+    /// column for existing records.
+    var configJSON: String?
 
     init(id: String = UUID().uuidString, type: String, name: String,
-         targetHost: String = "", targetPort: Int = 0, enabled: Bool = true) {
+         targetHost: String = "", targetPort: Int = 0, enabled: Bool = true,
+         configJSON: String? = nil) {
         self.id = id
         self.type = type
         self.name = name
         self.targetHost = targetHost
         self.targetPort = targetPort
         self.enabled = enabled
+        self.configJSON = configJSON
+    }
+}
+
+/// Supported network interface kinds. Stored as the `type` column on
+/// `InterfaceConfigEntity`.
+enum InterfaceKind: String, CaseIterable, Identifiable {
+    case tcpClient = "TCPClient"
+    case rnode     = "RNode"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .tcpClient: return "TCP Client"
+        case .rnode:     return "RNode (Bluetooth)"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .tcpClient: return "network"
+        case .rnode:     return "antenna.radiowaves.left.and.right"
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .tcpClient: return "Connect to a Reticulum node over the internet."
+        case .rnode:     return "Connect a LoRa radio over Bluetooth."
+        }
     }
 }
 
@@ -198,4 +236,81 @@ enum DeliveryState {
     /// Direct delivery failed; message has been handed to a propagation node
     /// for store-and-forward delivery.
     static let propagating = 4
+}
+
+// MARK: - Channel SwiftData Models
+
+@Model
+final class ChannelEntity {
+    @Attribute(.unique) var channelHash: String  // 32-char hex (16 bytes)
+    var channelName: String
+    var rfedNodeHash: String                      // 32-char hex of rfed.channel dest
+    var lastMessageTime: Double
+    var isSubscribed: Bool
+    var stampCost: Int?                           // PoW bits required by rfed; nil = disabled
+
+    init(channelHash: String, channelName: String, rfedNodeHash: String,
+         lastMessageTime: Double = 0, isSubscribed: Bool = true, stampCost: Int? = nil) {
+        self.channelHash = channelHash
+        self.channelName = channelName
+        self.rfedNodeHash = rfedNodeHash
+        self.lastMessageTime = lastMessageTime
+        self.isSubscribed = isSubscribed
+        self.stampCost = stampCost
+    }
+}
+
+@Model
+final class ChannelMessageEntity {
+    @Attribute(.unique) var id: String           // sender_hex+timestamp hex
+    var channelHash: String
+    var senderHash: String                        // 32-char hex (16 bytes)
+    var senderDisplayName: String = ""            // display name embedded by sender in blob
+    var content: String
+    var timestamp: Double                         // Unix ms
+    var isOutgoing: Bool
+    /// Same `DeliveryState` numeric values used by direct/group chat:
+    /// 0=pending, 1=sent (= published to RFed), 3=failed.
+    /// Default 1 (sent) so existing rows from before this column existed
+    /// render with the previous “no indicator needed” behaviour.
+    var deliveryState: Int = DeliveryState.sent
+
+    init(id: String, channelHash: String, senderHash: String, senderDisplayName: String = "",
+         content: String, timestamp: Double, isOutgoing: Bool = false,
+         deliveryState: Int = DeliveryState.sent) {
+        self.id = id
+        self.channelHash = channelHash
+        self.senderHash = senderHash
+        self.senderDisplayName = senderDisplayName
+        self.content = content
+        self.timestamp = timestamp
+        self.isOutgoing = isOutgoing
+        self.deliveryState = deliveryState
+    }
+}
+
+// MARK: - Channel View Models
+
+struct Channel: Identifiable, Hashable {
+    let id: String          // channelHash hex
+    var channelName: String
+    var rfedNodeHash: String
+    var lastMessageTime: Double
+    var isSubscribed: Bool
+    var stampCost: Int?     // nil = no stamp required
+}
+
+struct ChannelMessage: Identifiable {
+    let id: String
+    var channelHash: String
+    var senderHash: String
+    var senderDisplayName: String  // embedded in blob at send time; stored once on receive
+    var content: String
+    var timestamp: Double
+    var isOutgoing: Bool
+    /// Mirrors the direct/group `DeliveryState` ints. For incoming
+    /// messages this is always `delivered`; outgoing messages start at
+    /// `pending`, transition to `sent` once RFed accepts the packet,
+    /// and to `failed` if every retry path is exhausted.
+    var deliveryState: Int = DeliveryState.delivered
 }

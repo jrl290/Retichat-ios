@@ -18,6 +18,7 @@
 //
 
 import Foundation
+import Network
 
 @MainActor
 final class ConnectionStateManager {
@@ -36,8 +37,23 @@ final class ConnectionStateManager {
     /// Hex hashes of all peers in the currently-open conversation (empty when no chat is on screen).
     private var activeConversationHexes: Set<String> = []
 
+    /// Cached rfed.channel destination kept open while the app is in the foreground.
+    private var rfedLinkDestData: Data? = nil
+
     /// Weak reference to the LXMF client, set after startup.
     private weak var lxmfClient: LxmfClient? = nil
+
+    /// Network reachability monitor — fires `appLinkNetworkChanged()` on every
+    /// path-status transition so the router gets exactly one retry trigger per
+    /// real network event (no polling).
+    private var pathMonitor: NWPathMonitor? = nil
+    private var lastPathStatus: NWPath.Status = .requiresConnection
+    /// NWPathMonitor delivers an initial callback as soon as it starts, just
+    /// reporting current reachability — that is NOT a network change. Swallow
+    /// the first callback so we do not burn the router's single per-trigger
+    /// app-link attempt before Transport has had a chance to resolve any
+    /// paths. Real subsequent transitions still fire normally.
+    private var pathMonitorPrimed: Bool = false
 
     private init() {}
 
@@ -46,7 +62,53 @@ final class ConnectionStateManager {
     /// Call once after the LXMF stack has started.
     func register(lxmfClient: LxmfClient) {
         self.lxmfClient = lxmfClient
+
+        // Register reconnect handlers for rfed.channel and rfed.notify so the
+        // LXMF router re-establishes app-links to those destinations on announce.
+        // (The built-in delivery_announce_handler only covers lxmf.delivery.)
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify")
+
         requestEssentialPaths()
+        // Open the rfed.channel app-link immediately so the SettingsView
+        // "RFed Node" status pill (which polls appLinkStatus on the
+        // rfed.channel destination) reflects reality on first launch.
+        // Without this the pill stayed at "No path" indefinitely on cold
+        // start because openRfedNodeLink() only ran on onNetworkRecover.
+        openRfedNodeLink()
+        startNetworkMonitor()
+    }
+
+    /// Spawn an NWPathMonitor and forward every reachability transition into
+    /// the LXMF router as a single network-change trigger. This is the only
+    /// signal that retries an offline app-link — there is no polling.
+    private func startNetworkMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        let queue = DispatchQueue(label: "retichat.connection.pathmonitor")
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor in
+                guard let self = self else { return }
+                let prev = self.lastPathStatus
+                self.lastPathStatus = path.status
+                // First callback after monitor.start() is the initial state
+                // report, not a transition. Record it and return without
+                // triggering an app-link attempt — paths haven't resolved yet.
+                guard self.pathMonitorPrimed else {
+                    self.pathMonitorPrimed = true
+                    print("[ConnState] network monitor primed: status=\(path.status), interfaces=\(path.availableInterfaces.map(\.name))")
+                    return
+                }
+                guard prev != path.status else { return }
+                print("[ConnState] network change: \(prev) → \(path.status), interfaces=\(path.availableInterfaces.map(\.name))")
+                let client = self.lxmfClient
+                Task.detached(priority: .userInitiated) {
+                    client?.appLinkNetworkChanged()
+                }
+            }
+        }
+        monitor.start(queue: queue)
+        pathMonitor = monitor
     }
 
     // MARK: - Announce-driven reachability
@@ -161,10 +223,92 @@ final class ConnectionStateManager {
         }
     }
 
-    /// Call when NWPathMonitor reports network connectivity restored.
+    // MARK: - RFed node link
+
+    /// Open (or re-open) an app link to the configured rfed.channel destination.
+    /// Call on app foreground; the link is kept alive until `closeRfedNodeLink()`.
+    func openRfedNodeLink() {
+        guard let destData = rfedChannelDestData() else { return }
+        rfedLinkDestData = destData
+        let client = lxmfClient
+        Task.detached(priority: .userInitiated) {
+            // rfed.channel — NOT lxmf.delivery. Without the right aspects the
+            // router would resolve the destination identity wrong on every
+            // (re)establishment and the link would never reach ACTIVE.
+            client?.appLinkOpen(destData, app: "rfed", aspects: ["channel"])
+        }
+    }
+
+    /// Tear down the app link to the rfed node. Call on app background.
+    func closeRfedNodeLink() {
+        guard let destData = rfedLinkDestData else { return }
+        rfedLinkDestData = nil
+        let client = lxmfClient
+        Task.detached(priority: .userInitiated) {
+            client?.appLinkClose(destData)
+        }
+    }
+
+    /// Current app-link status for the rfed node.
+    /// Returns: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
+    func rfedNodeLinkStatus() -> Int32 {
+        guard let destData = rfedLinkDestData ?? rfedChannelDestData(),
+              let client = lxmfClient else { return 0 }
+        return client.appLinkStatus(destData)
+    }
+
+    /// Snapshot the (LxmfClient, rfed.channel destData) pair for use from a
+    /// background thread.  Returns nil if either is unavailable.
+    func rfedAppLinkSnapshot() -> (LxmfClient, Data)? {
+        guard let destData = rfedLinkDestData ?? rfedChannelDestData(),
+              let client = lxmfClient else { return nil }
+        return (client, destData)
+    }
+
+    /// Public access to the rfed.channel destination derived from current
+    /// preferences.  Used by the SettingsView status indicator to tell
+    /// "no config" apart from "config present but no link".
+    func rfedChannelDestDataPublic() -> Data? {
+        return rfedChannelDestData()
+    }
+
+    /// True if the routing table currently has a path to the configured
+    /// rfed.channel destination.  Used by the SettingsView status indicator
+    /// to distinguish a transient "link not active yet" from a genuine
+    /// "no path" failure.
+    func rfedChannelHasPath() -> Bool {
+        guard let destData = rfedChannelDestData() else { return false }
+        return RetichatBridge.shared.transportHasPath(destHash: destData)
+    }
+
+    /// Wait for the rfed.channel app-link to reach ACTIVE (status == 3).
+    /// Polls every 250 ms.  Safe to call from any context (re-enters MainActor
+    /// for each status check).
+    func waitForRfedAppLinkActive(timeoutSecs: Double) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSecs)
+        while Date() < deadline {
+            if rfedNodeLinkStatus() == 3 { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
+    }
+
+    /// Derives the rfed.channel 16-byte dest from current prefs.
+    private func rfedChannelDestData() -> Data? {
+        let identityHex = UserPreferences.shared.rfedNodeIdentityHash
+        guard !identityHex.isEmpty else { return nil }
+        let destHex = RfedChannelClient.rfedDestHash(
+            identityHashHex: identityHex, app: "rfed", aspects: ["channel"])
+        guard !destHex.isEmpty else { return nil }
+        return Data(hexString: destHex)
+    }
+
     /// Re-requests paths to always-needed destinations and re-opens active links.
+    /// Call when NWPathMonitor reports network connectivity restored.
     func onNetworkReconnect() {
         requestEssentialPaths()
+        // Re-open the rfed node link — path may have been purged when TCP dropped.
+        openRfedNodeLink()
         let peers = activeConversationHexes.compactMap { Data(hexString: $0) }
         let bridge = RetichatBridge.shared
         Task.detached(priority: .userInitiated) {
@@ -196,6 +340,19 @@ final class ConnectionStateManager {
         if !rfedHex.isEmpty, let rfedHash = Data(hexString: rfedHex) {
             destinations.append(rfedHash)
         }
+        // Also request paths to rfed.channel and rfed.delivery so the app
+        // link has a fresh route immediately after network reconnect.
+        if let rfedChannel = rfedChannelDestData() {
+            destinations.append(rfedChannel)
+        }
+        let identityHex = UserPreferences.shared.rfedNodeIdentityHash
+        if !identityHex.isEmpty {
+            let deliveryHex = RfedChannelClient.rfedDestHash(
+                identityHashHex: identityHex, app: "rfed", aspects: ["delivery"])
+            if !deliveryHex.isEmpty, let deliveryHash = Data(hexString: deliveryHex) {
+                destinations.append(deliveryHash)
+            }
+        }
 
         // Pre-compute hex labels on the main actor before going off-thread.
         let destPairs: [(Data, String)] = destinations.map { ($0, String($0.hexString.prefix(8))) }
@@ -205,16 +362,45 @@ final class ConnectionStateManager {
         Task.detached(priority: .userInitiated) {
             let t = CFAbsoluteTimeGetCurrent()
             print("[DIAG][requestEssentialPaths] task start count=\(destPairs.count)")
+            var requested: [(Data, String)] = []
             for (dest, label) in destPairs {
                 let hasPath = bridge.transportHasPath(destHash: dest)
                 print("[DIAG][requestEssentialPaths] dest=\(label) hasPath=\(hasPath)")
                 if !hasPath {
                     _ = bridge.transportRequestPath(destHash: dest)
                     print("[DIAG][requestEssentialPaths] requestPath done dest=\(label)")
+                    requested.append((dest, label))
                 }
             }
             let took = String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t)
             print("[DIAG][requestEssentialPaths] task done took=\(took)s")
+
+            // If we asked for any paths, poll briefly for resolution and
+            // force-persist the on-disk path table once all asked-for
+            // essentials have been resolved (or after a hard timeout).
+            // This closes the cold-start "No path" gap caused by the
+            // 5-minute periodic persist cadence.
+            guard !requested.isEmpty else { return }
+            let pollDeadline = CFAbsoluteTimeGetCurrent() + 20.0
+            var resolvedAny = false
+            while CFAbsoluteTimeGetCurrent() < pollDeadline {
+                requested.removeAll { dest, label in
+                    if bridge.transportHasPath(destHash: dest) {
+                        print("[DIAG][requestEssentialPaths] resolved dest=\(label)")
+                        resolvedAny = true
+                        return true
+                    }
+                    return false
+                }
+                if requested.isEmpty { break }
+                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 s
+            }
+            if resolvedAny {
+                bridge.transportSavePaths()
+                print("[DIAG][requestEssentialPaths] persisted path table to disk")
+            } else {
+                print("[DIAG][requestEssentialPaths] no essentials resolved before timeout; skipping persist")
+            }
         }
     }
 }
