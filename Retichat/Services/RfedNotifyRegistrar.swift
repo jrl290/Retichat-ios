@@ -25,8 +25,10 @@ final class RfedNotifyRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    private let maxAttempts  = 8
-    private let baseDelaySec = 5.0
+    /// One-shot guard so reconnect storms don't fire duplicate registers.
+    /// Only mutated from the MainActor handler dispatched by
+    /// `ConnectionStateManager.setAppLinkStatusHandler`.
+    private var didRegisterOnActive = false
 
     private init() {}
 
@@ -34,6 +36,10 @@ final class RfedNotifyRegistrar {
 
     /// Register this subscriber's relay hash with rfed.
     /// `identityHandle` is the Rust FFI handle for the local identity.
+    ///
+    /// Driven by the rfed.notify APP_LINK status callback so we only fire
+    /// once the persistent link is ACTIVE — never on a 5 s cold-start
+    /// timeout. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     func registerIfNeeded(identityHandle: UInt64) {
         let rfedDestHex = prefs.rfedNotifyHash
         guard !rfedDestHex.isEmpty else { return }
@@ -53,18 +59,26 @@ final class RfedNotifyRegistrar {
             return
         }
 
-        Task.detached(priority: .background) { [weak self] in
-            await self?.requestWithRetry(
-                rfedHash: rfedHash,
-                identityHandle: identityHandle,
-                payload: payload
-            )
+        Task { @MainActor [weak self] in
+            ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: rfedHash) { status in
+                guard status == 3 else { return }
+                guard let self = self else { return }
+                guard !self.didRegisterOnActive else { return }
+                self.didRegisterOnActive = true
+                Task.detached(priority: .background) { [weak self] in
+                    await self?.sendOnce(
+                        rfedHash: rfedHash,
+                        payload: payload,
+                        kind: "register"
+                    )
+                }
+            }
         }
     }
 
     /// Best-effort deregistration from a previous rfed node.
-    /// Sends a single `/rfed/notify/unregister` request with no retry.
-    /// Call before changing `rfedNotifyHash` in UserPreferences and restarting the service.
+    /// Sends a single `/rfed/notify/unregister` request via the persistent
+    /// rfed.notify APP_LINK (no Swift-side one-shot link).
     func deregisterFrom(oldNotifyHashHex: String, identityHandle: UInt64) {
         guard !oldNotifyHashHex.isEmpty,
               let rfedHash = Data(hexString: oldNotifyHashHex) else { return }
@@ -72,22 +86,18 @@ final class RfedNotifyRegistrar {
 
         guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: nil, identityHandle: identityHandle) else { return }
 
-        let bridge = self.bridge
         Task.detached(priority: .background) {
-            guard bridge.transportHasPath(destHash: rfedHash) else {
-                print("[RfedNotify] No path to old rfed node — skipping deregister")
-                return
-            }
-            _ = bridge.linkRequest(
+            let resp = await ConnectionStateManager.shared.appLinkSend(
                 destHash: rfedHash,
-                appName: "rfed",
-                aspects: "notify",
-                identityHandle: identityHandle,
+                app: "rfed", aspects: ["notify"],
                 path: "/rfed/notify/unregister",
-                payload: payload,
-                timeoutSecs: 5.0
+                payload: payload
             )
-            print("[RfedNotify] Sent unregister to old rfed node")
+            if resp != nil {
+                print("[RfedNotify] Sent unregister to old rfed node")
+            } else {
+                print("[RfedNotify] Unregister: no response within 5 s")
+            }
         }
     }
 
@@ -107,8 +117,8 @@ final class RfedNotifyRegistrar {
             return
         }
         Task.detached(priority: .background) { [weak self] in
-            await self?.requestWithRetry(rfedHash: rfedHash, identityHandle: identityHandle,
-                                         payload: payload)
+            await self?.sendOnce(rfedHash: rfedHash,
+                                 payload: payload, kind: "channel-register")
         }
     }
 
@@ -120,69 +130,44 @@ final class RfedNotifyRegistrar {
         guard let relayHex = ApnsBridgeHashes.notifyRelayHex else { return }
         guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: channelHash,
                                                identityHandle: identityHandle) else { return }
-        let bridge = self.bridge
         Task.detached(priority: .background) {
-            guard bridge.transportHasPath(destHash: rfedHash) else { return }
-            _ = bridge.linkRequest(destHash: rfedHash, appName: "rfed", aspects: "notify",
-                                   identityHandle: identityHandle,
-                                   path: "/rfed/notify/unregister",
-                                   payload: payload, timeoutSecs: 5.0)
-            print("[RfedNotify] Sent channel deregister (channel=\(channelHash.hexString.prefix(8))…)")
+            let resp = await ConnectionStateManager.shared.appLinkSend(
+                destHash: rfedHash,
+                app: "rfed", aspects: ["notify"],
+                path: "/rfed/notify/unregister",
+                payload: payload
+            )
+            if resp != nil {
+                print("[RfedNotify] Sent channel deregister (channel=\(channelHash.hexString.prefix(8))…)")
+            }
         }
     }
 
     // MARK: - Private
 
-    nonisolated private func requestWithRetry(rfedHash: Data, identityHandle: UInt64,
-                                              payload: Data) async {
-        var delay = baseDelaySec
-        for attempt in 1...maxAttempts {
-            // Ensure path to rfed is known.
-            if !bridge.transportHasPath(destHash: rfedHash) {
-                _ = bridge.transportRequestPath(destHash: rfedHash)
-                print("[RfedNotify] Waiting for path (attempt \(attempt))…")
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                delay = min(delay * 2, 120)
-                continue
-            }
+    /// Single-attempt registration via the persistent rfed.notify APP_LINK.
+    /// Per DESIGN_PRINCIPLES.md §1-§2: one shot with a 5s budget. The link is
+    /// managed by Rust (auto-reconnect on announce, etc.). If it does not
+    /// reach ACTIVE within 5 s, the operation has failed — no retries.
+    private func sendOnce(rfedHash: Data, payload: Data, kind: String) async {
+        let response = await ConnectionStateManager.shared.appLinkSend(
+            destHash: rfedHash,
+            app: "rfed", aspects: ["notify"],
+            path: "/rfed/notify/register",
+            payload: payload
+        )
 
-            let response = bridge.linkRequest(
-                destHash: rfedHash,
-                appName: "rfed",
-                aspects: "notify",
-                identityHandle: identityHandle,
-                path: "/rfed/notify/register",
-                payload: payload,
-                // Long enough to cover a worst-case ~5-hop link establishment
-                // (per-hop timeout ~6s) plus a request round-trip. Shorter
-                // values caused the first attempt to abort while the link
-                // was still handshaking, even when the network was healthy.
-                timeoutSecs: 45.0
-            )
-
-            if let resp = response {
-                // Response should be msgpack bool (true = 0xc3).
-                let success = resp.count == 1 && resp[0] == 0xc3
-                if success {
-                    print("[RfedNotify] Registered relay with rfed")
-                    return
-                } else {
-                    print("[RfedNotify] rfed returned false (attempt \(attempt))")
-                }
+        if let resp = response {
+            // Response should be msgpack bool (true = 0xc3).
+            let success = resp.count == 1 && resp[0] == 0xc3
+            if success {
+                print("[RfedNotify] \(kind): registered with rfed")
             } else {
-                let err = bridge.lastError() ?? "unknown"
-                print("[RfedNotify] Link request failed (attempt \(attempt)): \(err)")
-                // Request a fresh path — the stored path may be stale (e.g. old rfed
-                // instance at many hops whose route is now broken).  A fresh PATH_REQUEST
-                // forces rmap.world to update its routing table entry for this destination,
-                // so the next attempt uses the current best route.
-                _ = bridge.transportRequestPath(destHash: rfedHash)
+                print("[RfedNotify] \(kind): rfed returned false")
             }
-
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            delay = min(delay * 2, 120)
+        } else {
+            print("[RfedNotify] \(kind): APP_LINK not ACTIVE within 5 s — skipping")
         }
-        print("[RfedNotify] Giving up after \(maxAttempts) attempts")
     }
 
     // MARK: - msgpack encoding

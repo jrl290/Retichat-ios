@@ -20,6 +20,26 @@
 import Foundation
 import Network
 
+/// C trampoline for the LXMF APP_LINK status callback.
+///
+/// Runs on the link-actor thread.  Copies the destination hash, computes
+/// its hex key, and dispatches to `ConnectionStateManager.shared` on the
+/// main actor.  Declared as `@convention(c)` so it can be passed across
+/// the FFI boundary as a plain function pointer.
+let _appLinkStatusTrampoline: lxmf_app_link_status_callback_t = {
+    (_ context: UnsafeMutableRawPointer?,
+     _ destPtr: UnsafePointer<UInt8>?,
+     _ destLen: UInt32,
+     _ status: UInt8) -> Void in
+    guard let destPtr = destPtr, destLen > 0 else { return }
+    let bytes = UnsafeBufferPointer(start: destPtr, count: Int(destLen))
+    let hex = Data(bytes).hexString
+    Task { @MainActor in
+        ConnectionStateManager.shared._appLinkStatusChanged(
+            destHashHex: hex, status: status)
+    }
+}
+
 @MainActor
 final class ConnectionStateManager {
     static let shared = ConnectionStateManager()
@@ -64,6 +84,13 @@ final class ConnectionStateManager {
     private let persistQueue = DispatchQueue(
         label: "chat.retichat.path-persist", qos: .utility)
 
+    /// APP_LINK status-change handlers, keyed by destination-hash hex.
+    /// Each handler receives the new status byte (0..4).  Multiple handlers
+    /// per dest are not supported — last register wins.  Handlers are
+    /// dispatched on the main actor.  Used by services (RfedChannelClient,
+    /// RfedNotifyRegistrar, etc.) to react to ACTIVE without polling.
+    private var appLinkStatusHandlers: [String: (UInt8) -> Void] = [:]
+
     private init() {}
 
     // MARK: - Setup
@@ -72,11 +99,18 @@ final class ConnectionStateManager {
     func register(lxmfClient: LxmfClient) {
         self.lxmfClient = lxmfClient
 
-        // Register reconnect handlers for rfed.channel and rfed.notify so the
-        // LXMF router re-establishes app-links to those destinations on announce.
-        // (The built-in delivery_announce_handler only covers lxmf.delivery.)
+        // Register reconnect handlers for rfed.channel, rfed.notify, rfed.delivery
+        // so the LXMF router re-establishes app-links to those destinations on
+        // announce. (The built-in delivery_announce_handler only covers lxmf.delivery.)
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel")
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.delivery")
+
+        // Register a single APP_LINK status-change C callback that fans out
+        // to per-dest Swift handlers registered via setAppLinkStatusHandler.
+        // This is how services react to ACTIVE without polling — see
+        // DESIGN_PRINCIPLES.md §1, §3.
+        lxmfClient.setAppLinkStatusCallback(_appLinkStatusTrampoline, context: nil)
 
         requestEssentialPaths()
         // Open the rfed.channel app-link immediately so the SettingsView
@@ -86,6 +120,31 @@ final class ConnectionStateManager {
         // start because openRfedNodeLink() only ran on onNetworkRecover.
         openRfedNodeLink()
         startNetworkMonitor()
+    }
+
+    /// Register a handler that fires whenever the APP_LINK to `destHash`
+    /// changes status.  Replaces any previous handler for the same dest.
+    /// Pass `nil` to remove.
+    ///
+    /// Handlers are dispatched on the main actor.  Used by services that
+    /// must wait for an ACTIVE link before performing work that would
+    /// otherwise blindly hit the 5 s send-budget — e.g. re-subscribe to
+    /// channels after restart, register for push notifications.
+    func setAppLinkStatusHandler(destHash: Data, handler: ((UInt8) -> Void)?) {
+        let key = destHash.hexString
+        if let h = handler {
+            appLinkStatusHandlers[key] = h
+        } else {
+            appLinkStatusHandlers.removeValue(forKey: key)
+        }
+    }
+
+    /// Internal: invoked by the C trampoline on the link-actor thread.
+    /// Hops to MainActor and dispatches to the per-dest handler.
+    fileprivate func _appLinkStatusChanged(destHashHex: String, status: UInt8) {
+        if let handler = appLinkStatusHandlers[destHashHex] {
+            handler(status)
+        }
     }
 
     /// Spawn an NWPathMonitor and forward every reachability transition into
@@ -183,7 +242,82 @@ final class ConnectionStateManager {
         return LxmfMethod.propagated
     }
 
-    // MARK: - Conversation lifecycle
+    /// Async variant of `deliveryMethod(for:)` used at message-send time.
+    ///
+    /// If an APP_LINK to the peer is currently `PATH_REQUESTED` (1) or
+    /// `ESTABLISHING` (2), this awaits its resolution for **up to 5 seconds**
+    /// (DESIGN_PRINCIPLES.md §1) before deciding. If it reaches `ACTIVE` (3)
+    /// in that window, we send DIRECT over the link the user just opened
+    /// when they entered the conversation. If 5 s elapses without ACTIVE,
+    /// we fall back to PROPAGATED — never raise this ceiling.
+    ///
+    /// Caller MUST run this off the main thread (it awaits).
+    func awaitDeliveryMethod(for destHash: Data) async -> UInt8 {
+        // Fast-path: synchronous decision if not in linking limbo.
+        if let client = lxmfClient {
+            let status = client.appLinkStatus(destHash)
+            if status == 3 { return LxmfMethod.direct }
+            if client.peerLinkStatus(destHash) == 2 { return LxmfMethod.direct }
+            if status == 1 || status == 2 {
+                // Wait up to 5 s for the in-flight establishment.
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                let deadline = Date().addingTimeInterval(5.0)
+                while Date() < deadline {
+                    if client.appLinkStatus(destHash) == 3 {
+                        return LxmfMethod.direct
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
+                }
+                // Linking did not resolve inside the 5 s budget — fall back.
+                return LxmfMethod.propagated
+            }
+        }
+
+        if RetichatBridge.shared.transportHasPath(destHash: destHash) {
+            return LxmfMethod.direct
+        }
+        return LxmfMethod.propagated
+    }
+
+    // MARK: - APP_LINK request helper
+
+    /// Open (idempotently) an APP_LINK to `destHash` for the given app/aspects
+    /// tuple, wait up to 5 s for it to reach ACTIVE, then run a request on it.
+    ///
+    /// All link management is delegated to the Rust APP_LINK layer — no
+    /// Swift-side one-shot links, no retries, no exponential backoff.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    ///
+    /// Returns the response bytes from the request, or `nil` if the link
+    /// did not reach ACTIVE inside the 5 s budget or the request itself
+    /// failed/timed out.
+    func appLinkSend(destHash: Data,
+                     app: String,
+                     aspects: [String],
+                     path: String,
+                     payload: Data) async -> Data? {
+        guard let client = lxmfClient else { return nil }
+
+        // Idempotent open: no-op if already registered/active.
+        if client.appLinkStatus(destHash) != 3 {
+            client.appLinkOpen(destHash, app: app, aspects: aspects)
+        }
+
+        // Wait up to 5 s for ACTIVE.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let deadline = Date().addingTimeInterval(5.0)
+        while Date() < deadline {
+            if client.appLinkStatus(destHash) == 3 { break }
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
+        }
+        guard client.appLinkStatus(destHash) == 3 else { return nil }
+
+        // Issue the request off the main thread.
+        return await Task.detached(priority: .userInitiated) {
+            client.appLinkRequest(destHash: destHash, path: path,
+                                  payload: payload, timeoutSecs: 5.0)
+        }.value
+    }
 
     /// Call when a conversation screen appears for a peer (direct or group member).
     /// Opens an app link: watches announces, requests path, and establishes a

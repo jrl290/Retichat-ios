@@ -239,6 +239,20 @@ final class LxmfClient: @unchecked Sendable {
         }
     }
 
+    /// Register an APP_LINK status callback.  Fires whenever an APP_LINK
+    /// transitions state.  `status` byte: 0=NONE, 1=PATH_REQUESTED,
+    /// 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
+    ///
+    /// The callback runs on the link-actor thread and MUST NOT block —
+    /// copy the destination hash and dispatch off-thread.
+    @discardableResult
+    nonisolated func setAppLinkStatusCallback(
+        _ callback: lxmf_app_link_status_callback_t,
+        context: UnsafeMutableRawPointer? = nil
+    ) -> Bool {
+        lxmf_app_link_register_status_callback(handle, callback, context) == 0
+    }
+
     /// Notify the router that the host's network reachability state has
     /// changed (interface up/down, Wi-Fi ↔ cellular, etc.).
     /// Triggers ONE fresh attempt for every registered app-link not currently

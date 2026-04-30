@@ -145,6 +145,12 @@ typedef void (*lxmf_message_state_callback_t)(
     uint8_t state
 );
 
+typedef void (*lxmf_app_link_status_callback_t)(
+    void *context,
+    const uint8_t *dest_hash, uint32_t hash_len,
+    uint8_t status
+);
+
 int32_t lxmf_client_set_delivery_callback(uint64_t client,
                                            lxmf_delivery_callback_t callback,
                                            void *context);
@@ -222,6 +228,19 @@ int32_t lxmf_app_link_status(uint64_t client,
 /// Returns 0 on success, -1 on error.
 int32_t lxmf_app_link_register_reconnect(uint64_t client,
                                           const char *aspect_filter);
+
+/// Register an APP_LINK status callback on the global registry.
+///
+/// The callback fires whenever an APP_LINK transitions state.  Status byte:
+///   0 = NONE, 1 = PATH_REQUESTED, 2 = ESTABLISHING,
+///   3 = ACTIVE, 4 = DISCONNECTED.
+///
+/// Multiple callbacks may be registered.  The callback runs on the link
+/// actor thread and MUST NOT block — copy any data and dispatch off-thread.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_register_status_callback(uint64_t client,
+                                                lxmf_app_link_status_callback_t callback,
+                                                void *context);
 
 /// Notify the router that the host's network reachability state has
 /// changed (interface up/down, Wi-Fi <-> cellular, VPN flipped, etc.).

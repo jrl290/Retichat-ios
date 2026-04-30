@@ -23,10 +23,6 @@ final class ApnsTokenRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    // Number of times to poll for path availability before giving up.
-    private let maxAttempts  = 8
-    private let baseDelaySec = 5.0
-
     private init() {}
 
     // MARK: - Public API
@@ -57,44 +53,39 @@ final class ApnsTokenRegistrar {
         }
 
         Task.detached(priority: .background) { [weak self] in
-            await self?.sendWithRetry(destHash: destHash, payload: payload,
-                                      subscriberHashHex: subscriberHash.hexString)
+            await self?.sendOnce(destHash: destHash, payload: payload,
+                                 subscriberHashHex: subscriberHash.hexString)
         }
     }
 
     // MARK: - Private
 
-    private func sendWithRetry(destHash: Data, payload: Data,
-                                subscriberHashHex: String) async {
-        var delay = baseDelaySec
-        for attempt in 1...maxAttempts {
-            // Ensure path is known first
-            if !bridge.transportHasPath(destHash: destHash) {
-                _ = bridge.transportRequestPath(destHash: destHash)
-                print("[APNsRegistrar] Waiting for path (attempt \(attempt))…")
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                delay = min(delay * 2, 120)
-                continue
-            }
-
-            let ok = bridge.packetSendToHash(
-                destHash: destHash,
-                appName:  "rfed",
-                aspects:  "apns",
-                payload:  payload
-            )
-            if ok {
-                print("[APNsRegistrar] Token registered for \(subscriberHashHex.prefix(8))…")
-                return
-            } else {
-                let err = bridge.lastError() ?? "unknown"
-                print("[APNsRegistrar] Send failed (attempt \(attempt)): \(err)")
-            }
-
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            delay = min(delay * 2, 120)
+    /// Single-attempt registration. No retries, no polling, no backoff.
+    /// Per DESIGN_PRINCIPLES.md §1-§2: one shot. The rfed.apns destination
+    /// receives plain encrypted packets (no link), so success is "we asked
+    /// the transport to send and it accepted the packet." If we have no
+    /// path, fail loudly — registration will be re-attempted on app start.
+    private func sendOnce(destHash: Data, payload: Data,
+                          subscriberHashHex: String) async {
+        if !bridge.transportHasPath(destHash: destHash) {
+            // Kick a path request, but do not wait for it.
+            _ = bridge.transportRequestPath(destHash: destHash)
+            print("[APNsRegistrar] No path to rfed.apns yet — skipping until next app start")
+            return
         }
-        print("[APNsRegistrar] Giving up after \(maxAttempts) attempts")
+
+        let ok = bridge.packetSendToHash(
+            destHash: destHash,
+            appName:  "rfed",
+            aspects:  "apns",
+            payload:  payload
+        )
+        if ok {
+            print("[APNsRegistrar] Token registered for \(subscriberHashHex.prefix(8))…")
+        } else {
+            let err = bridge.lastError() ?? "unknown"
+            print("[APNsRegistrar] Send failed: \(err)")
+        }
     }
 
     // MARK: - msgpack encoding (hand-rolled, no library needed)

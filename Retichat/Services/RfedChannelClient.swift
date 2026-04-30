@@ -80,6 +80,12 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
     private var linkStatusTimer: AnyCancellable?
 
+    /// One-shot guard: re-subscribe to persisted channels exactly once
+    /// per app run, the first time the rfed.channel APP_LINK reaches
+    /// ACTIVE.  Set to true after the first successful re-subscribe pass
+    /// kicks off so subsequent ACTIVE callbacks don't redundantly re-fire.
+    private var didResubscribeOnActive = false
+
     // MARK: - Dependencies
 
     private let bridge = RetichatBridge.shared
@@ -126,7 +132,15 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
         loadPersistedChannels()
         loadPersistedMessages()
-        resubscribePersistedChannels()
+
+        // Drive re-subscribe from the rfed.channel APP_LINK status callback
+        // instead of firing it blindly at startup. On cold start the
+        // first announce can take 30+ seconds to arrive over multiple TCP
+        // hops; the previous unconditional re-subscribe always failed the
+        // §1 5-second budget and lost the registration.  When the link
+        // becomes ACTIVE (3) the handler kicks one re-subscribe pass.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        scheduleResubscribeOnRfedChannelActive()
     }
 
     func stop() {
@@ -307,10 +321,13 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         } else {
             payload = Self.msgpackBin(channelHashData)
         }
-        Task.detached(priority: .background) { [bridge = self.bridge, handle = identityHandle] in
-            _ = bridge.linkRequest(destHash: rfedDest, appName: "rfed", aspects: "channel",
-                                   identityHandle: handle, path: "/rfed/unsubscribe",
-                                   payload: payload, timeoutSecs: 10.0)
+        Task.detached(priority: .background) {
+            _ = await ConnectionStateManager.shared.appLinkSend(
+                destHash: rfedDest,
+                app: "rfed", aspects: ["channel"],
+                path: "/rfed/unsubscribe",
+                payload: payload
+            )
         }
 
         // Deregister per-channel push notification wakeup.
@@ -646,17 +663,15 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             Task { @MainActor in self.pullInFlight[nodeKey] = false }
         }
 
-        let handle = identityHandle
-        let bridge = self.bridge
-
-        let response = await Task.detached(priority: .background) {
-            bridge.linkRequest(destHash: rfedDeliveryDest, appName: "rfed", aspects: "delivery",
-                               identityHandle: handle, path: "/rfed/pull",
-                               payload: Data(), timeoutSecs: 15.0)
-        }.value
+        let response = await ConnectionStateManager.shared.appLinkSend(
+            destHash: rfedDeliveryDest,
+            app: "rfed", aspects: ["delivery"],
+            path: "/rfed/pull",
+            payload: Data()
+        )
 
         guard let data = response else {
-            print("[RfedChannel] PULL: no response or error")
+            print("[RfedChannel] PULL: APP_LINK not ACTIVE within 5 s or no response")
             return false
         }
 
@@ -836,71 +851,20 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             throw ChannelError.subscribeFailed("failed to sign subscribe payload")
         }
         let payload = Self.msgpackSigned(value: channelHashData, pubkey: pubkey, sig: sig)
-        let handle = identityHandle
-        let bridge = self.bridge
 
-        // ---- Preferred path: multiplex onto the persistent rfed.channel APP_LINK ----
-        //
-        // Make sure the APP_LINK is opening, then wait up to 30 s for it to
-        // become ACTIVE.  All channel subscribes share this single link
-        // instead of opening one fresh outbound link per subscribe — this
-        // eliminates the cold-start "thundering herd" of parallel link
-        // establishments competing for the same long path.
-        ConnectionStateManager.shared.openRfedNodeLink()
-        let appLinkActive = await ConnectionStateManager.shared
-            .waitForRfedAppLinkActive(timeoutSecs: 30.0)
-
-        if appLinkActive,
-           let snap = ConnectionStateManager.shared.rfedAppLinkSnapshot(),
-           snap.1 == rfedChannelDest
-        {
-            let client = snap.0
-            let response = await Task.detached(priority: .background) {
-                client.appLinkRequest(destHash: rfedChannelDest,
-                                      path: "/rfed/subscribe",
-                                      payload: payload,
-                                      timeoutSecs: 20.0)
-            }.value
-            if let resp = response {
-                let stampCost: Int? = Self.parseSubscribeResponse(resp)
-                guard stampCost != nil || resp.first == 0xc3
-                        || resp.first == 0x92 || resp.first == 0x91 else {
-                    throw ChannelError.subscribeFailed("unexpected response: \(resp.hexString)")
-                }
-                print("[RfedChannel] subscribe: used persistent APP_LINK")
-                return stampCost
-            }
-            // Fall through to legacy path on failure.
-            print("[RfedChannel] subscribe: APP_LINK request returned nil — falling back to one-shot link")
-        } else {
-            print("[RfedChannel] subscribe: APP_LINK not ACTIVE within timeout — using one-shot link")
-        }
-
-        // ---- Fallback: legacy one-shot link request ----
-        // Ensure the rfed.channel destination is known before opening a link.
-        let pathKnown = await Task.detached(priority: .background) { () -> Bool in
-            if bridge.transportHasPath(destHash: rfedChannelDest) { return true }
-            _ = bridge.transportRequestPath(destHash: rfedChannelDest)
-            let deadline = Date().addingTimeInterval(20)
-            while Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.5)
-                if bridge.transportHasPath(destHash: rfedChannelDest) { return true }
-            }
-            return false
-        }.value
-
-        guard pathKnown else {
-            throw ChannelError.subscribeFailed("rfed node not reachable — no announce received")
-        }
-
-        let response = await Task.detached(priority: .background) {
-            bridge.linkRequest(destHash: rfedChannelDest, appName: "rfed", aspects: "channel",
-                               identityHandle: handle, path: "/rfed/subscribe",
-                               payload: payload, timeoutSecs: 20.0)
-        }.value
+        // All channel subscribes share the persistent rfed.channel APP_LINK
+        // managed by Rust (auto-reconnect on announce, no Swift one-shot links).
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let response = await ConnectionStateManager.shared.appLinkSend(
+            destHash: rfedChannelDest,
+            app: "rfed", aspects: ["channel"],
+            path: "/rfed/subscribe",
+            payload: payload
+        )
 
         guard let resp = response else {
-            throw ChannelError.subscribeFailed("link request timed out or failed")
+            throw ChannelError.subscribeFailed(
+                "rfed.channel APP_LINK not ACTIVE within 5 s")
         }
         let stampCost: Int? = Self.parseSubscribeResponse(resp)
         guard stampCost != nil || resp.first == 0xc3 || resp.first == 0x92 || resp.first == 0x91 else {
@@ -951,6 +915,29 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                     isSubscribed: $0.isSubscribed, stampCost: $0.stampCost)
         }
         try? ctx.save()
+    }
+
+    /// Register a one-shot APP_LINK status handler on the rfed.channel
+    /// destination.  When the link transitions to ACTIVE, re-subscribe to
+    /// every persisted-subscribed channel once.  Idempotent — guarded by
+    /// `didResubscribeOnActive` so reconnect storms don't spam the rfed
+    /// node with duplicate subscribes.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    private func scheduleResubscribeOnRfedChannelActive() {
+        let rfedHashHex = Self.rfedDestHash(
+            identityHashHex: prefs.rfedNodeIdentityHash,
+            app: "rfed", aspects: ["channel"])
+        guard let rfedDest = Data(hexString: rfedHashHex) else { return }
+
+        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: rfedDest) { [weak self] status in
+            // Status: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
+            guard let self = self else { return }
+            guard status == 3 else { return }
+            guard !self.didResubscribeOnActive else { return }
+            self.didResubscribeOnActive = true
+            print("[RfedChannel] rfed.channel APP_LINK ACTIVE → re-subscribing persisted channels")
+            self.resubscribePersistedChannels()
+        }
     }
 
     /// Re-subscribe to all channels that were subscribed before the app was killed.

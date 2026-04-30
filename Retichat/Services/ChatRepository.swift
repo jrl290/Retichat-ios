@@ -551,10 +551,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
-        // Decide delivery method at send time from live link state (no polling).
-        let method = ConnectionStateManager.shared.deliveryMethod(for: destData)
-        let methodName = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
-        print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
+        // Decide delivery method at send time from live link state.
+        //
+        // If a link to this peer is currently being established (we just
+        // opened the conversation, an announce just arrived, etc.) wait up
+        // to 5 s for it to reach ACTIVE before falling back to PROPAGATED.
+        // The wait happens off the UI thread; the optimistic bubble below
+        // is inserted before we await so the UI never blocks.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let initialMethod = ConnectionStateManager.shared.deliveryMethod(for: destData)
+        let initialName = initialMethod == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
+        print("[Retichat] sendMessage: initial method=\(initialName) dest=\(destHashHex.prefix(8))")
 
         // --- Optimistic bubble: insert immediately so the UI responds without waiting for FFI ---
         let tempId = "pending_\(UUID().uuidString)"
@@ -585,14 +592,24 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let ownHex = ownHashHex
         let attachmentsCopy = attachments
 
-        // Run FFI calls (create, pack, send) off the main thread.
-        ffiQueue.async { [weak self] in
-            let msgHandle = client.createMessage(
-                to: destData,
-                content: content,
-                title: "",
-                method: method
-            )
+        // Resolve the final delivery method off the main thread (may await
+        // up to 5 s for an in-flight APP_LINK to reach ACTIVE), then run
+        // the FFI calls (create, pack, send) on the FFI queue.
+        let ffiQueueRef = ffiQueue
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let method = await ConnectionStateManager.shared
+                .awaitDeliveryMethod(for: destData)
+            if method != initialMethod {
+                let n = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
+                print("[Retichat] sendMessage: resolved method=\(n) dest=\(destHashHex.prefix(8))")
+            }
+            ffiQueueRef.async { [weak self] in
+                let msgHandle = client.createMessage(
+                    to: destData,
+                    content: content,
+                    title: "",
+                    method: method
+                )
             guard msgHandle != 0 else {
                 print("[Retichat] Failed to create message: \(LxmfClient.lastError ?? "")")
                 Task { @MainActor [weak self] in
@@ -703,7 +720,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
                 self.refreshChats()
             }
-        }
+            }  // ffiQueueRef.async
+        }  // Task.detached
     }
 
     // MARK: - Group message send (fanout to all accepted members)
