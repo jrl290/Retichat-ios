@@ -312,11 +312,13 @@ final class ConnectionStateManager {
         }
         guard client.appLinkStatus(destHash) == 3 else { return nil }
 
-        // Issue the request off the main thread.
-        return await Task.detached(priority: .userInitiated) {
-            client.appLinkRequest(destHash: destHash, path: path,
-                                  payload: payload, timeoutSecs: 5.0)
-        }.value
+        // Async FFI variant: suspends the awaiting Task without parking
+        // a cooperative-pool thread on a synchronous Rust receive.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        return await client.appLinkRequestAsync(
+            destHash: destHash, path: path,
+            payload: payload, timeoutSecs: 5.0
+        )
     }
 
     /// Call when a conversation screen appears for a peer (direct or group member).

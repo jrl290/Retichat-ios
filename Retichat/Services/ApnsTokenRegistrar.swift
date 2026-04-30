@@ -23,13 +23,25 @@ final class ApnsTokenRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
+    /// One-shot guard so multiple registerIfNeeded() calls (token refresh,
+    /// service restart, etc.) don't queue up redundant sends per app run.
+    /// Reset only on explicit re-registration request.
+    private var didRegister = false
+
     private init() {}
 
     // MARK: - Public API
 
     /// Call after service starts (and identity is known) whenever the APNs token
     /// or the rfed.apns hash changes.
+    ///
+    /// rfed.apns is a packet endpoint (no link), so we can't hang off the
+    /// APP_LINK status callback the way RfedNotifyRegistrar does. Instead we
+    /// poll path availability with a short tick: the path is requested at
+    /// startup and arrives with the first matching announce (typically 1–15 s).
+    /// We wait up to 30 s, send once, and log loudly if the window elapses.
     func registerIfNeeded(subscriberHash: Data) {
+        guard !didRegister else { return }
         guard !prefs.rfedNodeIdentityHash.isEmpty else {
             print("[APNsRegistrar] No RFed node configured; skipping APNs registration")
             return
@@ -52,25 +64,33 @@ final class ApnsTokenRegistrar {
             return
         }
 
+        didRegister = true
         Task.detached(priority: .background) { [weak self] in
-            await self?.sendOnce(destHash: destHash, payload: payload,
-                                 subscriberHashHex: subscriberHash.hexString)
+            await self?.awaitPathThenSend(
+                destHash: destHash, payload: payload,
+                subscriberHashHex: subscriberHash.hexString
+            )
         }
     }
 
     // MARK: - Private
 
-    /// Single-attempt registration. No retries, no polling, no backoff.
-    /// Per DESIGN_PRINCIPLES.md §1-§2: one shot. The rfed.apns destination
-    /// receives plain encrypted packets (no link), so success is "we asked
-    /// the transport to send and it accepted the packet." If we have no
-    /// path, fail loudly — registration will be re-attempted on app start.
-    private func sendOnce(destHash: Data, payload: Data,
-                          subscriberHashHex: String) async {
+    /// Poll path availability up to 30 s, then send once.
+    private func awaitPathThenSend(destHash: Data, payload: Data,
+                                   subscriberHashHex: String) async {
+        // Kick a path request immediately if we don't have one yet.
         if !bridge.transportHasPath(destHash: destHash) {
-            // Kick a path request, but do not wait for it.
             _ = bridge.transportRequestPath(destHash: destHash)
-            print("[APNsRegistrar] No path to rfed.apns yet — skipping until next app start")
+        }
+
+        // Wait up to 30 s for path. 200 ms tick keeps wakeups cheap.
+        let deadline = Date().addingTimeInterval(30.0)
+        while Date() < deadline {
+            if bridge.transportHasPath(destHash: destHash) { break }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        guard bridge.transportHasPath(destHash: destHash) else {
+            print("[APNsRegistrar] No path to rfed.apns within 30 s — will retry on next app start")
             return
         }
 

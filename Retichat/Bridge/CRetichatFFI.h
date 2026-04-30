@@ -151,6 +151,23 @@ typedef void (*lxmf_app_link_status_callback_t)(
     uint8_t status
 );
 
+/// APP_LINK request completion callback (async variant).
+///
+/// Fires exactly once per `lxmf_app_link_request_async` invocation.
+///
+/// `status`:
+///   0 = success — `bytes`/`bytes_len` describe the response payload.
+///       Pointer is only valid for the duration of the callback; copy
+///       before returning.
+///   1 = timeout
+///   2 = failed (peer rejected / link torn down before response)
+///   3 = error (link not active, invalid args; check `lxmf_last_error`)
+typedef void (*lxmf_app_link_request_callback_t)(
+    void *context,
+    const uint8_t *bytes, uint32_t bytes_len,
+    int32_t status
+);
+
 int32_t lxmf_client_set_delivery_callback(uint64_t client,
                                            lxmf_delivery_callback_t callback,
                                            void *context);
@@ -268,6 +285,27 @@ uint8_t *lxmf_app_link_request(uint64_t client,
                                 const uint8_t *payload, uint32_t payload_len,
                                 double timeout_secs,
                                 uint32_t *out_len);
+
+/// Non-blocking variant of `lxmf_app_link_request`.
+///
+/// Issues a request on the existing app-link to `dest_hash` and fires
+/// `callback(context, bytes, bytes_len, status)` exactly once when the
+/// response arrives, the request fails, or `timeout_secs` elapses.
+///
+/// Returns 0 on success (callback will fire), -1 on immediate error
+/// (callback will NOT fire; check `lxmf_last_error`).
+///
+/// Preferred over the blocking variant when called from cooperative
+/// concurrency contexts (Swift async, Kotlin coroutines): avoids parking
+/// a high-QoS pool thread on a Default-QoS Rust receive. See
+/// DESIGN_PRINCIPLES.md §1.
+int32_t lxmf_app_link_request_async(uint64_t client,
+                                     const uint8_t *dest_hash, uint32_t dest_len,
+                                     const char *path,
+                                     const uint8_t *payload, uint32_t payload_len,
+                                     double timeout_secs,
+                                     lxmf_app_link_request_callback_t callback,
+                                     void *context);
 
 #pragma mark - LXMF Announce
 

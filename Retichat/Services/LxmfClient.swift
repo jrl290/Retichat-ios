@@ -44,6 +44,29 @@ struct LxmfClientConfig: Sendable {
 
 // MARK: - LxmfClient
 
+/// Heap box for a `CheckedContinuation` so we can pass an opaque pointer
+/// across the Rust FFI boundary and resume from a callback thread.
+/// Used by `appLinkRequestAsync` (and any future async-callback FFI).
+fileprivate final class ContinuationBox {
+    let cont: CheckedContinuation<Data?, Never>
+    init(cont: CheckedContinuation<Data?, Never>) { self.cont = cont }
+}
+
+/// Top-level C-compatible trampoline for `lxmf_app_link_request_async`.
+/// Cannot be a `@_cdecl` func — Swift forbids forming a C function pointer
+/// from such a func in property contexts. Closure form works.
+fileprivate let _appLinkRequestTrampoline: lxmf_app_link_request_callback_t = {
+    (ctx, bytesPtr, bytesLen, status) -> Void in
+    guard let ctx = ctx else { return }
+    let unbox = Unmanaged<ContinuationBox>.fromOpaque(ctx).takeRetainedValue()
+    if status == 0, let p = bytesPtr, bytesLen > 0 {
+        let data = Data(bytes: p, count: Int(bytesLen))
+        unbox.cont.resume(returning: data)
+    } else {
+        unbox.cont.resume(returning: nil)
+    }
+}
+
 /// Manages a complete Reticulum + LXMF stack lifecycle through one opaque
 /// handle.  All protocol internals are hidden behind the Rust `lxmf_*` FFI.
 final class LxmfClient: @unchecked Sendable {
@@ -292,6 +315,58 @@ final class LxmfClient: @unchecked Sendable {
                     lxmf_free_bytes(raw, outLen)
                     return result
                 }
+            }
+        }
+    }
+
+    /// Async/awaitable variant of `appLinkRequest`.
+    ///
+    /// Bridges Rust's callback-based `lxmf_app_link_request_async` to
+    /// Swift structured concurrency via `withCheckedContinuation`. The
+    /// awaiting Task suspends without parking a cooperative-pool thread
+    /// (the previous synchronous variant produced a User-initiated →
+    /// Default-QoS priority inversion observed by the Thread Performance
+    /// Checker — see DESIGN_PRINCIPLES.md §1).
+    ///
+    /// Caller MUST have `appLinkOpen`'d the destination and confirmed
+    /// `appLinkStatus(destHash) == 3` (ACTIVE) before calling.
+    /// Returns response bytes, or `nil` on timeout / failure / error.
+    nonisolated func appLinkRequestAsync(destHash: Data, path: String,
+                                         payload: Data,
+                                         timeoutSecs: Double) async -> Data?
+    {
+        await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+            // The continuation must outlive this scope — the Rust side
+            // delivers the callback from a background thread (response,
+            // failed, or timeout) and we need to be able to resume from
+            // there. Heap-box and pass the box pointer as the C context.
+            let box = ContinuationBox(cont: cont)
+            let ctxPtr = Unmanaged.passRetained(box).toOpaque()
+
+            let rc: Int32 = destHash.withUnsafeBytes { destBuf -> Int32 in
+                let destPtr = destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                return path.withCString { cPath -> Int32 in
+                    return payload.withUnsafeBytes { payBuf -> Int32 in
+                        let payPtr = payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                        return lxmf_app_link_request_async(
+                            self.handle,
+                            destPtr, UInt32(destHash.count),
+                            cPath,
+                            payPtr, UInt32(payload.count),
+                            timeoutSecs,
+                            _appLinkRequestTrampoline,
+                            ctxPtr
+                        )
+                    }
+                }
+            }
+
+            if rc != 0 {
+                // Immediate error — the Rust side will NOT fire the callback,
+                // so we must resume here and free the box ourselves.
+                let unbox = Unmanaged<ContinuationBox>.fromOpaque(ctxPtr)
+                    .takeRetainedValue()
+                unbox.cont.resume(returning: nil)
             }
         }
     }
