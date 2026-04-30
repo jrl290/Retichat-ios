@@ -106,8 +106,13 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
             bgTaskId = .invalid
         }
 
-        bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "RetichatPoll") { [weak self] in
-            // Expiration — system is about to suspend
+        bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "RetichatPoll") { [weak self, weak repository] in
+            // Expiration — system is about to suspend us, which means iOS
+            // will tear down all our TCP sockets and Reticulum links.
+            // Mark the repository so the next foreground transition issues
+            // a fresh PSYNC (any messages that arrived while we were
+            // suspended would otherwise wait until the 5-minute timer fires).
+            repository?.psyncNeededOnForeground = true
             guard let self else { return }
             if self.bgTaskId != .invalid {
                 UIApplication.shared.endBackgroundTask(self.bgTaskId)
@@ -182,10 +187,15 @@ struct RetichatApp: App {
                         ownHashHex: repository.ownHashHex
                     )
                     channelClient.start()
-                    // Open the rfed.channel app-link on first start so it is
-                    // established immediately rather than waiting for the first
-                    // background→active transition.
-                    ConnectionStateManager.shared.openRfedNodeLink()
+                    // NOTE: Do NOT call ConnectionStateManager.openRfedNodeLink()
+                    // here — `ConnectionStateManager.register(lxmfClient:)`
+                    // already opened it during `finishStartService`. Calling
+                    // again would be a no-op now that `app_link_open` is gated
+                    // on PATH_REQUESTED, but it is also redundant signal noise
+                    // in the startup log. The startup ordering is documented
+                    // in `ChatRepository.finishStartService` (single sequenced
+                    // path: identity → callbacks → connection-state register
+                    // → publish → polling → notify → channelClient.start).
                 }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -202,8 +212,12 @@ struct RetichatApp: App {
                 } else {
                     // Import any messages the NSE delivered while backgrounded
                     repository.importNSEMessages()
-                    // Immediate poll when returning to foreground
-                    repository.pollPropagationNode()
+                    // Force a PSYNC only if iOS actually suspended us
+                    // (sockets would have been torn down). For quick
+                    // app-switches the throttle keeps us off the network.
+                    let needPsync = repository.psyncNeededOnForeground
+                    repository.psyncNeededOnForeground = false
+                    repository.pollPropagationNode(force: needPsync)
                     // Re-establish path discovery for the active conversation (if any).
                     ConnectionStateManager.shared.onAppForeground()
                     // Re-open the persistent rfed node link.

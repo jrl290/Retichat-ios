@@ -34,6 +34,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private var modelContext: ModelContext?
     private var pollTimer: Timer?
 
+    /// Last time `pollPropagationNode` was actually allowed to issue an FFI
+    /// `client.sync(...)`. Used to throttle redundant callers (background-task
+    /// expiry, NSE bridges, etc.) so the propagation node sees at most one
+    /// query per `pollMinInterval`. Foreground transitions explicitly bypass
+    /// the throttle by passing `force: true`.
+    private var lastPollTime: Date = .distantPast
+    private let pollMinInterval: TimeInterval = 290  // ~5 min, slightly < timer
+
+    /// Set to `true` whenever the system suspends us (background-task
+    /// expiration fires) — sockets will be torn down by iOS while we're
+    /// suspended, so the next foreground transition needs a fresh PSYNC.
+    /// Cleared on each foreground PSYNC so a quick app-switch that didn't
+    /// trigger a real suspension won't re-fire the propagation node.
+    var psyncNeededOnForeground: Bool = false
+
     // MARK: - Outbound message state tracking
     //
     // Keyed by LXMF message hash hex.  Populated at send time, removed when
@@ -124,6 +139,25 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// Second half of startup — runs on @MainActor after the FFI call completes.
+    ///
+    /// Startup ordering (deterministic; do not rearrange casually):
+    ///   1. Stash client + own-hash so other layers can find them.
+    ///   2. Wire up the FFI callbacks (must be before any traffic flows).
+    ///   3. Configure announce-drop policy (must be before path discovery).
+    ///   4. Register with `ConnectionStateManager` — this kicks off the
+    ///      single, coordinated `requestEssentialPaths` + `openRfedNodeLink`
+    ///      sequence. All other components (RfedNotify, APNsRegistrar,
+    ///      RfedChannelClient.start) rely on `app_link_open` being idempotent
+    ///      under PATH_REQUESTED so they don't re-fire path requests.
+    ///   5. Flip `serviceRunning = true` — this lets the App scene's
+    ///      `.onReceive` handler wire up `RfedChannelClient` exactly once.
+    ///   6. Start RNode interfaces (independent of the path/link stack).
+    ///   7. Hand delivery destination to publish daemon (auto-re-announce).
+    ///   8. Side-tasks: ratchet sync, periodic poll, rfed notify register.
+    ///
+    /// Each step that touches the FFI is hopped to `ffiQueue` (serial) or to
+    /// a detached Task; all on-main-actor work above runs synchronously in
+    /// the order written, so component callbacks observe a consistent state.
     private func finishStartService(result: Result<LxmfClient, Error>, configDir: String, storagePath: String) {
         let client: LxmfClient
         switch result {
@@ -453,8 +487,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         refreshChats()
     }
 
-    func pollPropagationNode() {
+    func pollPropagationNode(force: Bool = false) {
         guard let client = lxmfClient else { return }
+
+        // Throttle: only foreground transitions (force=true) may bypass the
+        // 5-minute floor. The background-task hooks, the periodic timer, and
+        // any other casual caller all share the same minimum cadence so we
+        // never spam the propagation node like the pre-2026-04 logs showed.
+        let now = Date()
+        if !force, now.timeIntervalSince(lastPollTime) < pollMinInterval {
+            return
+        }
+        lastPollTime = now
+
         propManager.setUserConfiguredNode(prefs.lxmfPropagationHash)
 
         if let nodeHash = propManager.currentNode() {

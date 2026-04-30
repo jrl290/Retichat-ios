@@ -55,6 +55,15 @@ final class ConnectionStateManager {
     /// paths. Real subsequent transitions still fire normally.
     private var pathMonitorPrimed: Bool = false
 
+    /// Dedicated serial queue for path-table disk persistence. Decouples the
+    /// (potentially slow) on-disk write from the FFI/transport queue while
+    /// still preserving write order — saves are issued in the order they are
+    /// requested. Path-table snapshot bytes are computed on the FFI side
+    /// (transport_save_paths is internally synchronized); only the I/O hop
+    /// runs here.
+    private let persistQueue = DispatchQueue(
+        label: "chat.retichat.path-persist", qos: .utility)
+
     private init() {}
 
     // MARK: - Setup
@@ -357,6 +366,7 @@ final class ConnectionStateManager {
         // Pre-compute hex labels on the main actor before going off-thread.
         let destPairs: [(Data, String)] = destinations.map { ($0, String($0.hexString.prefix(8))) }
         let bridge = RetichatBridge.shared
+        let persistQueue = self.persistQueue
 
         // All FFI work off the main thread.
         Task.detached(priority: .userInitiated) {
@@ -396,8 +406,13 @@ final class ConnectionStateManager {
                 try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 s
             }
             if resolvedAny {
-                bridge.transportSavePaths()
-                print("[DIAG][requestEssentialPaths] persisted path table to disk")
+                // Hop the actual disk-write to a dedicated serial queue so the
+                // FFI/utility queue is free to handle the next path/link work
+                // immediately. The serial queue preserves write ordering.
+                persistQueue.async {
+                    bridge.transportSavePaths()
+                    print("[DIAG][requestEssentialPaths] persisted path table to disk")
+                }
             } else {
                 print("[DIAG][requestEssentialPaths] no essentials resolved before timeout; skipping persist")
             }
