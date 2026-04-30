@@ -61,7 +61,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// Serial queue for all FFI calls into the Rust LXMF library.
     /// Keeps the main thread responsive while crypto, link establishment,
     /// and outbound processing run in the background.
-    private let ffiQueue = DispatchQueue(label: "chat.retichat.ffi", qos: .userInitiated)
+    ///
+    /// QoS is `.utility` (not `.userInitiated`) deliberately: FFI calls
+    /// can block on link-actor mailboxes that ultimately wait on socket
+    /// writes to remote peers. If this queue ran at `.userInitiated`,
+    /// any user-driven UI work that later awaited the same queue would
+    /// inherit a priority inversion against the default-QoS Rust threads
+    /// servicing those sockets (Thread Performance Checker warning, and
+    /// in pathological cases a permanent UI freeze).
+    private let ffiQueue = DispatchQueue(label: "chat.retichat.ffi", qos: .utility)
 
     // MARK: - Init
 
