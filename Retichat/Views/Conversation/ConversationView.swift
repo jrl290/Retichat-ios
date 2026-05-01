@@ -57,7 +57,7 @@ struct ConversationView: View {
     /// Master switch for the title-bar direct-link status dot.  Set to
     /// `false` to hide the indicator while keeping the supporting code in
     /// place for easy re-enable.
-    private static let showPeerLinkDot: Bool = false
+    private static let showPeerLinkDot: Bool = true
 
     // MARK: - Convenience
 
