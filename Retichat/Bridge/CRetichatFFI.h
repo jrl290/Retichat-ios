@@ -343,6 +343,14 @@ int32_t lxmf_message_add_field_bool(uint64_t msg, uint8_t key, int32_t value);
 int32_t lxmf_message_add_attachment(uint64_t msg, const char *filename,
                                      const uint8_t *data, uint32_t data_len);
 int32_t lxmf_message_send(uint64_t client, uint64_t msg);
+/// Send via the top-level AppLinks::send pipeline (iface-race + 2 s
+/// liveness cache; no client/router handle required — uses the global
+/// router registered by lxmf_router_create).
+int32_t lxmf_message_send_via_app_links(uint64_t msg);
+/// Forget the cached liveness winner for `dest_hash` so the next
+/// lxmf_message_send_via_app_links re-races interfaces. Call on
+/// known network-state changes (WiFi→cellular, etc).
+int32_t lxmf_app_links_invalidate_liveness(const uint8_t *dest_hash, uint32_t dest_len);
 int32_t lxmf_message_state(uint64_t msg);
 float   lxmf_message_progress(uint64_t msg);
 int32_t lxmf_message_hash(uint64_t msg, uint8_t *out_buf, uint32_t buf_len);

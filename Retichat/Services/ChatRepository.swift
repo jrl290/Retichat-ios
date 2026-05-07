@@ -554,13 +554,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Decide delivery method at send time from live link state.
         //
         // If a link to this peer is currently being established (we just
-        // opened the conversation, an announce just arrived, etc.) wait up
-        // to 5 s for it to reach ACTIVE before falling back to PROPAGATED.
-        // The wait happens off the UI thread; the optimistic bubble below
-        // is inserted before we await so the UI never blocks.
+        // opened the conversation, an announce just arrived, etc.) the Rust
+        // process_outbound stagger will handle the DIRECT→PROPAGATED fallback
+        // within 3 s. No need to pre-decide here.
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        let initialMethod = ConnectionStateManager.shared.deliveryMethod(for: destData)
-        let initialName = initialMethod == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
+        let initialName = ConnectionStateManager.shared.deliveryMethod(for: destData) == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
         print("[Retichat] sendMessage: initial method=\(initialName) dest=\(destHashHex.prefix(8))")
 
         // --- Optimistic bubble: insert immediately so the UI responds without waiting for FFI ---
@@ -592,17 +590,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let ownHex = ownHashHex
         let attachmentsCopy = attachments
 
-        // Resolve the final delivery method off the main thread (may await
-        // up to 5 s for an in-flight APP_LINK to reach ACTIVE), then run
-        // the FFI calls (create, pack, send) on the FFI queue.
+        // Resolve delivery method synchronously — Rust (process_outbound)
+        // owns the DIRECT→PROPAGATED stagger and backstop, so there is no
+        // reason to wait here.  We always pass DIRECT if a path or active
+        // link exists; Rust falls back to PROPAGATED after its 3-second
+        // stagger if the link doesn't materialise in time.
+        let method = ConnectionStateManager.shared.deliveryMethod(for: destData)
+        let methodName = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
+        print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
+
         let ffiQueueRef = ffiQueue
         Task.detached(priority: .userInitiated) { [weak self] in
-            let method = await ConnectionStateManager.shared
-                .awaitDeliveryMethod(for: destData)
-            if method != initialMethod {
-                let n = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
-                print("[Retichat] sendMessage: resolved method=\(n) dest=\(destHashHex.prefix(8))")
-            }
             ffiQueueRef.async { [weak self] in
                 let msgHandle = client.createMessage(
                     to: destData,

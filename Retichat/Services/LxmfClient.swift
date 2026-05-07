@@ -457,6 +457,31 @@ final class LxmfClient: @unchecked Sendable {
         lxmf_message_send(handle, msgHandle) == 0
     }
 
+    /// Submit a previously created message via the top-level
+    /// `AppLinks::send` pipeline.
+    ///
+    /// The Rust side runs an interface-race (parallel `request_path` on
+    /// every online, non-LoRa iface, 2 s liveness cache) before
+    /// dispatching, so the app no longer has to pre-warm a path or pick
+    /// an iface. Returns `false` on failure (no usable iface, 5 s
+    /// liveness budget exceeded, or LXMF dispatch error). See
+    /// `RetichatFFI.lastError()` for the reason.
+    @discardableResult
+    func sendMessageViaAppLinks(_ msgHandle: UInt64) -> Bool {
+        lxmf_message_send_via_app_links(msgHandle) == 0
+    }
+
+    /// Forget the cached liveness winner for `destHash`. Call from your
+    /// `NWPathMonitor` handler when the active path flips (e.g. WiFi
+    /// dropped, cellular came up) so the next AppLinks send re-races
+    /// instead of reusing a now-dead iface.
+    static func invalidateLiveness(_ destHash: Data) {
+        destHash.withUnsafeBytes { buf in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            _ = lxmf_app_links_invalidate_liveness(p, UInt32(destHash.count))
+        }
+    }
+
     // MARK: - Message tracking
 
     /// Get message delivery state.

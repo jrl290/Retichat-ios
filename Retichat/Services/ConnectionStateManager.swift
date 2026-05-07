@@ -242,43 +242,6 @@ final class ConnectionStateManager {
         return LxmfMethod.propagated
     }
 
-    /// Async variant of `deliveryMethod(for:)` used at message-send time.
-    ///
-    /// If an APP_LINK to the peer is currently `PATH_REQUESTED` (1) or
-    /// `ESTABLISHING` (2), this awaits its resolution for **up to 5 seconds**
-    /// (DESIGN_PRINCIPLES.md §1) before deciding. If it reaches `ACTIVE` (3)
-    /// in that window, we send DIRECT over the link the user just opened
-    /// when they entered the conversation. If 5 s elapses without ACTIVE,
-    /// we fall back to PROPAGATED — never raise this ceiling.
-    ///
-    /// Caller MUST run this off the main thread (it awaits).
-    func awaitDeliveryMethod(for destHash: Data) async -> UInt8 {
-        // Fast-path: synchronous decision if not in linking limbo.
-        if let client = lxmfClient {
-            let status = client.appLinkStatus(destHash)
-            if status == 3 { return LxmfMethod.direct }
-            if client.peerLinkStatus(destHash) == 2 { return LxmfMethod.direct }
-            if status == 1 || status == 2 {
-                // Wait up to 5 s for the in-flight establishment.
-                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-                let deadline = Date().addingTimeInterval(5.0)
-                while Date() < deadline {
-                    if client.appLinkStatus(destHash) == 3 {
-                        return LxmfMethod.direct
-                    }
-                    try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
-                }
-                // Linking did not resolve inside the 5 s budget — fall back.
-                return LxmfMethod.propagated
-            }
-        }
-
-        if RetichatBridge.shared.transportHasPath(destHash: destHash) {
-            return LxmfMethod.direct
-        }
-        return LxmfMethod.propagated
-    }
-
     // MARK: - APP_LINK request helper
 
     /// Open (idempotently) an APP_LINK to `destHash` for the given app/aspects
