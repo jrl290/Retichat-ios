@@ -29,6 +29,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "app_links"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "reticulum_rust",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -960,6 +968,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 name = "lxmf_rust"
 version = "0.1.0"
 dependencies = [
+ "app_links",
  "atty",
  "base64",
  "ctrlc",
