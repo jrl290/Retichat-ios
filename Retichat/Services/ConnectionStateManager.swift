@@ -219,27 +219,16 @@ final class ConnectionStateManager {
     /// Returns the LXMF delivery method to use when sending to a peer.
     /// Uses live link status and recent announce data — instant, no I/O.
     ///
-    /// Strategy: prefer DIRECT whenever there is any routing path.  The
-    /// app-level 5-second fallback in ChatRepository will send a parallel
-    /// PROPAGATED copy if the direct attempt doesn't deliver in time.
-    /// This avoids the old problem where degradedPeers forced PROPAGATED
-    /// before even attempting DIRECT.
+    /// Strategy: always DIRECT.  AppLinks owns the full tier chain (inbound
+    /// link → cached outbound → fresh path-race + link establishment) plus
+    /// Timer P which starts a parallel PROPAGATED send at exactly 5 s if
+    /// DIRECT hasn't delivered.  Pre-empting to PROPAGATED here — even when
+    /// transportHasPath is false — would bypass AppLinks entirely and skip
+    /// the parallel-send mechanism, leading to a send failure if the prop
+    /// node link is also slow or unavailable at that instant.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     func deliveryMethod(for destHash: Data) -> UInt8 {
-        // An ACTIVE app link or direct/backchannel link exists — use it.
-        if let client = lxmfClient {
-            if client.appLinkStatus(destHash) == 3 { return LxmfMethod.direct }  // ACTIVE app link
-            if client.peerLinkStatus(destHash) == 2 { return LxmfMethod.direct }
-        }
-
-        // If we have any routing path to the peer, try DIRECT.
-        // The 5-second prop fallback will cover the case where
-        // the peer is unreachable.
-        if RetichatBridge.shared.transportHasPath(destHash: destHash) {
-            return LxmfMethod.direct
-        }
-
-        // No path at all — propagation node is the only option.
-        return LxmfMethod.propagated
+        return LxmfMethod.direct
     }
 
     // MARK: - APP_LINK request helper

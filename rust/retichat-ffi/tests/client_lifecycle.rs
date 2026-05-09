@@ -26,21 +26,28 @@ fn make_client_dir() -> TempDir {
 
 #[test]
 fn test_shutdown_invalid_handle_returns_error() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_shutdown_invalid_handle_returns_error");
     let s = "lxmf_client_shutdown(0) → expect -1";
     helpers::step(s);
     let rc = retichat_ffi::lxmf_client_shutdown(0);
     assert_eq!(rc, -1, "expected -1 for handle 0, got {rc}");
     let err = helpers::last_error_str();
-    assert!(err.is_some(), "expected an error string for invalid handle shutdown");
+    assert!(
+        err.is_some(),
+        "expected an error string for invalid handle shutdown"
+    );
     eprintln!("    error: {:?}", err.as_deref().unwrap_or("none"));
     helpers::done(s);
 }
 
 #[test]
 fn test_identity_handle_query_invalid_handle() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_identity_handle_query_invalid_handle");
     let s = "lxmf_client_identity_handle(0) → expect 0";
     helpers::step(s);
@@ -56,7 +63,9 @@ fn test_identity_handle_query_invalid_handle() {
 
 #[test]
 fn test_start_gives_nonzero_handle() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_start_gives_nonzero_handle");
     let dir = make_client_dir();
 
@@ -74,7 +83,9 @@ fn test_start_gives_nonzero_handle() {
 
 #[test]
 fn test_identity_hash_is_16_bytes_and_nonzero() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_identity_hash_is_16_bytes_and_nonzero");
     let dir = make_client_dir();
     let client = helpers::start_test_client(dir.path(), "Lifecycle-IdHash");
@@ -83,7 +94,10 @@ fn test_identity_hash_is_16_bytes_and_nonzero() {
     helpers::step(s);
     let hash = helpers::client_identity_hash(client);
     assert_eq!(hash.len(), 16, "identity hash must be 16 bytes");
-    assert!(!hash.iter().all(|&b| b == 0), "identity hash must not be all zeros");
+    assert!(
+        !hash.iter().all(|&b| b == 0),
+        "identity hash must not be all zeros"
+    );
     eprintln!("    identity hash: {}", hex::encode(&hash));
     helpers::done(s);
 
@@ -95,7 +109,9 @@ fn test_identity_hash_is_16_bytes_and_nonzero() {
 
 #[test]
 fn test_dest_hash_is_16_bytes_and_nonzero() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_dest_hash_is_16_bytes_and_nonzero");
     let dir = make_client_dir();
     let client = helpers::start_test_client(dir.path(), "Lifecycle-DestHash");
@@ -104,7 +120,10 @@ fn test_dest_hash_is_16_bytes_and_nonzero() {
     helpers::step(s);
     let hash = helpers::client_dest_hash(client);
     assert_eq!(hash.len(), 16, "dest hash must be 16 bytes");
-    assert!(!hash.iter().all(|&b| b == 0), "dest hash must not be all zeros");
+    assert!(
+        !hash.iter().all(|&b| b == 0),
+        "dest hash must not be all zeros"
+    );
     eprintln!("    dest hash: {}", hex::encode(&hash));
     helpers::done(s);
 
@@ -116,7 +135,9 @@ fn test_dest_hash_is_16_bytes_and_nonzero() {
 
 #[test]
 fn test_identity_handle_nonzero_after_start() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_identity_handle_nonzero_after_start");
     let dir = make_client_dir();
     let client = helpers::start_test_client(dir.path(), "Lifecycle-IdHandle");
@@ -135,7 +156,9 @@ fn test_identity_handle_nonzero_after_start() {
 
 #[test]
 fn test_double_shutdown_second_returns_error() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_double_shutdown_second_returns_error");
     let dir = make_client_dir();
     let client = helpers::start_test_client(dir.path(), "Lifecycle-DblShutdown");
@@ -155,7 +178,9 @@ fn test_double_shutdown_second_returns_error() {
 
 #[test]
 fn test_identity_and_dest_hash_differ() {
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     helpers::test_banner("test_identity_and_dest_hash_differ");
     let dir = make_client_dir();
     let client = helpers::start_test_client(dir.path(), "Lifecycle-HashDiff");
@@ -164,7 +189,10 @@ fn test_identity_and_dest_hash_differ() {
     helpers::step(s);
     let id_hash = helpers::client_identity_hash(client);
     let dest_hash = helpers::client_dest_hash(client);
-    assert_ne!(id_hash, dest_hash, "identity hash and LXMF dest hash must differ");
+    assert_ne!(
+        id_hash, dest_hash,
+        "identity hash and LXMF dest hash must differ"
+    );
     eprintln!("    identity: {}", hex::encode(&id_hash));
     eprintln!("    dest:     {}", hex::encode(&dest_hash));
     helpers::done(s);

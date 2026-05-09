@@ -23,8 +23,8 @@
 mod helpers;
 
 use std::ffi::CString;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 const TEST_CONTENT: &str = "retichat-ffi-messaging-test";
@@ -37,13 +37,16 @@ const TEST_CONTENT: &str = "retichat-ffi-messaging-test";
 #[test]
 fn test_rust_sends_to_python_receiver() {
     helpers::test_banner("test_rust_sends_to_python_receiver");
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let s = "Start Rust LXMF client";
     helpers::step(s);
     let rust_dir = tempfile::tempdir().expect("rust config tempdir");
     helpers::write_rns_config(rust_dir.path(), &helpers::rnsd_host(), helpers::rnsd_port());
-    let _client_guard = helpers::ClientGuard::new(helpers::start_test_client(rust_dir.path(), "MsgSendTest"));
+    let _client_guard =
+        helpers::ClientGuard::new(helpers::start_test_client(rust_dir.path(), "MsgSendTest"));
     let client = _client_guard.handle();
     helpers::done(s);
 
@@ -56,7 +59,12 @@ fn test_rust_sends_to_python_receiver() {
         helpers::state_trampoline,
         state_ctx,
     );
-    assert_eq!(rc, 0, "set_message_state_callback failed: {:?}", helpers::last_error_str());
+    assert_eq!(
+        rc,
+        0,
+        "set_message_state_callback failed: {:?}",
+        helpers::last_error_str()
+    );
     helpers::done(s);
 
     let s = "Announce Rust client";
@@ -87,10 +95,20 @@ fn test_rust_sends_to_python_receiver() {
         std::ptr::null(), // no title
         2,                // direct
     );
-    assert_ne!(msg, 0, "lxmf_message_new failed: {:?}", helpers::last_error_str());
+    assert_ne!(
+        msg,
+        0,
+        "lxmf_message_new failed: {:?}",
+        helpers::last_error_str()
+    );
 
     let rc = retichat_ffi::lxmf_message_send(client, msg);
-    assert_eq!(rc, 0, "lxmf_message_send failed: {:?}", helpers::last_error_str());
+    assert_eq!(
+        rc,
+        0,
+        "lxmf_message_send failed: {:?}",
+        helpers::last_error_str()
+    );
     helpers::done(&send_label);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -106,20 +124,31 @@ fn test_rust_sends_to_python_receiver() {
     {
         let (lock, _) = &*state_capture;
         for ev in lock.lock().unwrap().iter() {
-            eprintln!("    state: 0x{:02X} for msg={}", ev.state, hex::encode(&ev.msg_hash));
+            eprintln!(
+                "    state: 0x{:02X} for msg={}",
+                ev.state,
+                hex::encode(&ev.msg_hash)
+            );
         }
     }
 
     retichat_ffi::lxmf_message_destroy(msg);
-    if exit_code == 0 && last_line.starts_with("RECEIVED:") { helpers::done(s); }
+    if exit_code == 0 && last_line.starts_with("RECEIVED:") {
+        helpers::done(s);
+    }
 
     let s = "Shut down Rust client";
     helpers::step(s);
     helpers::shutdown_client(client);
-    unsafe { helpers::release_ctx_ptr::<helpers::StateEvent>(state_ctx); }
+    unsafe {
+        helpers::release_ctx_ptr::<helpers::StateEvent>(state_ctx);
+    }
     helpers::done(s);
 
-    assert_eq!(exit_code, 0, "Python receiver exited with {exit_code}; last line: {last_line:?}");
+    assert_eq!(
+        exit_code, 0,
+        "Python receiver exited with {exit_code}; last line: {last_line:?}"
+    );
     assert!(
         last_line.starts_with("RECEIVED:"),
         "expected Python receiver to print 'RECEIVED:\u{2026}', got: {last_line:?}"
@@ -135,13 +164,16 @@ fn test_rust_sends_to_python_receiver() {
 #[test]
 fn test_python_sender_delivers_to_rust() {
     helpers::test_banner("test_python_sender_delivers_to_rust");
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let s = "Start Rust LXMF client and register delivery callback";
     helpers::step(s);
     let rust_dir = tempfile::tempdir().expect("rust config tempdir");
     helpers::write_rns_config(rust_dir.path(), &helpers::rnsd_host(), helpers::rnsd_port());
-    let _client_guard = helpers::ClientGuard::new(helpers::start_test_client(rust_dir.path(), "MsgRecvTest"));
+    let _client_guard =
+        helpers::ClientGuard::new(helpers::start_test_client(rust_dir.path(), "MsgRecvTest"));
     let client = _client_guard.handle();
     let delivery_capture = helpers::new_capture::<helpers::DeliveredMsg>();
     let delivery_ctx = helpers::capture_ctx_ptr(&delivery_capture);
@@ -150,7 +182,12 @@ fn test_python_sender_delivers_to_rust() {
         helpers::delivery_trampoline,
         delivery_ctx,
     );
-    assert_eq!(rc, 0, "set_delivery_callback failed: {:?}", helpers::last_error_str());
+    assert_eq!(
+        rc,
+        0,
+        "set_delivery_callback failed: {:?}",
+        helpers::last_error_str()
+    );
     helpers::done(s);
 
     let s = "Announce Rust client";
@@ -189,17 +226,21 @@ fn test_python_sender_delivers_to_rust() {
     let received = helpers::wait_for_one(&delivery_capture, Duration::from_secs(60));
     let (py_exit, py_last) = helpers::wait_python(py_proc);
     eprintln!("    python sender exited {py_exit}: {py_last:?}");
-    if received.is_some() { helpers::done(s); }
+    if received.is_some() {
+        helpers::done(s);
+    }
 
     let s = "Shut down Rust client";
     helpers::step(s);
     helpers::shutdown_client(client);
-    unsafe { helpers::release_ctx_ptr::<helpers::DeliveredMsg>(delivery_ctx); }
+    unsafe {
+        helpers::release_ctx_ptr::<helpers::DeliveredMsg>(delivery_ctx);
+    }
     helpers::done(s);
 
     let msg = received.expect(
         "Rust delivery callback never fired within 60 s; \
-         check that rnsd is reachable and the Python sender succeeded"
+         check that rnsd is reachable and the Python sender succeeded",
     );
     assert_eq!(
         msg.content, TEST_CONTENT,
@@ -207,4 +248,3 @@ fn test_python_sender_delivers_to_rust() {
         TEST_CONTENT, msg.content
     );
 }
-

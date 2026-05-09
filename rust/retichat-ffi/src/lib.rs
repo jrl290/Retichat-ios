@@ -17,19 +17,19 @@
 
 // Re-export the universal C FFI layers so all symbols end up in
 // this static library.
-pub use reticulum_rust::cffi::*;
 pub use lxmf_rust::cffi::*;
+pub use reticulum_rust::cffi::*;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sha2::{Digest, Sha256};
-use reticulum_rust::ffi as rns;
 use reticulum_rust::destination::{Destination, DestinationType};
+use reticulum_rust::ffi as rns;
 use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::Packet;
 use reticulum_rust::transport::Transport;
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -72,11 +72,7 @@ pub extern "C" fn retichat_identity_from_bytes(bytes: *const u8, len: u32) -> u6
 /// Get identity public key.  Writes to `out_buf` (must be >= 64 bytes).
 /// Returns byte count written, or -1 on error.
 #[no_mangle]
-pub extern "C" fn retichat_identity_public_key(
-    handle: u64,
-    out_buf: *mut u8,
-    buf_len: u32,
-) -> i32 {
+pub extern "C" fn retichat_identity_public_key(handle: u64, out_buf: *mut u8, buf_len: u32) -> i32 {
     match rns::identity_public_key(handle) {
         Ok(bytes) => {
             if buf_len < bytes.len() as u32 {
@@ -112,7 +108,9 @@ pub extern "C" fn retichat_identity_sign(
     let d = slice_from_raw(data, data_len);
     match rns::identity_sign(handle, &d) {
         Ok(sig) => {
-            unsafe { std::ptr::copy_nonoverlapping(sig.as_ptr(), out_sig, 64); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(sig.as_ptr(), out_sig, 64);
+            }
             64
         }
         Err(e) => {
@@ -145,7 +143,11 @@ pub extern "C" fn retichat_identity_destroy(handle: u64) -> i32 {
 #[no_mangle]
 pub extern "C" fn retichat_transport_has_path(dest_hash: *const u8, len: u32) -> i32 {
     let h = slice_from_raw(dest_hash, len);
-    if rns::transport_has_path(&h) { 1 } else { 0 }
+    if rns::transport_has_path(&h) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Request path to destination.  Returns 0 on success, -1 on error.
@@ -245,10 +247,7 @@ pub extern "C" fn retichat_packet_send_to_hash(
     let hash = slice_from_raw(dest_hash, dest_hash_len);
     let app = unsafe { cstr_to_string(app_name) };
     let asp_str = unsafe { cstr_to_string(aspects) };
-    let asp_vec: Vec<String> = asp_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    let asp_vec: Vec<String> = asp_str.split(',').map(|s| s.trim().to_string()).collect();
     let payload_data = slice_from_raw(payload, payload_len);
 
     let dest_handle = match rns::destination_create_outbound_from_hash(&hash, &app, asp_vec) {
@@ -313,20 +312,27 @@ pub extern "C" fn retichat_link_request(
     let hash = slice_from_raw(dest_hash, dest_hash_len);
     let app = unsafe { cstr_to_string(app_name) };
     let asp_str = unsafe { cstr_to_string(aspects) };
-    let asp_vec: Vec<String> = asp_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    let asp_vec: Vec<String> = asp_str.split(',').map(|s| s.trim().to_string()).collect();
     let p = unsafe { cstr_to_string(path) };
     let data = slice_from_raw(payload, payload_len);
 
-    match rns::link_request(&hash, &app, asp_vec, identity_handle, &p, &data, timeout_secs) {
+    match rns::link_request(
+        &hash,
+        &app,
+        asp_vec,
+        identity_handle,
+        &p,
+        &data,
+        timeout_secs,
+    ) {
         Ok(response) => {
             let len = response.len() as u32;
             let boxed = response.into_boxed_slice();
             let raw = Box::into_raw(boxed);
             if !out_len.is_null() {
-                unsafe { *out_len = len; }
+                unsafe {
+                    *out_len = len;
+                }
             }
             raw as *mut u8
         }
@@ -408,7 +414,11 @@ pub extern "C" fn retichat_rfed_delivery_start(
     let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> =
         Arc::new(move |data: &[u8], _pkt: &Packet| {
             if let Some(f) = cb {
-                f(data.as_ptr(), data.len() as u32, ctx_usize as *mut std::ffi::c_void);
+                f(
+                    data.as_ptr(),
+                    data.len() as u32,
+                    ctx_usize as *mut std::ffi::c_void,
+                );
             }
         });
     dest.set_packet_callback(Some(packet_cb));
@@ -487,7 +497,9 @@ pub extern "C" fn retichat_channel_encrypt(
         Ok(id) => id,
         Err(e) => {
             rns::set_error(e);
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -497,12 +509,16 @@ pub extern "C" fn retichat_channel_encrypt(
             let mut boxed = ct.into_boxed_slice();
             let ptr = boxed.as_mut_ptr();
             std::mem::forget(boxed);
-            unsafe { *out_len = len; }
+            unsafe {
+                *out_len = len;
+            }
             ptr
         }
         Err(e) => {
             rns::set_error(e);
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             std::ptr::null_mut()
         }
     }
@@ -522,7 +538,9 @@ pub extern "C" fn retichat_channel_decrypt(
         Ok(id) => id,
         Err(e) => {
             rns::set_error(e);
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -532,12 +550,16 @@ pub extern "C" fn retichat_channel_decrypt(
             let mut boxed = pt.into_boxed_slice();
             let ptr = boxed.as_mut_ptr();
             std::mem::forget(boxed);
-            unsafe { *out_len = len; }
+            unsafe {
+                *out_len = len;
+            }
             ptr
         }
         Err(e) => {
             rns::set_error(e);
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             std::ptr::null_mut()
         }
     }
@@ -578,7 +600,9 @@ pub extern "C" fn retichat_compute_channel_stamp(
 ) -> *mut u8 {
     use reticulum_rust::lxstamper::LXStamper;
     if cost == 0 {
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     let data = slice_from_raw(payload, payload_len);
@@ -592,16 +616,22 @@ pub extern "C" fn retichat_compute_channel_stamp(
         rns::set_error(format!(
             "stamp PoW failed: required cost={} but achieved value={} (payload_len={}). \
              Either iteration cap exceeded or workblock mismatch.",
-            cost, value, data.len()
+            cost,
+            value,
+            data.len()
         ));
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     let len = stamp.len() as u32;
     let mut boxed = stamp.into_boxed_slice();
     let ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
-    unsafe { *out_len = len; }
+    unsafe {
+        *out_len = len;
+    }
     ptr
 }
 
@@ -738,15 +768,17 @@ fn channel_destination(name: &str) -> Result<Destination, String> {
 /// Returns a heap-allocated buffer (free with `lxmf_free_bytes`) in the
 /// following layout, or NULL on error (call `lxmf_last_error`):
 ///
-///     offset  size  field
-///     ------  ----  -----
-///     0       8     timestamp_ms_be    (u64 BE) — the LXMF timestamp the
-///                                       sender baked into the signed
-///                                       payload, returned out-of-band so
-///                                       the caller can match it against
-///                                       the echo for local-persist dedup.
-///     8       16    channel_id_hash    (the routing label for RFed)
-///     24      *     EC_encrypted(source_hash || signature || msgpack_payload)
+/// ```text
+/// offset  size  field
+/// ------  ----  -----
+/// 0       8     timestamp_ms_be    (u64 BE) — the LXMF timestamp the
+///                                   sender baked into the signed
+///                                   payload, returned out-of-band so
+///                                   the caller can match it against
+///                                   the echo for local-persist dedup.
+/// 8       16    channel_id_hash    (the routing label for RFed)
+/// 24      *     EC_encrypted(source_hash || signature || msgpack_payload)
+/// ```
 ///
 /// The wire payload is `output[8..]` — the 8-byte timestamp prefix is
 /// stripped before sending.
@@ -763,7 +795,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
     let name = unsafe { cstr_to_string(name_ptr) };
     if name.is_empty() {
         rns::set_error("channel name is empty".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     let content = slice_from_raw(content_ptr, content_len);
@@ -773,7 +807,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
         Some(id) => id,
         None => {
             rns::set_error("invalid sender identity handle".into());
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -786,7 +822,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
         Ok(b) => b,
         Err(e) => {
             rns::set_error(format!("sender identity has no public key: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -795,7 +833,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
             "sender identity public key wrong length: expected 64, got {}",
             sender_pub_bytes.len()
         ));
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
 
@@ -803,7 +843,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
         Ok(d) => d,
         Err(e) => {
             rns::set_error(format!("channel destination: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -816,7 +858,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
         Ok(d) => d,
         Err(e) => {
             rns::set_error(format!("sender destination: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -826,24 +870,28 @@ pub extern "C" fn retichat_channel_lxm_pack(
         Some(sender_dest),
         Some(content),
         Some(title),
-        None,                              // fields = empty map (default)
-        Some(LXMessage::PROPAGATED),       // desired_method
+        None,                        // fields = empty map (default)
+        Some(LXMessage::PROPAGATED), // desired_method
         None,
         None,
-        None,                              // stamp_cost (PoW is at the RFed wrapper, not LXMF)
-        false,                             // include_ticket
+        None,  // stamp_cost (PoW is at the RFed wrapper, not LXMF)
+        false, // include_ticket
     ) {
         Ok(m) => m,
         Err(e) => {
             rns::set_error(format!("LXMessage::new: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
 
     if let Err(e) = msg.pack(false) {
         rns::set_error(format!("LXMessage::pack: {}", e));
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
 
@@ -862,13 +910,17 @@ pub extern "C" fn retichat_channel_lxm_pack(
         Some(p) => p,
         None => {
             rns::set_error("LXMessage missing packed buffer after pack".into());
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
     if packed.len() < LXMessage::DESTINATION_LENGTH {
         rns::set_error("packed buffer too short".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     // Prepend the SOURCE-IDENTITY PRELUDE to the LXMF tail before
@@ -885,7 +937,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
         Ok(d) => d,
         Err(e) => {
             rns::set_error(format!("channel encrypt: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -896,19 +950,25 @@ pub extern "C" fn retichat_channel_lxm_pack(
             Some(h) => h,
             None => {
                 rns::set_error("channel identity has no hash".into());
-                unsafe { *out_len = 0; }
+                unsafe {
+                    *out_len = 0;
+                }
                 return std::ptr::null_mut();
             }
         },
         Err(e) => {
             rns::set_error(format!("channel identity: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
     if id_hash.len() != LXMessage::DESTINATION_LENGTH {
         rns::set_error("channel identity hash wrong length".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
 
@@ -924,7 +984,9 @@ pub extern "C" fn retichat_channel_lxm_pack(
     let mut boxed = wire.into_boxed_slice();
     let ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
-    unsafe { *out_len = len; }
+    unsafe {
+        *out_len = len;
+    }
     ptr
 }
 
@@ -938,17 +1000,19 @@ pub extern "C" fn retichat_channel_lxm_pack(
 /// Returns a heap-allocated buffer (free with `lxmf_free_bytes`) containing
 /// a flat parsed-message struct in the following layout, or NULL on error:
 ///
-///     offset  size  field
-///     ------  ----  -----
-///     0       16    source_hash
-///     16      8     timestamp_ms_be      (u64, big-endian, milliseconds)
-///     24      1     signature_validated  (1 = OK, 0 = NOT verified)
-///     25      1     unverified_reason    (0 = ok, 1 = SOURCE_UNKNOWN,
-///                                          2 = SIGNATURE_INVALID)
-///     26      2     title_len_be         (u16, big-endian)
-///     28      4     content_len_be       (u32, big-endian)
-///     32      title_len    title bytes (UTF-8)
-///     32+t    content_len  content bytes (UTF-8)
+/// ```text
+/// offset  size  field
+/// ------  ----  -----
+/// 0       16    source_hash
+/// 16      8     timestamp_ms_be      (u64, big-endian, milliseconds)
+/// 24      1     signature_validated  (1 = OK, 0 = NOT verified)
+/// 25      1     unverified_reason    (0 = ok, 1 = SOURCE_UNKNOWN,
+///                                      2 = SIGNATURE_INVALID)
+/// 26      2     title_len_be         (u16, big-endian)
+/// 28      4     content_len_be       (u32, big-endian)
+/// 32      title_len    title bytes (UTF-8)
+/// 32+t    content_len  content bytes (UTF-8)
+/// ```
 ///
 /// Total = 32 + title_len + content_len bytes.
 #[no_mangle]
@@ -961,13 +1025,17 @@ pub extern "C" fn retichat_channel_lxm_unpack(
     let name = unsafe { cstr_to_string(name_ptr) };
     if name.is_empty() {
         rns::set_error("channel name is empty".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     let data = slice_from_raw(lxmf_data, lxmf_data_len);
     if data.len() < LXMessage::DESTINATION_LENGTH + 32 {
         rns::set_error("lxmf_data too short".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
 
@@ -976,7 +1044,9 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         Ok(id) => id,
         Err(e) => {
             rns::set_error(format!("channel identity: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -985,7 +1055,9 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         Ok(p) => p,
         Err(e) => {
             rns::set_error(format!("channel decrypt: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -1002,14 +1074,18 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         rns::set_error(
             "channel: missing SOURCE-IDENTITY PRELUDE — sender on incompatible build or payload malformed".into()
         );
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     let identity_pub = &decrypted[4..CHANNEL_IDENTITY_PRELUDE_LEN];
     let lxmf_tail = &decrypted[CHANNEL_IDENTITY_PRELUDE_LEN..];
     if lxmf_tail.len() < LXMessage::DESTINATION_LENGTH {
         rns::set_error("channel: LXMF tail after prelude too short".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     // Register identity_pub under the LXMF source_hash (= the
@@ -1024,7 +1100,9 @@ pub extern "C" fn retichat_channel_lxm_unpack(
     let claimed_source_hash = &lxmf_tail[..LXMessage::DESTINATION_LENGTH];
     if let Err(e) = Identity::remember_destination(claimed_source_hash, identity_pub, None) {
         rns::set_error(format!("channel: remember_destination failed: {}", e));
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
 
@@ -1038,13 +1116,17 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         Ok(d) => d.hash.clone(),
         Err(e) => {
             rns::set_error(format!("channel destination: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
     if lxmf_dest.len() != LXMessage::DESTINATION_LENGTH {
         rns::set_error("lxmf dest hash wrong length".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
 
@@ -1056,7 +1138,9 @@ pub extern "C" fn retichat_channel_lxm_unpack(
         Ok(m) => m,
         Err(e) => {
             rns::set_error(format!("LXMessage::unpack: {}", e));
-            unsafe { *out_len = 0; }
+            unsafe {
+                *out_len = 0;
+            }
             return std::ptr::null_mut();
         }
     };
@@ -1064,7 +1148,9 @@ pub extern "C" fn retichat_channel_lxm_unpack(
     let source_hash = msg.source_hash.clone();
     if source_hash.len() != LXMessage::DESTINATION_LENGTH {
         rns::set_error("source_hash wrong length".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     let timestamp_ms: u64 = (msg.timestamp.unwrap_or(0.0) * 1000.0) as u64;
@@ -1079,29 +1165,35 @@ pub extern "C" fn retichat_channel_lxm_unpack(
     let content = msg.content.clone();
     if title.len() > u16::MAX as usize {
         rns::set_error("title too large".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
     if content.len() > u32::MAX as usize {
         rns::set_error("content too large".into());
-        unsafe { *out_len = 0; }
+        unsafe {
+            *out_len = 0;
+        }
         return std::ptr::null_mut();
     }
 
     let mut out = Vec::with_capacity(32 + title.len() + content.len());
-    out.extend_from_slice(&source_hash);                           // [0..16]
-    out.extend_from_slice(&timestamp_ms.to_be_bytes());            // [16..24]
-    out.push(sig_ok);                                              // [24]
-    out.push(reason);                                              // [25]
-    out.extend_from_slice(&(title.len() as u16).to_be_bytes());    // [26..28]
-    out.extend_from_slice(&(content.len() as u32).to_be_bytes());  // [28..32]
-    out.extend_from_slice(&title);                                 // [32..32+t]
-    out.extend_from_slice(&content);                               // [32+t..]
+    out.extend_from_slice(&source_hash); // [0..16]
+    out.extend_from_slice(&timestamp_ms.to_be_bytes()); // [16..24]
+    out.push(sig_ok); // [24]
+    out.push(reason); // [25]
+    out.extend_from_slice(&(title.len() as u16).to_be_bytes()); // [26..28]
+    out.extend_from_slice(&(content.len() as u32).to_be_bytes()); // [28..32]
+    out.extend_from_slice(&title); // [32..32+t]
+    out.extend_from_slice(&content); // [32+t..]
 
     let len = out.len() as u32;
     let mut boxed = out.into_boxed_slice();
     let ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
-    unsafe { *out_len = len; }
+    unsafe {
+        *out_len = len;
+    }
     ptr
 }

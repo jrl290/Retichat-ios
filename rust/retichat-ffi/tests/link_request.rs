@@ -15,6 +15,9 @@
 //!   * non-null response pointer
 //!   * non-zero response length
 //!   * the response pointer can be freed without memory errors
+//!
+//! Ignored by default: this is a live-infrastructure probe and depends on the
+//! configured RFED_NODE_HASH being online and answering path/link requests.
 
 mod helpers;
 
@@ -23,15 +26,19 @@ use std::time::Duration;
 /// Open a link to rfed.node, send an empty request on the "/" path,
 /// receive a response, and free the buffer.
 #[test]
+#[ignore = "requires a live rfed.node responder configured by RFED_NODE_HASH"]
 fn test_link_request_to_rfed_node() {
     helpers::test_banner("test_link_request_to_rfed_node");
-    let _guard = helpers::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = helpers::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let s = "Start Rust LXMF client";
     helpers::step(s);
     let dir = tempfile::tempdir().expect("tempdir");
     helpers::write_rns_config(dir.path(), &helpers::rnsd_host(), helpers::rnsd_port());
-    let _client_guard = helpers::ClientGuard::new(helpers::start_test_client(dir.path(), "LinkReqTest"));
+    let _client_guard =
+        helpers::ClientGuard::new(helpers::start_test_client(dir.path(), "LinkReqTest"));
     let client = _client_guard.handle();
     let identity_handle = retichat_ffi::lxmf_client_identity_handle(client);
     assert_ne!(identity_handle, 0);
@@ -47,7 +54,9 @@ fn test_link_request_to_rfed_node() {
     retichat_ffi::retichat_transport_request_path(rfed_hash.as_ptr(), rfed_hash.len() as u32);
     let path_deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if retichat_ffi::retichat_transport_has_path(rfed_hash.as_ptr(), rfed_hash.len() as u32) != 0 {
+        if retichat_ffi::retichat_transport_has_path(rfed_hash.as_ptr(), rfed_hash.len() as u32)
+            != 0
+        {
             break;
         }
         assert!(
@@ -79,7 +88,7 @@ fn test_link_request_to_rfed_node() {
         path_c.as_ptr(),
         std::ptr::null(), // no payload
         0,
-        15.0,             // 15 s timeout
+        15.0, // 15 s timeout
         &mut out_len,
     );
 
@@ -96,7 +105,10 @@ fn test_link_request_to_rfed_node() {
 
     let s = format!("Assert response non-empty ({out_len} bytes) and free buffer");
     helpers::step(&s);
-    assert!(out_len > 0, "expected non-empty response from rfed.node, got {out_len} bytes");
+    assert!(
+        out_len > 0,
+        "expected non-empty response from rfed.node, got {out_len} bytes"
+    );
     retichat_ffi::lxmf_free_bytes(response_ptr, out_len);
     helpers::done(&s);
 

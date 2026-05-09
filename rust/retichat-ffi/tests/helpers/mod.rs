@@ -18,8 +18,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::raw::{c_char, c_void};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -142,10 +142,10 @@ pub fn start_test_client(dir: &Path, display_name: &str) -> u64 {
         config_c.as_ptr(),
         storage_c.as_ptr(),
         identity_c.as_ptr(),
-        1,              // create_identity = true
+        1, // create_identity = true
         name_c.as_ptr(),
-        0,              // log_level
-        -1,             // stamp_cost = none
+        0,  // log_level
+        -1, // stamp_cost = none
     );
 
     if handle == 0 {
@@ -268,7 +268,9 @@ pub fn spawn_python_receiver(config_dir: &Path) -> (PyProcess, Vec<u8>) {
     let mut reader = BufReader::new(stdout);
     let dest_hash_hex = loop {
         let mut line = String::new();
-        reader.read_line(&mut line).expect("read from rns_receiver.py");
+        reader
+            .read_line(&mut line)
+            .expect("read from rns_receiver.py");
         let line = line.trim().to_string();
         eprintln!("  [py-recv] {line}");
         if let Some(hex) = line.strip_prefix("READY:") {
@@ -283,7 +285,11 @@ pub fn spawn_python_receiver(config_dir: &Path) -> (PyProcess, Vec<u8>) {
         .unwrap_or_else(|_| panic!("invalid dest hash hex from receiver: {dest_hash_hex}"));
 
     // Keep the reader in the struct so wait_python can drain the RECEIVED: line.
-    let proc = PyProcess { child, name: "rns_receiver".to_string(), piped_stdout: Some(reader) };
+    let proc = PyProcess {
+        child,
+        name: "rns_receiver".to_string(),
+        piped_stdout: Some(reader),
+    };
     (proc, dest_bytes)
 }
 
@@ -306,7 +312,9 @@ pub fn spawn_python_announcer(config_dir: &Path) -> (PyProcess, Vec<u8>) {
     let mut reader = BufReader::new(stdout);
     let dest_hash_hex = loop {
         let mut line = String::new();
-        reader.read_line(&mut line).expect("read from rns_announcer.py");
+        reader
+            .read_line(&mut line)
+            .expect("read from rns_announcer.py");
         let line = line.trim().to_string();
         eprintln!("  [py-announce] {line}");
         if let Some(hex) = line.strip_prefix("ANNOUNCED:") {
@@ -320,7 +328,11 @@ pub fn spawn_python_announcer(config_dir: &Path) -> (PyProcess, Vec<u8>) {
     let dest_bytes = hex::decode(&dest_hash_hex)
         .unwrap_or_else(|_| panic!("invalid dest hash hex from announcer: {dest_hash_hex}"));
 
-    let proc = PyProcess { child, name: "rns_announcer".to_string(), piped_stdout: Some(reader) };
+    let proc = PyProcess {
+        child,
+        name: "rns_announcer".to_string(),
+        piped_stdout: Some(reader),
+    };
     (proc, dest_bytes)
 }
 
@@ -347,15 +359,15 @@ pub fn spawn_python_sender(
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn rns_sender.py: {e}"));
 
-    PyProcess { child, name: "rns_sender".to_string(), piped_stdout: None }
+    PyProcess {
+        child,
+        name: "rns_sender".to_string(),
+        piped_stdout: None,
+    }
 }
 
 /// Spawn `rns_prop_sender.py <config_dir> <dest_hex> <content>`.
-pub fn spawn_python_prop_sender(
-    config_dir: &Path,
-    dest_hash: &[u8],
-    content: &str,
-) -> PyProcess {
+pub fn spawn_python_prop_sender(config_dir: &Path, dest_hash: &[u8], content: &str) -> PyProcess {
     let script = python_script("rns_prop_sender.py");
     let dest_hex = hex::encode(dest_hash);
     let child = Command::new(python_bin())
@@ -371,7 +383,11 @@ pub fn spawn_python_prop_sender(
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn rns_prop_sender.py: {e}"));
 
-    PyProcess { child, name: "rns_prop_sender".to_string(), piped_stdout: None }
+    PyProcess {
+        child,
+        name: "rns_prop_sender".to_string(),
+        piped_stdout: None,
+    }
 }
 
 /// Wait for a Python process to exit, draining its stdout.
@@ -595,7 +611,9 @@ pub extern "C" fn state_trampoline(
 
 pub extern "C" fn sync_trampoline(ctx: *mut c_void, message_count: u32) {
     let capture = unsafe { &*(ctx as *const Capture<SyncCompleteEvent>) };
-    let event = SyncCompleteEvent { count: message_count };
+    let event = SyncCompleteEvent {
+        count: message_count,
+    };
     let (lock, cvar) = &**capture;
     lock.lock().unwrap().push(event);
     cvar.notify_one();

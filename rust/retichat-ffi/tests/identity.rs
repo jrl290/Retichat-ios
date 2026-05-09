@@ -16,7 +16,10 @@ fn test_destroy_invalid_handle() {
     let rc = retichat_identity_destroy(0);
     assert_eq!(rc, -1, "expected -1 for handle 0, got {rc}");
     let err = helpers::last_error_str();
-    assert!(err.is_some(), "expected an error string after invalid handle destroy");
+    assert!(
+        err.is_some(),
+        "expected an error string after invalid handle destroy"
+    );
     eprintln!("    error: {:?}", err.as_deref().unwrap_or("none"));
     helpers::done(s);
 }
@@ -30,7 +33,10 @@ fn test_pubkey_invalid_handle() {
     let rc = retichat_identity_public_key(0, buf.as_mut_ptr(), 64);
     assert_eq!(rc, -1, "expected -1 for handle 0, got {rc}");
     let err = helpers::last_error_str();
-    assert!(err.is_some(), "expected an error string after invalid handle pubkey query");
+    assert!(
+        err.is_some(),
+        "expected an error string after invalid handle pubkey query"
+    );
     eprintln!("    error: {:?}", err.as_deref().unwrap_or("none"));
     helpers::done(s);
 }

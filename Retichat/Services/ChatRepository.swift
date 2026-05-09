@@ -709,12 +709,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     hasAttachments: !attachmentsCopy.isEmpty
                 )
 
-                // Schedule a 5-second fallback: if direct doesn't deliver in
-                // time, proactively send via propagation too.  LXMF dedup on
-                // the receiver handles a possible double-delivery.
-                if method == LxmfMethod.direct && attachmentsCopy.isEmpty {
-                    self.schedulePropFallback(directHashHex: msgHashHex)
-                }
+                // The 5-second propagation fallback is now owned by Rust
+                // (AppLinks Timer P).  It fires PROP_FALLBACK_REQUESTED (0x10)
+                // via message_state_callback at exactly 5 s after send starts.
+                // No iOS-side timer needed.
 
                 self.refreshChats()
             }
@@ -926,6 +924,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             cancelPropFallback(directHashHex: hashHex)
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.delivered)
             completePending(hashHex: hashHex, pending: pending)
+
+        case 0x10:  // PROP_FALLBACK_REQUESTED — Rust Timer P fired at 5 s.
+            // The direct send is still running; start propagation in parallel.
+            // LXMF dedup on the receiver handles any double-delivery.
+            if pending.method == LxmfMethod.direct && !pending.hasAttachments {
+                if !propFallbackSent.contains(pending.messageId) {
+                    propFallbackSent.insert(pending.messageId)
+                    updateDeliveryState(messageId: pending.messageId, state: DeliveryState.propagating)
+                    retrySendViaPropNode(pending)
+                }
+            }
 
         case 0xFD, 0xFE, 0xFF:  // REJECTED, CANCELLED, FAILED.
             cancelPropFallback(directHashHex: hashHex)

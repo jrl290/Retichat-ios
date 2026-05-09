@@ -55,6 +55,7 @@ PROP_NODE_HASH  = os.environ.get("PROP_NODE_HASH", "90c650419e3a991a0bbe4cb31237
 
 done_event = threading.Event()
 final_state = [None]
+jobs_stop = threading.Event()
 
 # For propagated messages, SENT means the prop node accepted it.
 # DELIVERED is also acceptable (direct path happened to be available).
@@ -81,6 +82,11 @@ def delivery_cb(message):
 
 def failed_cb(message):
     state_changed_or_delivered(message)
+
+def router_jobs_driver(router):
+    while not jobs_stop.is_set():
+        router.jobs()
+        jobs_stop.wait(1)
 
 # ── Main ──────────────────────────────────────────────────────────────────
 RNS.loglevel = RNS.LOG_WARNING
@@ -189,13 +195,17 @@ import threading
 poll_thread = threading.Thread(target=poller, daemon=True)
 
 print(f"[py-prop-send] sending propagated message ...", flush=True)
+jobs_thread = threading.Thread(target=router_jobs_driver, args=(router,), daemon=True)
+jobs_thread.start()
 router.handle_outbound(msg)
 poll_thread.start()
 
 if done_event.wait(timeout=SEND_TIMEOUT):
+    jobs_stop.set()
     result = final_state[0]
     print(result, flush=True)
     sys.exit(0 if result == "SENT" else 1)
 else:
+    jobs_stop.set()
     print(f"FAILED:timeout after {SEND_TIMEOUT}s (state={msg.state:#04x})", flush=True)
     sys.exit(1)
