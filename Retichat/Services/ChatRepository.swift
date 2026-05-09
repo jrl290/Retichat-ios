@@ -146,9 +146,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///   3. Configure announce-drop policy (must be before path discovery).
     ///   4. Register with `ConnectionStateManager` — this kicks off the
     ///      single, coordinated `requestEssentialPaths` + `openRfedNodeLink`
-    ///      sequence. All other components (RfedNotify, APNsRegistrar,
-    ///      RfedChannelClient.start) rely on `app_link_open` being idempotent
-    ///      under PATH_REQUESTED so they don't re-fire path requests.
+    ///      sequence. RFed/propagation components use their own request/link
+    ///      flows and do not depend on AppLinks.
     ///   5. Flip `serviceRunning = true` — this lets the App scene's
     ///      `.onReceive` handler wire up `RfedChannelClient` exactly once.
     ///   6. Start RNode interfaces (independent of the path/link stack).

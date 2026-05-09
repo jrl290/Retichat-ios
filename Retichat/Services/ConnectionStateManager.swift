@@ -57,7 +57,7 @@ final class ConnectionStateManager {
     /// Hex hashes of all peers in the currently-open conversation (empty when no chat is on screen).
     private var activeConversationHexes: Set<String> = []
 
-    /// Cached rfed.channel destination kept open while the app is in the foreground.
+    /// Cached rfed.channel destination tracked while the app is in the foreground.
     private var rfedLinkDestData: Data? = nil
 
     /// Weak reference to the LXMF client, set after startup.
@@ -273,6 +273,30 @@ final class ConnectionStateManager {
         )
     }
 
+    /// Single RFed infrastructure request. RFed channel/delivery/notify nodes
+    /// are not AppLinks; each request owns its link lifecycle and runs off the
+    /// main actor so the UI never blocks on network I/O.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §6, §7
+    func rfedLinkRequest(destHash: Data,
+                         app: String,
+                         aspects: String,
+                         identityHandle: UInt64,
+                         path: String,
+                         payload: Data,
+                         timeoutSecs: Double = 5.0) async -> Data? {
+        await Task.detached(priority: .userInitiated) {
+            RetichatBridge.shared.linkRequest(
+                destHash: destHash,
+                appName: app,
+                aspects: aspects,
+                identityHandle: identityHandle,
+                path: path,
+                payload: payload,
+                timeoutSecs: timeoutSecs
+            )
+        }.value
+    }
+
     /// Call when a conversation screen appears for a peer (direct or group member).
     /// Opens an app link: watches announces, requests path, and establishes a
     /// direct link proactively while the user is on screen.
@@ -322,44 +346,26 @@ final class ConnectionStateManager {
 
     // MARK: - RFed node link
 
-    /// Open (or re-open) an app link to the configured rfed.channel destination.
-    /// Call on app foreground; the link is kept alive until `closeRfedNodeLink()`.
+    /// Request a path to the configured rfed.channel destination. RFed is
+    /// infrastructure traffic and does not use AppLinks.
     func openRfedNodeLink() {
         guard let destData = rfedChannelDestData() else { return }
         rfedLinkDestData = destData
-        let client = lxmfClient
         Task.detached(priority: .userInitiated) {
-            // rfed.channel — NOT lxmf.delivery. Without the right aspects the
-            // router would resolve the destination identity wrong on every
-            // (re)establishment and the link would never reach ACTIVE.
-            client?.appLinkOpen(destData, app: "rfed", aspects: ["channel"])
+            _ = RetichatBridge.shared.transportRequestPath(destHash: destData)
         }
     }
 
-    /// Tear down the app link to the rfed node. Call on app background.
+    /// Stop tracking the rfed node status in the foreground UI.
     func closeRfedNodeLink() {
-        guard let destData = rfedLinkDestData else { return }
         rfedLinkDestData = nil
-        let client = lxmfClient
-        Task.detached(priority: .userInitiated) {
-            client?.appLinkClose(destData)
-        }
     }
 
-    /// Current app-link status for the rfed node.
-    /// Returns: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
+    /// Current reachability status for the rfed node.
+    /// Returns: 0=NONE/no config, 3=path reachable, 4=no path.
     func rfedNodeLinkStatus() -> Int32 {
-        guard let destData = rfedLinkDestData ?? rfedChannelDestData(),
-              let client = lxmfClient else { return 0 }
-        return client.appLinkStatus(destData)
-    }
-
-    /// Snapshot the (LxmfClient, rfed.channel destData) pair for use from a
-    /// background thread.  Returns nil if either is unavailable.
-    func rfedAppLinkSnapshot() -> (LxmfClient, Data)? {
-        guard let destData = rfedLinkDestData ?? rfedChannelDestData(),
-              let client = lxmfClient else { return nil }
-        return (client, destData)
+        guard let destData = rfedLinkDestData ?? rfedChannelDestData() else { return 0 }
+        return RetichatBridge.shared.transportHasPath(destHash: destData) ? 3 : 4
     }
 
     /// Public access to the rfed.channel destination derived from current
@@ -378,10 +384,8 @@ final class ConnectionStateManager {
         return RetichatBridge.shared.transportHasPath(destHash: destData)
     }
 
-    /// Wait for the rfed.channel app-link to reach ACTIVE (status == 3).
-    /// Polls every 250 ms.  Safe to call from any context (re-enters MainActor
-    /// for each status check).
-    func waitForRfedAppLinkActive(timeoutSecs: Double) async -> Bool {
+    /// Wait for the rfed.channel route to become reachable.
+    func waitForRfedReachable(timeoutSecs: Double) async -> Bool {
         let deadline = Date().addingTimeInterval(timeoutSecs)
         while Date() < deadline {
             if rfedNodeLinkStatus() == 3 { return true }

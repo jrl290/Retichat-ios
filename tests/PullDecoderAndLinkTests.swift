@@ -27,7 +27,7 @@
 //   3. bin32 / array32 tags decode correctly — earlier code only handled the
 //      fixarray and bin8/bin16 paths.
 //
-//   4. Link-generation primitive: a monotonic Int that bumps only on the
+//   4. Reachability-generation primitive: a monotonic Int that bumps only on the
 //      transition INTO `.connected`.  Stays put while `.connected` is held.
 //      Bumps again on every fresh re-establishment.  Wraps with `&+=` so a
 //      decade of reconnects doesn't trap.
@@ -321,11 +321,11 @@ func testWrongOuterArityRejected() {
     check(decodePullResponse(d) == nil, "non-2-element outer MUST decode to nil")
 }
 
-// ── Link generation + refcounted monitor (mirror RfedChannelClient logic) ──
+// ── Reachability generation + refcounted monitor (mirror RfedChannelClient logic) ──
 
-enum NodeStatus { case unknown, unreachable, establishing, connected }
+enum NodeStatus { case unknown, unreachable, connected }
 
-/// Pure-logic stand-in for RfedChannelClient's link state machine.
+/// Pure-logic stand-in for RfedChannelClient's reachability state machine.
 /// No timers, no Combine — just the deterministic transitions we need to
 /// pin down with tests.
 final class LinkMonitorModel {
@@ -348,13 +348,12 @@ final class LinkMonitorModel {
     }
 
     /// Mirror of `refreshRfedNodeStatus` in production.
-    func apply(rawAppLinkStatus: Int) {
+    func apply(rawReachabilityStatus: Int) {
         let next: NodeStatus
-        switch rawAppLinkStatus {
-        case 3:    next = .connected
-        case 1, 2: next = .establishing
-        case 4:    next = .unreachable
-        default:   next = .unknown
+        switch rawReachabilityStatus {
+        case 3:  next = .connected
+        case 4:  next = .unreachable
+        default: next = .unknown
         }
         let wasConnected = status == .connected
         status = next
@@ -366,30 +365,30 @@ final class LinkMonitorModel {
 
 func testGenerationStartsAtZero() {
     let m = LinkMonitorModel()
-    check(m.generation == 0, "rfedLinkGeneration starts at 0")
+    check(m.generation == 0, "rfedReachabilityGeneration starts at 0")
 }
 
 func testGenerationBumpsOnEstablishment() {
     let m = LinkMonitorModel()
-    m.apply(rawAppLinkStatus: 3) // ACTIVE
+    m.apply(rawReachabilityStatus: 3) // reachable
     check(m.generation == 1, "first .connected bumps generation to 1")
 }
 
 func testGenerationDoesNotBumpWhileHeldConnected() {
     let m = LinkMonitorModel()
-    m.apply(rawAppLinkStatus: 3)
-    m.apply(rawAppLinkStatus: 3)
-    m.apply(rawAppLinkStatus: 3)
+    m.apply(rawReachabilityStatus: 3)
+    m.apply(rawReachabilityStatus: 3)
+    m.apply(rawReachabilityStatus: 3)
     check(m.generation == 1,
           "polling while .connected MUST NOT bump generation")
 }
 
 func testGenerationBumpsAgainAfterReestablishment() {
     let m = LinkMonitorModel()
-    m.apply(rawAppLinkStatus: 3) // ACTIVE
-    m.apply(rawAppLinkStatus: 4) // DISCONNECTED
-    m.apply(rawAppLinkStatus: 2) // ESTABLISHING
-    m.apply(rawAppLinkStatus: 3) // ACTIVE again
+    m.apply(rawReachabilityStatus: 3) // reachable
+    m.apply(rawReachabilityStatus: 4) // unreachable
+    m.apply(rawReachabilityStatus: 0) // unknown
+    m.apply(rawReachabilityStatus: 3) // reachable again
     check(m.generation == 2,
           "fresh .connected after a drop MUST bump generation again")
 }
@@ -397,8 +396,8 @@ func testGenerationBumpsAgainAfterReestablishment() {
 func testGenerationMonotonicAcrossManyCycles() {
     let m = LinkMonitorModel()
     for _ in 0..<10 {
-        m.apply(rawAppLinkStatus: 3)
-        m.apply(rawAppLinkStatus: 4)
+        m.apply(rawReachabilityStatus: 3)
+        m.apply(rawReachabilityStatus: 4)
     }
     check(m.generation == 10,
           "ten establish/drop cycles bump generation exactly ten times")
@@ -406,10 +405,10 @@ func testGenerationMonotonicAcrossManyCycles() {
 
 func testGenerationIgnoresTransitionsBetweenNonConnected() {
     let m = LinkMonitorModel()
-    m.apply(rawAppLinkStatus: 0) // NONE
-    m.apply(rawAppLinkStatus: 1) // PATH_REQUESTED
-    m.apply(rawAppLinkStatus: 2) // ESTABLISHING
-    m.apply(rawAppLinkStatus: 4) // DISCONNECTED
+    m.apply(rawReachabilityStatus: 0) // no config / unknown
+    m.apply(rawReachabilityStatus: 1) // legacy non-reachable value
+    m.apply(rawReachabilityStatus: 2) // legacy non-reachable value
+    m.apply(rawReachabilityStatus: 4) // unreachable
     check(m.generation == 0,
           "no .connected transition → no generation bump")
 }
@@ -470,7 +469,7 @@ testTruncatedBufferRejected()
 testMissingTrailingBoolRejected()
 testWrongOuterArityRejected()
 
-print("─── Link-generation + refcount tests ───────────────")
+print("─── Reachability-generation + refcount tests ───────")
 testGenerationStartsAtZero()
 testGenerationBumpsOnEstablishment()
 testGenerationDoesNotBumpWhileHeldConnected()

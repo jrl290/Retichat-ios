@@ -81,9 +81,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     private var linkStatusTimer: AnyCancellable?
 
     /// One-shot guard: re-subscribe to persisted channels exactly once
-    /// per app run, the first time the rfed.channel APP_LINK reaches
-    /// ACTIVE.  Set to true after the first successful re-subscribe pass
-    /// kicks off so subsequent ACTIVE callbacks don't redundantly re-fire.
+    /// per app run, the first time the rfed.channel route is reachable.
+    /// Set to true after the first successful re-subscribe pass kicks off.
     private var didResubscribeOnActive = false
 
     // MARK: - Dependencies
@@ -133,12 +132,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         loadPersistedChannels()
         loadPersistedMessages()
 
-        // Drive re-subscribe from the rfed.channel APP_LINK status callback
-        // instead of firing it blindly at startup. On cold start the
-        // first announce can take 30+ seconds to arrive over multiple TCP
-        // hops; the previous unconditional re-subscribe always failed the
-        // §1 5-second budget and lost the registration.  When the link
-        // becomes ACTIVE (3) the handler kicks one re-subscribe pass.
+        // Drive re-subscribe from rfed.channel reachability instead of
+        // routing RFed through the direct-chat AppLinks mechanism.
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
         scheduleResubscribeOnRfedChannelActive()
     }
@@ -199,7 +194,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         // Semantics for the SettingsView pill:
         //   .unknown      → no rfed node configured (pill hidden)
         //   .establishing → config present, link not active (pill: "Linking…")
-        //   .connected    → link ACTIVE (pill: "Linked")
+        //   .connected    → node reachable (pill: "Reachable")
         //   .unreachable  → config present but no path AND not currently
         //                   trying — i.e. genuine "No path" (pill: "No path")
         //
@@ -322,9 +317,10 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             payload = Self.msgpackBin(channelHashData)
         }
         Task.detached(priority: .background) {
-            _ = await ConnectionStateManager.shared.appLinkSend(
+            _ = await ConnectionStateManager.shared.rfedLinkRequest(
                 destHash: rfedDest,
-                app: "rfed", aspects: ["channel"],
+                app: "rfed", aspects: "channel",
+                identityHandle: self.identityHandle,
                 path: "/rfed/unsubscribe",
                 payload: payload
             )
@@ -663,15 +659,16 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             Task { @MainActor in self.pullInFlight[nodeKey] = false }
         }
 
-        let response = await ConnectionStateManager.shared.appLinkSend(
+        let response = await ConnectionStateManager.shared.rfedLinkRequest(
             destHash: rfedDeliveryDest,
-            app: "rfed", aspects: ["delivery"],
+            app: "rfed", aspects: "delivery",
+            identityHandle: identityHandle,
             path: "/rfed/pull",
             payload: Data()
         )
 
         guard let data = response else {
-            print("[RfedChannel] PULL: APP_LINK not ACTIVE within 5 s or no response")
+            print("[RfedChannel] PULL: rfed.delivery request failed or no response within 5 s")
             return false
         }
 
@@ -852,19 +849,20 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
         let payload = Self.msgpackSigned(value: channelHashData, pubkey: pubkey, sig: sig)
 
-        // All channel subscribes share the persistent rfed.channel APP_LINK
-        // managed by Rust (auto-reconnect on announce, no Swift one-shot links).
+        // RFed channel subscription is an infrastructure request, not an
+        // AppLink. It owns one link request and surfaces failure directly.
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        let response = await ConnectionStateManager.shared.appLinkSend(
+        let response = await ConnectionStateManager.shared.rfedLinkRequest(
             destHash: rfedChannelDest,
-            app: "rfed", aspects: ["channel"],
+            app: "rfed", aspects: "channel",
+            identityHandle: identityHandle,
             path: "/rfed/subscribe",
             payload: payload
         )
 
         guard let resp = response else {
             throw ChannelError.subscribeFailed(
-                "rfed.channel APP_LINK not ACTIVE within 5 s")
+                "rfed.channel request failed or no response within 5 s")
         }
         let stampCost: Int? = Self.parseSubscribeResponse(resp)
         guard stampCost != nil || resp.first == 0xc3 || resp.first == 0x92 || resp.first == 0x91 else {
@@ -917,25 +915,16 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         try? ctx.save()
     }
 
-    /// Register a one-shot APP_LINK status handler on the rfed.channel
-    /// destination.  When the link transitions to ACTIVE, re-subscribe to
-    /// every persisted-subscribed channel once.  Idempotent — guarded by
-    /// `didResubscribeOnActive` so reconnect storms don't spam the rfed
-    /// node with duplicate subscribes.
+    /// Re-subscribe to every persisted-subscribed channel once the rfed.channel
+    /// route is reachable. Idempotent so reconnect storms don't spam the node.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     private func scheduleResubscribeOnRfedChannelActive() {
-        let rfedHashHex = Self.rfedDestHash(
-            identityHashHex: prefs.rfedNodeIdentityHash,
-            app: "rfed", aspects: ["channel"])
-        guard let rfedDest = Data(hexString: rfedHashHex) else { return }
-
-        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: rfedDest) { [weak self] status in
-            // Status: 0=NONE, 1=PATH_REQUESTED, 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
-            guard let self = self else { return }
-            guard status == 3 else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            guard await ConnectionStateManager.shared.waitForRfedReachable(timeoutSecs: 5.0) else { return }
             guard !self.didResubscribeOnActive else { return }
             self.didResubscribeOnActive = true
-            print("[RfedChannel] rfed.channel APP_LINK ACTIVE → re-subscribing persisted channels")
+            print("[RfedChannel] rfed.channel reachable → re-subscribing persisted channels")
             self.resubscribePersistedChannels()
         }
     }

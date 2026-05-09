@@ -25,9 +25,7 @@ final class RfedNotifyRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    /// One-shot guard so reconnect storms don't fire duplicate registers.
-    /// Only mutated from the MainActor handler dispatched by
-    /// `ConnectionStateManager.setAppLinkStatusHandler`.
+    /// One-shot guard so foreground/reconnect storms don't fire duplicate registers.
     private var didRegisterOnActive = false
 
     private init() {}
@@ -37,9 +35,9 @@ final class RfedNotifyRegistrar {
     /// Register this subscriber's relay hash with rfed.
     /// `identityHandle` is the Rust FFI handle for the local identity.
     ///
-    /// Driven by the rfed.notify APP_LINK status callback so we only fire
-    /// once the persistent link is ACTIVE — never on a 5 s cold-start
-    /// timeout. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    /// RFed notify is an infrastructure request, not an AppLink. Send one
+    /// request and surface failure; no persistent link, no retry loop.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     func registerIfNeeded(identityHandle: UInt64) {
         let rfedDestHex = prefs.rfedNotifyHash
         guard !rfedDestHex.isEmpty else { return }
@@ -59,26 +57,20 @@ final class RfedNotifyRegistrar {
             return
         }
 
-        Task { @MainActor [weak self] in
-            ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: rfedHash) { status in
-                guard status == 3 else { return }
-                guard let self = self else { return }
-                guard !self.didRegisterOnActive else { return }
-                self.didRegisterOnActive = true
-                Task.detached(priority: .background) { [weak self] in
-                    await self?.sendOnce(
-                        rfedHash: rfedHash,
-                        payload: payload,
-                        kind: "register"
-                    )
-                }
-            }
+        guard !didRegisterOnActive else { return }
+        didRegisterOnActive = true
+        Task.detached(priority: .background) { [weak self] in
+            await self?.sendOnce(
+                rfedHash: rfedHash,
+                payload: payload,
+                kind: "register",
+                identityHandle: identityHandle
+            )
         }
     }
 
     /// Best-effort deregistration from a previous rfed node.
-    /// Sends a single `/rfed/notify/unregister` request via the persistent
-    /// rfed.notify APP_LINK (no Swift-side one-shot link).
+    /// Sends a single `/rfed/notify/unregister` infrastructure request.
     func deregisterFrom(oldNotifyHashHex: String, identityHandle: UInt64) {
         guard !oldNotifyHashHex.isEmpty,
               let rfedHash = Data(hexString: oldNotifyHashHex) else { return }
@@ -87,9 +79,10 @@ final class RfedNotifyRegistrar {
         guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: nil, identityHandle: identityHandle) else { return }
 
         Task.detached(priority: .background) {
-            let resp = await ConnectionStateManager.shared.appLinkSend(
+            let resp = await ConnectionStateManager.shared.rfedLinkRequest(
                 destHash: rfedHash,
-                app: "rfed", aspects: ["notify"],
+                app: "rfed", aspects: "notify",
+                identityHandle: identityHandle,
                 path: "/rfed/notify/unregister",
                 payload: payload
             )
@@ -118,7 +111,8 @@ final class RfedNotifyRegistrar {
         }
         Task.detached(priority: .background) { [weak self] in
             await self?.sendOnce(rfedHash: rfedHash,
-                                 payload: payload, kind: "channel-register")
+                                 payload: payload, kind: "channel-register",
+                                 identityHandle: identityHandle)
         }
     }
 
@@ -131,9 +125,10 @@ final class RfedNotifyRegistrar {
         guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: channelHash,
                                                identityHandle: identityHandle) else { return }
         Task.detached(priority: .background) {
-            let resp = await ConnectionStateManager.shared.appLinkSend(
+            let resp = await ConnectionStateManager.shared.rfedLinkRequest(
                 destHash: rfedHash,
-                app: "rfed", aspects: ["notify"],
+                app: "rfed", aspects: "notify",
+                identityHandle: identityHandle,
                 path: "/rfed/notify/unregister",
                 payload: payload
             )
@@ -145,14 +140,12 @@ final class RfedNotifyRegistrar {
 
     // MARK: - Private
 
-    /// Single-attempt registration via the persistent rfed.notify APP_LINK.
-    /// Per DESIGN_PRINCIPLES.md §1-§2: one shot with a 5s budget. The link is
-    /// managed by Rust (auto-reconnect on announce, etc.). If it does not
-    /// reach ACTIVE within 5 s, the operation has failed — no retries.
-    private func sendOnce(rfedHash: Data, payload: Data, kind: String) async {
-        let response = await ConnectionStateManager.shared.appLinkSend(
+    /// Single-attempt registration via an RFed infrastructure request.
+    private func sendOnce(rfedHash: Data, payload: Data, kind: String, identityHandle: UInt64) async {
+        let response = await ConnectionStateManager.shared.rfedLinkRequest(
             destHash: rfedHash,
-            app: "rfed", aspects: ["notify"],
+            app: "rfed", aspects: "notify",
+            identityHandle: identityHandle,
             path: "/rfed/notify/register",
             payload: payload
         )
@@ -166,7 +159,7 @@ final class RfedNotifyRegistrar {
                 print("[RfedNotify] \(kind): rfed returned false")
             }
         } else {
-            print("[RfedNotify] \(kind): APP_LINK not ACTIVE within 5 s — skipping")
+            print("[RfedNotify] \(kind): request failed or no response within 5 s — skipping")
         }
     }
 

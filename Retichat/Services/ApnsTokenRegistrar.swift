@@ -35,9 +35,8 @@ final class ApnsTokenRegistrar {
     /// Call after service starts (and identity is known) whenever the APNs token
     /// or the rfed.apns hash changes.
     ///
-    /// rfed.apns is a packet endpoint (no link), so we can't hang off the
-    /// APP_LINK status callback the way RfedNotifyRegistrar does. Instead we
-    /// poll path availability with a short tick: the path is requested at
+    /// rfed.apns is a packet endpoint (no link). We poll path availability
+    /// with a short tick: the path is requested at
     /// startup and arrives with the first matching announce (typically 1–15 s).
     /// We wait up to 30 s, send once, and log loudly if the window elapses.
     func registerIfNeeded(subscriberHash: Data) {

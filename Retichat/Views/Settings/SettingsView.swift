@@ -309,7 +309,7 @@ struct SettingsView: View {
     private var rfedNodeStatusIndicator: some View {
         let (color, label): (Color, String) = {
             switch channelClient.rfedNodeStatus {
-            case .connected:    return (.green, "Linked")
+            case .connected:    return (.green, "Reachable")
             case .establishing: return (.orange, "Linking…")
             case .unreachable:  return (.red, "No path")
             case .unknown:      return (.gray, "")
