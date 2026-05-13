@@ -48,6 +48,7 @@ void     rns_client_persist(uint64_t client);
 #pragma mark - RNS Transport
 
 int32_t rns_transport_has_path(const uint8_t *dest_hash, uint32_t len);
+int32_t rns_identity_known(const uint8_t *dest_hash, uint32_t len);
 int32_t rns_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t rns_transport_hops_to(const uint8_t *dest_hash, uint32_t len);
 
@@ -382,6 +383,7 @@ int32_t retichat_identity_destroy(uint64_t handle);
 #pragma mark - Transport
 
 int32_t retichat_transport_has_path(const uint8_t *dest_hash, uint32_t len);
+int32_t retichat_identity_known(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_hops_to(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_path_interface_online(const uint8_t *dest_hash, uint32_t len);

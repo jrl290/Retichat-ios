@@ -96,6 +96,16 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    /// True iff the destination's identity (public key) is in the
+    /// known-destinations table. Sending an encrypted packet requires
+    /// identity, not just a path.
+    nonisolated func transportIdentityKnown(destHash: Data) -> Bool {
+        return destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_identity_known(ptr, UInt32(destHash.count)) == 1
+        }
+    }
+
     nonisolated func transportRequestPath(destHash: Data) -> Bool {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)

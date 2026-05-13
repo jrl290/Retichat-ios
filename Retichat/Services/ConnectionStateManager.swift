@@ -482,8 +482,13 @@ final class ConnectionStateManager {
             var requested: [(Data, String)] = []
             for (dest, label) in destPairs {
                 let hasPath = bridge.transportHasPath(destHash: dest)
-                print("[DIAG][requestEssentialPaths] dest=\(label) hasPath=\(hasPath)")
-                if !hasPath {
+                let hasIdentity = bridge.transportIdentityKnown(destHash: dest)
+                print("[DIAG][requestEssentialPaths] dest=\(label) hasPath=\(hasPath) hasIdentity=\(hasIdentity)")
+                // Outbound encrypted send needs identity, not just a cached
+                // path. If identity is missing we issue a path request — the
+                // PATH_RESPONSE is an announce that populates the
+                // known-destinations table.
+                if !hasIdentity {
                     _ = bridge.transportRequestPath(destHash: dest)
                     print("[DIAG][requestEssentialPaths] requestPath done dest=\(label)")
                     requested.append((dest, label))
@@ -502,7 +507,7 @@ final class ConnectionStateManager {
             var resolvedAny = false
             while CFAbsoluteTimeGetCurrent() < pollDeadline {
                 requested.removeAll { dest, label in
-                    if bridge.transportHasPath(destHash: dest) {
+                    if bridge.transportIdentityKnown(destHash: dest) {
                         print("[DIAG][requestEssentialPaths] resolved dest=\(label)")
                         resolvedAny = true
                         return true

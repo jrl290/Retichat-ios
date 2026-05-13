@@ -79,19 +79,24 @@ final class ApnsTokenRegistrar {
     /// Poll path availability up to 30 s, then send once.
     private func awaitPathThenSend(destHash: Data, payload: Data,
                                    subscriberHashHex: String) async {
-        // Kick a path request immediately if we don't have one yet.
-        if !bridge.transportHasPath(destHash: destHash) {
+        // Outbound encrypted send needs the bridge's identity, not just a
+        // cached path. A path can survive across launches via the on-disk
+        // path table while the identity has not yet been re-cached this
+        // session. Issue a path request whenever identity is missing —
+        // PATH_RESPONSE is an announce and will populate the
+        // known-destinations table on receipt.
+        if !bridge.transportIdentityKnown(destHash: destHash) {
             _ = bridge.transportRequestPath(destHash: destHash)
         }
 
-        // Wait up to 30 s for path. 200 ms tick keeps wakeups cheap.
+        // Wait up to 30 s for identity. 200 ms tick keeps wakeups cheap.
         let deadline = Date().addingTimeInterval(30.0)
         while Date() < deadline {
-            if bridge.transportHasPath(destHash: destHash) { break }
+            if bridge.transportIdentityKnown(destHash: destHash) { break }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
-        guard bridge.transportHasPath(destHash: destHash) else {
-            print("[APNsRegistrar] No path to rfed.apns within 30 s — will retry on next app start")
+        guard bridge.transportIdentityKnown(destHash: destHash) else {
+            print("[APNsRegistrar] No identity for rfed.apns within 30 s — will retry on next app start")
             return
         }
 
