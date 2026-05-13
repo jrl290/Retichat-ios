@@ -520,6 +520,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         propManager.setUserConfiguredNode(prefs.effectiveLxmfPropagationHash)
 
         if let nodeHash = propManager.currentNode() {
+            // PSYNC link establishment needs the propagation node's identity
+            // (public key), not just a cached path. On cold start the path
+            // table loads from disk while known-destinations is empty until
+            // an announce arrives. Kick a path request if identity is
+            // missing — PATH_RESPONSE is an announce and will populate the
+            // known-destinations table on receipt. The next poll cycle then
+            // succeeds. See DESIGN_PRINCIPLES.md §1: no retries here, the
+            // existing periodic poll IS the retry cadence.
+            let bridge = RetichatBridge.shared
+            if !bridge.transportIdentityKnown(destHash: nodeHash) {
+                _ = bridge.transportRequestPath(destHash: nodeHash)
+                print("[Retichat] pollPropagationNode: requested path for \(nodeHash.hexString.prefix(8)) (identity not yet known) — skipping this cycle")
+                return
+            }
             ffiQueue.async { [weak self] in
                 let ok = client.sync(nodeHash: nodeHash)
                 if !ok {

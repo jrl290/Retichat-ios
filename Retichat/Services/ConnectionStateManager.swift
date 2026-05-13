@@ -470,6 +470,27 @@ final class ConnectionStateManager {
             }
         }
 
+        // Also refresh identity for every propagation node candidate whose
+        // path was loaded from disk this session.  LXMF's internal trigger
+        // (or a saved outbound_propagation_node from a previous run) may
+        // attempt PSYNC against any of these — bounded to the failover pool
+        // and the user-configured node, deduped, no network flood because
+        // the identity-gate downstream only requests paths whose identity
+        // is missing.
+        let bridgeRef = RetichatBridge.shared
+        var nodeCandidates = PropagationNodeManager.shared.orderedNodeHashes()
+        let userPropHex = UserPreferences.shared.effectiveLxmfPropagationHash
+        if !userPropHex.isEmpty, !nodeCandidates.contains(userPropHex) {
+            nodeCandidates.append(userPropHex)
+        }
+        for nodeHex in nodeCandidates {
+            if let nodeHash = Data(hexString: nodeHex),
+               bridgeRef.transportHasPath(destHash: nodeHash),
+               !destinations.contains(nodeHash) {
+                destinations.append(nodeHash)
+            }
+        }
+
         // Pre-compute hex labels on the main actor before going off-thread.
         let destPairs: [(Data, String)] = destinations.map { ($0, String($0.hexString.prefix(8))) }
         let bridge = RetichatBridge.shared

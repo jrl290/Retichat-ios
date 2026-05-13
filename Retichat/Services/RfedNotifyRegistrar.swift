@@ -146,6 +146,24 @@ final class RfedNotifyRegistrar {
 
     /// Single-attempt registration via an RFed infrastructure request.
     private func sendOnce(rfedHash: Data, payload: Data, kind: String, identityHandle: UInt64) async {
+        // Outbound link needs the destination's identity (public key), not
+        // just a cached path. On cold start the path table is loaded from
+        // disk but the known-destinations table is empty until an announce
+        // arrives. Issue a path request — PATH_RESPONSE is an announce and
+        // will populate the identity on receipt.
+        if !bridge.transportIdentityKnown(destHash: rfedHash) {
+            _ = bridge.transportRequestPath(destHash: rfedHash)
+        }
+        let deadline = Date().addingTimeInterval(30.0)
+        while Date() < deadline {
+            if bridge.transportIdentityKnown(destHash: rfedHash) { break }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        guard bridge.transportIdentityKnown(destHash: rfedHash) else {
+            print("[RfedNotify] \(kind): no identity for rfed.notify within 30 s — skipping")
+            return
+        }
+
         let response = await ConnectionStateManager.shared.rfedLinkRequest(
             destHash: rfedHash,
             app: "rfed", aspects: "notify",
