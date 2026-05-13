@@ -170,6 +170,25 @@ pub extern "C" fn retichat_transport_hops_to(dest_hash: *const u8, len: u32) -> 
     rns::transport_hops_to(&h)
 }
 
+/// Query whether the cached path's attached interface is online.
+/// Returns: 1 = online, 0 = offline, -1 = no path / unknown interface.
+#[no_mangle]
+pub extern "C" fn retichat_transport_path_interface_online(dest_hash: *const u8, len: u32) -> i32 {
+    let h = slice_from_raw(dest_hash, len);
+    let Some(interface_name) = Transport::next_hop_interface(&h) else {
+        return -1;
+    };
+    rns::interface_online(&interface_name)
+}
+
+/// Soft-expire a cached path so the next lookup forces fresh path resolution.
+/// Returns 1 if an existing path entry was expired, 0 if no cached path exists.
+#[no_mangle]
+pub extern "C" fn retichat_transport_drop_path(dest_hash: *const u8, len: u32) -> i32 {
+    let h = slice_from_raw(dest_hash, len);
+    if Transport::expire_path(&h) { 1 } else { 0 }
+}
+
 /// Force-flush the in-memory destination/path table to disk so newly
 /// resolved essential paths survive a force-quit. Cheap (a few KB).
 /// Returns 0 on success.

@@ -130,7 +130,7 @@ struct SettingsView: View {
 
     private func applySettings() {
         // Capture old rfed notify hash before prefs are overwritten.
-        let oldNotifyHash = UserPreferences.shared.rfedNotifyHash
+        let oldNotifyHash = UserPreferences.shared.effectiveRfedNotifyHash
         let rfedNodeChanged = vm.rfedNodeIdentityHash != UserPreferences.shared.rfedNodeIdentityHash
 
         // Persist all settings to UserDefaults.

@@ -23,10 +23,10 @@ final class ApnsTokenRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    /// One-shot guard so multiple registerIfNeeded() calls (token refresh,
-    /// service restart, etc.) don't queue up redundant sends per app run.
-    /// Reset only on explicit re-registration request.
-    private var didRegister = false
+    /// Last token-registration input tuple attempted during this app run.
+    /// Prevents duplicate sends for the same subscriber/token pair while still
+    /// allowing a real APNs token change to trigger a fresh registration.
+    private var lastRegistrationKey: String? = nil
 
     private init() {}
 
@@ -40,8 +40,7 @@ final class ApnsTokenRegistrar {
     /// startup and arrives with the first matching announce (typically 1–15 s).
     /// We wait up to 30 s, send once, and log loudly if the window elapses.
     func registerIfNeeded(subscriberHash: Data) {
-        guard !didRegister else { return }
-        guard !prefs.rfedNodeIdentityHash.isEmpty else {
+        guard !prefs.effectiveRfedNodeIdentityHash.isEmpty else {
             print("[APNsRegistrar] No RFed node configured; skipping APNs registration")
             return
         }
@@ -63,7 +62,10 @@ final class ApnsTokenRegistrar {
             return
         }
 
-        didRegister = true
+        let registrationKey = subscriberHash.hexString + ":" + apnsToken
+        guard lastRegistrationKey != registrationKey else { return }
+        lastRegistrationKey = registrationKey
+
         Task.detached(priority: .background) { [weak self] in
             await self?.awaitPathThenSend(
                 destHash: destHash, payload: payload,

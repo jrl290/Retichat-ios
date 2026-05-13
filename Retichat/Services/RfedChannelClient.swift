@@ -327,7 +327,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
 
         // Deregister per-channel push notification wakeup.
-        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
+        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
                                                   app: "rfed", aspects: ["notify"])
         if let channelHashForNotify = Data(hexString: channelHashHex), !rfedNotifyHashHex.isEmpty {
             RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashForNotify,
@@ -362,7 +362,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     func enableChannelPush(channelHashHex: String) {
         UserPreferences.shared.enableChannelPush(channelHashHex)
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
-        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
+        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
                                                    app: "rfed", aspects: ["notify"])
         guard !rfedNotifyHashHex.isEmpty else { return }
         RfedNotifyRegistrar.shared.registerForChannel(channelHash: channelHashData,
@@ -374,7 +374,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     func disableChannelPush(channelHashHex: String) {
         UserPreferences.shared.disableChannelPush(channelHashHex)
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
-        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.rfedNodeIdentityHash,
+        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
                                                    app: "rfed", aspects: ["notify"])
         guard !rfedNotifyHashHex.isEmpty else { return }
         RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashData,
@@ -954,7 +954,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                     // but only if the user has push enabled for this channel.
                     if UserPreferences.shared.isChannelPushEnabled(channel.id) {
                         let rfedNotifyHashHex = Self.rfedDestHash(
-                            identityHashHex: prefs.rfedNodeIdentityHash,
+                            identityHashHex: prefs.effectiveRfedNodeIdentityHash,
                             app: "rfed", aspects: ["notify"])
                         RfedNotifyRegistrar.shared.registerForChannel(
                             channelHash: channelHashData,
@@ -991,7 +991,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     /// rfedNodeHash field as the rfed.channel dest hex (not the raw identity hash).
     /// For delivery PULL, we derive rfed.delivery from the same identity hash stored in prefs.
     private func rfedIdentityHashFromChannelDest(_ channelDestHex: String) -> String {
-        return prefs.rfedNodeIdentityHash
+        return prefs.effectiveRfedNodeIdentityHash
     }
 
     // MARK: - Static helpers

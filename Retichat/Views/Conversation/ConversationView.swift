@@ -57,7 +57,7 @@ struct ConversationView: View {
     /// Master switch for the title-bar direct-link status dot.  Set to
     /// `false` to hide the indicator while keeping the supporting code in
     /// place for easy re-enable.
-    private static let showPeerLinkDot: Bool = true
+    private static let showPeerLinkDot: Bool = false
 
     // MARK: - Convenience
 
@@ -91,6 +91,19 @@ struct ConversationView: View {
     private var inputBarPlaceholder: String {
         if let ch = channel { return "Message #\(ch.channelName)..." }
         return "Message..."
+    }
+
+    /// "Designed for iPad" on macOS is a runtime environment, not a
+    /// Catalyst target, so detect both forms explicitly.
+    private var shouldUseReturnToSendOnMac: Bool {
+        #if targetEnvironment(macCatalyst)
+        return true
+        #else
+        if #available(iOS 14.0, *) {
+            return ProcessInfo.processInfo.isiOSAppOnMac
+        }
+        return false
+        #endif
     }
 
     /// Color of the direct-link status dot shown next to the title in DM mode.
@@ -605,8 +618,8 @@ struct ConversationView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .glassBackground(cornerRadius: 20)
-                #if targetEnvironment(macCatalyst)
                 .onChange(of: messageText) { _, newValue in
+                    guard shouldUseReturnToSendOnMac else { return }
                     guard newValue.hasSuffix("\n") else { return }
                     let shiftHeld: Bool = {
                         guard let kb = GCKeyboard.coalesced?.keyboardInput else { return false }
@@ -618,7 +631,6 @@ struct ConversationView: View {
                         sendMessage()
                     }
                 }
-                #endif
 
             Button {
                 sendMessage()

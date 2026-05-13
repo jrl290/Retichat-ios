@@ -25,8 +25,10 @@ final class RfedNotifyRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    /// One-shot guard so foreground/reconnect storms don't fire duplicate registers.
-    private var didRegisterOnActive = false
+    /// Last rfed.notify registration tuple attempted during this app run.
+    /// This suppresses reconnect storms for the same destination while still
+    /// allowing re-registration when the RFed node or local identity changes.
+    private var lastRegistrationKey: String? = nil
 
     private init() {}
 
@@ -39,7 +41,7 @@ final class RfedNotifyRegistrar {
     /// request and surface failure; no persistent link, no retry loop.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     func registerIfNeeded(identityHandle: UInt64) {
-        let rfedDestHex = prefs.rfedNotifyHash
+        let rfedDestHex = prefs.effectiveRfedNotifyHash
         guard !rfedDestHex.isEmpty else { return }
         guard let rfedHash = Data(hexString: rfedDestHex) else {
             print("[RfedNotify] Invalid rfedNotifyHash — not 32 hex chars")
@@ -57,8 +59,10 @@ final class RfedNotifyRegistrar {
             return
         }
 
-        guard !didRegisterOnActive else { return }
-        didRegisterOnActive = true
+        let registrationKey = rfedDestHex + ":" + relayHex + ":" + String(identityHandle)
+        guard lastRegistrationKey != registrationKey else { return }
+        lastRegistrationKey = registrationKey
+
         Task.detached(priority: .background) { [weak self] in
             await self?.sendOnce(
                 rfedHash: rfedHash,

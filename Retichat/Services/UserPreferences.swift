@@ -6,9 +6,11 @@
 //
 
 import Foundation
+import CryptoKit
 
 final class UserPreferences {
     static let shared = UserPreferences()
+    private static let hiddenDefaultRfedNodeIdentityHash = "7e5ff856dc2aa0fbc9fc8831b62d2834"
 
     private let defaults = UserDefaults.standard
 
@@ -60,6 +62,16 @@ final class UserPreferences {
         set { defaults.set(newValue, forKey: Keys.rfedNotifyHash) }
     }
 
+    /// Runtime RFed notify destination.
+    /// Falls back to the app's hidden default RFed node when no explicit
+    /// value has been saved in Settings.
+    var effectiveRfedNotifyHash: String {
+        let configured = Self.normalizedHex(rfedNotifyHash)
+        if !configured.isEmpty { return configured }
+        return Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
+                                app: "rfed", aspects: ["notify"]) ?? ""
+    }
+
 
 
     /// Last known APNs device token (hex string). Stored for re-registration on launch.
@@ -76,12 +88,29 @@ final class UserPreferences {
         set { defaults.set(newValue, forKey: Keys.lxmfPropagationHash) }
     }
 
+    /// Runtime LXMF propagation destination.
+    /// When the override field is blank, derive from the effective RFed node.
+    var effectiveLxmfPropagationHash: String {
+        let configured = Self.normalizedHex(lxmfPropagationHash)
+        if !configured.isEmpty { return configured }
+        return Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
+                                app: "lxmf", aspects: ["propagation"]) ?? ""
+    }
+
     /// 32-char hex public identity hash of the RFed node.
     /// Capability destination hashes (rfed.notify, rfed.channel, rfed.delivery,
     /// lxmf.propagation) are derived automatically from this value.
     var rfedNodeIdentityHash: String {
         get { defaults.string(forKey: Keys.rfedNodeIdentityHash) ?? "" }
         set { defaults.set(newValue, forKey: Keys.rfedNodeIdentityHash) }
+    }
+
+    /// Runtime RFed identity hash.
+    /// Uses the hidden fallback only when Settings is blank.
+    var effectiveRfedNodeIdentityHash: String {
+        let configured = Self.normalizedHex(rfedNodeIdentityHash)
+        if !configured.isEmpty { return configured }
+        return Self.hiddenDefaultRfedNodeIdentityHash
     }
 
     /// Optional override for the LXMF propagation hash.
@@ -210,5 +239,20 @@ final class UserPreferences {
         var map = channelLastOpened
         map[channelId] = time
         channelLastOpened = map
+    }
+
+    private static func normalizedHex(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func rnsDestHash(identityHashHex: String, app: String, aspects: [String]) -> String? {
+        let hex = normalizedHex(identityHashHex)
+        guard hex.count == 32, let identityBytes = Data(hexString: hex) else { return nil }
+        let name = ([app] + aspects).joined(separator: ".")
+        let nameHashFull = SHA256.hash(data: Data(name.utf8))
+        let nameHashTrunc = Data(nameHashFull.prefix(10))
+        let material = nameHashTrunc + identityBytes
+        let destHashFull = SHA256.hash(data: material)
+        return Data(destHashFull.prefix(16)).hexString
     }
 }

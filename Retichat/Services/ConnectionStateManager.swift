@@ -155,21 +155,22 @@ final class ConnectionStateManager {
         let monitor = NWPathMonitor()
         let queue = DispatchQueue(label: "retichat.connection.pathmonitor")
         monitor.pathUpdateHandler = { [weak self] path in
+            let manager = self
             Task { @MainActor in
-                guard let self = self else { return }
-                let prev = self.lastPathStatus
-                self.lastPathStatus = path.status
+                guard let manager else { return }
+                let prev = manager.lastPathStatus
+                manager.lastPathStatus = path.status
                 // First callback after monitor.start() is the initial state
                 // report, not a transition. Record it and return without
                 // triggering an app-link attempt — paths haven't resolved yet.
-                guard self.pathMonitorPrimed else {
-                    self.pathMonitorPrimed = true
+                guard manager.pathMonitorPrimed else {
+                    manager.pathMonitorPrimed = true
                     print("[ConnState] network monitor primed: status=\(path.status), interfaces=\(path.availableInterfaces.map(\.name))")
                     return
                 }
                 guard prev != path.status else { return }
                 print("[ConnState] network change: \(prev) → \(path.status), interfaces=\(path.availableInterfaces.map(\.name))")
-                let client = self.lxmfClient
+                let client = manager.lxmfClient
                 Task.detached(priority: .userInitiated) {
                     client?.appLinkNetworkChanged()
                 }
@@ -276,6 +277,10 @@ final class ConnectionStateManager {
     /// Single RFed infrastructure request. RFed channel/delivery/notify nodes
     /// are not AppLinks; each request owns its link lifecycle and runs off the
     /// main actor so the UI never blocks on network I/O.
+    ///
+    /// Use `.utility`, not `.userInitiated`: the Rust transport/request path
+    /// ultimately waits on default-QoS worker threads, and running the wrapper
+    /// task hotter triggers Thread Performance Checker inversions.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §6, §7
     func rfedLinkRequest(destHash: Data,
                          app: String,
@@ -284,8 +289,9 @@ final class ConnectionStateManager {
                          path: String,
                          payload: Data,
                          timeoutSecs: Double = 5.0) async -> Data? {
-        await Task.detached(priority: .userInitiated) {
-            RetichatBridge.shared.linkRequest(
+        let bridge = RetichatBridge.shared
+                        return await Task.detached(priority: .utility) {
+                            return bridge.linkRequest(
                 destHash: destHash,
                 appName: app,
                 aspects: aspects,
@@ -349,10 +355,11 @@ final class ConnectionStateManager {
     /// Request a path to the configured rfed.channel destination. RFed is
     /// infrastructure traffic and does not use AppLinks.
     func openRfedNodeLink() {
-        guard let destData = rfedChannelDestData() else { return }
+        guard let destData = rfedChannelDestData(includeHiddenDefault: true) else { return }
         rfedLinkDestData = destData
+        let bridge = RetichatBridge.shared
         Task.detached(priority: .userInitiated) {
-            _ = RetichatBridge.shared.transportRequestPath(destHash: destData)
+            _ = bridge.transportRequestPath(destHash: destData)
         }
     }
 
@@ -364,7 +371,7 @@ final class ConnectionStateManager {
     /// Current reachability status for the rfed node.
     /// Returns: 0=NONE/no config, 3=path reachable, 4=no path.
     func rfedNodeLinkStatus() -> Int32 {
-        guard let destData = rfedLinkDestData ?? rfedChannelDestData() else { return 0 }
+        guard let destData = rfedChannelDestData(includeHiddenDefault: false) else { return 0 }
         return RetichatBridge.shared.transportHasPath(destHash: destData) ? 3 : 4
     }
 
@@ -372,7 +379,7 @@ final class ConnectionStateManager {
     /// preferences.  Used by the SettingsView status indicator to tell
     /// "no config" apart from "config present but no link".
     func rfedChannelDestDataPublic() -> Data? {
-        return rfedChannelDestData()
+        return rfedChannelDestData(includeHiddenDefault: false)
     }
 
     /// True if the routing table currently has a path to the configured
@@ -380,7 +387,7 @@ final class ConnectionStateManager {
     /// to distinguish a transient "link not active yet" from a genuine
     /// "no path" failure.
     func rfedChannelHasPath() -> Bool {
-        guard let destData = rfedChannelDestData() else { return false }
+        guard let destData = rfedChannelDestData(includeHiddenDefault: false) else { return false }
         return RetichatBridge.shared.transportHasPath(destHash: destData)
     }
 
@@ -388,20 +395,28 @@ final class ConnectionStateManager {
     func waitForRfedReachable(timeoutSecs: Double) async -> Bool {
         let deadline = Date().addingTimeInterval(timeoutSecs)
         while Date() < deadline {
-            if rfedNodeLinkStatus() == 3 { return true }
+            if rfedNodeLinkStatusRuntime() == 3 { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
         return false
     }
 
     /// Derives the rfed.channel 16-byte dest from current prefs.
-    private func rfedChannelDestData() -> Data? {
-        let identityHex = UserPreferences.shared.rfedNodeIdentityHash
+    private func rfedChannelDestData(includeHiddenDefault: Bool) -> Data? {
+        let prefs = UserPreferences.shared
+        let identityHex = includeHiddenDefault
+            ? prefs.effectiveRfedNodeIdentityHash
+            : prefs.rfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !identityHex.isEmpty else { return nil }
         let destHex = RfedChannelClient.rfedDestHash(
             identityHashHex: identityHex, app: "rfed", aspects: ["channel"])
         guard !destHex.isEmpty else { return nil }
         return Data(hexString: destHex)
+    }
+
+    private func rfedNodeLinkStatusRuntime() -> Int32 {
+        guard let destData = rfedLinkDestData ?? rfedChannelDestData(includeHiddenDefault: true) else { return 0 }
+        return RetichatBridge.shared.transportHasPath(destHash: destData) ? 3 : 4
     }
 
     /// Re-requests paths to always-needed destinations and re-opens active links.
@@ -437,16 +452,16 @@ final class ConnectionStateManager {
         for dest in [ApnsBridgeHashes.apnsRegistration, ApnsBridgeHashes.notifyRelay].compactMap({ $0 }) {
             destinations.append(dest)
         }
-        let rfedHex = UserPreferences.shared.rfedNotifyHash
+        let rfedHex = UserPreferences.shared.effectiveRfedNotifyHash
         if !rfedHex.isEmpty, let rfedHash = Data(hexString: rfedHex) {
             destinations.append(rfedHash)
         }
         // Also request paths to rfed.channel and rfed.delivery so the app
         // link has a fresh route immediately after network reconnect.
-        if let rfedChannel = rfedChannelDestData() {
+        if let rfedChannel = rfedChannelDestData(includeHiddenDefault: true) {
             destinations.append(rfedChannel)
         }
-        let identityHex = UserPreferences.shared.rfedNodeIdentityHash
+        let identityHex = UserPreferences.shared.effectiveRfedNodeIdentityHash
         if !identityHex.isEmpty {
             let deliveryHex = RfedChannelClient.rfedDestHash(
                 identityHashHex: identityHex, app: "rfed", aspects: ["delivery"])

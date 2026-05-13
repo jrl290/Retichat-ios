@@ -33,6 +33,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     private var modelContext: ModelContext?
     private var pollTimer: Timer?
+    private var serviceStarting = false
 
     /// Last time `pollPropagationNode` was actually allowed to issue an FFI
     /// `client.sync(...)`. Used to throttle redundant callers (background-task
@@ -95,14 +96,27 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - Service lifecycle
 
     func startService() {
-        guard !serviceRunning else { return }
+        guard !serviceRunning, !serviceStarting else { return }
+        serviceStarting = true
 
         print("[Retichat] v1.0 build 2 starting")
 
         statusMessage = "Starting…"
 
         let configDir = reticulumConfigDir()
-        generateConfig(configDir: configDir)
+        let needsFallbackEndpoints = enabledTCPClientInterfaces().isEmpty
+
+        Task { [weak self] in
+            guard let self else { return }
+            let fallbackEndpoints = needsFallbackEndpoints
+                ? await DefaultEndpointManager.selectFallbackEndpoints()
+                : []
+            self.continueStartService(configDir: configDir, fallbackEndpoints: fallbackEndpoints)
+        }
+    }
+
+    private func continueStartService(configDir: String, fallbackEndpoints: [(host: String, port: Int)]) {
+        generateConfig(configDir: configDir, fallbackEndpoints: fallbackEndpoints)
 
         let idPath = configDir + "/identity"
         let storagePath = configDir + "/lxmf_storage"
@@ -158,6 +172,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// a detached Task; all on-main-actor work above runs synchronously in
     /// the order written, so component callbacks observe a consistent state.
     private func finishStartService(result: Result<LxmfClient, Error>, configDir: String, storagePath: String) {
+        serviceStarting = false
         let client: LxmfClient
         switch result {
         case .success(let c):
@@ -201,9 +216,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // daemon: it will announce immediately, on every interface up-edge,
         // and every 30 minutes thereafter.  Replaces the previous Timer +
         // onConnect re-announce + foreground re-announce pattern.
-        ffiQueue.async { [weak self] in
-            guard let client = self?.lxmfClient else { return }
-            _ = client.publish(refreshSecs: 30 * 60)
+        let publishClient = lxmfClient
+        ffiQueue.async {
+            guard let publishClient else { return }
+            _ = publishClient.publish(refreshSecs: 30 * 60)
         }
 
         // Sync ratchets to App Group after announce (so the NSE can decrypt).
@@ -288,7 +304,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return dir
     }
 
-    private func generateConfig(configDir: String) {
+    private func enabledTCPClientInterfaces() -> [InterfaceConfigEntity] {
+        guard let ctx = modelContext else { return [] }
+        let tcpType = InterfaceKind.tcpClient.rawValue
+        let descriptor = FetchDescriptor<InterfaceConfigEntity>(
+            predicate: #Predicate { $0.enabled == true && $0.type == tcpType }
+        )
+        return (try? ctx.fetch(descriptor)) ?? []
+    }
+
+    private func generateConfig(configDir: String, fallbackEndpoints: [(host: String, port: Int)]) {
         let configPath = configDir + "/config"
 
         // Build config with proper format:
@@ -308,7 +333,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Explicitly disable AutoInterface so the app never does local network
         // discovery (IPv6 multicast). Without this, when running on a simulator
         // the app can discover and directly connect to local Reticulum nodes
-        // (hops=0), bypassing the configured remote node at 192.168.2.107.
+        // (hops=0), bypassing the configured public backbone endpoints.
         lines.append("")
         lines.append("  [[AutoInterface]]")
         lines.append("    type = AutoInterface")
@@ -318,32 +343,35 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // RNode rows are realised through the BLE bridge + rns_rnode_iface_*
         // FFI, not the TOML config).
         var addedInterfaces = false
-        if let ctx = modelContext {
-            let tcpType = InterfaceKind.tcpClient.rawValue
-            let descriptor = FetchDescriptor<InterfaceConfigEntity>(
-                predicate: #Predicate { $0.enabled == true && $0.type == tcpType }
-            )
-            if let interfaces = try? ctx.fetch(descriptor), !interfaces.isEmpty {
-                for iface in interfaces {
-                    lines.append("")
-                    lines.append("  [[\(iface.name)]]")
-                    lines.append("    type = TCPClientInterface")
-                    lines.append("    target_host = \(iface.targetHost)")
-                    lines.append("    target_port = \(iface.targetPort)")
-                    lines.append("    enabled = yes")
-                }
-                addedInterfaces = true
+        let interfaces = enabledTCPClientInterfaces()
+        if !interfaces.isEmpty {
+            for iface in interfaces {
+                lines.append("")
+                lines.append("  [[\(iface.name)]]")
+                lines.append("    type = TCPClientInterface")
+                lines.append("    target_host = \(iface.targetHost)")
+                lines.append("    target_port = \(iface.targetPort)")
+                lines.append("    enabled = yes")
             }
+            addedInterfaces = true
         }
 
         if !addedInterfaces {
-            // Default: connect only to the known rfed node
-            lines.append("")
-            lines.append("  [[Default]]")
-            lines.append("    type = TCPClientInterface")
-            lines.append("    target_host = 192.168.2.107")
-            lines.append("    target_port = 4242")
-            lines.append("    enabled = yes")
+            let endpoints = fallbackEndpoints.isEmpty
+                ? Array(DefaultEndpointManager.shuffled().prefix(DefaultEndpointManager.fallbackEndpointCount))
+                : fallbackEndpoints
+            print("[DefaultEndpoint] selected fallback endpoints: \(endpoints.map { "\($0.host):\($0.port)" }.joined(separator: ", "))")
+            // Default: connect to the first reachable public backbone endpoints
+            // from a randomized probe pool, padded from the same pool if the
+            // network is offline during startup.
+            for (index, endpoint) in endpoints.enumerated() {
+                lines.append("")
+                lines.append("  [[DefaultBackbone\(index + 1)]]")
+                lines.append("    type = TCPClientInterface")
+                lines.append("    target_host = \(endpoint.host)")
+                lines.append("    target_port = \(endpoint.port)")
+                lines.append("    enabled = yes")
+            }
         }
 
         let config = lines.joined(separator: "\n") + "\n"
@@ -354,7 +382,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     private func startPropagationPolling() {
         // Apply user-configured node before the first poll fires.
-        propManager.setUserConfiguredNode(prefs.lxmfPropagationHash)
+        propManager.setUserConfiguredNode(prefs.effectiveLxmfPropagationHash)
 
         // Share propagation node list with NSE so it can sync on its own.
         syncPropagationNodesToAppGroup()
@@ -373,17 +401,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// Write the full propagation node list to the App Group so the NSE can
     /// request messages when the main app is dead (force-quit).
     private func syncPropagationNodesToAppGroup() {
-        var hashes: [String] = []
-        // User-configured node first (if any)
-        let userHash = prefs.lxmfPropagationHash.trimmingCharacters(in: .whitespaces).lowercased()
-        if userHash.count == 32, userHash.allSatisfy({ $0.isHexDigit }) {
-            hashes.append(userHash)
-        }
-        // Add the current node from the manager (may differ from user hash)
-        if let current = propManager.currentNode() {
-            let hex = current.map { String(format: "%02x", $0) }.joined()
-            if !hashes.contains(hex) { hashes.append(hex) }
-        }
+        let hashes = propManager.orderedNodeHashes()
         // Heavy I/O (persist + file copies) runs off the main thread
         let configDir = reticulumConfigDir()
         let client = lxmfClient
@@ -499,7 +517,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         lastPollTime = now
 
-        propManager.setUserConfiguredNode(prefs.lxmfPropagationHash)
+        propManager.setUserConfiguredNode(prefs.effectiveLxmfPropagationHash)
 
         if let nodeHash = propManager.currentNode() {
             ffiQueue.async { [weak self] in

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Network
 
 struct DefaultEndpointManager {
     static let endpoints: [(host: String, port: Int)] = [
@@ -61,6 +62,34 @@ struct DefaultEndpointManager {
         ("world.reticulum.is", 3400),
     ]
 
+    static let fallbackEndpointCount = 3
+
+    private static let probeCandidateCount = 12
+    private static let probeTimeoutSecs: TimeInterval = 1.5
+    private static let probeQueue = DispatchQueue(
+        label: "chat.retichat.default-endpoint.probe",
+        qos: .utility,
+        attributes: .concurrent
+    )
+
+    private final class ProbeContinuationBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var finished = false
+        private let continuation: CheckedContinuation<Bool, Never>
+
+        init(_ continuation: CheckedContinuation<Bool, Never>) {
+            self.continuation = continuation
+        }
+
+        func resume(_ success: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else { return }
+            finished = true
+            continuation.resume(returning: success)
+        }
+    }
+
     /// Return a shuffled copy of the endpoint list.
     static func shuffled() -> [(host: String, port: Int)] {
         return endpoints.shuffled()
@@ -69,5 +98,72 @@ struct DefaultEndpointManager {
     /// Pick the first endpoint, rotating from a shuffled copy.
     static func pick() -> (host: String, port: Int) {
         return endpoints.randomElement() ?? endpoints[0]
+    }
+
+    /// Probe a randomized pool of public endpoints and return up to
+    /// `fallbackEndpointCount` hosts that accepted a TCP connection.
+    ///
+    /// If the current network is offline or not enough probes succeed
+    /// inside the timeout budget, the returned list is padded from the
+    /// same shuffled pool so startup still has fallback targets once the
+    /// network comes back.
+    static func selectFallbackEndpoints() async -> [(host: String, port: Int)] {
+        let shuffledCandidates = shuffled()
+        let probeCandidates = Array(shuffledCandidates.prefix(min(probeCandidateCount, shuffledCandidates.count)))
+        let reachableKeys = await withTaskGroup(of: (String, Bool).self) { group in
+            for endpoint in probeCandidates {
+                let key = endpointKey(endpoint)
+                group.addTask {
+                    (key, await probeConnectability(of: endpoint, timeoutSecs: probeTimeoutSecs))
+                }
+            }
+
+            var successes = Set<String>()
+            for await (key, success) in group where success {
+                successes.insert(key)
+            }
+            return successes
+        }
+
+        var selected = probeCandidates.filter { reachableKeys.contains(endpointKey($0)) }
+        if selected.count < fallbackEndpointCount {
+            for endpoint in shuffledCandidates where !selected.contains(where: { endpointKey($0) == endpointKey(endpoint) }) {
+                selected.append(endpoint)
+                if selected.count == fallbackEndpointCount { break }
+            }
+        }
+
+        return Array(selected.prefix(fallbackEndpointCount))
+    }
+
+    private static func endpointKey(_ endpoint: (host: String, port: Int)) -> String {
+        "\(endpoint.host):\(endpoint.port)"
+    }
+
+    private static func probeConnectability(of endpoint: (host: String, port: Int), timeoutSecs: TimeInterval) async -> Bool {
+        guard let port = NWEndpoint.Port(rawValue: UInt16(endpoint.port)) else { return false }
+
+        return await withCheckedContinuation { continuation in
+            let connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: port, using: .tcp)
+            let result = ProbeContinuationBox(continuation)
+
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    connection.cancel()
+                    result.resume(true)
+                case .failed(_), .cancelled:
+                    result.resume(false)
+                default:
+                    break
+                }
+            }
+
+            connection.start(queue: probeQueue)
+            probeQueue.asyncAfter(deadline: .now() + timeoutSecs) {
+                connection.cancel()
+                result.resume(false)
+            }
+        }
     }
 }

@@ -384,6 +384,8 @@ int32_t retichat_identity_destroy(uint64_t handle);
 int32_t retichat_transport_has_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_hops_to(const uint8_t *dest_hash, uint32_t len);
+int32_t retichat_transport_path_interface_online(const uint8_t *dest_hash, uint32_t len);
+int32_t retichat_transport_drop_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_save_paths(void);
 
 #pragma mark - Settings

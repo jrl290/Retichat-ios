@@ -435,7 +435,7 @@ private struct NewChannelForm: View {
     private func joinChannel() {
         let name = fullChannelName
         guard !name.isEmpty else { return }
-        let nodeHash = UserPreferences.shared.rfedNodeIdentityHash.trimmingCharacters(in: .whitespaces)
+        let nodeHash = UserPreferences.shared.effectiveRfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines)
         guard nodeHash.count >= 32 else { errorMessage = "RFed node hash not configured. Please set it in Settings."; return }
         isJoining = true
         errorMessage = nil

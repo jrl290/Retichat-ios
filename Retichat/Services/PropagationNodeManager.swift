@@ -71,6 +71,17 @@ final class PropagationNodeManager {
         return Data(hexString: hex)
     }
 
+    /// Current failover order as lowercase 32-char hex hashes, starting with
+    /// the node that will be tried next. Used by the NSE/background path so it
+    /// preserves the same failover pool as the foreground app.
+    func orderedNodeHashes() -> [String] {
+        guard !shuffledNodes.isEmpty else { return [] }
+        let start = currentIndex % shuffledNodes.count
+        return (0..<shuffledNodes.count).map { offset in
+            shuffledNodes[(start + offset) % shuffledNodes.count]
+        }
+    }
+
     /// Rotate to next node on failure.
     func rotateToNext() {
         currentIndex = (currentIndex + 1) % shuffledNodes.count
@@ -90,7 +101,7 @@ final class PropagationNodeManager {
 // MARK: - Data hex helper
 
 extension Data {
-    init?(hexString: String) {
+    nonisolated init?(hexString: String) {
         let hex = hexString.replacingOccurrences(of: " ", with: "")
         guard hex.count % 2 == 0 else { return nil }
 
@@ -105,7 +116,7 @@ extension Data {
         self = data
     }
 
-    var hexString: String {
+    nonisolated var hexString: String {
         return map { String(format: "%02x", $0) }.joined()
     }
 }

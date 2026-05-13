@@ -69,7 +69,7 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
 
         // If the token changed (or is new), re-register with the rfed APNs bridge.
         if hex != oldToken, !repository.ownHash.isEmpty,
-           !UserPreferences.shared.rfedNodeIdentityHash.isEmpty {
+              !UserPreferences.shared.effectiveRfedNodeIdentityHash.isEmpty {
             ApnsTokenRegistrar.shared.registerIfNeeded(subscriberHash: repository.ownHash)
         }
     }
@@ -84,14 +84,61 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
     // MARK: - APNs — silent background push
 
     /// Fired when a push arrives while the app is running.
-    /// The NSE handles the actual message fetch; we no longer wake the main
-    /// app stack from here (content-available removed from payload).
+    /// The NSE handles `mutable-content` alerts, but the app must still react
+    /// to rfed wake pushes that arrive as `content-available` notifications or
+    /// that bypass the NSE entirely.
     func application(
         _ application: UIApplication,
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        completionHandler(.noData)
+        guard userInfo["rfed"] != nil else {
+            completionHandler(.noData)
+            return
+        }
+
+        let isActive = application.applicationState == .active
+        let hasContentAvailable = apsFlag(userInfo, key: "content-available")
+        let hasMutableContent = apsFlag(userInfo, key: "mutable-content")
+        print(
+            "[APNs] remote push received active=\(isActive) " +
+            "content-available=\(hasContentAvailable) " +
+            "mutable-content=\(hasMutableContent)"
+        )
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                completionHandler(.failed)
+                return
+            }
+
+            // Import any message the NSE already fetched before we decide
+            // whether we also need to wake the full stack.
+            self.repository.importNSEMessages()
+
+            if isActive {
+                if self.repository.serviceRunning {
+                    self.repository.pollPropagationNode(force: true)
+                } else {
+                    self.repository.startService()
+                }
+            } else {
+                if !self.repository.serviceRunning {
+                    self.repository.startService()
+                }
+                self.beginBackgroundExecution(repository: self.repository, forcePoll: true)
+            }
+
+            completionHandler(.newData)
+        }
+    }
+
+    private func apsFlag(_ userInfo: [AnyHashable: Any], key: String) -> Bool {
+        guard let aps = userInfo["aps"] as? [AnyHashable: Any] else { return false }
+        if let value = aps[key] as? NSNumber {
+            return value.intValue != 0
+        }
+        return false
     }
 
     // MARK: - Immediate background execution
@@ -99,7 +146,7 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
     /// Request background time from the OS (~30 seconds guaranteed).
     /// This keeps the Rust stack alive long enough to flush outbound
     /// messages and poll propagation for new ones.
-    func beginBackgroundExecution(repository: ChatRepository) {
+    func beginBackgroundExecution(repository: ChatRepository, forcePoll: Bool = false) {
         // End any existing background task first
         if bgTaskId != .invalid {
             UIApplication.shared.endBackgroundTask(bgTaskId)
@@ -127,13 +174,13 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
             repository.flushPendingMessages()
 
             // Poll propagation nodes for new messages
-            repository.pollPropagationNode()
+            repository.pollPropagationNode(force: forcePoll)
 
             // Give the Rust networking stack time to complete the request
             try? await Task.sleep(for: .seconds(20))
 
             // Poll again to catch responses that arrived during wait
-            repository.pollPropagationNode()
+            repository.pollPropagationNode(force: forcePoll)
 
             // Persist path table and ratchets to disk before suspension
             repository.persist()

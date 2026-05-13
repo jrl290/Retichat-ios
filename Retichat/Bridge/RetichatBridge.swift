@@ -110,6 +110,41 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    /// Query whether the cached path's attached interface is online.
+    /// Returns: .some(true) if online, .some(false) if offline, nil if there
+    /// is no cached path or the interface cannot be resolved.
+    nonisolated func transportPathInterfaceOnline(destHash: Data) -> Bool? {
+        let result = destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_transport_path_interface_online(ptr, UInt32(destHash.count))
+        }
+        switch result {
+        case 1:  return true
+        case 0:  return false
+        default: return nil
+        }
+    }
+
+    /// Soft-expire a cached path so future sends request a fresh route.
+    @discardableResult
+    nonisolated func transportDropPath(destHash: Data) -> Bool {
+        return destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_transport_drop_path(ptr, UInt32(destHash.count)) == 1
+        }
+    }
+
+    /// If the cached path is pinned to an offline interface, expire it and
+    /// immediately request a fresh path.
+    @discardableResult
+    nonisolated func transportRefreshOfflinePath(destHash: Data) -> Bool {
+        guard transportHasPath(destHash: destHash) else { return false }
+        guard transportPathInterfaceOnline(destHash: destHash) == false else { return false }
+        _ = transportDropPath(destHash: destHash)
+        _ = transportRequestPath(destHash: destHash)
+        return true
+    }
+
     /// Force-flush the in-memory destination/path table to disk so newly
     /// resolved essential paths survive a force-quit before the next
     /// 5-minute periodic persist tick.

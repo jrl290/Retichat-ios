@@ -17,7 +17,7 @@ struct AddChannelView: View {
     @State private var errorMessage: String?
 
     private var rfedAddressConfigured: Bool {
-        !UserPreferences.shared.rfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        UserPreferences.shared.effectiveRfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).count == 32
     }
 
     var body: some View {
@@ -111,12 +111,16 @@ struct AddChannelView: View {
 
     private var canJoin: Bool {
         !channelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        rfedIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).count == 32
+        {
+            let hash = rfedIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines)
+            return hash.isEmpty || hash.count == 32
+        }()
     }
 
     private func join() {
         let name = channelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hash = rfedIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let enteredHash = rfedIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hash = enteredHash.isEmpty ? UserPreferences.shared.effectiveRfedNodeIdentityHash : enteredHash
         errorMessage = nil
         isJoining = true
         Task {
