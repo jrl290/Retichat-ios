@@ -18,7 +18,6 @@
 //
 
 import Foundation
-import Security
 
 final class ApnsTokenRegistrar {
     static let shared = ApnsTokenRegistrar()
@@ -188,24 +187,53 @@ final class ApnsTokenRegistrar {
     /// `aps-environment` entitlement embedded in this code-signed binary.
     /// Falls back to `#if DEBUG` heuristic if the entitlement cannot be read.
     static func currentApsEnvironment() -> String {
-        // SecTaskCopyValueForEntitlement reads the entitlement that was
-        // actually baked into the signed binary (not the source .entitlements
-        // file), which is the same value Apple uses to choose which APNs
-        // gateway to bind the device token to.
-        if let task = SecTaskCreateFromSelf(nil) {
-            let key = "aps-environment" as CFString
-            if let value = SecTaskCopyValueForEntitlement(task, key, nil) {
-                if let s = value as? String {
-                    if s == "development" { return "sandbox" }
-                    if s == "production"  { return "production" }
-                }
-            }
+        // The `SecTask*` APIs aren't available in the public iOS / Mac
+        // Catalyst SDK, so instead we parse `embedded.mobileprovision`
+        // (present in development, ad-hoc, enterprise, and TestFlight
+        // builds). The provisioning profile carries the same
+        // `aps-environment` value Apple uses to bind the device token to a
+        // specific APNs gateway.
+        //
+        // App Store distribution builds ship without an embedded profile;
+        // those are always production.
+        if let url = Bundle.main.url(forResource: "embedded",
+                                     withExtension: "mobileprovision"),
+           let data = try? Data(contentsOf: url),
+           let env = parseApsEnvironment(fromMobileProvision: data) {
+            if env == "development" { return "sandbox" }
+            if env == "production"  { return "production" }
         }
         #if DEBUG
         return "sandbox"
         #else
         return "production"
         #endif
+    }
+
+    /// Extracts the `aps-environment` value from a CMS-wrapped
+    /// `embedded.mobileprovision` blob without needing the Security
+    /// framework's CMS decoder.  The signed blob contains a plain XML plist
+    /// between the literal markers `<?xml` … `</plist>`; we slice that out
+    /// and feed it to PropertyListSerialization.
+    private static func parseApsEnvironment(fromMobileProvision data: Data) -> String? {
+        guard
+            let openRange  = data.range(of: Data("<?xml".utf8)),
+            let closeRange = data.range(
+                of: Data("</plist>".utf8),
+                options: [],
+                in: openRange.upperBound..<data.endIndex
+            )
+        else { return nil }
+
+        let plistData = data.subdata(in: openRange.lowerBound..<closeRange.upperBound)
+        guard
+            let plist = try? PropertyListSerialization.propertyList(
+                from: plistData, options: [], format: nil
+            ) as? [String: Any],
+            let entitlements = plist["Entitlements"] as? [String: Any],
+            let env = entitlements["aps-environment"] as? String
+        else { return nil }
+        return env
     }
 
     private enum RegistrarError: Error {

@@ -229,6 +229,9 @@ class NotificationService: UNNotificationServiceExtension {
             } else {
                 senderName = String(msg.senderHash.prefix(8)) + "\u{2026}"
             }
+            // --- Explicit APNs push receipt log ---
+            NSLog("[NSE] APNs push received and processed: sender=%@ hash=%@", senderName, msg.messageHash)
+
             best.title = senderName
             best.body  = msg.content
             best.subtitle = ""

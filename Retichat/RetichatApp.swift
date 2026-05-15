@@ -112,6 +112,9 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 return
             }
 
+            // --- Explicit APNs push receipt log ---
+            print("[APNs] didReceiveRemoteNotification: APNs push received, importing NSE messages")
+
             // Import any message the NSE already fetched before we decide
             // whether we also need to wake the full stack.
             self.repository.importNSEMessages()
