@@ -2,13 +2,13 @@
 //  RfedNotifyRegistrar.swift
 //  Retichat
 //
-//  Registers this device's push-notification relay with rfed via a Link request
-//  to `/rfed/notify/register`.
+//  Registers this device's push-notification relay with rfed via a signed
+//  plain DATA packet on the ephemeral `rfed.notify` AppLink.
 //
 //  Architecture:
-//    iOS app ──Link+identify──▶ rfed.notify (/rfed/notify/register)
-//      payload: the apns_bridge's rfed.notify dest hash (32-char hex)
-//      response: msgpack bool (true = success)
+//    iOS app ──APP_LINK DATA──▶ rfed.notify
+//      payload: signed msgpack [op, relay_hex, channel_hash|nil]
+//      success: Reticulum LRPROOF for that packet
 //
 //  Required UserPreferences:
 //    rfedNotifyHash  — rfed's rfed.notify destination hash (Link target)
@@ -25,10 +25,12 @@ final class RfedNotifyRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    /// Last rfed.notify registration tuple attempted during this app run.
-    /// This suppresses reconnect storms for the same destination while still
-    /// allowing re-registration when the RFed node or local identity changes.
+    /// Last rfed.notify registration tuple successfully accepted during this
+    /// app run. Failed sends must not latch success, or a later APP_LINK
+    /// ACTIVE event would be unable to retry the same tuple.
     private var lastRegistrationKey: String? = nil
+    private var pendingRegistrationKey: String? = nil
+    private let stateQueue = DispatchQueue(label: "chat.retichat.rfednotify.state")
 
     private init() {}
 
@@ -37,9 +39,12 @@ final class RfedNotifyRegistrar {
     /// Register this subscriber's relay hash with rfed.
     /// `identityHandle` is the Rust FFI handle for the local identity.
     ///
-    /// RFed notify is an infrastructure request, not an AppLink. Send one
-    /// request and surface failure; no persistent link, no retry loop.
+    /// The registration is a one-shot signed DATA send over the ephemeral
+    /// `rfed.notify` AppLink. We fire one immediate attempt and leave an
+    /// ACTIVE-status handler installed so a later readiness event can drive
+    /// the same send without Swift owning link lifecycle or retries.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    @MainActor
     func registerIfNeeded(identityHandle: UInt64) {
         let rfedDestHex = prefs.effectiveRfedNotifyHash
         guard !rfedDestHex.isEmpty else { return }
@@ -54,46 +59,68 @@ final class RfedNotifyRegistrar {
 
         // Payload: fixarray-3 [str(relayHex), bin(64) pubkey, bin(64) sig_over_utf8(relayHex)]
         // Subscriber identity is derived from pubkey on the server — no timing dependency.
-        guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: nil, identityHandle: identityHandle) else {
+        guard let payload = buildSignedPayload(
+            operation: "register",
+            relayHex: relayHex,
+            channelHash: nil,
+            identityHandle: identityHandle
+        ) else {
             print("[RfedNotify] Failed to sign payload")
             return
         }
 
         let registrationKey = rfedDestHex + ":" + relayHex + ":" + String(identityHandle)
-        guard lastRegistrationKey != registrationKey else { return }
-        lastRegistrationKey = registrationKey
+        guard shouldAttempt(registrationKey) else { return }
 
-        Task.detached(priority: .background) { [weak self] in
-            await self?.sendOnce(
+        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: rfedHash) { [weak self] status in
+            guard status == 3 else { return }
+            self?.attemptRegistrationIfNeeded(
+                registrationKey,
                 rfedHash: rfedHash,
                 payload: payload,
-                kind: "register",
-                identityHandle: identityHandle
+                kind: "register"
             )
         }
+
+        _ = ConnectionStateManager.shared.appLinkPrime(
+            destHash: rfedHash,
+            app: "rfed",
+            aspects: ["notify"]
+        )
+
+        attemptRegistrationIfNeeded(
+            registrationKey,
+            rfedHash: rfedHash,
+            payload: payload,
+            kind: "register"
+        )
     }
 
     /// Best-effort deregistration from a previous rfed node.
-    /// Sends a single `/rfed/notify/unregister` infrastructure request.
+    /// Sends a single signed DATA packet over the ephemeral `rfed.notify`
+    /// AppLink.
     func deregisterFrom(oldNotifyHashHex: String, identityHandle: UInt64) {
         guard !oldNotifyHashHex.isEmpty,
               let rfedHash = Data(hexString: oldNotifyHashHex) else { return }
         guard let relayHex = ApnsBridgeHashes.notifyRelayHex else { return }
 
-        guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: nil, identityHandle: identityHandle) else { return }
+        guard let payload = buildSignedPayload(
+            operation: "unregister",
+            relayHex: relayHex,
+            channelHash: nil,
+            identityHandle: identityHandle
+        ) else { return }
 
         Task.detached(priority: .background) {
-            let resp = await ConnectionStateManager.shared.rfedLinkRequest(
+            let delivered = await ConnectionStateManager.shared.appLinkSendData(
                 destHash: rfedHash,
-                app: "rfed", aspects: "notify",
-                identityHandle: identityHandle,
-                path: "/rfed/notify/unregister",
+                app: "rfed", aspects: ["notify"],
                 payload: payload
             )
-            if resp != nil {
-                print("[RfedNotify] Sent unregister to old rfed node")
+            if delivered {
+                print("[RfedNotify] Delivered unregister to old rfed node")
             } else {
-                print("[RfedNotify] Unregister: no response within 5 s")
+                print("[RfedNotify] Unregister: no delivery proof within budget")
             }
         }
     }
@@ -108,15 +135,16 @@ final class RfedNotifyRegistrar {
             print("[RfedNotify] PushBridgeConfig.plist missing — skipping channel notify registration")
             return
         }
-        guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: channelHash,
+        guard let payload = buildSignedPayload(operation: "register",
+                                               relayHex: relayHex,
+                                               channelHash: channelHash,
                                                identityHandle: identityHandle) else {
             print("[RfedNotify] Failed to sign channel notify payload")
             return
         }
         Task.detached(priority: .background) { [weak self] in
             await self?.sendOnce(rfedHash: rfedHash,
-                                 payload: payload, kind: "channel-register",
-                                 identityHandle: identityHandle)
+                                 payload: payload, kind: "channel-register")
         }
     }
 
@@ -126,87 +154,109 @@ final class RfedNotifyRegistrar {
         guard !rfedNotifyHashHex.isEmpty,
               let rfedHash = Data(hexString: rfedNotifyHashHex) else { return }
         guard let relayHex = ApnsBridgeHashes.notifyRelayHex else { return }
-        guard let payload = buildSignedPayload(relayHex: relayHex, channelHash: channelHash,
+        guard let payload = buildSignedPayload(operation: "unregister",
+                                               relayHex: relayHex,
+                                               channelHash: channelHash,
                                                identityHandle: identityHandle) else { return }
         Task.detached(priority: .background) {
-            let resp = await ConnectionStateManager.shared.rfedLinkRequest(
+            let delivered = await ConnectionStateManager.shared.appLinkSendData(
                 destHash: rfedHash,
-                app: "rfed", aspects: "notify",
-                identityHandle: identityHandle,
-                path: "/rfed/notify/unregister",
+                app: "rfed", aspects: ["notify"],
                 payload: payload
             )
-            if resp != nil {
-                print("[RfedNotify] Sent channel deregister (channel=\(channelHash.hexString.prefix(8))…)")
+            if delivered {
+                print("[RfedNotify] Delivered channel deregister (channel=\(channelHash.hexString.prefix(8))…)")
             }
         }
     }
 
     // MARK: - Private
 
-    /// Single-attempt registration via an RFed infrastructure request.
-    private func sendOnce(rfedHash: Data, payload: Data, kind: String, identityHandle: UInt64) async {
-        _ = bridge.transportRefreshOfflinePath(destHash: rfedHash)
-
-        // Outbound link needs the destination's identity (public key), not
-        // just a cached path. On cold start the path table is loaded from
-        // disk but the known-destinations table is empty until an announce
-        // arrives. Issue a path request — PATH_RESPONSE is an announce and
-        // will populate the identity on receipt.
-        if !bridge.transportHasPath(destHash: rfedHash) || !bridge.transportIdentityKnown(destHash: rfedHash) {
-            _ = bridge.transportRequestPath(destHash: rfedHash)
-        }
-        let deadline = Date().addingTimeInterval(30.0)
-        while Date() < deadline {
-            if bridge.transportHasPath(destHash: rfedHash)
-                && bridge.transportIdentityKnown(destHash: rfedHash) {
-                break
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        guard bridge.transportHasPath(destHash: rfedHash) else {
-            print("[RfedNotify] \(kind): no live path for rfed.notify within 30 s — skipping")
-            return
-        }
-
-        guard bridge.transportIdentityKnown(destHash: rfedHash) else {
-            print("[RfedNotify] \(kind): no identity for rfed.notify within 30 s — skipping")
-            return
-        }
-
-        let response = await ConnectionStateManager.shared.rfedLinkRequest(
+    /// Single-attempt registration via a signed DATA send on the ephemeral
+    /// `rfed.notify` AppLink.
+    private func sendOnce(rfedHash: Data, payload: Data, kind: String) async -> Bool {
+        let delivered = await ConnectionStateManager.shared.appLinkSendData(
             destHash: rfedHash,
-            app: "rfed", aspects: "notify",
-            identityHandle: identityHandle,
-            path: "/rfed/notify/register",
+            app: "rfed", aspects: ["notify"],
             payload: payload
         )
 
-        if let resp = response {
-            // Response should be msgpack bool (true = 0xc3).
-            let success = resp.count == 1 && resp[0] == 0xc3
-            if success {
-                print("[RfedNotify] \(kind): registered with rfed")
-            } else {
-                print("[RfedNotify] \(kind): rfed returned false")
-            }
+        if delivered {
+            print("[RfedNotify] \(kind): delivered to rfed.notify")
+            return true
         } else {
-            print("[RfedNotify] \(kind): request failed or no response within 5 s — skipping")
+            print("[RfedNotify] \(kind): no delivery proof within budget — skipping")
+            return false
+        }
+    }
+
+    private func attemptRegistrationIfNeeded(_ key: String,
+                                             rfedHash: Data,
+                                             payload: Data,
+                                             kind: String) {
+        guard shouldAttempt(key) else { return }
+        markPending(key)
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            let success = await self.sendOnce(
+                rfedHash: rfedHash,
+                payload: payload,
+                kind: kind
+            )
+            if success {
+                self.markRegistrationSucceeded(key)
+            } else {
+                self.clearPendingRegistration(key)
+            }
+        }
+    }
+
+    private func shouldAttempt(_ key: String) -> Bool {
+        stateQueue.sync {
+            lastRegistrationKey != key && pendingRegistrationKey != key
+        }
+    }
+
+    private func markPending(_ key: String) {
+        stateQueue.sync {
+            pendingRegistrationKey = key
+        }
+    }
+
+    private func clearPendingRegistration(_ key: String) {
+        stateQueue.sync {
+            if pendingRegistrationKey == key {
+                pendingRegistrationKey = nil
+            }
+        }
+    }
+
+    private func markRegistrationSucceeded(_ key: String) {
+        stateQueue.sync {
+            lastRegistrationKey = key
+            if pendingRegistrationKey == key {
+                pendingRegistrationKey = nil
+            }
         }
     }
 
     // MARK: - msgpack encoding
 
     /// Build the signed payload: fixarray-3 [bin(value), bin(64) pubkey, bin(64) sig]
-    /// where value = msgpack fixarray-2 [str(relay_hex), bin(16 channel_hash) | nil].
-    /// Pass channelHash = nil for LXMF wakeup registration (server registers against
-    /// the lxmf.delivery dest hash); pass the 16-byte channel hash for rfed channel
-    /// wakeup registration.
-    private func buildSignedPayload(relayHex: String, channelHash: Data?,
+    /// where value = msgpack fixarray-3 [str(op), str(relay_hex)|nil,
+    /// bin(16 channel_hash)|nil].
+    private func buildSignedPayload(operation: String,
+                                    relayHex: String?,
+                                    channelHash: Data?,
                                     identityHandle: UInt64) -> Data? {
-        // Value: msgpack fixarray-2 [str(relay_hex), bin(16 channel_hash) | nil]
-        var value = Data([0x92])                    // fixarray of 2
-        value.append(encodeMsgpackString(relayHex))
+        // Value: msgpack fixarray-3 [str(op), str(relay_hex)|nil, bin(16 channel_hash)|nil]
+        var value = Data([0x93])                    // fixarray of 3
+        value.append(encodeMsgpackString(operation))
+        if let relayHex {
+            value.append(encodeMsgpackString(relayHex))
+        } else {
+            value.append(0xc0)
+        }
         if let ch = channelHash {
             value.append(msgpackBin(ch))
         } else {

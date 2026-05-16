@@ -52,6 +52,13 @@ fileprivate final class ContinuationBox {
     init(cont: CheckedContinuation<Data?, Never>) { self.cont = cont }
 }
 
+/// Heap box for a Bool continuation used by fire-and-forget APP_LINK DATA
+/// sends that still await Reticulum delivery proof.
+fileprivate final class BoolContinuationBox {
+    let cont: CheckedContinuation<Bool, Never>
+    init(cont: CheckedContinuation<Bool, Never>) { self.cont = cont }
+}
+
 /// Top-level C-compatible trampoline for `lxmf_app_link_request_async`.
 /// Cannot be a `@_cdecl` func — Swift forbids forming a C function pointer
 /// from such a func in property contexts. Closure form works.
@@ -65,6 +72,14 @@ fileprivate let _appLinkRequestTrampoline: lxmf_app_link_request_callback_t = {
     } else {
         unbox.cont.resume(returning: nil)
     }
+}
+
+/// Top-level trampoline for `lxmf_app_link_send_async`.
+fileprivate let _appLinkSendTrampoline: lxmf_app_link_send_callback_t = {
+    (ctx, status) -> Void in
+    guard let ctx = ctx else { return }
+    let unbox = Unmanaged<BoolContinuationBox>.fromOpaque(ctx).takeRetainedValue()
+    unbox.cont.resume(returning: status == 0)
 }
 
 /// Manages a complete Reticulum + LXMF stack lifecycle through one opaque
@@ -233,6 +248,26 @@ final class LxmfClient: @unchecked Sendable {
         }
     }
 
+    /// Open a persistent app link for the given destination.
+    ///
+    /// Same registration semantics as `appLinkOpen`, but once the path-race
+    /// succeeds AppLinks holds the outbound link open so request-style
+    /// traffic can reuse it directly.
+    @discardableResult
+    nonisolated func appLinkOpenPersistent(_ destHash: Data,
+                                           app: String = "lxmf",
+                                           aspects: [String] = ["delivery"]) -> Bool {
+        let aspectsCsv = aspects.joined(separator: ".")
+        return destHash.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return app.withCString { (appC: UnsafePointer<CChar>) -> Bool in
+                aspectsCsv.withCString { (aspC: UnsafePointer<CChar>) -> Bool in
+                    lxmf_app_link_open_persistent(handle, p, UInt32(destHash.count), appC, aspC) == 0
+                }
+            }
+        }
+    }
+
     /// Close an app link for the given destination and tear down the direct link.
     @discardableResult
     nonisolated func appLinkClose(_ destHash: Data) -> Bool {
@@ -248,6 +283,15 @@ final class LxmfClient: @unchecked Sendable {
         destHash.withUnsafeBytes { buf -> Int32 in
             let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return lxmf_app_link_status(handle, p, UInt32(destHash.count))
+        }
+    }
+
+    /// Trigger one explicit re-open cycle for an existing app link.
+    @discardableResult
+    nonisolated func appLinkReopen(_ destHash: Data) -> Bool {
+        destHash.withUnsafeBytes { buf -> Bool in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_app_link_reopen(handle, p, UInt32(destHash.count)) == 0
         }
     }
 
@@ -287,9 +331,10 @@ final class LxmfClient: @unchecked Sendable {
 
     /// Send a blocking request on an existing app-link.
     ///
-    /// Reuses the persistent app-link opened by `appLinkOpen` instead of
-    /// opening a fresh outbound link per request.  The link must already be
-    /// `ACTIVE` (status == 3); call `appLinkStatus` first.
+    /// Reuses an existing active app-link handle, typically one established
+    /// by `appLinkOpenPersistent`, instead of opening a fresh outbound link
+    /// per request.  The link must already be `ACTIVE` (status == 3); call
+    /// `appLinkStatus` first.
     ///
     /// Blocking — must be called from a background thread.
     /// Returns response bytes, or `nil` on timeout / error / link not active.
@@ -328,8 +373,9 @@ final class LxmfClient: @unchecked Sendable {
     /// Default-QoS priority inversion observed by the Thread Performance
     /// Checker — see DESIGN_PRINCIPLES.md §1).
     ///
-    /// Caller MUST have `appLinkOpen`'d the destination and confirmed
-    /// `appLinkStatus(destHash) == 3` (ACTIVE) before calling.
+    /// For outbound request flows, callers should `appLinkOpenPersistent`
+    /// the destination and confirm `appLinkStatus(destHash) == 3` (ACTIVE)
+    /// before calling.
     /// Returns response bytes, or `nil` on timeout / failure / error.
     nonisolated func appLinkRequestAsync(destHash: Data, path: String,
                                          payload: Data,
@@ -367,6 +413,49 @@ final class LxmfClient: @unchecked Sendable {
                 let unbox = Unmanaged<ContinuationBox>.fromOpaque(ctxPtr)
                     .takeRetainedValue()
                 unbox.cont.resume(returning: nil)
+            }
+        }
+    }
+
+    /// Async/awaitable APP_LINK plain-DATA send.
+    ///
+    /// Registers the destination spec for `app`/`aspects`, fires one
+    /// AppLinks send, and suspends until LRPROOF delivery or terminal
+    /// failure.
+    nonisolated func appLinkSendAsync(destHash: Data,
+                                      app: String,
+                                      aspects: [String],
+                                      payload: Data) async -> Bool
+    {
+        let aspectsCsv = aspects.joined(separator: ".")
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let box = BoolContinuationBox(cont: cont)
+            let ctxPtr = Unmanaged.passRetained(box).toOpaque()
+
+            let rc: Int32 = destHash.withUnsafeBytes { destBuf -> Int32 in
+                let destPtr = destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                return app.withCString { cApp -> Int32 in
+                    return aspectsCsv.withCString { cAspects -> Int32 in
+                        return payload.withUnsafeBytes { payBuf -> Int32 in
+                            let payPtr = payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                            return lxmf_app_link_send_async(
+                                self.handle,
+                                destPtr, UInt32(destHash.count),
+                                cApp,
+                                cAspects,
+                                payPtr, UInt32(payload.count),
+                                _appLinkSendTrampoline,
+                                ctxPtr
+                            )
+                        }
+                    }
+                }
+            }
+
+            if rc != 0 {
+                let unbox = Unmanaged<BoolContinuationBox>.fromOpaque(ctxPtr)
+                    .takeRetainedValue()
+                unbox.cont.resume(returning: false)
             }
         }
     }

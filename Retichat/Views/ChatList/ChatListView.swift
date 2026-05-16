@@ -100,6 +100,16 @@ struct ChatListView: View {
                             .foregroundColor(.retichatPrimary)
                     }
 
+                    Button {
+                        repository.pollPropagationNode(force: true)
+                    } label: {
+                        Image(systemName: "arrow.down.circle")
+                            .font(.system(size: 20))
+                            .foregroundColor(.retichatPrimary)
+                    }
+                    .accessibilityLabel("Pull propagation messages")
+                    .disabled(!repository.serviceRunning)
+
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
                             .font(.system(size: 20))

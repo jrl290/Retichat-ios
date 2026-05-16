@@ -202,6 +202,36 @@ pub extern "C" fn retichat_transport_drop_path(dest_hash: *const u8, len: u32) -
     if Transport::expire_path(&h) { 1 } else { 0 }
 }
 
+/// Clone a live path entry from `source_hash` to `dest_hash` and, when the
+/// source destination's public key is known, remember that same public key for
+/// the destination hash. This is used for sibling SINGLE destinations on the
+/// same remote identity (e.g. rfed.node -> rfed.notify).
+///
+/// Returns 1 if a live path entry was cloned, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn retichat_transport_clone_path_and_identity(
+    source_hash: *const u8,
+    source_len: u32,
+    dest_hash: *const u8,
+    dest_len: u32,
+) -> i32 {
+    let source = slice_from_raw(source_hash, source_len);
+    let dest = slice_from_raw(dest_hash, dest_len);
+    if source.is_empty() || dest.is_empty() || source == dest {
+        return 0;
+    }
+
+    if !Transport::clone_path(&source, &dest) {
+        return 0;
+    }
+
+    if let Some(public_key) = Identity::recall_public_key(&source) {
+        let _ = Identity::remember_destination(&dest, &public_key, None);
+    }
+
+    1
+}
+
 /// Force-flush the in-memory destination/path table to disk so newly
 /// resolved essential paths survive a force-quit. Cheap (a few KB).
 /// Returns 0 on success.

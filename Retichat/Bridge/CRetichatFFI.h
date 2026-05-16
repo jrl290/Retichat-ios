@@ -169,6 +169,18 @@ typedef void (*lxmf_app_link_request_callback_t)(
     int32_t status
 );
 
+/// APP_LINK plain-DATA send completion callback.
+///
+/// Fires exactly once per `lxmf_app_link_send_async` invocation.
+///
+/// `status`:
+///   0 = delivered (Reticulum LRPROOF received)
+///   1 = failed (tier chain exhausted without delivery proof)
+typedef void (*lxmf_app_link_send_callback_t)(
+    void *context,
+    int32_t status
+);
+
 int32_t lxmf_client_set_delivery_callback(uint64_t client,
                                            lxmf_delivery_callback_t callback,
                                            void *context);
@@ -222,6 +234,17 @@ int32_t lxmf_app_link_open(uint64_t client,
                             const char *app_name,
                             const char *aspects_csv);
 
+/// Open a persistent app link.
+///
+/// Same registration semantics as `lxmf_app_link_open`, but once the
+/// path-race succeeds AppLinks holds the outbound link open so request-style
+/// traffic can reuse it directly.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_open_persistent(uint64_t client,
+                                       const uint8_t *dest_hash, uint32_t dest_len,
+                                       const char *app_name,
+                                       const char *aspects_csv);
+
 /// Close an app link.  Tears down the direct link.
 /// Returns 0 on success, -1 on error.
 int32_t lxmf_app_link_close(uint64_t client,
@@ -235,6 +258,15 @@ int32_t lxmf_app_link_close(uint64_t client,
 ///   4 = disconnected, will reconnect on next announce (DISCONNECTED)
 ///  -1 = parameter error
 int32_t lxmf_app_link_status(uint64_t client,
+                              const uint8_t *dest_hash, uint32_t dest_len);
+
+/// Explicit deterministic re-open trigger for an existing app link.
+///
+/// Invalidates the cached liveness winner for `dest_hash` and runs one fresh
+/// AppLinks re-open cycle. Intended for host-driven nudges when the app has a
+/// concrete reason to refresh a persistent link now.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_reopen(uint64_t client,
                               const uint8_t *dest_hash, uint32_t dest_len);
 
 /// Register an app-link reconnect handler for a non-LXMF destination aspect.
@@ -272,10 +304,11 @@ int32_t lxmf_app_link_network_changed(uint64_t client);
 
 /// Send a blocking request on an existing app-link.
 ///
-/// Reuses the persistent app-link opened by `lxmf_app_link_open` instead of
-/// opening a fresh outbound link per request.  The link must already be in
-/// the ACTIVE state (call `lxmf_app_link_status` first) — returns NULL with
-/// `lxmf_last_error` describing the reason if not.
+/// Reuses an existing active app-link handle, typically one established by
+/// `lxmf_app_link_open_persistent`, instead of opening a fresh outbound link
+/// per request.  The link must already be in the ACTIVE state (call
+/// `lxmf_app_link_status` first) — returns NULL with `lxmf_last_error`
+/// describing the reason if not.
 ///
 /// Blocking call — invoke from a background thread.
 /// Returns response bytes (free with `lxmf_free_bytes`) or NULL on error
@@ -307,6 +340,20 @@ int32_t lxmf_app_link_request_async(uint64_t client,
                                      double timeout_secs,
                                      lxmf_app_link_request_callback_t callback,
                                      void *context);
+
+/// Non-blocking plain DATA send via an ephemeral APP_LINK.
+///
+/// Registers the destination spec for `app_name` / `aspects_csv`, sends one
+/// DATA packet, and fires `callback` exactly once on LRPROOF delivery or
+/// terminal failure.
+/// Returns 0 on success (callback will fire), -1 on immediate error.
+int32_t lxmf_app_link_send_async(uint64_t client,
+                                  const uint8_t *dest_hash, uint32_t dest_len,
+                                  const char *app_name,
+                                  const char *aspects_csv,
+                                  const uint8_t *payload, uint32_t payload_len,
+                                  lxmf_app_link_send_callback_t callback,
+                                  void *context);
 
 #pragma mark - LXMF Announce
 
@@ -388,6 +435,8 @@ int32_t retichat_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_hops_to(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_path_interface_online(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_drop_path(const uint8_t *dest_hash, uint32_t len);
+int32_t retichat_transport_clone_path_and_identity(const uint8_t *source_hash, uint32_t source_len,
+                                                   const uint8_t *dest_hash, uint32_t dest_len);
 int32_t retichat_transport_save_paths(void);
 
 #pragma mark - Settings

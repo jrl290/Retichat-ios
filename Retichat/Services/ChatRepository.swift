@@ -141,10 +141,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 try LxmfClient.start(config: config)
             }
 
+            // Persist the live router state before mirroring files into the App
+            // Group, otherwise the NSE can read an older ratchet snapshot.
+            if case .success(let client) = result {
+                client.persist()
+            }
+
             // App Group file copies are pure I/O — keep them off main thread too
             PendingNotification.copyIdentityToAppGroup(from: idPath)
             PendingNotification.copyConfigToAppGroup(from: configDir + "/config")
             PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
+            PendingNotification.syncRatchetsToAppGroup(from: storagePath)
 
             await MainActor.run { [weak self] in
                 self?.finishStartService(result: result, configDir: configDir, storagePath: storagePath)

@@ -113,6 +113,22 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    /// Clone a live path entry from one destination hash to another and
+    /// seed the destination hash with the source destination's public key
+    /// when available.
+    nonisolated func transportClonePathAndIdentity(from sourceHash: Data, to destHash: Data) -> Bool {
+        return sourceHash.withUnsafeBytes { sourceBuf in
+            destHash.withUnsafeBytes { destBuf in
+                let sourcePtr = sourceBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                let destPtr = destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                return retichat_transport_clone_path_and_identity(
+                    sourcePtr, UInt32(sourceHash.count),
+                    destPtr, UInt32(destHash.count)
+                ) == 1
+            }
+        }
+    }
+
     nonisolated func transportHopsTo(destHash: Data) -> Int32 {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
