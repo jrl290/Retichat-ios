@@ -223,6 +223,9 @@ struct RetichatApp: App {
                 .environmentObject(repository)
                 .environmentObject(channelClient)
                 .modelContainer(modelContainer)
+                .onReceive(NotificationCenter.default.publisher(for: .rfedPushReceived)) { _ in
+                    handleRfedPushReceived()
+                }
                 .onOpenURL { url in
                     handleDeepLink(url)
                 }
@@ -290,6 +293,17 @@ struct RetichatApp: App {
             default:
                 break
             }
+        }
+    }
+
+    @MainActor
+    private func handleRfedPushReceived() {
+        repository.importNSEMessages()
+
+        if repository.serviceRunning {
+            repository.pollPropagationNode(force: true)
+        } else {
+            repository.startService()
         }
     }
 

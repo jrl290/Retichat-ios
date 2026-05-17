@@ -104,11 +104,13 @@ final class ConnectionStateManager {
     func register(lxmfClient: LxmfClient) {
         self.lxmfClient = lxmfClient
 
-        // Register reconnect handlers for rfed.channel, rfed.notify, rfed.delivery
+        // Register reconnect handlers for rfed.channel, rfed.notify, rfed.apns,
+        // and rfed.delivery
         // so the LXMF router re-establishes app-links to those destinations on
         // announce. (The built-in delivery_announce_handler only covers lxmf.delivery.)
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel")
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.apns")
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.delivery")
 
         // Register a single APP_LINK status-change C callback that fans out

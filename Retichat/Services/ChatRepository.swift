@@ -288,13 +288,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - RFed APNs token registration
 
     /// Registers this device for push notifications:
-    /// 1. Sends APNs token to the apns_bridge (rfed.apns, hardcoded).
-    /// 2. Registers the relay hash with rfed (rfed.notify Link request).
+    /// 1. Sends APNs token to the apns_bridge via `rfed.apns` AppLinks DATA.
+    /// 2. Registers the relay hash with rfed via `rfed.notify` AppLinks DATA.
+    /// Both destinations are infrastructure-facing, so we prefer AppLinks
+    /// delivery proof and link-backed fallback over single-packet minimization.
     private func registerRfedNotify() {
         guard !ownHash.isEmpty, let client = lxmfClient else { return }
-        // 1. Register APNs token with the apns_bridge (plain packet → rfed.apns)
+        // 1. Register APNs token with the apns_bridge (AppLinks DATA → rfed.apns)
         ApnsTokenRegistrar.shared.registerIfNeeded(subscriberHash: ownHash)
-        // 2. Register relay hash with rfed (Link request → rfed.notify)
+        // 2. Register relay hash with rfed (AppLinks DATA → rfed.notify)
         RfedNotifyRegistrar.shared.registerIfNeeded(identityHandle: client.identityHandle)
     }
 

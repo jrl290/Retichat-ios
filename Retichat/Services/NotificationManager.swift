@@ -15,6 +15,9 @@ import UIKit
 /// The `object` is the `chatId` string.
 extension Notification.Name {
     static let openChatFromNotification = Notification.Name("OpenChatFromNotification")
+    /// Posted for rfed/APNs wakes that arrive through the user-notification
+    /// delegate path instead of UIApplication's remote-notification callback.
+    static let rfedPushReceived = Notification.Name("RfedPushReceived")
 }
 
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
@@ -163,6 +166,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    private func notifyRfedPushIfNeeded(_ userInfo: [AnyHashable: Any]) {
+        guard userInfo["rfed"] != nil else { return }
+        NotificationCenter.default.post(name: .rfedPushReceived, object: nil)
+    }
+
     // MARK: - UNUserNotificationCenterDelegate
 
     /// Called when a notification arrives while the app is in the foreground.
@@ -172,6 +180,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+        notifyRfedPushIfNeeded(notification.request.content.userInfo)
+
         let chatId = notification.request.content.userInfo["chatId"] as? String
         let body = notification.request.content.body
 
@@ -197,6 +207,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
+        notifyRfedPushIfNeeded(userInfo)
         if let chatId = userInfo["chatId"] as? String {
             DispatchQueue.main.async {
                 NotificationCenter.default.post(

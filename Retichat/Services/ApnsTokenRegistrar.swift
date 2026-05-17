@@ -4,7 +4,7 @@
 //
 //  Registers this device's APNs token with the rfed APNs bridge (rfed.apns).
 //
-//  Protocol (plain encrypted RNS packet):
+//  Protocol payload (msgpack Map sent as APP_LINK DATA):
 //    Payload: msgpack Map
 //      register:   {"subscriber_hash": bin(16),
 //                   "apns_token":      str(64 hex),
@@ -14,7 +14,11 @@
 //  The rfed.apns destination hash is loaded from PushBridgeConfig.plist when
 //  available. Without it, APNs bridge registration is disabled.
 //  Registration is attempted on service start and whenever the APNs token
-//  changes.  Retried with exponential backoff if the path is not yet known.
+//  changes. We intentionally keep the client on AppLinks Ephemeral mode here:
+//  reliability and delivery proof matter more than single-packet minimization,
+//  while APNs token registration volume is low enough that holding a
+//  persistent link open is not required. Rust owns path readiness, link
+//  establishment, and delivery proof handling.
 //
 
 import Foundation
@@ -22,13 +26,14 @@ import Foundation
 final class ApnsTokenRegistrar {
     static let shared = ApnsTokenRegistrar()
 
-    private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    /// Last token-registration input tuple attempted during this app run.
-    /// Prevents duplicate sends for the same subscriber/token pair while still
-    /// allowing a real APNs token change to trigger a fresh registration.
+    /// Last APNs registration tuple successfully accepted during this app run.
+    /// Failed sends must not latch success, or a later APP_LINK ACTIVE event
+    /// would be unable to retry the same tuple.
     private var lastRegistrationKey: String? = nil
+    private var pendingRegistrationKey: String? = nil
+    private let stateQueue = DispatchQueue(label: "chat.retichat.apns.state")
 
     private init() {}
 
@@ -37,10 +42,12 @@ final class ApnsTokenRegistrar {
     /// Call after service starts (and identity is known) whenever the APNs token
     /// or the rfed.apns hash changes.
     ///
-    /// rfed.apns is a packet endpoint (no link). We poll path availability
-    /// with a short tick: the path is requested at
-    /// startup and arrives with the first matching announce (typically 1–15 s).
-    /// We wait up to 30 s, send once, and log loudly if the window elapses.
+    /// The registration is a one-shot DATA send via the ephemeral `rfed.apns`
+    /// AppLink. This deliberately favors proof-backed infrastructure delivery
+    /// over raw packet minimization. We fire one immediate attempt and leave an
+    /// ACTIVE-status handler installed so a later readiness event can drive the
+    /// same send without Swift owning path polling or retry timing.
+    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     func registerIfNeeded(subscriberHash: Data) {
         guard !prefs.effectiveRfedNodeIdentityHash.isEmpty else {
             print("[APNsRegistrar] No RFed node configured; skipping APNs registration")
@@ -67,54 +74,102 @@ final class ApnsTokenRegistrar {
 
         let registrationKey = subscriberHash.hexString + ":" + apnsToken
                               + ":" + Self.currentApsEnvironment()
-        guard lastRegistrationKey != registrationKey else { return }
-        lastRegistrationKey = registrationKey
+        guard shouldAttempt(registrationKey) else { return }
 
-        Task.detached(priority: .background) { [weak self] in
-            await self?.awaitPathThenSend(
-                destHash: destHash, payload: payload,
+        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: destHash) { [weak self] status in
+            guard status == 3 else { return }
+            self?.attemptRegistrationIfNeeded(
+                registrationKey,
+                destHash: destHash,
+                payload: payload,
                 subscriberHashHex: subscriberHash.hexString
             )
         }
+
+        _ = ConnectionStateManager.shared.appLinkPrime(
+            destHash: destHash,
+            app: "rfed",
+            aspects: ["apns"]
+        )
+
+        attemptRegistrationIfNeeded(
+            registrationKey,
+            destHash: destHash,
+            payload: payload,
+            subscriberHashHex: subscriberHash.hexString
+        )
     }
 
     // MARK: - Private
 
-    /// Poll path availability up to 30 s, then send once.
-    private func awaitPathThenSend(destHash: Data, payload: Data,
-                                   subscriberHashHex: String) async {
-        // Outbound encrypted send needs the bridge's identity, not just a
-        // cached path. A path can survive across launches via the on-disk
-        // path table while the identity has not yet been re-cached this
-        // session. Issue a path request whenever identity is missing —
-        // PATH_RESPONSE is an announce and will populate the
-        // known-destinations table on receipt.
-        if !bridge.transportIdentityKnown(destHash: destHash) {
-            _ = bridge.transportRequestPath(destHash: destHash)
-        }
-
-        // Wait up to 30 s for identity. 200 ms tick keeps wakeups cheap.
-        let deadline = Date().addingTimeInterval(30.0)
-        while Date() < deadline {
-            if bridge.transportIdentityKnown(destHash: destHash) { break }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        guard bridge.transportIdentityKnown(destHash: destHash) else {
-            print("[APNsRegistrar] No identity for rfed.apns within 30 s — will retry on next app start")
-            return
-        }
-
-        let ok = bridge.packetSendToHash(
+    /// Single-attempt registration via a plain DATA send on the ephemeral
+    /// `rfed.apns` AppLink.
+    private func sendOnce(destHash: Data,
+                          payload: Data,
+                          subscriberHashHex: String) async -> Bool {
+        let delivered = await ConnectionStateManager.shared.appLinkSendData(
             destHash: destHash,
-            appName:  "rfed",
-            aspects:  "apns",
-            payload:  payload
+            app: "rfed",
+            aspects: ["apns"],
+            payload: payload
         )
-        if ok {
+
+        if delivered {
             print("[APNsRegistrar] Token registered for \(subscriberHashHex.prefix(8))…")
+            return true
         } else {
-            let err = bridge.lastError() ?? "unknown"
-            print("[APNsRegistrar] Send failed: \(err)")
+            print("[APNsRegistrar] Registration: no delivery proof within budget")
+            return false
+        }
+    }
+
+    private func attemptRegistrationIfNeeded(_ key: String,
+                                             destHash: Data,
+                                             payload: Data,
+                                             subscriberHashHex: String) {
+        guard shouldAttempt(key) else { return }
+        markPending(key)
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            let success = await self.sendOnce(
+                destHash: destHash,
+                payload: payload,
+                subscriberHashHex: subscriberHashHex
+            )
+            if success {
+                self.markRegistrationSucceeded(key)
+            } else {
+                self.clearPendingRegistration(key)
+            }
+        }
+    }
+
+    private func shouldAttempt(_ key: String) -> Bool {
+        stateQueue.sync {
+            lastRegistrationKey != key && pendingRegistrationKey != key
+        }
+    }
+
+    private func markPending(_ key: String) {
+        stateQueue.sync {
+            pendingRegistrationKey = key
+        }
+    }
+
+    private func clearPendingRegistration(_ key: String) {
+        stateQueue.sync {
+            if pendingRegistrationKey == key {
+                pendingRegistrationKey = nil
+            }
+        }
+    }
+
+    private func markRegistrationSucceeded(_ key: String) {
+        stateQueue.sync {
+            lastRegistrationKey = key
+            if pendingRegistrationKey == key {
+                pendingRegistrationKey = nil
+            }
         }
     }
 
