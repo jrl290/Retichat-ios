@@ -3,18 +3,21 @@
 //  Retichat
 //
 //  Registers this device's push-notification relay with rfed via a signed
-//  plain DATA packet on the ephemeral `rfed.notify` AppLink.
+//  plain DATA packet on the ephemeral `rfed.notify.register` /
+//  `rfed.notify.unregister` AppLinks (split per REFACTOR.md step 1).
 //
 //  Architecture:
-//    iOS app ──APP_LINK DATA──▶ rfed.notify
+//    iOS app ──APP_LINK DATA──▶ rfed.notify.{register|unregister}
 //      payload: signed msgpack [op, relay_hex, channel_hash|nil]
 //      success: Reticulum LRPROOF for that packet
 //
 //  Required UserPreferences:
-//    rfedNotifyHash  — rfed's rfed.notify destination hash (Link target)
+//    rfedNotifyHash  — rfed's rfed.notify.register destination hash
+//                       (UI status probe; the unregister hash is derived
+//                        on demand from the rfed identity hash).
 //
-//  The relay hash (apns_bridge's rfed.notify dest) is loaded from
-//  PushBridgeConfig.plist when available.
+//  The relay hash (apns-bridge's `apns.relay` destination) is loaded from
+//  PushBridgeConfig.plist via `ApnsBridgeHashes.effectiveRelayHex`.
 //
 
 import Foundation
@@ -40,9 +43,9 @@ final class RfedNotifyRegistrar {
     /// `identityHandle` is the Rust FFI handle for the local identity.
     ///
     /// The registration is a one-shot signed DATA send over the ephemeral
-    /// `rfed.notify` AppLink. We fire one immediate attempt and leave an
-    /// ACTIVE-status handler installed so a later readiness event can drive
-    /// the same send without Swift owning link lifecycle or retries.
+    /// `rfed.notify.register` AppLink. We fire one immediate attempt and
+    /// leave an ACTIVE-status handler installed so a later readiness event
+    /// can drive the same send without Swift owning link lifecycle or retries.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     @MainActor
     func registerIfNeeded(identityHandle: UInt64) {
@@ -52,7 +55,7 @@ final class RfedNotifyRegistrar {
             print("[RfedNotify] Invalid rfedNotifyHash — not 32 hex chars")
             return
         }
-        guard let relayHex = ApnsBridgeHashes.notifyRelayHex else {
+        guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else {
             print("[RfedNotify] PushBridgeConfig.plist missing or invalid; skipping relay registration")
             return
         }
@@ -85,7 +88,7 @@ final class RfedNotifyRegistrar {
         _ = ConnectionStateManager.shared.appLinkPrime(
             destHash: rfedHash,
             app: "rfed",
-            aspects: ["notify"]
+            aspects: ["notify", "register"]
         )
 
         attemptRegistrationIfNeeded(
@@ -97,12 +100,16 @@ final class RfedNotifyRegistrar {
     }
 
     /// Best-effort deregistration from a previous rfed node.
-    /// Sends a single signed DATA packet over the ephemeral `rfed.notify`
-    /// AppLink.
-    func deregisterFrom(oldNotifyHashHex: String, identityHandle: UInt64) {
-        guard !oldNotifyHashHex.isEmpty,
-              let rfedHash = Data(hexString: oldNotifyHashHex) else { return }
-        guard let relayHex = ApnsBridgeHashes.notifyRelayHex else { return }
+    /// Sends a single signed DATA packet over the ephemeral
+    /// `rfed.notify.unregister` AppLink derived from `oldRfedIdentityHashHex`.
+    func deregisterFrom(oldRfedIdentityHashHex: String, identityHandle: UInt64) {
+        let trimmed = oldRfedIdentityHashHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let unregisterHex = RfedChannelClient.rfedDestHash(
+            identityHashHex: trimmed, app: "rfed", aspects: ["notify", "unregister"])
+        guard !unregisterHex.isEmpty,
+              let rfedHash = Data(hexString: unregisterHex) else { return }
+        guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else { return }
 
         guard let payload = buildSignedPayload(
             operation: "unregister",
@@ -114,7 +121,7 @@ final class RfedNotifyRegistrar {
         Task.detached(priority: .background) {
             let delivered = await ConnectionStateManager.shared.appLinkSendData(
                 destHash: rfedHash,
-                app: "rfed", aspects: ["notify"],
+                app: "rfed", aspects: ["notify", "unregister"],
                 payload: payload
             )
             if delivered {
@@ -131,7 +138,7 @@ final class RfedNotifyRegistrar {
     func registerForChannel(channelHash: Data, rfedNotifyHashHex: String, identityHandle: UInt64) {
         guard !rfedNotifyHashHex.isEmpty,
               let rfedHash = Data(hexString: rfedNotifyHashHex) else { return }
-        guard let relayHex = ApnsBridgeHashes.notifyRelayHex else {
+        guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else {
             print("[RfedNotify] PushBridgeConfig.plist missing — skipping channel notify registration")
             return
         }
@@ -144,16 +151,23 @@ final class RfedNotifyRegistrar {
         }
         Task.detached(priority: .background) { [weak self] in
             await self?.sendOnce(rfedHash: rfedHash,
-                                 payload: payload, kind: "channel-register")
+                                 payload: payload, kind: "channel-register",
+                                 aspects: ["notify", "register"])
         }
     }
 
     /// Deregister this device from per-channel push notifications (best-effort, no retry).
     /// Call when the user leaves / unsubscribes from a channel.
     func deregisterForChannel(channelHash: Data, rfedNotifyHashHex: String, identityHandle: UInt64) {
-        guard !rfedNotifyHashHex.isEmpty,
-              let rfedHash = Data(hexString: rfedNotifyHashHex) else { return }
-        guard let relayHex = ApnsBridgeHashes.notifyRelayHex else { return }
+        // `rfedNotifyHashHex` is the register-op hash; derive the unregister
+        // hash by re-routing through the rfed identity. Pulling it from the
+        // register hex is not reversible.
+        let identityHex = prefs.effectiveRfedNodeIdentityHash
+        let unregisterHex = RfedChannelClient.rfedDestHash(
+            identityHashHex: identityHex, app: "rfed", aspects: ["notify", "unregister"])
+        guard !unregisterHex.isEmpty,
+              let rfedHash = Data(hexString: unregisterHex) else { return }
+        guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else { return }
         guard let payload = buildSignedPayload(operation: "unregister",
                                                relayHex: relayHex,
                                                channelHash: channelHash,
@@ -161,7 +175,7 @@ final class RfedNotifyRegistrar {
         Task.detached(priority: .background) {
             let delivered = await ConnectionStateManager.shared.appLinkSendData(
                 destHash: rfedHash,
-                app: "rfed", aspects: ["notify"],
+                app: "rfed", aspects: ["notify", "unregister"],
                 payload: payload
             )
             if delivered {
@@ -173,16 +187,17 @@ final class RfedNotifyRegistrar {
     // MARK: - Private
 
     /// Single-attempt registration via a signed DATA send on the ephemeral
-    /// `rfed.notify` AppLink.
-    private func sendOnce(rfedHash: Data, payload: Data, kind: String) async -> Bool {
+    /// `rfed.notify.register` (or unregister) AppLink.
+    private func sendOnce(rfedHash: Data, payload: Data, kind: String,
+                          aspects: [String]) async -> Bool {
         let delivered = await ConnectionStateManager.shared.appLinkSendData(
             destHash: rfedHash,
-            app: "rfed", aspects: ["notify"],
+            app: "rfed", aspects: aspects,
             payload: payload
         )
 
         if delivered {
-            print("[RfedNotify] \(kind): delivered to rfed.notify")
+            print("[RfedNotify] \(kind): delivered to rfed.\(aspects.joined(separator: "."))")
             return true
         } else {
             print("[RfedNotify] \(kind): no delivery proof within budget — skipping")
@@ -201,7 +216,8 @@ final class RfedNotifyRegistrar {
             let success = await self.sendOnce(
                 rfedHash: rfedHash,
                 payload: payload,
-                kind: kind
+                kind: kind,
+                aspects: ["notify", "register"]
             )
             if success {
                 self.markRegistrationSucceeded(key)

@@ -104,14 +104,30 @@ final class ConnectionStateManager {
     func register(lxmfClient: LxmfClient) {
         self.lxmfClient = lxmfClient
 
-        // Register reconnect handlers for rfed.channel, rfed.notify, rfed.apns,
-        // and rfed.delivery
-        // so the LXMF router re-establishes app-links to those destinations on
-        // announce. (The built-in delivery_announce_handler only covers lxmf.delivery.)
+        // Register reconnect handlers for every rfed aspect this app uses
+        // and the apns relay, so the LXMF router re-establishes app-links
+        // to those destinations on announce. (The built-in delivery_announce
+        // _handler only covers lxmf.delivery.)
+        //
+        // Per REFACTOR.md step 4: rfed.channel and rfed.notify are split
+        // into per-op aspects; the legacy rfed.channel/rfed.notify aspects
+        // remain registered because mixed-version servers still announce and
+        // serve them for compatibility. apns.notifyRelay is renamed apns.relay.
+        // Live receive paths now use rfed.channel.stream and
+        // rfed.propagation.stream.
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel")
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.apns")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.delivery")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.subscribe")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.unsubscribe")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.publish")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.pull")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.stream")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.propagation.stream")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify.register")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify.unregister")
+        lxmfClient.appLinkRegisterReconnect(aspect: "apns.relay")
+        lxmfClient.appLinkRegisterReconnect(aspect: "apns.register")
+        lxmfClient.appLinkRegisterReconnect(aspect: "apns.unregister")
 
         // Register a single APP_LINK status-change C callback that fans out
         // to per-dest Swift handlers registered via setAppLinkStatusHandler.
@@ -156,6 +172,13 @@ final class ConnectionStateManager {
         } else {
             essentialReadyHandlers.removeValue(forKey: key)
         }
+    }
+
+    @discardableResult
+    func registerAppLinkPacketCallback(destHash: Data,
+                                       callback: @escaping @Sendable (Data) -> Void) -> Bool {
+        guard let client = lxmfClient else { return false }
+        return client.setAppLinkPacketCallback(destHash: destHash, callback: callback)
     }
 
     /// Internal: invoked by the C trampoline on the link-actor thread.
@@ -241,14 +264,20 @@ final class ConnectionStateManager {
     ///
     /// Strategy: always DIRECT.  AppLinks owns the full tier chain (inbound
     /// link → cached outbound → fresh path-race + link establishment) plus
-    /// Timer P which starts a parallel PROPAGATED send at exactly 5 s if
-    /// DIRECT hasn't delivered.  Pre-empting to PROPAGATED here — even when
+    /// Timer P which starts a parallel PROPAGATED send after the normal 5 s
+    /// budget, or immediately when the current APP_LINK status is already
+    /// DISCONNECTED. Pre-empting to PROPAGATED here — even when
     /// transportHasPath is false — would bypass AppLinks entirely and skip
     /// the parallel-send mechanism, leading to a send failure if the prop
     /// node link is also slow or unavailable at that instant.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     func deliveryMethod(for destHash: Data) -> UInt8 {
         return LxmfMethod.direct
+    }
+
+    func appLinkStatus(destHash: Data) -> Int32 {
+        guard let client = lxmfClient else { return 0 }
+        return client.appLinkStatus(destHash)
     }
 
     // MARK: - APP_LINK request helper
@@ -263,6 +292,20 @@ final class ConnectionStateManager {
     /// Returns the response bytes from the request, or `nil` if the link
     /// did not reach ACTIVE inside the 5 s budget or the request itself
     /// failed/timed out.
+    func appLinkSend(destHash: Data,
+                     app: String,
+                     aspects: String,
+                     path: String,
+                     payload: Data) async -> Data? {
+        await appLinkSend(
+            destHash: destHash,
+            app: app,
+            aspects: normalizedAspectSegments(app: app, aspects: aspects),
+            path: path,
+            payload: payload
+        )
+    }
+
     func appLinkSend(destHash: Data,
                      app: String,
                      aspects: [String],
@@ -298,6 +341,17 @@ final class ConnectionStateManager {
     @discardableResult
     func appLinkPrime(destHash: Data,
                       app: String,
+                      aspects: String) -> Bool {
+        appLinkPrime(
+            destHash: destHash,
+            app: app,
+            aspects: normalizedAspectSegments(app: app, aspects: aspects)
+        )
+    }
+
+    @discardableResult
+    func appLinkPrime(destHash: Data,
+                      app: String,
                       aspects: [String]) -> Bool {
         guard let client = lxmfClient else { return false }
         return client.appLinkOpen(destHash, app: app, aspects: aspects)
@@ -305,6 +359,18 @@ final class ConnectionStateManager {
 
     /// Send a plain DATA packet via AppLinks and suspend until Reticulum
     /// delivery proof arrives or the tier chain fails.
+    func appLinkSendData(destHash: Data,
+                         app: String,
+                         aspects: String,
+                         payload: Data) async -> Bool {
+        await appLinkSendData(
+            destHash: destHash,
+            app: app,
+            aspects: normalizedAspectSegments(app: app, aspects: aspects),
+            payload: payload
+        )
+    }
+
     func appLinkSendData(destHash: Data,
                          app: String,
                          aspects: [String],
@@ -318,6 +384,20 @@ final class ConnectionStateManager {
         )
     }
 
+    private func normalizedAspectSegments(app: String, aspects: String) -> [String] {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        var segments = aspects
+            .split(whereSeparator: { $0 == "." || $0 == "," })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if segments.first == normalizedApp {
+            segments.removeFirst()
+        }
+
+        return segments
+    }
+
     /// Legacy single-shot RFed infrastructure request.
     ///
     /// Use this only for flows that intentionally own a fresh link lifecycle.
@@ -328,6 +408,7 @@ final class ConnectionStateManager {
     /// ultimately waits on default-QoS worker threads, and running the wrapper
     /// task hotter triggers Thread Performance Checker inversions.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §6, §7
+    @available(*, deprecated, message: "Use appLinkSend(...) for registered RFed request flows; keep raw link ownership only for intentional fresh-session probes.")
     func rfedLinkRequest(destHash: Data,
                          app: String,
                          aspects: String,
@@ -415,10 +496,12 @@ final class ConnectionStateManager {
     }
 
     /// Current reachability status for the rfed node.
-    /// Returns: 0=NONE/no config, 3=path reachable, 4=no path.
+    /// Returns: 0=NONE/no config, 3=path verified this session, 4=no fresh path.
     func rfedNodeLinkStatus() -> Int32 {
         guard let destData = rfedChannelDestData(includeHiddenDefault: false) else { return 0 }
-        return RetichatBridge.shared.transportHasPath(destHash: destData) ? 3 : 4
+        let bridge = RetichatBridge.shared
+        return (bridge.transportHasPath(destHash: destData)
+                && bridge.transportPathVerifiedThisSession(destHash: destData)) ? 3 : 4
     }
 
     /// Public access to the rfed.channel destination derived from current
@@ -434,35 +517,54 @@ final class ConnectionStateManager {
     /// "no path" failure.
     func rfedChannelHasPath() -> Bool {
         guard let destData = rfedChannelDestData(includeHiddenDefault: false) else { return false }
-        return RetichatBridge.shared.transportHasPath(destHash: destData)
+        let bridge = RetichatBridge.shared
+        return bridge.transportHasPath(destHash: destData)
+            && bridge.transportPathVerifiedThisSession(destHash: destData)
     }
 
-    /// Wait for the rfed.channel route to become reachable.
+    /// Wait for the rfed.channel.subscribe route to become reachable.
     func waitForRfedReachable(timeoutSecs: Double) async -> Bool {
+        guard let destData = rfedServiceDestData(includeHiddenDefault: true,
+                                                 aspects: ["channel", "subscribe"]) else {
+            return false
+        }
+        let bridge = RetichatBridge.shared
         let deadline = Date().addingTimeInterval(timeoutSecs)
         while Date() < deadline {
-            if rfedNodeLinkStatusRuntime() == 3 { return true }
+            if bridge.transportHasPath(destHash: destData)
+                && bridge.transportPathVerifiedThisSession(destHash: destData) {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
         return false
     }
 
-    /// Derives the rfed.channel 16-byte dest from current prefs.
+    /// Derives the rfed.node 16-byte dest from current prefs.
+    /// Used as the reachability probe for the configured RFed node (the
+    /// rfed.node aspect is always registered — see RFed-rust step 1).
     private func rfedChannelDestData(includeHiddenDefault: Bool) -> Data? {
+        rfedServiceDestData(includeHiddenDefault: includeHiddenDefault, aspects: ["node"])
+    }
+
+    private func rfedServiceDestData(includeHiddenDefault: Bool,
+                                     aspects: [String]) -> Data? {
         let prefs = UserPreferences.shared
         let identityHex = includeHiddenDefault
             ? prefs.effectiveRfedNodeIdentityHash
             : prefs.rfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !identityHex.isEmpty else { return nil }
         let destHex = RfedChannelClient.rfedDestHash(
-            identityHashHex: identityHex, app: "rfed", aspects: ["channel"])
+            identityHashHex: identityHex, app: "rfed", aspects: aspects)
         guard !destHex.isEmpty else { return nil }
         return Data(hexString: destHex)
     }
 
     private func rfedNodeLinkStatusRuntime() -> Int32 {
         guard let destData = rfedLinkDestData ?? rfedChannelDestData(includeHiddenDefault: true) else { return 0 }
-        return RetichatBridge.shared.transportHasPath(destHash: destData) ? 3 : 4
+        let bridge = RetichatBridge.shared
+        return (bridge.transportHasPath(destHash: destData)
+                && bridge.transportPathVerifiedThisSession(destHash: destData)) ? 3 : 4
     }
 
     /// Re-requests paths to always-needed destinations and re-opens active links.
@@ -507,11 +609,21 @@ final class ConnectionStateManager {
             : ""
 
         if let propNode = PropagationNodeManager.shared.currentNode() {
-            appendDestination("propagation.current", propNode)
+            // REFACTOR.md step 1: `propagation.current` slot dropped.
+            // The same destination is already covered by the lxmf.propagation
+            // clone-source block below when configured; if not, the
+            // identity-gate downstream and PSYNC trigger will fetch the path
+            // on demand. Keeping `propNode` referenced so the call site
+            // stays in scope for the lxmf.propagation logic that follows.
+            _ = propNode
         }
-        for dest in [ApnsBridgeHashes.apnsRegistration, ApnsBridgeHashes.notifyRelay].compactMap({ $0 }) {
-            let label = dest == ApnsBridgeHashes.apnsRegistration ? "apns.register" : "apns.notifyRelay"
-            appendDestination(label, dest)
+        // APNs bridge endpoints. The plist now carries the canonical
+        // `apns.register` and `apns.relay` destination hashes directly.
+        if let registration = ApnsBridgeHashes.apnsRegistration {
+            appendDestination("apns.register", registration)
+        }
+        if let relay = ApnsBridgeHashes.effectiveRelay {
+            appendDestination("apns.relay", relay)
         }
 
         if !identityHex.isEmpty {
@@ -529,23 +641,26 @@ final class ConnectionStateManager {
             rfedCloneSources.append(("lxmf.propagation", derivedPropHash))
         }
 
-        let rfedHex = UserPreferences.shared.effectiveRfedNotifyHash
-        if !rfedHex.isEmpty, let rfedHash = Data(hexString: rfedHex) {
-            appendDestination("rfed.notify", rfedHash)
-            rfedServiceTargets.append(("rfed.notify", rfedHash))
-        }
-        // Also request paths to rfed.channel and rfed.delivery so the app
-        // link has a fresh route immediately after network reconnect.
-        if let rfedChannel = rfedChannelDestData(includeHiddenDefault: true) {
-            appendDestination("rfed.channel", rfedChannel)
-            rfedServiceTargets.append(("rfed.channel", rfedChannel))
-        }
+        // The 6 split rfed aspects (subscribe/unsubscribe/publish/pull and
+        // notify register/unregister) are derived per-op and pre-warmed here
+        // so app-links can come up immediately after network reconnect.
         if !identityHex.isEmpty {
-            let deliveryHex = RfedChannelClient.rfedDestHash(
-                identityHashHex: identityHex, app: "rfed", aspects: ["delivery"])
-            if !deliveryHex.isEmpty, let deliveryHash = Data(hexString: deliveryHex) {
-                appendDestination("rfed.delivery", deliveryHash)
-                rfedServiceTargets.append(("rfed.delivery", deliveryHash))
+            let splitAspects: [(String, [String])] = [
+                ("rfed.notify.register",   ["notify", "register"]),
+                ("rfed.notify.unregister", ["notify", "unregister"]),
+                ("rfed.channel.subscribe",   ["channel", "subscribe"]),
+                ("rfed.channel.unsubscribe", ["channel", "unsubscribe"]),
+                ("rfed.channel.publish",     ["channel", "publish"]),
+                ("rfed.channel.pull",        ["channel", "pull"]),
+                ("rfed.channel.stream",      ["channel", "stream"]),
+                ("rfed.propagation.stream",  ["propagation", "stream"]),
+            ]
+            for (label, aspects) in splitAspects {
+                let hex = RfedChannelClient.rfedDestHash(
+                    identityHashHex: identityHex, app: "rfed", aspects: aspects)
+                guard !hex.isEmpty, let hash = Data(hexString: hex) else { continue }
+                appendDestination(label, hash)
+                rfedServiceTargets.append((label, hash))
             }
         }
 
@@ -580,22 +695,29 @@ final class ConnectionStateManager {
         // All FFI work off the main thread.
         Task.detached(priority: .userInitiated) {
             let t = CFAbsoluteTimeGetCurrent()
+            func hasFreshPath(_ dest: Data) -> Bool {
+                bridge.transportHasPath(destHash: dest)
+                    && bridge.transportPathVerifiedThisSession(destHash: dest)
+            }
+
             func seedRfedServiceRoutesIfPossible() {
                 for (sourceName, sourceHash) in rfedCloneSources {
-                    guard bridge.transportHasPath(destHash: sourceHash),
+                    guard hasFreshPath(sourceHash),
                           bridge.transportIdentityKnown(destHash: sourceHash) else { continue }
 
                     for (targetName, targetHash) in rfedServiceTargets {
                         let hadPath = bridge.transportHasPath(destHash: targetHash)
+                        let hadFreshPath = bridge.transportPathVerifiedThisSession(destHash: targetHash)
                         let hadIdentity = bridge.transportIdentityKnown(destHash: targetHash)
-                        if hadPath && hadIdentity { continue }
+                        if hadPath && hadFreshPath && hadIdentity { continue }
 
                         guard bridge.transportClonePathAndIdentity(from: sourceHash, to: targetHash) else { continue }
 
                         let hasPathNow = bridge.transportHasPath(destHash: targetHash)
+                        let hasFreshPathNow = bridge.transportPathVerifiedThisSession(destHash: targetHash)
                         let hasIdentityNow = bridge.transportIdentityKnown(destHash: targetHash)
-                        if hadPath != hasPathNow || hadIdentity != hasIdentityNow {
-                            print("[DIAG][requestEssentialPaths] seeded dest=\(targetName)(\(String(targetHash.hexString.prefix(8)))) from=\(sourceName)(\(String(sourceHash.hexString.prefix(8)))) hasPath=\(hasPathNow) hasIdentity=\(hasIdentityNow)")
+                        if hadPath != hasPathNow || hadFreshPath != hasFreshPathNow || hadIdentity != hasIdentityNow {
+                            print("[DIAG][requestEssentialPaths] seeded dest=\(targetName)(\(String(targetHash.hexString.prefix(8)))) from=\(sourceName)(\(String(sourceHash.hexString.prefix(8)))) hasPath=\(hasPathNow) pathVerified=\(hasFreshPathNow) hasIdentity=\(hasIdentityNow)")
                         }
                     }
                 }
@@ -606,13 +728,15 @@ final class ConnectionStateManager {
             var requested: [(Data, String, Bool, Bool)] = []
             for (dest, label) in destPairs {
                 let hasPath = bridge.transportHasPath(destHash: dest)
+                let hasFreshPath = bridge.transportPathVerifiedThisSession(destHash: dest)
                 let hasIdentity = bridge.transportIdentityKnown(destHash: dest)
-                print("[DIAG][requestEssentialPaths] dest=\(label) hasPath=\(hasPath) hasIdentity=\(hasIdentity)")
+                print("[DIAG][requestEssentialPaths] dest=\(label) hasPath=\(hasPath) pathVerified=\(hasFreshPath) hasIdentity=\(hasIdentity)")
                 // Infrastructure sends need both a live route and the
                 // destination identity. A cold-start path table can leave us
-                // with identity-only or path-only partial state, so request a
-                // fresh path whenever either prerequisite is missing.
-                let needsPath = !hasPath
+                // with a disk-restored route whose interface is stale for this
+                // run, so request a fresh path whenever the route has not been
+                // verified by a PATH_RESPONSE / announce in the current session.
+                let needsPath = !hasPath || !hasFreshPath
                 let needsIdentity = !hasIdentity
                 if needsPath || needsIdentity {
                     _ = bridge.transportRequestPath(destHash: dest)
@@ -634,7 +758,7 @@ final class ConnectionStateManager {
             while CFAbsoluteTimeGetCurrent() < pollDeadline {
                 seedRfedServiceRoutesIfPossible()
                 requested.removeAll { dest, label, needsPath, needsIdentity in
-                    let pathReady = !needsPath || bridge.transportHasPath(destHash: dest)
+                    let pathReady = !needsPath || hasFreshPath(dest)
                     let identityReady = !needsIdentity || bridge.transportIdentityKnown(destHash: dest)
                     if pathReady && identityReady {
                         print("[DIAG][requestEssentialPaths] resolved dest=\(label)")

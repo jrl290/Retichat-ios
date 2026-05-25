@@ -83,6 +83,10 @@ private struct DirectMessageForm: View {
     @State private var showScanner = false
     @State private var errorMessage: String?
 
+    private var parsedPeer: SharedPeerIdentity? {
+        IdentityShareFormat.parse(destHash)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Fixed header
@@ -93,17 +97,19 @@ private struct DirectMessageForm: View {
 
                 HStack(spacing: 10) {
                     HStack {
-                        TextField("32-character hex hash…", text: $destHash)
+                        TextField("32-char hash or lxma:// URI…", text: $destHash)
                             .foregroundColor(.retichatOnSurface)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                             .font(.system(.body, design: .monospaced))
                             .onChange(of: destHash) { _, newValue in
-                                destHash = String(
-                                    newValue.lowercased()
-                                        .filter { "0123456789abcdef".contains($0) }
-                                        .prefix(32)
-                                )
+                                let normalized = newValue
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .lowercased()
+                                if normalized != newValue {
+                                    destHash = normalized
+                                }
+                                errorMessage = nil
                             }
 
                         if !destHash.isEmpty {
@@ -164,20 +170,24 @@ private struct DirectMessageForm: View {
             startChat()
         }
         .sheet(isPresented: $showScanner) {
-            QRCodeView(mode: .scan) { scannedHash in
-                destHash = scannedHash
+            QRCodeView(mode: .scan) { scannedPeer in
+                destHash = IdentityShareFormat.encode(
+                    destinationHashHex: scannedPeer.destinationHashHex,
+                    publicKey: scannedPeer.publicKey
+                ) ?? scannedPeer.destinationHashHex
                 showScanner = false
-                startChat()
+                startChat(peer: scannedPeer)
             }
         }
     }
 
-    private func startChat() {
-        let hash = destHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard hash.count == 32 else { errorMessage = "Hash must be exactly 32 hex characters"; return }
-        guard hash == hash.filter({ "0123456789abcdef".contains($0) }) else { errorMessage = "Invalid hex characters"; return }
-        if hash == repository.ownHashHex { errorMessage = "Cannot chat with yourself"; return }
-        let chatId = repository.createDirectChat(destHash: hash)
+    private func startChat(peer: SharedPeerIdentity? = nil) {
+        guard let peer = peer ?? parsedPeer else {
+            errorMessage = "Enter a 32-char hash or lxma://<hash>:<pubkey> URI"
+            return
+        }
+        if peer.destinationHashHex == repository.ownHashHex { errorMessage = "Cannot chat with yourself"; return }
+        let chatId = repository.createDirectChat(destHash: peer.destinationHashHex, publicKey: peer.publicKey)
         selectedChatId = chatId
         dismiss()
     }

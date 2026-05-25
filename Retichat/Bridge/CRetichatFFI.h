@@ -152,6 +152,11 @@ typedef void (*lxmf_app_link_status_callback_t)(
     uint8_t status
 );
 
+typedef void (*lxmf_app_link_packet_callback_t)(
+    void *context,
+    const uint8_t *bytes, uint32_t bytes_len
+);
+
 /// APP_LINK request completion callback (async variant).
 ///
 /// Fires exactly once per `lxmf_app_link_request_async` invocation.
@@ -205,7 +210,9 @@ int32_t lxmf_client_dest_hash(uint64_t client, uint8_t *out_buf, uint32_t buf_le
 
 #pragma mark - LXMF Propagation
 
+int32_t lxmf_client_set_propagation_node(uint64_t client, const uint8_t *node_hash, uint32_t node_len);
 int32_t lxmf_client_sync(uint64_t client, const uint8_t *node_hash, uint32_t node_len);
+int32_t lxmf_client_ingest_propagated(uint64_t client, const uint8_t *lxmf_data, uint32_t lxmf_len);
 int32_t lxmf_client_propagation_state(uint64_t client);
 float   lxmf_client_propagation_progress(uint64_t client);
 int32_t lxmf_client_cancel_propagation(uint64_t client);
@@ -290,6 +297,18 @@ int32_t lxmf_app_link_register_reconnect(uint64_t client,
 /// Returns 0 on success, -1 on error.
 int32_t lxmf_app_link_register_status_callback(uint64_t client,
                                                 lxmf_app_link_status_callback_t callback,
+                                                void *context);
+
+/// Register a packet callback for DATA received on a persistent APP_LINK.
+///
+/// The callback is attached to the tracked persistent link for `dest_hash`.
+/// If the link is already ACTIVE, it is installed immediately; if the link
+/// reconnects later, it is reattached on the next ACTIVE transition.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_register_packet_callback(uint64_t client,
+                                                const uint8_t *dest_hash,
+                                                uint32_t dest_len,
+                                                lxmf_app_link_packet_callback_t callback,
                                                 void *context);
 
 /// Notify the router that the host's network reachability state has
@@ -421,6 +440,10 @@ uint64_t retichat_identity_from_bytes(const uint8_t *bytes, uint32_t len);
 /// Get identity public key. Writes to out_buf (>= 64 bytes). Returns count or -1.
 int32_t retichat_identity_public_key(uint64_t handle, uint8_t *out_buf, uint32_t buf_len);
 
+/// Remember a remote destination hash from its public key.
+int32_t retichat_identity_remember_destination(const uint8_t *dest_hash, uint32_t dest_hash_len,
+                                               const uint8_t *public_key, uint32_t public_key_len);
+
 /// Sign data with the identity's Ed25519 signing key. Writes 64-byte sig to out_sig. Returns 64 or -1.
 int32_t retichat_identity_sign(uint64_t handle, const uint8_t *data, uint32_t data_len, uint8_t *out_sig, uint32_t sig_buf_len);
 
@@ -430,6 +453,7 @@ int32_t retichat_identity_destroy(uint64_t handle);
 #pragma mark - Transport
 
 int32_t retichat_transport_has_path(const uint8_t *dest_hash, uint32_t len);
+int32_t retichat_transport_path_verified_this_session(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_identity_known(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_hops_to(const uint8_t *dest_hash, uint32_t len);
@@ -466,25 +490,30 @@ uint8_t *retichat_link_request(const uint8_t *dest_hash, uint32_t dest_hash_len,
                                 double timeout_secs,
                                 uint32_t *out_len);
 
-#pragma mark - RFed Delivery (inbound channel blobs)
+#pragma mark - RFed delivery fallback
 
-/// Callback type fired when a channel blob arrives at the local rfed.delivery endpoint.
-/// Called on a Reticulum worker thread — dispatch to main thread if needed.
-typedef void (*rfed_blob_callback_t)(const uint8_t *data, uint32_t len, void *ctx);
+/// Callback fired for inbound RFed channel blobs delivered to the local
+/// `rfed.delivery` compatibility destination.
+///
+/// `blob` uses the server wire format: `channel_hash(16) | inner_blob(*)`.
+/// The pointer is only valid for the duration of the callback; copy it before
+/// returning.
+typedef void (*retichat_rfed_blob_callback_t)(
+    void *context,
+    const uint8_t *blob, uint32_t blob_len
+);
 
-/// Register an inbound rfed.delivery destination so the rfed server can push
-/// channel blobs to this device.  identity_handle must come from
-/// lxmf_client_identity_handle().  Returns 0 on success, -1 on error.
+/// Start the legacy inbound `rfed.delivery` compatibility destination.
+/// Mixed-version/public RFed nodes still use this when live channel streams
+/// are unavailable.
 int32_t retichat_rfed_delivery_start(uint64_t identity_handle,
-                                      rfed_blob_callback_t callback,
-                                      void *ctx);
+                                      retichat_rfed_blob_callback_t callback,
+                                      void *context);
 
-/// Announce the local rfed.delivery destination.  Call at startup and on
-/// foreground transitions to trigger flush of deferred blobs from the server.
-/// Returns 0 on success, -1 on error.
+/// Manually announce the local `rfed.delivery` destination.
 int32_t retichat_rfed_delivery_announce(void);
 
-/// Stop the local rfed.delivery endpoint and deregister from transport.
+/// Stop the legacy inbound `rfed.delivery` compatibility destination.
 int32_t retichat_rfed_delivery_stop(void);
 
 #pragma mark - Channel Crypto

@@ -62,14 +62,18 @@ final class UserPreferences {
         set { defaults.set(newValue, forKey: Keys.rfedNotifyHash) }
     }
 
-    /// Runtime RFed notify destination.
+    /// Runtime RFed notify-register destination.
     /// Falls back to the app's hidden default RFed node when no explicit
     /// value has been saved in Settings.
+    ///
+    /// After the rfed.notify aspect split this is the canonical probe used
+    /// for UI reachability indicators and as the target for the register
+    /// op. Unregister derives its own hash via `["notify", "unregister"]`.
     var effectiveRfedNotifyHash: String {
         let configured = Self.normalizedHex(rfedNotifyHash)
         if !configured.isEmpty { return configured }
         return Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
-                                app: "rfed", aspects: ["notify"]) ?? ""
+                                app: "rfed", aspects: ["notify", "register"]) ?? ""
     }
 
 
@@ -245,10 +249,24 @@ final class UserPreferences {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    private static func normalizedAspectSegments(app: String, aspects: [String]) -> [String] {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        var segments = aspects
+            .flatMap { $0.split(whereSeparator: { $0 == "." || $0 == "," }) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if segments.first == normalizedApp {
+            segments.removeFirst()
+        }
+
+        return segments
+    }
+
     private static func rnsDestHash(identityHashHex: String, app: String, aspects: [String]) -> String? {
         let hex = normalizedHex(identityHashHex)
         guard hex.count == 32, let identityBytes = Data(hexString: hex) else { return nil }
-        let name = ([app] + aspects).joined(separator: ".")
+        let name = ([app] + normalizedAspectSegments(app: app, aspects: aspects)).joined(separator: ".")
         let nameHashFull = SHA256.hash(data: Data(name.utf8))
         let nameHashTrunc = Data(nameHashFull.prefix(10))
         let material = nameHashTrunc + identityBytes

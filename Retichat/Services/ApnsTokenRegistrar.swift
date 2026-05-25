@@ -2,23 +2,21 @@
 //  ApnsTokenRegistrar.swift
 //  Retichat
 //
-//  Registers this device's APNs token with the rfed APNs bridge (rfed.apns).
+//  Registers this device's APNs token with the apns-bridge `apns.register`
+//  destination.
 //
 //  Protocol payload (msgpack Map sent as APP_LINK DATA):
 //    Payload: msgpack Map
 //      register:   {"subscriber_hash": bin(16),
 //                   "apns_token":      str(64 hex),
 //                   "env":             str("sandbox" | "production")}
-//      unregister: {"subscriber_hash": bin(16)}
 //
-//  The rfed.apns destination hash is loaded from PushBridgeConfig.plist when
-//  available. Without it, APNs bridge registration is disabled.
+//  The `apns.register` destination hash is loaded from PushBridgeConfig.plist
+//  when available (key `APNSRegistrationDestinationHash`). Without it, APNs
+//  bridge registration is disabled.
 //  Registration is attempted on service start and whenever the APNs token
-//  changes. We intentionally keep the client on AppLinks Ephemeral mode here:
-//  reliability and delivery proof matter more than single-packet minimization,
-//  while APNs token registration volume is low enough that holding a
-//  persistent link open is not required. Rust owns path readiness, link
-//  establishment, and delivery proof handling.
+//  changes. The send rides AppLinks' DATA path so Rust owns path readiness,
+//  link establishment, and delivery proof handling.
 //
 
 import Foundation
@@ -40,13 +38,12 @@ final class ApnsTokenRegistrar {
     // MARK: - Public API
 
     /// Call after service starts (and identity is known) whenever the APNs token
-    /// or the rfed.apns hash changes.
+    /// or the `apns.register` hash changes.
     ///
-    /// The registration is a one-shot DATA send via the ephemeral `rfed.apns`
-    /// AppLink. This deliberately favors proof-backed infrastructure delivery
-    /// over raw packet minimization. We fire one immediate attempt and leave an
-    /// ACTIVE-status handler installed so a later readiness event can drive the
-    /// same send without Swift owning path polling or retry timing.
+    /// The registration is a one-shot DATA send via the ephemeral
+    /// `apns.register` AppLink. We fire one immediate attempt and leave an
+    /// ACTIVE-status handler installed so a later readiness event can drive
+    /// the same send without Swift owning path polling or retry timing.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
     func registerIfNeeded(subscriberHash: Data) {
         guard !prefs.effectiveRfedNodeIdentityHash.isEmpty else {
@@ -88,8 +85,8 @@ final class ApnsTokenRegistrar {
 
         _ = ConnectionStateManager.shared.appLinkPrime(
             destHash: destHash,
-            app: "rfed",
-            aspects: ["apns"]
+            app: "apns",
+            aspects: ["register"]
         )
 
         attemptRegistrationIfNeeded(
@@ -103,14 +100,14 @@ final class ApnsTokenRegistrar {
     // MARK: - Private
 
     /// Single-attempt registration via a plain DATA send on the ephemeral
-    /// `rfed.apns` AppLink.
+    /// `apns.register` AppLink.
     private func sendOnce(destHash: Data,
                           payload: Data,
                           subscriberHashHex: String) async -> Bool {
         let delivered = await ConnectionStateManager.shared.appLinkSendData(
             destHash: destHash,
-            app: "rfed",
-            aspects: ["apns"],
+            app: "apns",
+            aspects: ["register"],
             payload: payload
         )
 

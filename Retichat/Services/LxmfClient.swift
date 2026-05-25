@@ -59,6 +59,13 @@ fileprivate final class BoolContinuationBox {
     init(cont: CheckedContinuation<Bool, Never>) { self.cont = cont }
 }
 
+/// Heap box retained across the C FFI boundary for persistent APP_LINK
+/// packet callbacks.
+fileprivate final class AppLinkPacketCallbackBox {
+    let callback: @Sendable (Data) -> Void
+    init(callback: @escaping @Sendable (Data) -> Void) { self.callback = callback }
+}
+
 /// Top-level C-compatible trampoline for `lxmf_app_link_request_async`.
 /// Cannot be a `@_cdecl` func — Swift forbids forming a C function pointer
 /// from such a func in property contexts. Closure form works.
@@ -82,9 +89,45 @@ fileprivate let _appLinkSendTrampoline: lxmf_app_link_send_callback_t = {
     unbox.cont.resume(returning: status == 0)
 }
 
+/// Top-level trampoline for `lxmf_app_link_register_packet_callback`.
+fileprivate let _appLinkPacketTrampoline: lxmf_app_link_packet_callback_t = {
+    (ctx, bytesPtr, bytesLen) -> Void in
+    guard let ctx = ctx else { return }
+    let box = Unmanaged<AppLinkPacketCallbackBox>.fromOpaque(ctx).takeUnretainedValue()
+    let data: Data
+    if let bytesPtr = bytesPtr, bytesLen > 0 {
+        data = Data(bytes: bytesPtr, count: Int(bytesLen))
+    } else {
+        data = Data()
+    }
+    box.callback(data)
+}
+
 /// Manages a complete Reticulum + LXMF stack lifecycle through one opaque
 /// handle.  All protocol internals are hidden behind the Rust `lxmf_*` FFI.
 final class LxmfClient: @unchecked Sendable {
+
+    private static func normalizedAspectSegments(app: String, aspects: [String]) -> [String] {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        var segments = aspects
+            .flatMap { $0.split(whereSeparator: { $0 == "." || $0 == "," }) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if segments.first == normalizedApp {
+            segments.removeFirst()
+        }
+
+        return segments
+    }
+
+    private static func normalizedAspectSpec(app: String, aspects: [String]) -> String {
+        normalizedAspectSegments(app: app, aspects: aspects).joined(separator: ".")
+    }
+
+    private static func normalizedAspectSpec(app: String, aspects: String) -> String {
+        normalizedAspectSpec(app: app, aspects: [aspects])
+    }
 
     /// Opaque handle returned by `lxmf_client_start`.
     let handle: UInt64
@@ -94,6 +137,9 @@ final class LxmfClient: @unchecked Sendable {
 
     /// Cached 16-byte LXMF delivery destination hash.
     let destHash: Data
+
+    private let appLinkPacketCallbackLock = NSLock()
+    private var appLinkPacketCallbackBoxes: [String: Unmanaged<AppLinkPacketCallbackBox>] = [:]
 
     /// The underlying identity handle for use with transport-level functions.
     var identityHandle: UInt64 {
@@ -203,6 +249,15 @@ final class LxmfClient: @unchecked Sendable {
         }
     }
 
+    /// Feed raw propagated `lxmf_data` into the normal client delivery path.
+    @discardableResult
+    func ingestPropagated(_ lxmfData: Data) -> Bool {
+        lxmfData.withUnsafeBytes { buf -> Bool in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_client_ingest_propagated(handle, p, UInt32(lxmfData.count)) == 1
+        }
+    }
+
     /// Current propagation transfer state byte.
     var propagationState: Int32 {
         lxmf_client_propagation_state(handle)
@@ -236,12 +291,27 @@ final class LxmfClient: @unchecked Sendable {
     @discardableResult
     nonisolated func appLinkOpen(_ destHash: Data,
                                  app: String = "lxmf",
+                                 aspects: String) -> Bool {
+        appLinkOpen(destHash, app: app,
+                    aspectSpec: Self.normalizedAspectSpec(app: app, aspects: aspects))
+    }
+
+    @discardableResult
+    nonisolated func appLinkOpen(_ destHash: Data,
+                                 app: String = "lxmf",
                                  aspects: [String] = ["delivery"]) -> Bool {
-        let aspectsCsv = aspects.joined(separator: ".")
+        appLinkOpen(destHash, app: app,
+                    aspectSpec: Self.normalizedAspectSpec(app: app, aspects: aspects))
+    }
+
+    @discardableResult
+    private nonisolated func appLinkOpen(_ destHash: Data,
+                                         app: String,
+                                         aspectSpec: String) -> Bool {
         return destHash.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
             let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return app.withCString { (appC: UnsafePointer<CChar>) -> Bool in
-                aspectsCsv.withCString { (aspC: UnsafePointer<CChar>) -> Bool in
+                aspectSpec.withCString { (aspC: UnsafePointer<CChar>) -> Bool in
                     lxmf_app_link_open(handle, p, UInt32(destHash.count), appC, aspC) == 0
                 }
             }
@@ -256,12 +326,27 @@ final class LxmfClient: @unchecked Sendable {
     @discardableResult
     nonisolated func appLinkOpenPersistent(_ destHash: Data,
                                            app: String = "lxmf",
+                                           aspects: String) -> Bool {
+        appLinkOpenPersistent(destHash, app: app,
+                              aspectSpec: Self.normalizedAspectSpec(app: app, aspects: aspects))
+    }
+
+    @discardableResult
+    nonisolated func appLinkOpenPersistent(_ destHash: Data,
+                                           app: String = "lxmf",
                                            aspects: [String] = ["delivery"]) -> Bool {
-        let aspectsCsv = aspects.joined(separator: ".")
+        appLinkOpenPersistent(destHash, app: app,
+                              aspectSpec: Self.normalizedAspectSpec(app: app, aspects: aspects))
+    }
+
+    @discardableResult
+    private nonisolated func appLinkOpenPersistent(_ destHash: Data,
+                                                   app: String,
+                                                   aspectSpec: String) -> Bool {
         return destHash.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
             let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return app.withCString { (appC: UnsafePointer<CChar>) -> Bool in
-                aspectsCsv.withCString { (aspC: UnsafePointer<CChar>) -> Bool in
+                aspectSpec.withCString { (aspC: UnsafePointer<CChar>) -> Bool in
                     lxmf_app_link_open_persistent(handle, p, UInt32(destHash.count), appC, aspC) == 0
                 }
             }
@@ -300,6 +385,18 @@ final class LxmfClient: @unchecked Sendable {
     /// Call once per extra aspect (e.g. `"rfed.channel"`, `"rfed.notify"`) during
     /// startup so the router reconnects app-links to those destinations on announce.
     @discardableResult
+    nonisolated func appLinkRegisterReconnect(app: String, aspects: String) -> Bool {
+        appLinkRegisterReconnect(app: app, aspects: [aspects])
+    }
+
+    @discardableResult
+    nonisolated func appLinkRegisterReconnect(app: String, aspects: [String]) -> Bool {
+        let normalized = Self.normalizedAspectSegments(app: app, aspects: aspects)
+        let aspect = ([app] + normalized).joined(separator: ".")
+        return appLinkRegisterReconnect(aspect: aspect)
+    }
+
+    @discardableResult
     nonisolated func appLinkRegisterReconnect(aspect: String) -> Bool {
         aspect.withCString { cAspect in
             lxmf_app_link_register_reconnect(handle, cAspect) == 0
@@ -318,6 +415,36 @@ final class LxmfClient: @unchecked Sendable {
         context: UnsafeMutableRawPointer? = nil
     ) -> Bool {
         lxmf_app_link_register_status_callback(handle, callback, context) == 0
+    }
+
+    /// Register a callback for DATA packets received on a persistent APP_LINK.
+    @discardableResult
+    nonisolated func setAppLinkPacketCallback(
+        destHash: Data,
+        callback: @escaping @Sendable (Data) -> Void
+    ) -> Bool {
+        let key = destHash.map { String(format: "%02x", $0) }.joined()
+        let box = Unmanaged.passRetained(AppLinkPacketCallbackBox(callback: callback))
+        let ok = destHash.withUnsafeBytes { buf -> Bool in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_app_link_register_packet_callback(
+                handle,
+                ptr,
+                UInt32(destHash.count),
+                _appLinkPacketTrampoline,
+                box.toOpaque()
+            ) == 0
+        }
+        guard ok else {
+            box.release()
+            return false
+        }
+
+        appLinkPacketCallbackLock.lock()
+        let old = appLinkPacketCallbackBoxes.updateValue(box, forKey: key)
+        appLinkPacketCallbackLock.unlock()
+        old?.release()
+        return true
     }
 
     /// Notify the router that the host's network reachability state has
@@ -424,10 +551,35 @@ final class LxmfClient: @unchecked Sendable {
     /// failure.
     nonisolated func appLinkSendAsync(destHash: Data,
                                       app: String,
+                                      aspects: String,
+                                      payload: Data) async -> Bool
+    {
+        await appLinkSendAsync(
+            destHash: destHash,
+            app: app,
+            aspectSpec: Self.normalizedAspectSpec(app: app, aspects: aspects),
+            payload: payload
+        )
+    }
+
+    nonisolated func appLinkSendAsync(destHash: Data,
+                                      app: String,
                                       aspects: [String],
                                       payload: Data) async -> Bool
     {
-        let aspectsCsv = aspects.joined(separator: ".")
+        await appLinkSendAsync(
+            destHash: destHash,
+            app: app,
+            aspectSpec: Self.normalizedAspectSpec(app: app, aspects: aspects),
+            payload: payload
+        )
+    }
+
+    private nonisolated func appLinkSendAsync(destHash: Data,
+                                              app: String,
+                                              aspectSpec: String,
+                                              payload: Data) async -> Bool
+    {
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let box = BoolContinuationBox(cont: cont)
             let ctxPtr = Unmanaged.passRetained(box).toOpaque()
@@ -435,7 +587,7 @@ final class LxmfClient: @unchecked Sendable {
             let rc: Int32 = destHash.withUnsafeBytes { destBuf -> Int32 in
                 let destPtr = destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
                 return app.withCString { cApp -> Int32 in
-                    return aspectsCsv.withCString { cAspects -> Int32 in
+                    return aspectSpec.withCString { cAspects -> Int32 in
                         return payload.withUnsafeBytes { payBuf -> Int32 in
                             let payPtr = payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
                             return lxmf_app_link_send_async(
@@ -611,7 +763,22 @@ final class LxmfClient: @unchecked Sendable {
 
     /// Shut down: destroy router, identity, and transport.
     func shutdown() {
+        releaseAppLinkPacketCallbackBoxes()
         lxmf_client_shutdown(handle)
+    }
+
+    deinit {
+        releaseAppLinkPacketCallbackBoxes()
+    }
+
+    private func releaseAppLinkPacketCallbackBoxes() {
+        appLinkPacketCallbackLock.lock()
+        let boxes = Array(appLinkPacketCallbackBoxes.values)
+        appLinkPacketCallbackBoxes.removeAll()
+        appLinkPacketCallbackLock.unlock()
+        for box in boxes {
+            box.release()
+        }
     }
 
     // MARK: - Helpers

@@ -27,8 +27,11 @@ protocol MessageStateCallback: AnyObject {
     @MainActor func onMessageState(hash: Data, state: UInt8)
 }
 
-/// Receives raw inner blobs arriving at the local rfed.delivery destination.
-/// Called on a background thread — implementations must dispatch to main thread if needed.
+/// Receives inbound RFed channel blobs from the local `rfed.delivery`
+/// compatibility destination.
+///
+/// Fired from a Rust background thread. Implementations that touch actor-bound
+/// or UI state must hop themselves.
 protocol RfedBlobCallback: AnyObject {
     func onRfedBlob(_ blob: Data)
 }
@@ -59,9 +62,23 @@ final class RetichatBridge: @unchecked Sendable {
     private weak var messageCallback: MessageCallback?
     private weak var announceCallback: AnnounceCallback?
     private weak var messageStateCallback: (any MessageStateCallback)?
-    private weak var rfedBlobCallback: (any RfedBlobCallback)?
+    private weak var rfedBlobCallback: RfedBlobCallback?
 
     private init() {}
+
+    private static func ffiAspectsCsv(appName: String, aspects: String) -> String {
+        let app = appName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var parts = aspects
+            .split(whereSeparator: { $0 == "." || $0 == "," })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if parts.first == app {
+            parts.removeFirst()
+        }
+
+        return parts.joined(separator: ",")
+    }
 
     // MARK: - Callback wiring
 
@@ -78,6 +95,26 @@ final class RetichatBridge: @unchecked Sendable {
         client.setMessageStateCallback(messageStateTrampoline, context: ctx)
     }
 
+    func rfedDeliveryStart(identityHandle: UInt64, callback: RfedBlobCallback) -> Bool {
+        rfedBlobCallback = callback
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        let ok = retichat_rfed_delivery_start(identityHandle, rfedBlobTrampoline, ctx) == 0
+        if !ok {
+            rfedBlobCallback = nil
+        }
+        return ok
+    }
+
+    func rfedDeliveryAnnounce() -> Bool {
+        retichat_rfed_delivery_announce() == 0
+    }
+
+    func rfedDeliveryStop() -> Bool {
+        let ok = retichat_rfed_delivery_stop() == 0
+        rfedBlobCallback = nil
+        return ok
+    }
+
     // MARK: - Last error
 
     func lastError() -> String? {
@@ -87,12 +124,26 @@ final class RetichatBridge: @unchecked Sendable {
         return str
     }
 
+    func rnsLastError() -> String? {
+        guard let ptr = rns_last_error() else { return nil }
+        let str = String(cString: ptr)
+        rns_free_string(ptr)
+        return str
+    }
+
     // MARK: - Transport
 
     nonisolated func transportHasPath(destHash: Data) -> Bool {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return retichat_transport_has_path(ptr, UInt32(destHash.count)) == 1
+        }
+    }
+
+    nonisolated func transportPathVerifiedThisSession(destHash: Data) -> Bool {
+        return destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_transport_path_verified_this_session(ptr, UInt32(destHash.count)) == 1
         }
     }
 
@@ -110,6 +161,20 @@ final class RetichatBridge: @unchecked Sendable {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return retichat_transport_request_path(ptr, UInt32(destHash.count)) == 0
+        }
+    }
+
+    @discardableResult
+    nonisolated func rememberDestination(destHash: Data, publicKey: Data) -> Bool {
+        return destHash.withUnsafeBytes { hashBuf in
+            publicKey.withUnsafeBytes { keyBuf in
+                let hashPtr = hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                let keyPtr = keyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                return retichat_identity_remember_destination(
+                    hashPtr, UInt32(destHash.count),
+                    keyPtr, UInt32(publicKey.count)
+                ) == 0
+            }
         }
     }
 
@@ -229,12 +294,14 @@ final class RetichatBridge: @unchecked Sendable {
 
     // MARK: - Raw packet send
 
+    @available(*, deprecated, message: "Use AppLinks DATA delivery helpers instead of raw packet sends from app code.")
     func packetSendToHash(destHash: Data, appName: String, aspects: String,
                           payload: Data) -> Bool {
+        let aspectsCsv = Self.ffiAspectsCsv(appName: appName, aspects: aspects)
         return destHash.withUnsafeBytes { hashBuf in
             payload.withUnsafeBytes { payBuf in
                 appName.withCString { cApp in
-                    aspects.withCString { cAsp in
+                    aspectsCsv.withCString { cAsp in
                         let hPtr = hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
                         let pPtr = payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
                         return retichat_packet_send_to_hash(
@@ -414,13 +481,15 @@ final class RetichatBridge: @unchecked Sendable {
 
     // MARK: - Link request
 
+    @available(*, deprecated, message: "Use AppLinks request helpers instead of raw one-shot link requests from app code.")
     nonisolated func linkRequest(destHash: Data, appName: String, aspects: String,
                      identityHandle: UInt64, path: String,
                      payload: Data, timeoutSecs: Double = 15.0) -> Data? {
+        let aspectsCsv = Self.ffiAspectsCsv(appName: appName, aspects: aspects)
         return destHash.withUnsafeBytes { hashBuf in
             payload.withUnsafeBytes { payBuf in
                 appName.withCString { cApp in
-                    aspects.withCString { cAsp in
+                    aspectsCsv.withCString { cAsp in
                         path.withCString { cPath in
                             var outLen: UInt32 = 0
                             let hPtr = hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
@@ -444,29 +513,6 @@ final class RetichatBridge: @unchecked Sendable {
                 }
             }
         }
-    }
-
-    // MARK: - RFed Delivery
-
-    /// Start the local rfed.delivery inbound endpoint.
-    /// `callback` fires on a background thread whenever a blob arrives.
-    @discardableResult
-    func startRfedDelivery(identityHandle: UInt64, callback: any RfedBlobCallback) -> Bool {
-        self.rfedBlobCallback = callback
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        return retichat_rfed_delivery_start(identityHandle, rfedBlobTrampoline, ctx) == 0
-    }
-
-    /// Announce the local rfed.delivery destination to trigger flush of deferred blobs.
-    @discardableResult
-    func rfedDeliveryAnnounce() -> Bool {
-        return retichat_rfed_delivery_announce() == 0
-    }
-
-    /// Stop the rfed.delivery endpoint.
-    func stopRfedDelivery() {
-        _ = retichat_rfed_delivery_stop()
-        rfedBlobCallback = nil
     }
 
     // MARK: - Internal callback dispatch
@@ -567,14 +613,16 @@ private func messageStateTrampoline(
     bridge.handleMessageState(hash: hashData, state: state)
 }
 
-/// Called from Rust on a background thread when a blob arrives at rfed.delivery.
+/// Called from Rust on a background thread when a blob arrives on the local
+/// legacy `rfed.delivery` endpoint.
 private func rfedBlobTrampoline(
-    data: UnsafePointer<UInt8>?,
-    len: UInt32,
-    context: UnsafeMutableRawPointer?
+    context: UnsafeMutableRawPointer?,
+    blob: UnsafePointer<UInt8>?, blobLen: UInt32
 ) {
-    guard let context = context, let data = data else { return }
+    guard let context = context else { return }
     let bridge = Unmanaged<RetichatBridge>.fromOpaque(context).takeUnretainedValue()
-    let blob = Data(bytes: data, count: Int(len))
-    bridge.handleRfedBlob(blob)
+
+    let blobData = blob.map { Data(bytes: $0, count: Int(blobLen)) } ?? Data()
+    bridge.handleRfedBlob(blobData)
 }
+

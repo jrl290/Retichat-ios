@@ -123,14 +123,18 @@ struct SettingsView: View {
                 interfaceStatusTimer?.invalidate()
                 interfaceStatusTimer = nil
             }
+            .onChange(of: vm.filterStrangers) { _, _ in
+                vm.persistFilterStrangersLive()
+            }
         }
     }
 
     // MARK: - Apply
 
     private func applySettings() {
-        // Capture old rfed notify hash before prefs are overwritten.
-        let oldNotifyHash = UserPreferences.shared.effectiveRfedNotifyHash
+        // Capture old rfed identity hash before prefs are overwritten so we
+        // can derive the OLD unregister destination after vm.apply().
+        let oldRfedIdentityHash = UserPreferences.shared.rfedNodeIdentityHash
         let rfedNodeChanged = vm.rfedNodeIdentityHash != UserPreferences.shared.rfedNodeIdentityHash
 
         // Persist all settings to UserDefaults.
@@ -144,7 +148,7 @@ struct SettingsView: View {
         if rfedNodeChanged,
            let client = repository.lxmfClient {
             RfedNotifyRegistrar.shared.deregisterFrom(
-                oldNotifyHashHex: oldNotifyHash,
+                oldRfedIdentityHashHex: oldRfedIdentityHash,
                 identityHandle: client.identityHandle
             )
         }

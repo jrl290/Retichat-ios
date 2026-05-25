@@ -1,0 +1,103 @@
+Command line invocation:
+    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -project Retichat.xcodeproj -scheme Retichat -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+Build settings from command line:
+    CODE_SIGNING_ALLOWED = NO
+    CODE_SIGNING_REQUIRED = NO
+    SDKROOT = iphonesimulator26.5
+
+--- xcodebuild: WARNING: Using the first of multiple matching destinations:
+{ platform:iOS Simulator, id:dvtdevice-DVTiOSDeviceSimulatorPlaceholder-iphonesimulator:placeholder, name:Any iOS Simulator Device }
+{ platform:iOS Simulator, arch:arm64, id:6CDB4090-7026-4631-810E-0A16A62873AF, OS:26.2, name:iPad (A16) }
+{ platform:iOS Simulator, arch:arm64, id:4BE2B146-096D-49AC-8F12-D2E8ACA44A49, OS:26.4.1, name:iPad (A16) }
+{ platform:iOS Simulator, arch:arm64, id:2EF09045-DDAC-4B30-9656-9DEA6E692A53, OS:26.5, name:iPad (A16) }
+{ platform:iOS Simulator, arch:arm64, id:C70FF255-4E3D-4A23-920F-19F8E190A05A, OS:26.2, name:iPad Air 11-inch (M3) }
+{ platform:iOS Simulator, arch:arm64, id:990157EA-193D-4BAC-8925-AC3697DF2809, OS:26.4.1, name:iPad Air 11-inch (M4) }
+{ platform:iOS Simulator, arch:arm64, id:4FA411C0-1A3E-4D2B-B00B-FA2E2A2E524D, OS:26.5, name:iPad Air 11-inch (M4) }
+{ platform:iOS Simulator, arch:arm64, id:37C335F0-11FA-439A-B5D5-87CE3B2E6C46, OS:26.2, name:iPad Air 13-inch (M3) }
+{ platform:iOS Simulator, arch:arm64, id:30815908-A365-48C8-A079-FECB4596D658, OS:26.4.1, name:iPad Air 13-inch (M4) }
+{ platform:iOS Simulator, arch:arm64, id:B06DAE16-50E3-4778-BE2D-C3F6EB464088, OS:26.5, name:iPad Air 13-inch (M4) }
+{ platform:iOS Simulator, arch:arm64, id:BDF1D282-7EA4-47D3-9BCD-0E2BB3107B5C, OS:26.2, name:iPad Pro 11-inch (M5) }
+{ platform:iOS Simulator, arch:arm64, id:612330A7-B960-4FBB-8549-E4829504A8C2, OS:26.4.1, name:iPad Pro 11-inch (M5) }
+{ platform:iOS Simulator, arch:arm64, id:0987B484-0925-4E47-A7B4-C30D8238FE1E, OS:26.5, name:iPad Pro 11-inch (M5) }
+{ platform:iOS Simulator, arch:arm64, id:2633DC50-4D84-4666-BB4B-8BE8F4133647, OS:26.2, name:iPad Pro 13-inch (M5) }
+{ platform:iOS Simulator, arch:arm64, id:6D720C71-ECD5-4F0E-A83E-3504C08EC21F, OS:26.4.1, name:iPad Pro 13-inch (M5) }
+{ platform:iOS Simulator, arch:arm64, id:DDDAAC7D-B4B7-432D-9B91-273759EB3B7D, OS:26.5, name:iPad Pro 13-inch (M5) }
+{ platform:iOS Simulator, arch:arm64, id:591939FC-2655-4028-BD8C-46226EEFE002, OS:26.2, name:iPad mini (A17 Pro) }
+{ platform:iOS Simulator, arch:arm64, id:A4B2C733-0223-4944-8A23-5DD443CC36DD, OS:26.4.1, name:iPad mini (A17 Pro) }
+{ platform:iOS Simulator, arch:arm64, id:FC8E3F5A-1E3C-4B3D-838B-DDDB466CC7F2, OS:26.5, name:iPad mini (A17 Pro) }
+{ platform:iOS Simulator, arch:arm64, id:0D209682-7DF5-4352-8279-6CEC9E6E5CEA, OS:18.5, name:iPhone 16 }
+{ platform:iOS Simulator, arch:x86_64, id:0D209682-7DF5-4352-8279-6CEC9E6E5CEA, OS:18.5, name:iPhone 16 }
+{ platform:iOS Simulator, arch:arm64, id:0ACC093E-59DC-4241-8F6F-39C5F736C41F, OS:26.2, name:iPhone 16e }
+{ platform:iOS Simulator, arch:arm64, id:BC85D45A-12C7-4D88-87AB-5B748B28F5DF, OS:26.2, name:iPhone 17 }
+{ platform:iOS Simulator, arch:arm64, id:F9E29536-769B-466C-B8F2-6186A07FBAA7, OS:26.4.1, name:iPhone 17 }
+{ platform:iOS Simulator, arch:arm64, id:D78E1D9E-306B-4871-AC7A-C29A004588BE, OS:26.5, name:iPhone 17 }
+{ platform:iOS Simulator, arch:arm64, id:20D20D10-6548-447A-9403-F2032E0E6B21, OS:26.2, name:iPhone 17 Pro }
+{ platform:iOS Simulator, arch:arm64, id:1FA0C9B7-5A3B-4376-9C57-F543D570B289, OS:26.4.1, name:iPhone 17 Pro }
+{ platform:iOS Simulator, arch:arm64, id:5C939089-1373-4BBB-9DCE-EA7B34258AB1, OS:26.5, name:iPhone 17 Pro }
+{ platform:iOS Simulator, arch:arm64, id:72F655FE-7DD2-43D6-BE88-00C49F415E2C, OS:26.2, name:iPhone 17 Pro Max }
+{ platform:iOS Simulator, arch:arm64, id:8CDFF341-43C4-4446-B3D2-7A97B4C622EB, OS:26.4.1, name:iPhone 17 Pro Max }
+{ platform:iOS Simulator, arch:arm64, id:6FC176CC-58FE-456C-B5A8-FF515B49B2CF, OS:26.5, name:iPhone 17 Pro Max }
+{ platform:iOS Simulator, arch:arm64, id:8A7424DA-2A66-4287-B683-E886BC1AD214, OS:26.4.1, name:iPhone 17e }
+{ platform:iOS Simulator, arch:arm64, id:DB335BD1-51AF-4775-9CAB-B988444068F8, OS:26.5, name:iPhone 17e }
+{ platform:iOS Simulator, arch:arm64, id:DC0C658D-871E-4AD6-B9D7-4B05BB3B69F0, OS:26.2, name:iPhone Air }
+{ platform:iOS Simulator, arch:arm64, id:F9AD5103-C8DD-4CCA-8C0E-0DC7E39FD38E, OS:26.4.1, name:iPhone Air }
+{ platform:iOS Simulator, arch:arm64, id:84E15DC6-5A77-46AC-9C98-D93051A1404D, OS:26.5, name:iPhone Air }
+{ platform:macOS, arch:arm64, variant:Mac Catalyst, id:00008103-001931C21AF2001E, name:My Mac }
+{ platform:macOS, arch:x86_64, variant:Mac Catalyst, id:00008103-001931C21AF2001E, name:My Mac }
+{ platform:macOS, arch:arm64, variant:Designed for [iPad,iPhone], id:00008103-001931C21AF2001E, name:My Mac }
+{ platform:iOS, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device }
+{ platform:macOS, variant:Mac Catalyst, name:Any Mac }
+{ platform:iOS, arch:arm64, id:00008030-001671AC1AC0A02E, name:JAMES’s iPad }
+ComputePackagePrebuildTargetDependencyGraph
+
+Prepare packages
+
+CreateBuildRequest
+
+SendProjectDescription
+
+CreateBuildOperation
+
+ComputeTargetDependencyGraph
+note: Building targets in dependency order
+note: Target dependency graph (2 targets)
+    Target 'Retichat' in project 'Retichat'
+        ➜ Explicit dependency on target 'NotificationService' in project 'Retichat'
+    Target 'NotificationService' in project 'Retichat' (no dependencies)
+
+GatherProvisioningInputs
+
+CreateBuildDescription
+
+ExecuteExternalTool /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc --version
+
+ExecuteExternalTool /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -v -E -dM -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk -x c -c /dev/null
+
+ExecuteExternalTool /Applications/Xcode.app/Contents/Developer/usr/bin/actool --print-asset-tag-combinations --output-format xml1 /Users/james/Offline/Reticulum/Retichat-ios/Retichat/Assets.xcassets
+
+ExecuteExternalTool /Applications/Xcode.app/Contents/Developer/usr/bin/actool --version --output-format xml1
+
+ExecuteExternalTool /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld -version_details
+
+Build description signature: 3760535a9255e74aa99c7666cb46aa37
+Build description path: /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Intermediates.noindex/XCBuildData/3760535a9255e74aa99c7666cb46aa37.xcbuilddata
+ClangStatCache /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang-stat-cache /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk /Users/james/Library/Developer/Xcode/DerivedData/SDKStatCaches.noindex/iphonesimulator26.5-23F73-6cfe768891a92b912361537c460fe42b.sdkstatcache
+    cd /Users/james/Offline/Reticulum/Retichat-ios/Retichat.xcodeproj
+    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang-stat-cache /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk -o /Users/james/Library/Developer/Xcode/DerivedData/SDKStatCaches.noindex/iphonesimulator26.5-23F73-6cfe768891a92b912361537c460fe42b.sdkstatcache
+
+ProcessInfoPlistFile /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/NotificationService.appex/Info.plist /Users/james/Offline/Reticulum/Retichat-ios/NotificationService/Info.plist (in target 'NotificationService' from project 'Retichat')
+    cd /Users/james/Offline/Reticulum/Retichat-ios
+    builtin-infoPlistUtility /Users/james/Offline/Reticulum/Retichat-ios/NotificationService/Info.plist -producttype com.apple.product-type.app-extension -expandbuildsettings -format binary -platform iphonesimulator -o /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/NotificationService.appex/Info.plist
+
+ProcessInfoPlistFile /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/Info.plist /Users/james/Offline/Reticulum/Retichat-ios/Info.plist (in target 'Retichat' from project 'Retichat')
+    cd /Users/james/Offline/Reticulum/Retichat-ios
+    builtin-infoPlistUtility /Users/james/Offline/Reticulum/Retichat-ios/Info.plist -producttype com.apple.product-type.application -genpkginfo /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/PkgInfo -expandbuildsettings -format binary -platform iphonesimulator -additionalcontentfile /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Intermediates.noindex/Retichat.build/Debug-iphonesimulator/Retichat.build/assetcatalog_generated_info.plist -scanforprivacyfile /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/PlugIns/NotificationService.appex -o /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/Info.plist
+
+CopySwiftLibs /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app (in target 'Retichat' from project 'Retichat')
+    cd /Users/james/Offline/Reticulum/Retichat-ios
+    builtin-swiftStdLibTool --copy --verbose --scan-executable /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/Retichat.debug.dylib --scan-folder /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/Frameworks --scan-folder /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/PlugIns --scan-folder /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/SystemExtensions --scan-folder /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/Extensions --scan-folder /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk/System/Library/Frameworks/CoreBluetooth.framework --scan-folder /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.4.sdk/System/Library/Frameworks/Intents.framework --scan-folder /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk/System/Library/Frameworks/IOKit.framework --scan-folder /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.5.sdk/System/Library/Frameworks/CoreGraphics.framework --platform iphonesimulator --toolchain /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain --destination /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Products/Debug-iphonesimulator/Retichat.app/Frameworks --strip-bitcode --strip-bitcode-tool /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip --emit-dependency-info /Users/james/Library/Developer/Xcode/DerivedData/Retichat-gcapfxwctpqqshfqyusodtjwrozd/Build/Intermediates.noindex/Retichat.build/Debug-iphonesimulator/Retichat.build/SwiftStdLibToolInputDependencies.dep --filter-for-swift-os --back-deploy-swift-span
+Ignoring --strip-bitcode because --sign was not passed
+
+** BUILD SUCCEEDED **
+

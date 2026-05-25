@@ -41,6 +41,7 @@ class SettingsViewModel: ObservableObject {
     private var originalRfedNodeIdentityHash: String
     private var originalRfedLxmfPropOverride: String
     private var originalFilterStrangers: Bool
+    private var persistedFilterStrangers: Bool
     private var originalInterfaces: [PendingInterface]
 
     /// True when any setting differs from the values present when the screen opened (or last Apply).
@@ -49,7 +50,7 @@ class SettingsViewModel: ObservableObject {
         channelDisplayName != originalChannelDisplayName ||
         rfedNodeIdentityHash != originalRfedNodeIdentityHash ||
         rfedLxmfPropOverride != originalRfedLxmfPropOverride ||
-        filterStrangers != originalFilterStrangers ||
+        filterStrangers != persistedFilterStrangers ||
         pendingInterfaces != originalInterfaces
     }
 
@@ -76,6 +77,7 @@ class SettingsViewModel: ObservableObject {
         self.originalRfedNodeIdentityHash = prefs.rfedNodeIdentityHash
         self.originalRfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.originalFilterStrangers = prefs.filterStrangers
+        self.persistedFilterStrangers = prefs.filterStrangers
         self.pendingInterfaces = []
         self.originalInterfaces = []
     }
@@ -98,11 +100,18 @@ class SettingsViewModel: ObservableObject {
         prefs.channelDisplayName = channelDisplayName
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
         prefs.rfedNotifyHash = Self.rnsDestHash(
-            identityHashHex: rfedNodeIdentityHash, app: "rfed", aspects: ["notify"]
+            identityHashHex: rfedNodeIdentityHash, app: "rfed", aspects: ["notify", "register"]
         ) ?? ""
         prefs.rfedLxmfPropOverride = rfedLxmfPropOverride
         prefs.filterStrangers = filterStrangers
         updateLxmfPropagationHash()
+    }
+
+    /// Persist the stranger-filter toggle immediately. This gate is enforced
+    /// in app code, so it must not depend on the separate Apply/restart flow.
+    func persistFilterStrangersLive() {
+        UserPreferences.shared.filterStrangers = filterStrangers
+        persistedFilterStrangers = filterStrangers
     }
 
     /// Commit pending interface changes to SwiftData.
@@ -144,6 +153,8 @@ class SettingsViewModel: ObservableObject {
         rfedNodeIdentityHash = originalRfedNodeIdentityHash
         rfedLxmfPropOverride = originalRfedLxmfPropOverride
         filterStrangers = originalFilterStrangers
+        UserPreferences.shared.filterStrangers = originalFilterStrangers
+        persistedFilterStrangers = originalFilterStrangers
         pendingInterfaces = originalInterfaces
     }
 
@@ -154,6 +165,7 @@ class SettingsViewModel: ObservableObject {
         originalRfedNodeIdentityHash = rfedNodeIdentityHash
         originalRfedLxmfPropOverride = rfedLxmfPropOverride
         originalFilterStrangers = filterStrangers
+        persistedFilterStrangers = filterStrangers
         originalInterfaces = pendingInterfaces
     }
 
@@ -182,14 +194,32 @@ class SettingsViewModel: ObservableObject {
     /// Algorithm (mirrors Destination::hash in Reticulum-rust):
     ///   name_hash_trunc = SHA256(app + "." + aspects.joined("."))[0..<10]
     ///   dest_hash       = SHA256(name_hash_trunc + identity_bytes)[0..<16]
+    static func rnsDestHash(identityHashHex: String, app: String, aspects: String) -> String? {
+        rnsDestHash(identityHashHex: identityHashHex, app: app, aspects: [aspects])
+    }
+
     static func rnsDestHash(identityHashHex: String, app: String, aspects: [String]) -> String? {
         let hex = identityHashHex.trimmingCharacters(in: .whitespaces).lowercased()
         guard hex.count == 32, let identityBytes = Data(hexString: hex) else { return nil }
-        let name = ([app] + aspects).joined(separator: ".")
+        let name = ([app] + normalizedAspectSegments(app: app, aspects: aspects)).joined(separator: ".")
         let nameHashFull = SHA256.hash(data: Data(name.utf8))
         let nameHashTrunc = Data(nameHashFull.prefix(10))   // 80 bits
         let material = nameHashTrunc + identityBytes
         let destHashFull = SHA256.hash(data: material)
         return Data(destHashFull.prefix(16)).hexString      // 128 bits
+    }
+
+    private static func normalizedAspectSegments(app: String, aspects: [String]) -> [String] {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        var segments = aspects
+            .flatMap { $0.split(whereSeparator: { $0 == "." || $0 == "," }) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if segments.first == normalizedApp {
+            segments.removeFirst()
+        }
+
+        return segments
     }
 }

@@ -143,7 +143,7 @@ final class GroupChatManager {
             _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupName,   value: groupName)
             _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
 
-            if client.sendMessage(handle) {
+            if client.sendMessageViaAppLinks(handle) {
                 onHandle?(handle, target)
             } else {
                 LxmfClient.messageDestroy(handle)
@@ -238,7 +238,7 @@ final class GroupChatManager {
     // MARK: - Private helpers
 
     private func destroyAfterSend(client: LxmfClient, handle: UInt64) {
-        if client.sendMessage(handle) {
+        if client.sendMessageViaAppLinks(handle) {
             DispatchQueue.global().asyncAfter(deadline: .now() + 60) {
                 LxmfClient.messageDestroy(handle)
             }

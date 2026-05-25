@@ -4,7 +4,7 @@
 <dict>
 	<key>APNSRegistrationDestinationHash</key>
 	<string>replace-with-32-char-hex-hash</string>
-	<key>APNSNotifyRelayDestinationHash</key>
+	<key>APNSRelayDestinationHash</key>
 	<string>replace-with-32-char-hex-hash</string>
 </dict>
 </plist>

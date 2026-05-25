@@ -21,8 +21,8 @@ pub use lxmf_rust::cffi::*;
 pub use reticulum_rust::cffi::*;
 
 use std::ffi::CStr;
-use std::os::raw::c_char;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::os::raw::{c_char, c_void};
+use std::sync::{Arc, Mutex};
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::ffi as rns;
@@ -40,6 +40,22 @@ unsafe fn cstr_to_string(ptr: *const c_char) -> String {
         return String::new();
     }
     CStr::from_ptr(ptr).to_string_lossy().into_owned()
+}
+
+fn parse_destination_aspects(app: &str, aspects: &str) -> Vec<String> {
+    let normalized_app = app.trim();
+    let mut parsed: Vec<String> = aspects
+        .split(|c| c == '.' || c == ',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+        .collect();
+
+    if parsed.first().map(|segment| segment.as_str()) == Some(normalized_app) {
+        parsed.remove(0);
+    }
+
+    parsed
 }
 
 fn slice_from_raw(ptr: *const u8, len: u32) -> Vec<u8> {
@@ -120,6 +136,39 @@ pub extern "C" fn retichat_identity_sign(
     }
 }
 
+/// Seed a known destination from a scanned public key.
+///
+/// Stores the mapping `dest_hash -> public_key` in the known-destinations
+/// table so outbound encrypted sends can proceed before the first announce.
+#[no_mangle]
+pub extern "C" fn retichat_identity_remember_destination(
+    dest_hash: *const u8,
+    dest_hash_len: u32,
+    public_key: *const u8,
+    public_key_len: u32,
+) -> i32 {
+    let hash = slice_from_raw(dest_hash, dest_hash_len);
+    let pub_key = slice_from_raw(public_key, public_key_len);
+
+    if hash.is_empty() {
+        rns::set_error("destination hash is empty".into());
+        return -1;
+    }
+
+    if let Err(e) = Identity::from_public_key(&pub_key) {
+        rns::set_error(format!("invalid public key: {}", e));
+        return -1;
+    }
+
+    match Identity::remember_destination(&hash, &pub_key, None) {
+        Ok(()) => 0,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
 /// Destroy a standalone identity handle.  Returns 0 on success, -1 on error.
 ///
 /// Do **not** call this on the identity owned by an `lxmf_client` — that is
@@ -144,6 +193,22 @@ pub extern "C" fn retichat_identity_destroy(handle: u64) -> i32 {
 pub extern "C" fn retichat_transport_has_path(dest_hash: *const u8, len: u32) -> i32 {
     let h = slice_from_raw(dest_hash, len);
     if rns::transport_has_path(&h) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Check whether the destination's current route has been verified by a live
+/// announce in this process. Cached paths loaded from disk do not count.
+/// Returns 1/0.
+#[no_mangle]
+pub extern "C" fn retichat_transport_path_verified_this_session(
+    dest_hash: *const u8,
+    len: u32,
+) -> i32 {
+    let h = slice_from_raw(dest_hash, len);
+    if Transport::is_path_verified_this_session(&h) {
         1
     } else {
         0
@@ -309,7 +374,7 @@ pub extern "C" fn retichat_packet_send_to_hash(
     let hash = slice_from_raw(dest_hash, dest_hash_len);
     let app = unsafe { cstr_to_string(app_name) };
     let asp_str = unsafe { cstr_to_string(aspects) };
-    let asp_vec: Vec<String> = asp_str.split(',').map(|s| s.trim().to_string()).collect();
+    let asp_vec = parse_destination_aspects(&app, &asp_str);
     let payload_data = slice_from_raw(payload, payload_len);
 
     let dest_handle = match rns::destination_create_outbound_from_hash(&hash, &app, asp_vec) {
@@ -374,7 +439,7 @@ pub extern "C" fn retichat_link_request(
     let hash = slice_from_raw(dest_hash, dest_hash_len);
     let app = unsafe { cstr_to_string(app_name) };
     let asp_str = unsafe { cstr_to_string(aspects) };
-    let asp_vec: Vec<String> = asp_str.split(',').map(|s| s.trim().to_string()).collect();
+    let asp_vec = parse_destination_aspects(&app, &asp_str);
     let p = unsafe { cstr_to_string(path) };
     let data = slice_from_raw(payload, payload_len);
 
@@ -406,49 +471,31 @@ pub extern "C" fn retichat_link_request(
 }
 
 // ---------------------------------------------------------------------------
-// RFed Delivery — inbound channel blob endpoint
+// RFed delivery fallback (legacy inbound channel blob endpoint)
 // ---------------------------------------------------------------------------
 
-/// C callback fired when a blob arrives at the local rfed.delivery destination.
-///
-/// `data`/`len` — raw inner blob bytes.
-/// `ctx`        — pointer passed to `retichat_rfed_delivery_start`.
-pub type RfedBlobCallback = extern "C" fn(data: *const u8, len: u32, ctx: *mut std::ffi::c_void);
+type RfedBlobCallback = Option<extern "C" fn(*mut c_void, *const u8, u32)>;
 
-/// Wraps a raw `*mut c_void` so it can be sent across threads.
-/// The C caller is responsible for lifetime management of the pointed object.
-struct SendableCtx(usize);
-unsafe impl Send for SendableCtx {}
-unsafe impl Sync for SendableCtx {}
+#[derive(Copy, Clone)]
+struct RfedDeliveryCallbackState {
+    callback: RfedBlobCallback,
+    ctx: usize,
+}
 
 struct RfedDeliveryState {
     dest: Destination,
-    callback: Option<RfedBlobCallback>,
-    ctx: SendableCtx,
 }
 
-static RFED_DELIVERY: OnceLock<Mutex<Option<RfedDeliveryState>>> = OnceLock::new();
+static RFED_DELIVERY: Mutex<Option<RfedDeliveryState>> = Mutex::new(None);
+static RFED_DELIVERY_CB: Mutex<Option<RfedDeliveryCallbackState>> = Mutex::new(None);
 
-fn rfed_delivery_storage() -> &'static Mutex<Option<RfedDeliveryState>> {
-    RFED_DELIVERY.get_or_init(|| Mutex::new(None))
-}
-
-/// Register an inbound `rfed.delivery` destination so the rfed server can
-/// push channel blobs to this device.
-///
-/// * `identity_handle` — LXMF client identity handle (from `lxmf_client_identity_handle`).
-/// * `callback`        — called on a background thread whenever a blob arrives.
-/// * `ctx`             — opaque context pointer forwarded to every `callback` call.
-///
-/// Returns 0 on success, -1 on error (check `lxmf_last_error`).
-/// Call `retichat_rfed_delivery_announce` afterwards to flush deferred blobs.
 #[no_mangle]
 pub extern "C" fn retichat_rfed_delivery_start(
     identity_handle: u64,
-    callback: Option<RfedBlobCallback>,
-    ctx: *mut std::ffi::c_void,
+    callback: RfedBlobCallback,
+    context: *mut c_void,
 ) -> i32 {
-    let identity: Identity = match rns::get_handle(identity_handle) {
+    let identity: Identity = match rns::get_handle::<Identity>(identity_handle) {
         Some(id) => id,
         None => {
             rns::set_error("invalid identity handle".into());
@@ -456,7 +503,10 @@ pub extern "C" fn retichat_rfed_delivery_start(
         }
     };
 
-    // Build inbound rfed.delivery destination from this identity.
+    if RFED_DELIVERY.lock().unwrap().is_some() {
+        let _ = retichat_rfed_delivery_stop();
+    }
+
     let mut dest = match Destination::new_inbound(
         Some(identity),
         DestinationType::Single,
@@ -470,39 +520,35 @@ pub extern "C" fn retichat_rfed_delivery_start(
         }
     };
 
-    // Register packet callback — fires on the Reticulum worker thread.
-    let cb = callback;
-    let ctx_usize = ctx as usize;
-    let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> =
-        Arc::new(move |data: &[u8], _pkt: &Packet| {
-            if let Some(f) = cb {
-                f(
-                    data.as_ptr(),
-                    data.len() as u32,
-                    ctx_usize as *mut std::ffi::c_void,
-                );
-            }
-        });
+    *RFED_DELIVERY_CB.lock().unwrap() = Some(RfedDeliveryCallbackState {
+        callback,
+        ctx: context as usize,
+    });
+
+    let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> = Arc::new(move |data: &[u8], _pkt: &Packet| {
+        let guard = RFED_DELIVERY_CB.lock().unwrap();
+        let Some(state) = guard.as_ref() else { return; };
+        let Some(callback) = state.callback else { return; };
+        callback(state.ctx as *mut c_void, data.as_ptr(), data.len() as u32);
+    });
     dest.set_packet_callback(Some(packet_cb));
     Transport::register_destination(dest.clone());
 
-    let mut guard = rfed_delivery_storage().lock().unwrap();
-    *guard = Some(RfedDeliveryState {
-        dest,
-        callback: cb,
-        ctx: SendableCtx(ctx_usize),
-    });
+    // Keep the compatibility destination published so mixed-version RFed nodes
+    // always have a fresh path back to this device when stream receive is absent.
+    Transport::publish_destination(
+        dest.hash.clone(),
+        Some(std::time::Duration::from_secs(30 * 60)),
+        None,
+    );
+
+    *RFED_DELIVERY.lock().unwrap() = Some(RfedDeliveryState { dest });
     0
 }
 
-/// Announce the local `rfed.delivery` destination so the rfed server flushes
-/// any deferred blobs queued for this subscriber.
-///
-/// Call this at startup, on foreground transitions, and after reconnecting.
-/// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn retichat_rfed_delivery_announce() -> i32 {
-    let mut guard = rfed_delivery_storage().lock().unwrap();
+    let mut guard = RFED_DELIVERY.lock().unwrap();
     if let Some(ref mut state) = *guard {
         if let Err(e) = state.dest.announce(None, false, None, None, true) {
             rns::set_error(e);
@@ -510,19 +556,19 @@ pub extern "C" fn retichat_rfed_delivery_announce() -> i32 {
         }
         return 0;
     }
-    rns::set_error("rfed delivery not started — call retichat_rfed_delivery_start first".into());
+
+    rns::set_error("rfed delivery not started".into());
     -1
 }
 
-/// Tear down the local `rfed.delivery` endpoint.
-/// The destination is deregistered from the Reticulum transport.
-/// Returns 0 always.
 #[no_mangle]
 pub extern "C" fn retichat_rfed_delivery_stop() -> i32 {
-    let mut guard = rfed_delivery_storage().lock().unwrap();
+    let mut guard = RFED_DELIVERY.lock().unwrap();
     if let Some(state) = guard.take() {
+        Transport::unpublish_destination(&state.dest.hash);
         Transport::deregister_destination(&state.dest.hash);
     }
+    *RFED_DELIVERY_CB.lock().unwrap() = None;
     0
 }
 

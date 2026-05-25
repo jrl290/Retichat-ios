@@ -10,8 +10,10 @@ import Foundation
 
 enum ApnsBridgeHashes {
     private enum Key {
+        /// Hash of the apns-bridge `apns.register` destination.
         static let apnsRegistrationHex = "APNSRegistrationDestinationHash"
-        static let notifyRelayHex = "APNSNotifyRelayDestinationHash"
+        /// Hash of the apns-bridge `apns.relay` destination.
+        static let apnsRelayHex = "APNSRelayDestinationHash"
     }
 
     private static let config: [String: String] = {
@@ -23,7 +25,7 @@ enum ApnsBridgeHashes {
     }()
 
     static var isConfigured: Bool {
-        apnsRegistration != nil && notifyRelay != nil
+        apnsRegistration != nil && apnsRelay != nil
     }
 
     static var apnsRegistrationHex: String? {
@@ -35,14 +37,22 @@ enum ApnsBridgeHashes {
         return Data(hexString: hex)
     }
 
-    static var notifyRelayHex: String? {
-        validatedHex(for: Key.notifyRelayHex)
+    /// `apns.relay` destination hash.
+    static var apnsRelayHex: String? {
+        validatedHex(for: Key.apnsRelayHex)
     }
 
-    static var notifyRelay: Data? {
-        guard let hex = notifyRelayHex else { return nil }
+    static var apnsRelay: Data? {
+        guard let hex = apnsRelayHex else { return nil }
         return Data(hexString: hex)
     }
+
+    /// Relay-target hash for outbound wake traffic from this device.
+    /// Kept as a named accessor (in addition to `apnsRelayHex`) so call
+    /// sites read intent — "where do I aim the wake packet" — rather than
+    /// a raw plist key.
+    static var effectiveRelayHex: String? { apnsRelayHex }
+    static var effectiveRelay: Data?      { apnsRelay }
 
     private static func validatedHex(for key: String) -> String? {
         guard let value = config[key]?.trimmingCharacters(in: .whitespacesAndNewlines),

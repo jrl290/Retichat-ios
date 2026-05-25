@@ -60,9 +60,6 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .tint(.retichatPrimary)
-        .onOpenURL { url in
-            handleDeepLink(url)
-        }
         .onReceive(NotificationCenter.default.publisher(for: .openChatFromNotification)) { notif in
             if let chatId = notif.object as? String {
                 showNewConversation = false
@@ -164,24 +161,4 @@ struct ContentView: View {
         .toolbar(.hidden, for: .navigationBar)
     }
 
-    // MARK: - Deep link
-
-    private func handleDeepLink(_ url: URL) {
-        let scheme = url.scheme?.lowercased() ?? ""
-        guard scheme == "lxma" || scheme == "lxmf" else { return }
-        // host contains <hash> or <hash>.<pubkey> — take only the hash part
-        var raw = (url.host ?? "").lowercased()
-        if raw.isEmpty {
-            raw = url.absoluteString
-                .replacingOccurrences(of: "\(scheme)://", with: "")
-        }
-        // Strip optional .<pubkey> suffix
-        let hashPart = raw.components(separatedBy: ".").first ?? raw
-        let hash = hashPart.filter { "0123456789abcdef".contains($0) }
-
-        if hash.count == 32 {
-            let chatId = repository.createDirectChat(destHash: hash)
-            selectedChatId = chatId
-        }
-    }
 }

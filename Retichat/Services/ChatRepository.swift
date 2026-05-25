@@ -69,10 +69,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     private var pendingOutbound: [String: PendingOutbound] = [:]
 
-    /// Timers for the 5-second propagation fallback. Keyed by direct msg hash hex.
-    private var propFallbackTimers: [String: DispatchWorkItem] = [:]
     /// Message IDs that already had a propagation fallback dispatched.
     private var propFallbackSent: Set<String> = []
+
+    /// Destination tracked for the live rfed.propagation.stream APP_LINK.
+    private var propagationStreamDest: Data?
 
     /// Serial queue for all FFI calls into the Rust LXMF library.
     /// Keeps the main thread responsive while crypto, link establishment,
@@ -206,6 +207,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Register with the connection state manager (path requests, peer tracking).
         ConnectionStateManager.shared.register(lxmfClient: client)
+        configurePropagationStream()
 
         serviceRunning = true
         statusMessage = "Connected — \(ownHashHex.prefix(8))…"
@@ -288,13 +290,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - RFed APNs token registration
 
     /// Registers this device for push notifications:
-    /// 1. Sends APNs token to the apns_bridge via `rfed.apns` AppLinks DATA.
+    /// 1. Sends APNs token to the apns_bridge via `apns.register` AppLinks DATA.
     /// 2. Registers the relay hash with rfed via `rfed.notify` AppLinks DATA.
-    /// Both destinations are infrastructure-facing, so we prefer AppLinks
-    /// delivery proof and link-backed fallback over single-packet minimization.
     private func registerRfedNotify() {
         guard !ownHash.isEmpty, let client = lxmfClient else { return }
-        // 1. Register APNs token with the apns_bridge (AppLinks DATA → rfed.apns)
+        // 1. Register APNs token with the apns_bridge (AppLinks DATA → apns.register)
         ApnsTokenRegistrar.shared.registerIfNeeded(subscriberHash: ownHash)
         // 2. Register relay hash with rfed (AppLinks DATA → rfed.notify)
         RfedNotifyRegistrar.shared.registerIfNeeded(identityHandle: client.identityHandle)
@@ -339,14 +339,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         lines.append("")
         lines.append("[interfaces]")
 
-        // Explicitly disable AutoInterface so the app never does local network
-        // discovery (IPv6 multicast). Without this, when running on a simulator
-        // the app can discover and directly connect to local Reticulum nodes
-        // (hops=0), bypassing the configured public backbone endpoints.
+        // Keep AutoInterface enabled so peers on the same local network can
+        // discover each other directly while the configured TCP backbones stay
+        // available for routed connectivity.
         lines.append("")
         lines.append("  [[AutoInterface]]")
         lines.append("    type = AutoInterface")
-        lines.append("    enabled = No")
+        lines.append("    enabled = Yes")
 
         // Get user-configured interfaces from database (TCP client only —
         // RNode rows are realised through the BLE bridge + rns_rnode_iface_*
@@ -424,6 +423,79 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
+    private func configurePropagationStream() {
+        guard let client = lxmfClient else { return }
+        let identityHex = prefs.effectiveRfedNodeIdentityHash
+        guard !identityHex.isEmpty else {
+            propagationStreamDest = nil
+            return
+        }
+
+        let streamHex = RfedChannelClient.rfedDestHash(
+            identityHashHex: identityHex,
+            app: "rfed",
+            aspects: ["propagation", "stream"])
+        guard let streamDest = Data(hexString: streamHex) else {
+            propagationStreamDest = nil
+            return
+        }
+
+        propagationStreamDest = streamDest
+
+        _ = ConnectionStateManager.shared.registerAppLinkPacketCallback(destHash: streamDest) { [weak self] data in
+            guard let self else { return }
+            self.ffiQueue.async { [weak self] in
+                guard let self, let client = self.lxmfClient else { return }
+                let accepted = client.ingestPropagated(data)
+                if !accepted {
+                    print("[Retichat] propagation.stream packet ignored len=\(data.count)")
+                }
+            }
+        }
+
+        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: streamDest) { [weak self] status in
+            guard status == 3 else { return }
+            self?.sendPropagationStreamOpen()
+        }
+
+        if ConnectionStateManager.shared.appLinkStatus(destHash: streamDest) == 3 {
+            sendPropagationStreamOpen()
+        } else {
+            _ = ConnectionStateManager.shared.appLinkPrime(
+                destHash: streamDest,
+                app: "rfed",
+                aspects: ["propagation", "stream"])
+        }
+    }
+
+    private func sendPropagationStreamOpen() {
+        guard let client = lxmfClient,
+              let streamDest = propagationStreamDest,
+              let pubkey = bridge.identityPublicKey(handle: client.identityHandle),
+              let sig = bridge.identitySign(handle: client.identityHandle, data: ownHash)
+        else { return }
+
+        let payload = RfedChannelClient.msgpackSigned(value: ownHash, pubkey: pubkey, sig: sig)
+        Task {
+            let response = await ConnectionStateManager.shared.appLinkSend(
+                destHash: streamDest,
+                app: "rfed",
+                aspects: ["propagation", "stream"],
+                path: "/rfed/propagation/stream/open",
+                payload: payload)
+            guard Self.streamOpenResponseOk(response) else {
+                print("[Retichat] propagation.stream open rejected resp=\(response?.hexString ?? "nil")")
+                return
+            }
+        }
+    }
+
+    private static func streamOpenResponseOk(_ response: Data?) -> Bool {
+        guard let response, response.count >= 2 else { return false }
+        return response[response.startIndex] == 0x92 &&
+            response[response.index(after: response.startIndex)] == 0xc3
+    }
+
     /// Flush in-memory path table and ratchets to disk so they survive app suspension.
     func persist() {
         guard let client = lxmfClient else { return }
@@ -477,7 +549,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
 
             // Filter: drop messages from senders not in the contact allowlist
-            guard isAllowlisted(destHash: srcHex) else { continue }
+            let allowlist = allowlistDecision(destHash: srcHex)
+            guard allowlist.isAllowed else {
+                print("[Retichat] importNSEMessages: DROPPED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
+                continue
+            }
 
             let chatId = srcHex
             ensureChat(id: chatId, peerHash: srcHex)
@@ -666,8 +742,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 _ = LxmfClient.messageAddAttachment(msgHandle, filename: filename, data: data)
             }
 
-            // pack() + process_outbound() run here, off the main thread.
-            guard client.sendMessage(msgHandle) else {
+            // pack() + AppLinks::send() run here, off the main thread.
+            guard client.sendMessageViaAppLinks(msgHandle) else {
                 print("[Retichat] Failed to send message: \(LxmfClient.lastError ?? "")")
                 LxmfClient.messageDestroy(msgHandle)
                 Task { @MainActor [weak self] in
@@ -749,9 +825,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     hasAttachments: !attachmentsCopy.isEmpty
                 )
 
-                // The 5-second propagation fallback is now owned by Rust
-                // (AppLinks Timer P).  It fires PROP_FALLBACK_REQUESTED (0x10)
-                // via message_state_callback at exactly 5 s after send starts.
+                // The propagation fallback delay is owned by Rust AppLinks
+                // Timer P. It normally uses the 5-second liveness budget, but
+                // collapses to zero when the current readiness is already
+                // DISCONNECTED (red). Swift only reacts to the resulting
+                // PROP_FALLBACK_REQUESTED callback.
                 // No iOS-side timer needed.
 
                 self.refreshChats()
@@ -956,16 +1034,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         switch state {
 
         case 0x04:  // SENT — propagated message accepted by the prop node.
-            cancelPropFallback(directHashHex: hashHex)
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.sent)
             completePending(hashHex: hashHex, pending: pending)
 
         case 0x08:  // DELIVERED — recipient downloaded and decrypted the message.
-            cancelPropFallback(directHashHex: hashHex)
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.delivered)
             completePending(hashHex: hashHex, pending: pending)
 
-        case 0x10:  // PROP_FALLBACK_REQUESTED — Rust Timer P fired at 5 s.
+        case 0x10:  // PROP_FALLBACK_REQUESTED — Rust Timer P fired after its current delay.
             // The direct send is still running; start propagation in parallel.
             // LXMF dedup on the receiver handles any double-delivery.
             if pending.method == LxmfMethod.direct && !pending.hasAttachments {
@@ -977,7 +1053,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
 
         case 0xFD, 0xFE, 0xFF:  // REJECTED, CANCELLED, FAILED.
-            cancelPropFallback(directHashHex: hashHex)
             if pending.method == LxmfMethod.direct && !pending.hasAttachments {
                 if propFallbackSent.contains(pending.messageId) {
                     // Prop fallback already dispatched — just clean up this direct entry.
@@ -1018,32 +1093,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
-    // MARK: - 5-second propagation fallback
-
-    private static let propFallbackDelay: TimeInterval = 5.0
-
-    private func schedulePropFallback(directHashHex: String) {
-        let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                guard let pending = self.pendingOutbound[directHashHex],
-                      pending.method == LxmfMethod.direct,
-                      !self.propFallbackSent.contains(pending.messageId) else { return }
-
-                print("[Retichat] 5s fallback: direct msg \(directHashHex.prefix(8)) not delivered, sending via propagation")
-                self.propFallbackSent.insert(pending.messageId)
-                self.updateDeliveryState(messageId: pending.messageId, state: DeliveryState.propagating)
-                self.retrySendViaPropNode(pending)
-            }
-        }
-        propFallbackTimers[directHashHex] = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.propFallbackDelay, execute: work)
-    }
-
-    private func cancelPropFallback(directHashHex: String) {
-        propFallbackTimers.removeValue(forKey: directHashHex)?.cancel()
-    }
-
     /// Retry a failed direct-mode message via the propagation node.
     private func retrySendViaPropNode(_ original: PendingOutbound) {
         guard let client = lxmfClient else {
@@ -1066,7 +1115,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 return
             }
 
-            guard client.sendMessage(msgHandle) else {
+            guard client.sendMessageViaAppLinks(msgHandle) else {
                 LxmfClient.messageDestroy(msgHandle)
                 Task { @MainActor [weak self] in
                     self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
@@ -1177,11 +1226,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Filter: drop direct messages from senders not in the contact allowlist.
         // Do this before any DB writes so strangers consume no resources.
-        guard isAllowlisted(destHash: srcHex) else {
-            print("[Retichat] handleIncomingMessage: DROPPED filterStrangers=\(prefs.filterStrangers) src=\(srcHex.prefix(8))")
+        let allowlist = allowlistDecision(destHash: srcHex)
+        guard allowlist.isAllowed else {
+            print("[Retichat] handleIncomingMessage: DROPPED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
             return
         }
-        print("[Retichat] handleIncomingMessage: ACCEPTED src=\(srcHex.prefix(8))")
+        print("[Retichat] handleIncomingMessage: ACCEPTED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
 
         // Direct message — find or create chat
         let chatId = srcHex
@@ -1270,8 +1320,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         fields: LxmfFields, groupId: String
     ) {
         // Apply stranger filter to the inviting node
-        guard isAllowlisted(destHash: srcHex) else {
-            print("[GroupChat] Dropped invite from stranger \(srcHex.prefix(8))")
+        let allowlist = allowlistDecision(destHash: srcHex)
+        guard allowlist.isAllowed else {
+            print("[GroupChat] Dropped invite reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
             return
         }
 
@@ -1521,11 +1572,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     // MARK: - Chat management
 
-    func createDirectChat(destHash: String) -> String {
+    func createDirectChat(destHash: String, publicKey: Data? = nil) -> String {
+        let normalizedHash = destHash.lowercased()
+
         // Unarchive if the chat already exists but was archived
         if let ctx = modelContext {
             let descriptor = FetchDescriptor<ChatEntity>(
-                predicate: #Predicate { $0.id == destHash }
+                predicate: #Predicate { $0.id == normalizedHash }
             )
             if let existing = try? ctx.fetch(descriptor).first, existing.isArchived {
                 existing.isArchived = false
@@ -1533,17 +1586,27 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
         }
 
-        ensureChat(id: destHash, peerHash: destHash)
-        ensureAllowlistedContact(destHash: destHash)
+        ensureChat(id: normalizedHash, peerHash: normalizedHash)
+        ensureAllowlistedContact(destHash: normalizedHash)
 
-        // Watch for announces
-        if let hashData = Data(hexString: destHash) {
+        // Seed the scanned public key when present, then request a path and
+        // keep watching announces so backbone-routed peers become reachable.
+        if let hashData = Data(hexString: normalizedHash) {
+            if let publicKey, publicKey.count == 64 {
+                if bridge.rememberDestination(destHash: hashData, publicKey: publicKey) {
+                    print("[Retichat] createDirectChat: seeded identity for \(normalizedHash.prefix(8))")
+                } else if let error = bridge.rnsLastError() {
+                    print("[Retichat] createDirectChat: failed to seed identity \(normalizedHash.prefix(8)): \(error)")
+                }
+            }
+
             RetichatBridge.shared.watchAnnounce(destHash: hashData)
             lxmfClient?.watch(destHash: hashData)
+            _ = bridge.transportRequestPath(destHash: hashData)
         }
 
         refreshChats()
-        return destHash
+        return normalizedHash
     }
 
     func createGroupChat(name: String, memberHashes: [String]) -> String {
@@ -1959,14 +2022,50 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
-    /// Returns true if the given hash is in the contact allowlist.
-    private func isAllowlisted(destHash: String) -> Bool {
-        guard prefs.filterStrangers else { return true }  // filter off → allow all
-        guard let ctx = modelContext else { return false }
+    private enum AllowlistDecision {
+        case allowedFilterDisabled
+        case allowedContact
+        case blockedMissingContact
+        case blockedContactNotAllowlisted
+
+        var isAllowed: Bool {
+            switch self {
+            case .allowedFilterDisabled, .allowedContact:
+                return true
+            case .blockedMissingContact, .blockedContactNotAllowlisted:
+                return false
+            }
+        }
+
+        var debugLabel: String {
+            switch self {
+            case .allowedFilterDisabled:
+                return "filter-disabled"
+            case .allowedContact:
+                return "allowlisted-contact"
+            case .blockedMissingContact:
+                return "missing-contact"
+            case .blockedContactNotAllowlisted:
+                return "contact-not-allowlisted"
+            }
+        }
+    }
+
+    private func allowlistDecision(destHash: String) -> AllowlistDecision {
+        guard prefs.filterStrangers else { return .allowedFilterDisabled }
+        guard let ctx = modelContext else { return .blockedMissingContact }
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == destHash }
         )
-        return (try? ctx.fetch(descriptor).first?.isAllowlisted) == true
+        guard let contact = try? ctx.fetch(descriptor).first else {
+            return .blockedMissingContact
+        }
+        return contact.isAllowlisted == true ? .allowedContact : .blockedContactNotAllowlisted
+    }
+
+    /// Returns true if the given hash is in the contact allowlist.
+    private func isAllowlisted(destHash: String) -> Bool {
+        allowlistDecision(destHash: destHash).isAllowed
     }
 
     func contactDisplayName(for destHash: String) -> String {

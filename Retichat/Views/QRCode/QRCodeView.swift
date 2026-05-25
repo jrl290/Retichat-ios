@@ -25,7 +25,7 @@ struct QRCodeView: View {
     @Environment(\.dismiss) private var dismiss
 
     var mode: QRMode = .display
-    var onScanned: ((String) -> Void)?
+    var onScanned: ((SharedPeerIdentity) -> Void)?
 
     @State private var currentTab: QRMode = .display
 
@@ -83,9 +83,15 @@ struct QRCodeView: View {
                         .foregroundColor(.retichatOnSurfaceVariant)
                 }
             } else {
-                let lxmfUri = "lxmf://\(hash)"
+                let publicKey = repository.lxmfClient.flatMap {
+                    RetichatBridge.shared.identityPublicKey(handle: $0.identityHandle)
+                }
+                let shareUri = IdentityShareFormat.encode(
+                    destinationHashHex: hash,
+                    publicKey: publicKey
+                ) ?? "lxmf://\(hash)"
 
-                if let qrImage = generateQRCode(from: lxmfUri) {
+                if let qrImage = generateQRCode(from: shareUri) {
                     Image(uiImage: qrImage)
                         .interpolation(.none)
                         .resizable()
@@ -111,9 +117,9 @@ struct QRCodeView: View {
                 .tint(.retichatPrimary)
 
                 Button {
-                    UIPasteboard.general.string = lxmfUri
+                    UIPasteboard.general.string = shareUri
                 } label: {
-                    Label("Copy LXMF URI", systemImage: "link")
+                    Label("Copy Contact URI", systemImage: "link")
                 }
                 .buttonStyle(.bordered)
                 .tint(.retichatPrimary)
@@ -126,29 +132,36 @@ struct QRCodeView: View {
 
     private var scanView: some View {
         QRScannerView { scannedString in
-            // Parse lxmf:// URI or raw 32-char hex
-            let hash: String
-            if scannedString.lowercased().hasPrefix("lxmf://") {
-                hash = String(scannedString.dropFirst(7)).lowercased()
-            } else {
-                hash = scannedString.lowercased()
-            }
-
-            let clean = hash.filter { "0123456789abcdef".contains($0) }
-            if clean.count == 32 {
-                onScanned?(clean)
+            if let peer = IdentityShareFormat.parse(scannedString) {
+                handleScannedPeer(peer)
                 dismiss()
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .padding()
         .overlay {
-            Text("Point camera at an LXMF QR code")
+            Text("Point camera at a Retichat or Columba QR code")
                 .font(.caption)
                 .foregroundColor(.retichatOnSurfaceVariant)
                 .frame(maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, 40)
         }
+    }
+
+    private func handleScannedPeer(_ peer: SharedPeerIdentity) {
+        if let onScanned {
+            onScanned(peer)
+            return
+        }
+
+        let chatId = repository.createDirectChat(
+            destHash: peer.destinationHashHex,
+            publicKey: peer.publicKey
+        )
+        NotificationCenter.default.post(
+            name: .openChatFromNotification,
+            object: chatId
+        )
     }
 
     // MARK: QR Generation

@@ -23,17 +23,17 @@
 //  is from, `signatureValidated == false` and the message is rejected.
 //
 //  Architecture:
-//    SEND   → fire-and-forget DATA packet to rfed.channel dest
+//    SEND   → AppLinks DATA send on legacy rfed.channel compatibility dest
 //             payload: lxmf_data [| pow_stamp(32)]
 //             (lxmf_data already begins with the channel_hash; no extra
 //              channel_hash prefix is added — the legacy
 //              [channel_hash | inner_blob | stamp] layout is byte-equivalent.)
-//    SUB    → link request /rfed/subscribe on rfed.channel, payload: msgpack bin(16)
-//    UNSUB  → link request /rfed/unsubscribe on rfed.channel, payload: msgpack bin(16)
-//    RECV   → inbound DATA at local rfed.delivery dest. Server hands us
+//    SUB    → AppLinks request /rfed/subscribe on legacy rfed.channel, payload: msgpack bin(16)
+//    UNSUB  → AppLinks request /rfed/unsubscribe on legacy rfed.channel, payload: msgpack bin(16)
+//    RECV   → live DATA over persistent rfed.channel.stream. Server hands us
 //             [channel_hash(16) | inner_blob] — concatenate them and feed
 //             the result to channelLxmUnpack as a complete lxmf_data.
-//    PULL   → link request /rfed/pull on rfed.delivery, response: [[bin16, blob], ...]
+//    PULL   → AppLinks request /rfed/pull on rfed.delivery, response: [[bin16, blob], ...]
 //  ============================================================================
 //
 
@@ -43,7 +43,7 @@ import SwiftData
 import CryptoKit
 
 @MainActor
-final class RfedChannelClient: ObservableObject, RfedBlobCallback {
+final class RfedChannelClient: ObservableObject {
 
     // MARK: - Node link status (shown in SettingsView)
 
@@ -79,6 +79,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     @Published var pullInFlight: [String: Bool] = [:]
 
     private var linkStatusTimer: AnyCancellable?
+    private var trackedChannelStreamNodes: Set<String> = []
 
     /// One-shot guard: re-subscribe to persisted channels exactly once
     /// per app run, the first time the rfed.channel route is reachable.
@@ -121,14 +122,6 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
     func start() {
         guard identityHandle != 0 else { return }
-        let ok = bridge.startRfedDelivery(identityHandle: identityHandle, callback: self)
-        if ok {
-            _ = bridge.rfedDeliveryAnnounce()
-            print("[RfedChannel] Delivery endpoint started and announced")
-        } else {
-            let err = bridge.lastError() ?? "unknown"
-            print("[RfedChannel] Failed to start delivery endpoint: \(err)")
-        }
         loadPersistedChannels()
         loadPersistedMessages()
 
@@ -139,12 +132,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     }
 
     func stop() {
-        bridge.stopRfedDelivery()
         stopRfedLinkMonitor()
-    }
-
-    func announceDelivery() {
-        _ = bridge.rfedDeliveryAnnounce()
     }
 
     // MARK: - RFed node link status monitor
@@ -230,40 +218,39 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
     /// Join (or create) a channel. Derives the channel hash from the name, subscribes
     /// on the rfed node, and persists the channel locally.
+    ///
+    /// `ChannelEntity.rfedNodeHash` stores the **rfed identity hash hex**
+    /// (32 chars). Per-op destinations (subscribe / unsubscribe / publish /
+    /// pull) are derived on demand from this identity. See REFACTOR.md step 4.
     func joinChannel(name: String, rfedNodeIdentityHashHex: String) async throws -> Channel {
         let channelHashData = try Self.channelHash(name: name)
         let channelHashHex = channelHashData.hexString
 
-        let rfedChannelDestHex = Self.rfedDestHash(identityHashHex: rfedNodeIdentityHashHex,
-                                                    app: "rfed", aspects: ["channel"])
+        let identityHex = Self.normalizedHex(rfedNodeIdentityHashHex)
 
-        // Already joined? If the rfed node changed, update the stored hash and re-subscribe.
+        // Already joined? If the rfed node changed, update the stored identity and re-subscribe.
         if let existing = channels.first(where: { $0.id == channelHashHex }) {
-            if existing.rfedNodeHash == rfedChannelDestHex {
+            if existing.rfedNodeHash == identityHex {
                 return existing
             }
-            // Node hash changed — update in-memory and DB, then fall through to re-subscribe
+            // Node identity changed — update in-memory and DB, then fall through to re-subscribe
             if let ctx = modelContext,
                let entity = try? ctx.fetch(FetchDescriptor<ChannelEntity>(
                    predicate: #Predicate { $0.channelHash == channelHashHex }
                )).first {
-                entity.rfedNodeHash = rfedChannelDestHex
+                entity.rfedNodeHash = identityHex
                 try? ctx.save()
             }
             channels = channels.map { ch in
                 ch.id == channelHashHex ? Channel(id: ch.id, channelName: ch.channelName,
-                    rfedNodeHash: rfedChannelDestHex,
+                    rfedNodeHash: identityHex,
                     lastMessageTime: ch.lastMessageTime, isSubscribed: ch.isSubscribed,
                     stampCost: ch.stampCost) : ch
             }
         }
-        guard let rfedChannelDest = Data(hexString: rfedChannelDestHex) else {
-            throw ChannelError.invalidRfedNode
-        }
-
         // Subscribe on the server (background thread, blocking)
         let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
-                                                    rfedChannelDest: rfedChannelDest)
+                                                    rfedNodeIdentityHashHex: identityHex)
 
         // Push wakeups are opt-in — do not register on join; user enables via Channel Info.
         // (No-op: channelPushEnabled defaults to absent/false for new channels.)
@@ -277,7 +264,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             // sorts directly against Chat.lastMessageTime.
             let now = Date().timeIntervalSince1970
             let entity = ChannelEntity(channelHash: channelHashHex, channelName: name,
-                                       rfedNodeHash: rfedChannelDestHex, lastMessageTime: now,
+                                       rfedNodeHash: identityHex, lastMessageTime: now,
                                        isSubscribed: true, stampCost: stampCost)
             ctx.insert(entity)
             try ctx.save()
@@ -291,22 +278,27 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
 
         if let existing = channels.first(where: { $0.id == channelHashHex }) {
+            reconfigureChannelStreams()
             return existing
         }
 
         let channel = Channel(id: channelHashHex, channelName: name,
-                              rfedNodeHash: rfedChannelDestHex,
+                              rfedNodeHash: identityHex,
                               lastMessageTime: Date().timeIntervalSince1970,
                               isSubscribed: true, stampCost: stampCost)
         channels.append(channel)
+        reconfigureChannelStreams()
         return channel
     }
 
     /// Leave a channel. Unsubscribes from the rfed node and removes local data.
     func leaveChannel(channelHashHex: String) async {
         guard let channel = channels.first(where: { $0.id == channelHashHex }) else { return }
+        let unsubscribeDestHex = Self.rfedDestHash(identityHashHex: channel.rfedNodeHash,
+                                app: "rfed",
+                                aspects: ["channel"])
         guard let channelHashData = Data(hexString: channelHashHex),
-              let rfedDest = Data(hexString: channel.rfedNodeHash) else { return }
+              let rfedDest = Data(hexString: unsubscribeDestHex) else { return }
 
         let pubkey = bridge.identityPublicKey(handle: identityHandle)
         let sig    = pubkey != nil ? bridge.identitySign(handle: identityHandle, data: channelHashData) : nil
@@ -317,10 +309,9 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             payload = Self.msgpackBin(channelHashData)
         }
         Task.detached(priority: .background) {
-            _ = await ConnectionStateManager.shared.rfedLinkRequest(
+            _ = await ConnectionStateManager.shared.appLinkSend(
                 destHash: rfedDest,
-                app: "rfed", aspects: "channel",
-                identityHandle: self.identityHandle,
+                app: "rfed", aspects: ["channel"],
                 path: "/rfed/unsubscribe",
                 payload: payload
             )
@@ -328,7 +319,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
         // Deregister per-channel push notification wakeup.
         let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                                                  app: "rfed", aspects: ["notify"])
+                                                  app: "rfed", aspects: ["notify", "register"])
         if let channelHashForNotify = Data(hexString: channelHashHex), !rfedNotifyHashHex.isEmpty {
             RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashForNotify,
                                                             rfedNotifyHashHex: rfedNotifyHashHex,
@@ -354,28 +345,29 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
 
         channels.removeAll { $0.id == channelHashHex }
         messages[channelHashHex] = nil
+        reconfigureChannelStreams()
     }
 
     // MARK: - Per-channel push toggle
 
-    /// Enable push wakeups for a channel: saves the pref and registers with rfed.notify.
+    /// Enable push wakeups for a channel: saves the pref and registers with rfed.notify.register.
     func enableChannelPush(channelHashHex: String) {
         UserPreferences.shared.enableChannelPush(channelHashHex)
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
         let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                                                   app: "rfed", aspects: ["notify"])
+                                                   app: "rfed", aspects: ["notify", "register"])
         guard !rfedNotifyHashHex.isEmpty else { return }
         RfedNotifyRegistrar.shared.registerForChannel(channelHash: channelHashData,
                                                        rfedNotifyHashHex: rfedNotifyHashHex,
                                                        identityHandle: identityHandle)
     }
 
-    /// Disable push wakeups for a channel: saves the pref and deregisters from rfed.notify.
+    /// Disable push wakeups for a channel: saves the pref and deregisters via rfed.notify.unregister.
     func disableChannelPush(channelHashHex: String) {
         UserPreferences.shared.disableChannelPush(channelHashHex)
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
         let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                                                   app: "rfed", aspects: ["notify"])
+                                                   app: "rfed", aspects: ["notify", "unregister"])
         guard !rfedNotifyHashHex.isEmpty else { return }
         RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashData,
                                                          rfedNotifyHashHex: rfedNotifyHashHex,
@@ -407,12 +399,11 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     /// Returns the freshly-fetched value (nil = no stamp required).
     @discardableResult
     private func refreshStampCost(for channel: Channel) async throws -> Int? {
-        guard let channelHashData = Data(hexString: channel.id),
-              let rfedChannelDest = Data(hexString: channel.rfedNodeHash) else {
+                guard let channelHashData = Data(hexString: channel.id) else {
             throw ChannelError.invalidRfedNode
         }
         let fresh = try await subscribeOnServer(channelHashData: channelHashData,
-                                                 rfedChannelDest: rfedChannelDest)
+                                                                                                 rfedNodeIdentityHashHex: channel.rfedNodeHash)
         if fresh != channel.stampCost {
             print("[RfedChannel] stampCost refreshed for \(channel.channelName): \(channel.stampCost.map(String.init) ?? "nil") → \(fresh.map(String.init) ?? "nil")")
         }
@@ -567,11 +558,21 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             print("[RfedChannel] stamp computed (cost=\(cost), stamp_bytes=\(stamp.count), payload_bytes=\(payload.count))")
         }
 
-        let ok = bridge.packetSendToHash(destHash: Data(hexString: channel.rfedNodeHash)!,
-                                          appName: "rfed", aspects: "channel",
-                                          payload: payload)
+        let publishDestHex = Self.rfedDestHash(identityHashHex: channel.rfedNodeHash,
+                                                app: "rfed",
+                                                aspects: ["channel"])
+        guard let publishDest = Data(hexString: publishDestHex) else {
+            print("[RfedChannel] Send failed: invalid publish dest derived from \(channel.rfedNodeHash)")
+            return false
+        }
+        let ok = await ConnectionStateManager.shared.appLinkSendData(
+            destHash: publishDest,
+            app: "rfed",
+            aspects: ["channel"],
+            payload: payload
+        )
         if !ok {
-            print("[RfedChannel] Send failed: \(bridge.lastError() ?? "unknown")")
+            print("[RfedChannel] Send failed: AppLinks DATA delivery failed")
             return false
         }
 
@@ -649,8 +650,8 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     @discardableResult
     func pullDeferred(channel: Channel) async -> Bool {
         let nodeKey = channel.rfedNodeHash
-        guard let rfedDeliveryDest = Data(hexString: Self.rfedDestHash(
-            identityHashHex: rfedIdentityHashFromChannelDest(nodeKey),
+        guard let rfedPullDest = Data(hexString: Self.rfedDestHash(
+            identityHashHex: nodeKey,
             app: "rfed", aspects: ["delivery"]
         )) else { return false }
 
@@ -659,10 +660,9 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             Task { @MainActor in self.pullInFlight[nodeKey] = false }
         }
 
-        let response = await ConnectionStateManager.shared.rfedLinkRequest(
-            destHash: rfedDeliveryDest,
-            app: "rfed", aspects: "delivery",
-            identityHandle: identityHandle,
+        let response = await ConnectionStateManager.shared.appLinkSend(
+            destHash: rfedPullDest,
+            app: "rfed", aspects: ["delivery"],
             path: "/rfed/pull",
             payload: Data()
         )
@@ -689,9 +689,9 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         return morePending
     }
 
-    // MARK: - RfedBlobCallback
+    // MARK: - Live channel stream receive
 
-    /// Called on a background thread by the Rust delivery endpoint.
+    /// Called on a background thread by the rfed.channel.stream AppLink callback.
     nonisolated func onRfedBlob(_ blob: Data) {
         // Blob format from server: channel_hash(16) | inner_blob(*)
         print("[RfedChannel] onRfedBlob total_bytes=\(blob.count)")
@@ -839,7 +839,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     /// Returns the rfed node's stamp_cost (nil = no stamp required).
     @discardableResult
     private func subscribeOnServer(channelHashData: Data,
-                                   rfedChannelDest: Data) async throws -> Int? {
+                                   rfedNodeIdentityHashHex: String) async throws -> Int? {
         // Payload: fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig]
         // sig = Ed25519(channel_hash). Server derives subscriber_hash from pubkey and
         // verifies the signature — no timing dependency on IDENTIFY.
@@ -849,20 +849,31 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         }
         let payload = Self.msgpackSigned(value: channelHashData, pubkey: pubkey, sig: sig)
 
-        // RFed channel subscription is an infrastructure request, not an
-        // AppLink. It owns one link request and surfaces failure directly.
+        let channelDestHex = Self.rfedDestHash(
+            identityHashHex: rfedNodeIdentityHashHex,
+            app: "rfed",
+            aspects: ["channel"]
+        )
+        guard let rfedChannelDest = Data(hexString: channelDestHex) else {
+            throw ChannelError.invalidRfedNode
+        }
+
+        // Route subscribe over the legacy rfed.channel compatibility destination.
+        // Mixed-version rfed nodes still serve /rfed/subscribe on rfed.channel
+        // even when the newer split destination hashes are absent. AppLinks
+        // still owns the path race and link establishment, so this preserves
+        // the stale-path fix without assuming split-destination support.
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        let response = await ConnectionStateManager.shared.rfedLinkRequest(
+        let response = await ConnectionStateManager.shared.appLinkSend(
             destHash: rfedChannelDest,
-            app: "rfed", aspects: "channel",
-            identityHandle: identityHandle,
+            app: "rfed", aspects: ["channel"],
             path: "/rfed/subscribe",
             payload: payload
         )
 
         guard let resp = response else {
             throw ChannelError.subscribeFailed(
-                "rfed.channel request failed or no response within 5 s")
+                "rfed.channel.subscribe request failed or no response within 5 s")
         }
         let stampCost: Int? = Self.parseSubscribeResponse(resp)
         guard stampCost != nil || resp.first == 0xc3 || resp.first == 0x92 || resp.first == 0x91 else {
@@ -901,6 +912,23 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     private func loadPersistedChannels() {
         guard let ctx = modelContext else { return }
         let entities = (try? ctx.fetch(FetchDescriptor<ChannelEntity>())) ?? []
+        // One-shot migration: pre-step-4 builds stored the rfed.channel dest hash
+        // in ChannelEntity.rfedNodeHash. Step 4 stores the rfed identity hash hex
+        // instead and derives per-op destinations on demand. If we detect a stored
+        // value that matches the legacy derivation for the user's current rfed node,
+        // rewrite it to the identity hex. NEVER REMOVE EVER — see REFACTOR.md.
+        let identityHex = prefs.effectiveRfedNodeIdentityHash
+        let legacyChannelDestHex = identityHex.isEmpty ? "" :
+            Self.rfedDestHash(identityHashHex: identityHex,
+                              app: "rfed", aspects: ["channel"])
+        var migrated = false
+        for entity in entities {
+            if !legacyChannelDestHex.isEmpty,
+               entity.rfedNodeHash == legacyChannelDestHex {
+                entity.rfedNodeHash = identityHex
+                migrated = true
+            }
+        }
         channels = entities.map {
             // Migrate legacy ms-encoded timestamps written before the unit
             // switch to seconds.  Anything > 1e11 cannot be a seconds-epoch
@@ -911,6 +939,9 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
             return Channel(id: $0.channelHash, channelName: $0.channelName,
                     rfedNodeHash: $0.rfedNodeHash, lastMessageTime: seconds,
                     isSubscribed: $0.isSubscribed, stampCost: $0.stampCost)
+        }
+        if migrated {
+            print("[RfedChannel] Migrated ChannelEntity.rfedNodeHash from legacy rfed.channel dest hash to rfed identity hex")
         }
         try? ctx.save()
     }
@@ -937,11 +968,10 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         print("[RfedChannel] Re-subscribing to \(toResub.count) persisted channel(s) after restart")
         Task {
             for channel in toResub {
-                guard let channelHashData = Data(hexString: channel.id),
-                      let rfedChannelDest  = Data(hexString: channel.rfedNodeHash) else { continue }
+                guard let channelHashData = Data(hexString: channel.id) else { continue }
                 do {
                     let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
-                                                               rfedChannelDest: rfedChannelDest)
+                                                               rfedNodeIdentityHashHex: channel.rfedNodeHash)
                     // Update in-memory stamp cost if the server returns a different value.
                     if let idx = channels.firstIndex(where: { $0.id == channel.id }) {
                         channels[idx] = Channel(id: channel.id, channelName: channel.channelName,
@@ -955,7 +985,7 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                     if UserPreferences.shared.isChannelPushEnabled(channel.id) {
                         let rfedNotifyHashHex = Self.rfedDestHash(
                             identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                            app: "rfed", aspects: ["notify"])
+                            app: "rfed", aspects: ["notify", "register"])
                         RfedNotifyRegistrar.shared.registerForChannel(
                             channelHash: channelHashData,
                             rfedNotifyHashHex: rfedNotifyHashHex,
@@ -964,6 +994,105 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
                 } catch {
                     print("[RfedChannel] Re-subscribe failed for \(channel.channelName): \(error)")
                 }
+            }
+            await MainActor.run {
+                self.reconfigureChannelStreams()
+            }
+        }
+    }
+
+    private func reconfigureChannelStreams() {
+        guard identityHandle != 0 else { return }
+
+        let channelsByNode = Dictionary(grouping: channels.filter { $0.isSubscribed }) {
+            $0.rfedNodeHash.lowercased()
+        }
+        let nodes = Set(channelsByNode.keys).union(trackedChannelStreamNodes)
+
+        for nodeIdentityHashHex in nodes {
+            let streamDestHex = Self.rfedDestHash(
+                identityHashHex: nodeIdentityHashHex,
+                app: "rfed",
+                aspects: ["channel", "stream"])
+            guard let streamDest = Data(hexString: streamDestHex) else { continue }
+
+            ensureChannelStreamTracked(nodeIdentityHashHex: nodeIdentityHashHex, streamDest: streamDest)
+
+            let filters = channelsByNode[nodeIdentityHashHex, default: []]
+                .compactMap { Data(hexString: $0.id) }
+            let status = ConnectionStateManager.shared.appLinkStatus(destHash: streamDest)
+
+            if filters.isEmpty {
+                if status == 3 {
+                    sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex,
+                                            streamDest: streamDest,
+                                            filters: filters)
+                }
+                continue
+            }
+
+            if status == 3 {
+                sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex,
+                                        streamDest: streamDest,
+                                        filters: filters)
+            } else {
+                _ = ConnectionStateManager.shared.appLinkPrime(
+                    destHash: streamDest,
+                    app: "rfed",
+                    aspects: ["channel", "stream"])
+            }
+        }
+    }
+
+    private func ensureChannelStreamTracked(nodeIdentityHashHex: String, streamDest: Data) {
+        let inserted = trackedChannelStreamNodes.insert(nodeIdentityHashHex).inserted
+        guard inserted else { return }
+
+        _ = ConnectionStateManager.shared.registerAppLinkPacketCallback(destHash: streamDest) { [weak self] data in
+            Task { @MainActor in
+                self?.onRfedBlob(data)
+            }
+        }
+
+        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: streamDest) { [weak self] status in
+            guard status == 3 else { return }
+            Task { @MainActor in
+                self?.sendChannelStreamConfigForNode(nodeIdentityHashHex: nodeIdentityHashHex)
+            }
+        }
+    }
+
+    private func sendChannelStreamConfigForNode(nodeIdentityHashHex: String) {
+        let streamDestHex = Self.rfedDestHash(
+            identityHashHex: nodeIdentityHashHex,
+            app: "rfed",
+            aspects: ["channel", "stream"])
+        guard let streamDest = Data(hexString: streamDestHex) else { return }
+        let filters = channels
+            .filter { $0.isSubscribed && $0.rfedNodeHash.caseInsensitiveCompare(nodeIdentityHashHex) == .orderedSame }
+            .compactMap { Data(hexString: $0.id) }
+        sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex,
+                                streamDest: streamDest,
+                                filters: filters)
+    }
+
+    private func sendChannelStreamConfig(nodeIdentityHashHex: String,
+                                         streamDest: Data,
+                                         filters: [Data]) {
+        guard let payload = buildChannelStreamPayload(filters: filters) else {
+            print("[RfedChannel] channel.stream config build failed for node=\(nodeIdentityHashHex)")
+            return
+        }
+
+        Task {
+            let response = await ConnectionStateManager.shared.appLinkSend(
+                destHash: streamDest,
+                app: "rfed",
+                aspects: ["channel", "stream"],
+                path: "/rfed/channel/stream/open",
+                payload: payload)
+            if !Self.channelStreamResponseOk(response) {
+                print("[RfedChannel] channel.stream config rejected for node=\(nodeIdentityHashHex) filters=\(filters.count) resp=\(response?.hexString ?? "nil")")
             }
         }
     }
@@ -986,12 +1115,9 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         messages = grouped
     }
 
-    /// Extract the rfed identity hash hex from a 32-char rfed.channel dest hash.
-    /// This is not directly reversible — we store the rfed node identity hash in the channel's
-    /// rfedNodeHash field as the rfed.channel dest hex (not the raw identity hash).
-    /// For delivery PULL, we derive rfed.delivery from the same identity hash stored in prefs.
-    private func rfedIdentityHashFromChannelDest(_ channelDestHex: String) -> String {
-        return prefs.effectiveRfedNodeIdentityHash
+    /// Helper: trim/lowercase a hex string and reject obvious non-hex input.
+    private static func normalizedHex(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     // MARK: - Static helpers
@@ -1008,14 +1134,37 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
     }
 
     /// Compute an RNS SINGLE-destination hash (mirrors Reticulum Destination::hash()).
+    nonisolated static func rfedDestHash(identityHashHex: String, app: String, aspects: String) -> String {
+        rfedDestHash(
+            identityHashHex: identityHashHex,
+            app: app,
+            aspects: normalizedAspectSegments(app: app, aspects: [aspects])
+        )
+    }
+
+    /// Compute an RNS SINGLE-destination hash (mirrors Reticulum Destination::hash()).
     nonisolated static func rfedDestHash(identityHashHex: String, app: String, aspects: [String]) -> String {
         let hex = identityHashHex.trimmingCharacters(in: .whitespaces).lowercased()
         guard hex.count == 32, let identityBytes = Data(hexString: hex) else { return "" }
-        let name = ([app] + aspects).joined(separator: ".")
+        let name = ([app] + normalizedAspectSegments(app: app, aspects: aspects)).joined(separator: ".")
         let nameHashFull = SHA256.hash(data: Data(name.utf8))
         let nameHashTrunc = Data(nameHashFull.prefix(10))
         let material = nameHashTrunc + identityBytes
         return Data(SHA256.hash(data: material).prefix(16)).hexString
+    }
+
+    private nonisolated static func normalizedAspectSegments(app: String, aspects: [String]) -> [String] {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        var segments = aspects
+            .flatMap { $0.split(whereSeparator: { $0 == "." || $0 == "," }) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if segments.first == normalizedApp {
+            segments.removeFirst()
+        }
+
+        return segments
     }
 
     /// Encode inner blob v2: 0x02 | senderHash(16) | timestampMS_BE(8) | nameLen_BE(2) | utf8name | utf8content
@@ -1052,6 +1201,36 @@ final class RfedChannelClient: ObservableObject, RfedBlobCallback {
         out.append(msgpackBin(pubkey))
         out.append(msgpackBin(sig))
         return out
+    }
+
+    nonisolated static func msgpackArrayOfBins(_ elements: [Data]) -> Data {
+        var out = Data()
+        if elements.count <= 0x0f {
+            out.append(UInt8(0x90 | elements.count))
+        } else if elements.count <= 0xffff {
+            out.append(0xdc)
+            out.append(UInt8((elements.count >> 8) & 0xff))
+            out.append(UInt8(elements.count & 0xff))
+        } else {
+            fatalError("too many channel stream filters")
+        }
+        for element in elements {
+            out.append(msgpackBin(element))
+        }
+        return out
+    }
+
+    private func buildChannelStreamPayload(filters: [Data]) -> Data? {
+        guard let pubkey = bridge.identityPublicKey(handle: identityHandle) else { return nil }
+        let value = Self.msgpackArrayOfBins(filters)
+        guard let sig = bridge.identitySign(handle: identityHandle, data: value) else { return nil }
+        return Self.msgpackSigned(value: value, pubkey: pubkey, sig: sig)
+    }
+
+    nonisolated private static func channelStreamResponseOk(_ response: Data?) -> Bool {
+        guard let response, response.count >= 2 else { return false }
+        return response[response.startIndex] == 0x92 &&
+            response[response.index(after: response.startIndex)] == 0xc3
     }
 
     /// Decode a paged PULL response from `/rfed/pull`.

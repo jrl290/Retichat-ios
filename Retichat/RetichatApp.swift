@@ -67,6 +67,12 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         let oldToken = UserPreferences.shared.apnsDeviceToken
         UserPreferences.shared.apnsDeviceToken = hex
 
+        // Log enough of the token to compare against the bridge's stored row
+        // without writing the full secret to disk.
+        let suffix = hex.count >= 8 ? String(hex.suffix(8)) : hex
+        let changed = (hex != oldToken)
+        print("[APNs] device token registered tail=…\(suffix) len=\(hex.count) changed=\(changed)")
+
         // If the token changed (or is new), re-register with the rfed APNs bridge.
         if hex != oldToken, !repository.ownHash.isEmpty,
               !UserPreferences.shared.effectiveRfedNodeIdentityHash.isEmpty {
@@ -275,8 +281,6 @@ struct RetichatApp: App {
                     ConnectionStateManager.shared.onAppForeground()
                     // Re-open the persistent rfed node link.
                     ConnectionStateManager.shared.openRfedNodeLink()
-                    // Re-announce rfed delivery to flush deferred channel blobs
-                    channelClient.announceDelivery()
                     // Note: lxmf.delivery is auto-announced by Transport's
                     // publish daemon on every interface up-edge and every
                     // 30 minutes — no explicit foreground re-announce needed.
@@ -307,20 +311,17 @@ struct RetichatApp: App {
         }
     }
 
-    // MARK: - Deep link: lxmf://<hash>
+    // MARK: - Deep link: lxma://<hash>:<pubkey> / lxmf://<hash>
 
     private func handleDeepLink(_ url: URL) {
-        let scheme = url.scheme?.lowercased() ?? ""
-        guard scheme == "lxma" || scheme == "lxmf" else { return }
-        // host may be <hash> or <hash>.<pubkey> — extract hash only
-        let raw = (url.host ?? "").lowercased()
-        let hashPart = raw.components(separatedBy: ".").first ?? raw
-        let hash = hashPart.filter { "0123456789abcdef".contains($0) }
-        guard hash.count == 32 else { return }
-        _ = repository.createDirectChat(destHash: hash)
+        guard let peer = IdentityShareFormat.parse(url.absoluteString) else { return }
+        let chatId = repository.createDirectChat(
+            destHash: peer.destinationHashHex,
+            publicKey: peer.publicKey
+        )
         NotificationCenter.default.post(
-            name: .init("OpenChat"),
-            object: hash
+            name: .openChatFromNotification,
+            object: chatId
         )
     }
 
@@ -328,6 +329,7 @@ struct RetichatApp: App {
 
     private func requestNotificationPermission() {
         NotificationManager.shared.checkPermission { status in
+            print("[APNs] notification auth status=\(status.rawValue)")
             switch status {
             case .notDetermined:
                 NotificationManager.shared.requestPermission()
@@ -336,7 +338,7 @@ struct RetichatApp: App {
                     UIApplication.shared.registerForRemoteNotifications()
                 }
             default:
-                break
+                print("[APNs] notification permission not granted (status=\(status.rawValue)); pushes will be dropped by the OS")
             }
         }
     }
