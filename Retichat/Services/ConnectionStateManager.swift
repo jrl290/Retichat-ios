@@ -44,6 +44,12 @@ let _appLinkStatusTrampoline: lxmf_app_link_status_callback_t = {
 final class ConnectionStateManager {
     static let shared = ConnectionStateManager()
 
+    private enum RequestOpenMode {
+        case none
+        case ephemeral
+        case persistent
+    }
+
     // MARK: - Private state
 
     /// Last-seen announce time per destination hash hex.
@@ -313,9 +319,22 @@ final class ConnectionStateManager {
                      payload: Data) async -> Data? {
         guard let client = lxmfClient else { return nil }
 
-            // Idempotent persistent open: no-op if already registered/active.
-        if client.appLinkStatus(destHash) != 3 {
-                client.appLinkOpenPersistent(destHash, app: app, aspects: aspects)
+        let normalizedAspects = normalizedAspectSegments(app: app, aspects: aspects)
+        let usePersistentLink = prefersPersistentAppLink(app: app, aspects: normalizedAspects)
+
+        switch requestOpenMode(
+            usePersistentLink: usePersistentLink,
+            currentStatus: client.appLinkStatus(destHash)
+        ) {
+        case .persistent:
+            // `open()` can report ACTIVE once the path is READY even though no
+            // held requestable handle exists yet. The live RFed stream endpoints
+            // need the held persistent link, not just a ready route.
+            client.appLinkOpenPersistent(destHash, app: app, aspects: normalizedAspects)
+        case .ephemeral:
+            client.appLinkOpen(destHash, app: app, aspects: normalizedAspects)
+        case .none:
+            break
         }
 
         // Wait up to 5 s for ACTIVE.
@@ -327,6 +346,19 @@ final class ConnectionStateManager {
         }
         guard client.appLinkStatus(destHash) == 3 else { return nil }
 
+        if !usePersistentLink {
+            let identityHandle = client.identityHandle
+            guard identityHandle != 0 else { return nil }
+            return await oneShotRfedRequest(
+                destHash: destHash,
+                app: app,
+                aspects: aspectSpec(app: app, aspects: normalizedAspects),
+                identityHandle: identityHandle,
+                path: path,
+                payload: payload
+            )
+        }
+
         // Async FFI variant: suspends the awaiting Task without parking
         // a cooperative-pool thread on a synchronous Rust receive.
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
@@ -336,8 +368,9 @@ final class ConnectionStateManager {
         )
     }
 
-    /// Prime an ephemeral APP_LINK destination so announce/path readiness can
-    /// be observed via the standard status callback fan-out.
+    /// Prime an APP_LINK destination using its preferred ownership mode so
+    /// announce/path readiness can be observed via the standard status callback
+    /// fan-out.
     @discardableResult
     func appLinkPrime(destHash: Data,
                       app: String,
@@ -354,7 +387,11 @@ final class ConnectionStateManager {
                       app: String,
                       aspects: [String]) -> Bool {
         guard let client = lxmfClient else { return false }
-        return client.appLinkOpen(destHash, app: app, aspects: aspects)
+        let normalizedAspects = normalizedAspectSegments(app: app, aspects: aspects)
+        if prefersPersistentAppLink(app: app, aspects: normalizedAspects) {
+            return client.appLinkOpenPersistent(destHash, app: app, aspects: normalizedAspects)
+        }
+        return client.appLinkOpen(destHash, app: app, aspects: normalizedAspects)
     }
 
     /// Send a plain DATA packet via AppLinks and suspend until Reticulum
@@ -398,6 +435,60 @@ final class ConnectionStateManager {
         return segments
     }
 
+    private func normalizedAspectSegments(app: String, aspects: [String]) -> [String] {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        var segments = aspects
+            .flatMap { $0.split(whereSeparator: { $0 == "." || $0 == "," }) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if segments.first == normalizedApp {
+            segments.removeFirst()
+        }
+
+        return segments
+    }
+
+    private func prefersPersistentAppLink(app: String, aspects: [String]) -> Bool {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        let segments = normalizedAspectSegments(app: app, aspects: aspects)
+        return normalizedApp == "rfed" && (
+            segments == ["channel", "stream"] ||
+            segments == ["propagation", "stream"]
+        )
+    }
+
+    private func requestOpenMode(usePersistentLink: Bool, currentStatus: Int32) -> RequestOpenMode {
+        if usePersistentLink { return .persistent }
+        if currentStatus != 3 { return .ephemeral }
+        return .none
+    }
+
+    private func aspectSpec(app: String, aspects: [String]) -> String {
+        normalizedAspectSegments(app: app, aspects: aspects).joined(separator: ".")
+    }
+
+    private func oneShotRfedRequest(destHash: Data,
+                                    app: String,
+                                    aspects: String,
+                                    identityHandle: UInt64,
+                                    path: String,
+                                    payload: Data,
+                                    timeoutSecs: Double = 5.0) async -> Data? {
+        let bridge = RetichatBridge.shared
+        return await Task.detached(priority: .utility) {
+            bridge.linkRequest(
+                destHash: destHash,
+                appName: app,
+                aspects: aspects,
+                identityHandle: identityHandle,
+                path: path,
+                payload: payload,
+                timeoutSecs: timeoutSecs
+            )
+        }.value
+    }
+
     /// Legacy single-shot RFed infrastructure request.
     ///
     /// Use this only for flows that intentionally own a fresh link lifecycle.
@@ -416,18 +507,15 @@ final class ConnectionStateManager {
                          path: String,
                          payload: Data,
                          timeoutSecs: Double = 5.0) async -> Data? {
-        let bridge = RetichatBridge.shared
-                        return await Task.detached(priority: .utility) {
-                            return bridge.linkRequest(
-                destHash: destHash,
-                appName: app,
-                aspects: aspects,
-                identityHandle: identityHandle,
-                path: path,
-                payload: payload,
-                timeoutSecs: timeoutSecs
-            )
-        }.value
+        await oneShotRfedRequest(
+            destHash: destHash,
+            app: app,
+            aspects: aspects,
+            identityHandle: identityHandle,
+            path: path,
+            payload: payload,
+            timeoutSecs: timeoutSecs
+        )
     }
 
     /// Call when a conversation screen appears for a peer (direct or group member).

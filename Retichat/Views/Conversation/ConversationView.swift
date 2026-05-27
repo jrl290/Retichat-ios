@@ -27,6 +27,7 @@ struct ConversationView: View {
     @EnvironmentObject var channelClient: RfedChannelClient
     @StateObject private var viewModel: ConversationViewModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     let mode: ConversationMode
 
@@ -314,6 +315,15 @@ struct ConversationView: View {
                 channelClient.releaseRfedLinkMonitor()
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active, let channel else { return }
+            let channelKey = channel.id.lowercased()
+            guard !(channelClient.pullInFlight[channelKey] ?? false) else { return }
+            channelClient.canPullMore[channelKey] = nil
+            Task {
+                await channelClient.pullDeferred(channel: channel)
+            }
+        }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
             if case .dm(let id) = mode {
                 viewModel.refreshMessages(chatId: id, repository: repository)
@@ -384,12 +394,12 @@ struct ConversationView: View {
 
     private func channelMessagesList(channel: Channel) -> some View {
         let msgs = channelClient.messages[channel.id] ?? []
-        let nodeKey = channel.rfedNodeHash
         // Treat "unknown" (nil) as "more might be pending" so the user is
         // always offered an initial pull when entering a channel; a previous
         // pull that returned more_pending=false explicitly sets it to false.
-        let canPull = channelClient.canPullMore[nodeKey] ?? true
-        let pulling = channelClient.pullInFlight[nodeKey] ?? false
+        let channelKey = channel.id.lowercased()
+        let canPull = channelClient.canPullMore[channelKey] ?? true
+        let pulling = channelClient.pullInFlight[channelKey] ?? false
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 4) {
@@ -489,10 +499,11 @@ struct ConversationView: View {
             }
             .onAppear {
                 scrollProxy = proxy
+                channelClient.markChannelOpenedForStreaming(channelHashHex: channel.id)
                 // Re-enable the page-load action whenever the user re-enters
                 // the channel: the server may have queued more blobs since
                 // the last visit.
-                channelClient.canPullMore[nodeKey] = nil
+                channelClient.canPullMore[channelKey] = nil
                 if !(channelClient.messages[channel.id] ?? []).isEmpty {
                     scrollChannelToBottom(proxy: proxy, animated: false)
                 }
@@ -510,6 +521,7 @@ struct ConversationView: View {
                 guard channelClient.rfedNodeStatus == .connected else { return }
                 let gen = channelClient.rfedLinkGeneration
                 guard lastAutoPullGeneration != gen else { return }
+                guard !(channelClient.pullInFlight[channelKey] ?? false) else { return }
                 lastAutoPullGeneration = gen
                 await channelClient.pullDeferred(channel: channel)
             }

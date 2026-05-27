@@ -36,6 +36,20 @@
 //      timer is started on the first retain and cancelled only on the LAST
 //      release.  Two surfaces (Settings + channel chat) must be able to
 //      observe concurrently without one cancelling the other.
+//
+//   6. Channel-stream filter policy: the persistent `rfed.channel.stream`
+//      link keeps a runtime-only filter set of channels whose conversation
+//      screen has been opened in this process. Subscribed-but-never-opened
+//      channels do not stream live, and opened channels remain in the set
+//      until process teardown or unsubscribe.
+//
+//   7. App-link request ownership policy: only the live RFed stream endpoints
+//      use held persistent links. Channel backlog pull stays on the ephemeral
+//      path and uses a one-shot raw request after AppLinks reports readiness.
+//
+//   8. Source-level hooks: channel backlog pull must target `rfed.channel.pull`
+//      with an addressed channel-hash payload, and the channel conversation
+//      must trigger that pull again on app foreground.
 
 import Foundation
 
@@ -51,6 +65,25 @@ func check(_ cond: @autoclosure () -> Bool, _ name: String, _ detail: String = "
         print("FAIL  - \(msg)")
         failures.append(msg)
     }
+}
+
+func sourceFile(_ components: [String]) throws -> String {
+    let sourceURL = components.reduce(
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    ) { partial, component in
+        partial.appendingPathComponent(component)
+    }
+    return try String(contentsOf: sourceURL, encoding: .utf8)
+}
+
+func sourceFragment(_ source: String, start: String, end: String) -> String? {
+    guard let startRange = source.range(of: start) else { return nil }
+    guard let endRange = source.range(of: end, range: startRange.upperBound..<source.endIndex) else {
+        return nil
+    }
+    return String(source[startRange.lowerBound..<endRange.lowerBound])
 }
 
 // ── msgpack encoder helpers (mirror rmpv output the server emits) ───────────
@@ -456,6 +489,326 @@ func testSettingsAndChannelChatCoexist() {
     check(!m.timerRunning, "monitor stops once the last surface releases")
 }
 
+// ── Channel-stream filter policy (mirror RfedChannelClient logic) ──────────
+
+struct StreamedChannel {
+    let id: String
+    let nodeId: String
+    let isSubscribed: Bool
+}
+
+final class ChannelStreamPolicyModel {
+    private(set) var openedChannelIds: Set<String> = []
+
+    func markChannelOpened(_ channelId: String) {
+        openedChannelIds.insert(channelId.lowercased())
+    }
+
+    func removeChannel(_ channelId: String) {
+        openedChannelIds.remove(channelId.lowercased())
+    }
+
+    func filtersByNode(channels: [StreamedChannel]) -> [String: [String]] {
+        let subscribed = channels.filter { $0.isSubscribed }
+        let nodes = Set(subscribed.map { $0.nodeId.lowercased() })
+        let openedByNode = Dictionary(grouping: subscribed.filter {
+            openedChannelIds.contains($0.id.lowercased())
+        }) {
+            $0.nodeId.lowercased()
+        }
+
+        var result: [String: [String]] = [:]
+        for node in nodes {
+            result[node] = openedByNode[node, default: []].map { $0.id.lowercased() }
+        }
+        return result
+    }
+}
+
+func testSubscribedChannelsStartWithEmptyLiveFilters() {
+    let model = ChannelStreamPolicyModel()
+    let filters = model.filtersByNode(channels: [
+        StreamedChannel(id: "aa", nodeId: "node1", isSubscribed: true),
+        StreamedChannel(id: "bb", nodeId: "node1", isSubscribed: true)
+    ])
+    check(filters["node1"] == [],
+          "subscribed-but-never-opened channels MUST NOT stream live")
+}
+
+func testOpeningChannelAddsOnlyThatChannelToLiveFilters() {
+    let model = ChannelStreamPolicyModel()
+    model.markChannelOpened("aa")
+    let filters = model.filtersByNode(channels: [
+        StreamedChannel(id: "aa", nodeId: "node1", isSubscribed: true),
+        StreamedChannel(id: "bb", nodeId: "node1", isSubscribed: true)
+    ])
+    check(filters["node1"] == ["aa"],
+          "opening one channel streams only that channel")
+}
+
+func testOpenedChannelsStayStreamedAcrossLaterOpens() {
+    let model = ChannelStreamPolicyModel()
+    model.markChannelOpened("aa")
+    model.markChannelOpened("bb")
+    let filters = model.filtersByNode(channels: [
+        StreamedChannel(id: "aa", nodeId: "node1", isSubscribed: true),
+        StreamedChannel(id: "bb", nodeId: "node1", isSubscribed: true),
+        StreamedChannel(id: "cc", nodeId: "node1", isSubscribed: true)
+    ])
+    check(filters["node1"] == ["aa", "bb"],
+          "later opens extend the live filter set without dropping earlier opens")
+}
+
+func testUnsubscribeDropsChannelFromRuntimeLiveFilters() {
+    let model = ChannelStreamPolicyModel()
+    model.markChannelOpened("aa")
+    model.removeChannel("aa")
+    let filters = model.filtersByNode(channels: [
+        StreamedChannel(id: "aa", nodeId: "node1", isSubscribed: true)
+    ])
+    check(filters["node1"] == [],
+          "unsubscribed channel MUST be removed from the runtime live filter set")
+}
+
+// ── App-link request ownership policy (mirror ConnectionStateManager logic) ──
+
+enum RequestOpenMode: Equatable {
+    case none
+    case ephemeral
+    case persistent
+}
+
+struct AppLinkRequestModel {
+    static func prefersPersistent(app: String, aspects: [String]) -> Bool {
+        let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        var segments = aspects
+        if segments.first == normalizedApp {
+            segments.removeFirst()
+        }
+        return normalizedApp == "rfed" && (
+            segments == ["channel", "stream"] ||
+            segments == ["propagation", "stream"]
+        )
+    }
+
+    static func requestOpenMode(usePersistentLink: Bool, currentStatus: Int) -> RequestOpenMode {
+        if usePersistentLink { return .persistent }
+        if currentStatus != 3 { return .ephemeral }
+        return .none
+    }
+}
+
+func testLiveStreamsPreferPersistentAppLinks() {
+    check(
+        AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["channel", "stream"]),
+        "channel.stream MUST prefer persistent AppLinks"
+    )
+    check(
+        AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["propagation", "stream"]),
+        "propagation.stream MUST prefer persistent AppLinks"
+    )
+    check(
+        !AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["channel", "pull"]),
+        "channel.pull MUST stay on the ephemeral AppLinks path"
+    )
+}
+
+func testPersistentRequestStillUpgradesReadyOnlyActiveToHeldLink() {
+    check(
+        AppLinkRequestModel.requestOpenMode(usePersistentLink: true, currentStatus: 3) == .persistent,
+        "persistent request helper MUST call openPersistent even when status is already ACTIVE"
+    )
+}
+
+func testEphemeralActiveRequestDoesNotReopen() {
+    check(
+        AppLinkRequestModel.requestOpenMode(usePersistentLink: false, currentStatus: 3) == .none,
+        "ephemeral active request MUST reuse the ready app-link state without reopening"
+    )
+}
+
+func testEphemeralInactiveRequestOpensEphemeralLink() {
+    check(
+        AppLinkRequestModel.requestOpenMode(usePersistentLink: false, currentStatus: 1) == .ephemeral,
+        "ephemeral inactive request MUST open the non-persistent app-link path"
+    )
+}
+
+func testChannelPullSourceUsesSplitDestinationAndAddressedPayload() {
+    do {
+        let source = try sourceFile(["Retichat", "Services", "RfedChannelClient.swift"])
+        guard let fragment = sourceFragment(
+            source,
+            start: "func pullDeferred(channel: Channel) async -> Bool {",
+            end: "    // MARK: - Live channel stream receive"
+        ) else {
+            check(false, "extracts pullDeferred source fragment")
+            return
+        }
+
+        check(
+            fragment.contains("aspects: [\"channel\", \"pull\"]"),
+            "channel pull uses rfed.channel.pull"
+        )
+        check(
+            fragment.contains("payload: Self.msgpackBin(channelHashData)"),
+            "channel pull sends the addressed channel hash payload"
+        )
+        check(
+            !fragment.contains("aspects: [\"delivery\"]"),
+            "channel pull no longer targets the legacy delivery destination"
+        )
+    } catch {
+        check(false, "reads RfedChannelClient source", String(describing: error))
+    }
+}
+
+func testConversationSourcePullsChannelOnForeground() {
+    do {
+        let source = try sourceFile(["Retichat", "Views", "Conversation", "ConversationView.swift"])
+
+        check(
+            source.contains("@Environment(\\.scenePhase) private var scenePhase"),
+            "conversation view watches scenePhase for foreground pulls"
+        )
+
+        guard let fragment = sourceFragment(
+            source,
+            start: ".onChange(of: scenePhase)",
+            end: ".onReceive(Timer.publish"
+        ) else {
+            check(false, "extracts scenePhase foreground source fragment")
+            return
+        }
+
+        check(
+            fragment.contains("channelClient.canPullMore[channelKey] = nil"),
+            "foreground channel pull re-enables the paging affordance before requesting"
+        )
+        check(
+            fragment.contains("await channelClient.pullDeferred(channel: channel)"),
+            "foreground channel pull requests channel backlog on app active"
+        )
+    } catch {
+        check(false, "reads ConversationView source", String(describing: error))
+    }
+}
+
+// ── Early startup + queued RFed ops (mirror RfedChannelClient logic) ─────
+
+enum ChannelClientStartAction: Equatable {
+    case loadPersistedState
+    case startNetworkFlows
+}
+
+final class ChannelClientStartModel {
+    var didLoadPersistedState = false
+    var didStartNetworkFlows = false
+    var identityReady = false
+
+    func start() -> [ChannelClientStartAction] {
+        var actions: [ChannelClientStartAction] = []
+        if !didLoadPersistedState {
+            didLoadPersistedState = true
+            actions.append(.loadPersistedState)
+        }
+        guard identityReady else { return actions }
+        if !didStartNetworkFlows {
+            didStartNetworkFlows = true
+            actions.append(.startNetworkFlows)
+        }
+        return actions
+    }
+}
+
+enum QueuedChannelOperation: Equatable {
+    case send(channelId: String)
+    case pull(channelId: String)
+}
+
+final class PendingRfedOpModel {
+    var identityReady = false
+    var ownHashReady = false
+    private(set) var queued: [QueuedChannelOperation] = []
+    private var queuedPullIds: Set<String> = []
+
+    private var canIssueRfedOperations: Bool {
+        identityReady && ownHashReady
+    }
+
+    func send(channelId: String) -> [QueuedChannelOperation] {
+        guard canIssueRfedOperations else {
+            queued.append(.send(channelId: channelId.lowercased()))
+            return []
+        }
+        return [.send(channelId: channelId.lowercased())]
+    }
+
+    func pull(channelId: String) -> [QueuedChannelOperation] {
+        let normalized = channelId.lowercased()
+        guard canIssueRfedOperations else {
+            if queuedPullIds.insert(normalized).inserted {
+                queued.append(.pull(channelId: normalized))
+            }
+            return []
+        }
+        return [.pull(channelId: normalized)]
+    }
+
+    func drainIfReady() -> [QueuedChannelOperation] {
+        guard canIssueRfedOperations else { return [] }
+        let drained = queued
+        queued = []
+        queuedPullIds = []
+        return drained
+    }
+}
+
+func testPersistedStateLoadsBeforeIdentityReady() {
+    let model = ChannelClientStartModel()
+    check(model.start() == [.loadPersistedState],
+          "channel state MUST hydrate before the RFed identity is ready")
+    model.identityReady = true
+    check(model.start() == [.startNetworkFlows],
+          "network flows start later, once identity becomes ready")
+}
+
+func testQueuedRfedOpsDrainInOriginalOrderOnceReady() {
+    let model = PendingRfedOpModel()
+    _ = model.send(channelId: "aa")
+    _ = model.pull(channelId: "bb")
+    model.identityReady = true
+    model.ownHashReady = true
+    check(model.drainIfReady() == [
+        .send(channelId: "aa"),
+        .pull(channelId: "bb")
+    ], "queued RFed send/pull requests MUST drain in FIFO order once ready")
+}
+
+func testQueuedPullCollapsesDuplicateRequestsUntilReady() {
+    let model = PendingRfedOpModel()
+    _ = model.pull(channelId: "aa")
+    _ = model.pull(channelId: "AA")
+    check(model.queued == [.pull(channelId: "aa")],
+          "duplicate queued pulls for the same channel MUST collapse before readiness")
+}
+
+// ── Verified channel-message delivery state (mirror RfedChannelClient) ─────
+
+func verifiedChannelMessageDeliveryState(isOutgoing: Bool) -> Int {
+    isOutgoing ? 1 : 2
+}
+
+func testOutgoingVerifiedChannelMessageStaysSingleCheck() {
+    check(verifiedChannelMessageDeliveryState(isOutgoing: true) == 1,
+          "outgoing echoed channel messages MUST stay at sent, not delivered")
+}
+
+func testIncomingVerifiedChannelMessageShowsDelivered() {
+    check(verifiedChannelMessageDeliveryState(isOutgoing: false) == 2,
+          "incoming channel messages still render as delivered")
+}
+
 // ── Run all ─────────────────────────────────────────────────────────────────
 
 print("─── PULL decoder tests ─────────────────────────────")
@@ -480,6 +833,29 @@ testRetainStartsTimerOnceForMultipleRetains()
 testReleaseStopsTimerOnlyOnFinalRelease()
 testReleaseIsClampedAtZero()
 testSettingsAndChannelChatCoexist()
+
+print("─── Channel-stream policy tests ─────────────────────")
+testSubscribedChannelsStartWithEmptyLiveFilters()
+testOpeningChannelAddsOnlyThatChannelToLiveFilters()
+testOpenedChannelsStayStreamedAcrossLaterOpens()
+testUnsubscribeDropsChannelFromRuntimeLiveFilters()
+
+print("─── App-link request policy tests ───────────────────")
+testLiveStreamsPreferPersistentAppLinks()
+testPersistentRequestStillUpgradesReadyOnlyActiveToHeldLink()
+testEphemeralActiveRequestDoesNotReopen()
+testEphemeralInactiveRequestOpensEphemeralLink()
+testChannelPullSourceUsesSplitDestinationAndAddressedPayload()
+testConversationSourcePullsChannelOnForeground()
+
+print("─── Early startup + queued RFed op tests ────────────")
+testPersistedStateLoadsBeforeIdentityReady()
+testQueuedRfedOpsDrainInOriginalOrderOnceReady()
+testQueuedPullCollapsesDuplicateRequestsUntilReady()
+
+print("─── Channel delivery-state tests ─────────────────────")
+testOutgoingVerifiedChannelMessageStaysSingleCheck()
+testIncomingVerifiedChannelMessageShowsDelivered()
 
 print("────────────────────────────────────────────────────")
 if failures.isEmpty {

@@ -54,6 +54,14 @@ func sourceFile(_ components: [String]) throws -> String {
     return try String(contentsOf: sourceURL, encoding: .utf8)
 }
 
+func sourceFragment(_ source: String, start: String, end: String) -> String? {
+    guard let startRange = source.range(of: start) else { return nil }
+    guard let endRange = source.range(of: end, range: startRange.upperBound..<source.endIndex) else {
+        return nil
+    }
+    return String(source[startRange.lowerBound..<endRange.lowerBound])
+}
+
 func testRfedPropagationStreamKeepsPolling() {
     let derived = "0f75ac15424242424242424242424242"
     check(
@@ -131,23 +139,32 @@ func testWhitespaceAndCaseNormalization() {
 func testSourceHooksPropagationReadyPolling() {
     do {
         let repository = try sourceFile(["Retichat", "Services", "ChatRepository.swift"])
-        let connectionState = try sourceFile(["Retichat", "Services", "ConnectionStateManager.swift"])
+        let app = try sourceFile(["Retichat", "RetichatApp.swift"])
 
         check(
-            repository.contains("setEssentialDestinationReadyHandler(destHash: watchDest)"),
-            "repository registers propagation ready handler"
+            repository.contains("_ = client.setPropagationNode(nodeHash: nodeHash)"),
+            "repository sets the propagation node before sync"
         )
         check(
-            repository.contains("pollPropagationNode(force: true)"),
-            "repository forces immediate poll on ready"
+            repository.contains("_ = bridge.transportRequestPath(destHash: nodeHash)"),
+            "repository requests the propagation path when identity is unknown"
         )
         check(
-            connectionState.contains("appendDestination(\"lxmf.propagation\", derivedPropHash)"),
-            "connection state tracks derived propagation as essential"
+            repository.contains("let ok = client.sync(nodeHash: nodeHash)"),
+            "repository foreground/background polling uses LXMF sync"
+        )
+
+        guard let activeFragment = sourceFragment(app, start: "case .active:", end: "case .background:") else {
+            check(false, "extracts app active scenePhase branch")
+            return
+        }
+        check(
+            activeFragment.contains("repository.psyncNeededOnForeground = false"),
+            "app foreground clears the suspension marker"
         )
         check(
-            connectionState.contains("rfedServiceTargets.append((\"lxmf.propagation\", derivedPropHash))"),
-            "connection state seeds derived propagation from rfed siblings"
+            activeFragment.contains("repository.pollPropagationNode(force: true)"),
+            "app foreground always forces propagation pull"
         )
     } catch {
         check(false, "reads propagation polling sources", String(describing: error))

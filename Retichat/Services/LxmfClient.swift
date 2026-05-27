@@ -240,6 +240,15 @@ final class LxmfClient: @unchecked Sendable {
 
     // MARK: - Propagation
 
+    /// Set the outbound propagation node without starting a sync.
+    @discardableResult
+    func setPropagationNode(nodeHash: Data) -> Bool {
+        nodeHash.withUnsafeBytes { buf -> Bool in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_client_set_propagation_node(handle, p, UInt32(nodeHash.count)) == 0
+        }
+    }
+
     /// Set a propagation node and request messages.
     @discardableResult
     func sync(nodeHash: Data) -> Bool {

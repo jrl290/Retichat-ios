@@ -33,7 +33,11 @@
 //    RECV   → live DATA over persistent rfed.channel.stream. Server hands us
 //             [channel_hash(16) | inner_blob] — concatenate them and feed
 //             the result to channelLxmUnpack as a complete lxmf_data.
-//    PULL   → AppLinks request /rfed/pull on rfed.delivery, response: [[bin16, blob], ...]
+//    PULL   → AppLinks request /rfed/pull on rfed.channel.pull,
+//             payload: msgpack bin(16) channel_hash,
+//             response: [ [[bin16, blob], ...], bool more_pending ]
+//             (legacy rfed.delivery /rfed/pull remains server-side for
+//              compatibility with older clients.)
 //  ============================================================================
 //
 
@@ -66,25 +70,40 @@ final class RfedChannelClient: ObservableObject {
 
     @Published var rfedNodeStatus: NodeStatus = .unknown
 
-    /// Whether the rfed node *might* still have pending deferred blobs queued
-    /// for this subscriber.  Keyed by the rfed node hash hex (since `/rfed/pull`
-    /// is per-node, not per-channel).  `nil` (or `true`) means "user may try a
-    /// PULL"; `false` means the last PULL returned `more_pending=false` so the
-    /// UI hides the page-load action until something happens to suggest more
-    /// blobs may have arrived (channel re-open, app foreground, etc.).
+    /// Whether the requested channel *might* still have pending deferred blobs.
+    /// Keyed by channel hash hex because `rfed.channel.pull` is channel-scoped.
+    /// `nil` (or `true`) means "user may try a PULL"; `false` means the last
+    /// addressed PULL returned `more_pending=false` so the UI hides the page-load
+    /// action until something happens to suggest more blobs may have arrived
+    /// (channel re-open, app foreground, etc.).
     @Published var canPullMore: [String: Bool] = [:]
 
-    /// True while a `/rfed/pull` request is in flight for the given node.
+    /// True while a `/rfed/pull` request is in flight for the given channel.
     /// UI uses this to disable the page-load button to prevent double taps.
     @Published var pullInFlight: [String: Bool] = [:]
 
     private var linkStatusTimer: AnyCancellable?
     private var trackedChannelStreamNodes: Set<String> = []
+    /// Runtime-only set of channel hashes whose conversation view has been
+    /// opened in this app process. `rfed.channel.stream` filters are derived
+    /// from this set so the persistent link only streams channels the user has
+    /// actually opened, while keeping them live until process teardown.
+    private var openedChannelStreamHashes: Set<String> = []
 
     /// One-shot guard: re-subscribe to persisted channels exactly once
     /// per app run, the first time the rfed.channel route is reachable.
     /// Set to true after the first successful re-subscribe pass kicks off.
     private var didResubscribeOnActive = false
+    private var didLoadPersistedState = false
+    private var didStartNetworkFlows = false
+
+    private enum PendingRfedOperation {
+        case send(content: String, channel: Channel, optimisticId: String)
+        case pull(channel: Channel)
+    }
+
+    private var pendingRfedOperations: [PendingRfedOperation] = []
+    private var pendingPullChannelHashes: Set<String> = []
 
     // MARK: - Dependencies
 
@@ -121,18 +140,85 @@ final class RfedChannelClient: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
-        guard identityHandle != 0 else { return }
-        loadPersistedChannels()
-        loadPersistedMessages()
+        if !didLoadPersistedState {
+            loadPersistedChannels()
+            loadPersistedMessages()
+            didLoadPersistedState = true
+        }
 
-        // Drive re-subscribe from rfed.channel reachability instead of
-        // routing RFed through the direct-chat AppLinks mechanism.
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        scheduleResubscribeOnRfedChannelActive()
+        guard identityHandle != 0 else { return }
+        if !didStartNetworkFlows {
+            didStartNetworkFlows = true
+
+            // Drive re-subscribe from rfed.channel reachability instead of
+            // routing RFed through the direct-chat AppLinks mechanism.
+            // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+            scheduleResubscribeOnRfedChannelActive()
+        }
+
+        drainPendingRfedOperationsIfReady()
     }
 
     func stop() {
+        didStartNetworkFlows = false
+        didResubscribeOnActive = false
         stopRfedLinkMonitor()
+    }
+
+    private var canIssueRfedOperations: Bool {
+        identityHandle != 0 && !ownHashHex.isEmpty
+    }
+
+    private func liveChannel(channelHashHex: String) -> Channel? {
+        let normalized = Self.normalizedHex(channelHashHex)
+        return channels.first { Self.normalizedHex($0.id) == normalized }
+    }
+
+    private func enqueuePendingSend(content: String, channel: Channel, optimisticId: String) {
+        pendingRfedOperations.append(.send(content: content, channel: channel, optimisticId: optimisticId))
+        print("[RfedChannel] queued SEND until RFed stack is ready channel=\(channel.channelName) pending=\(pendingRfedOperations.count)")
+    }
+
+    private func enqueuePendingPull(channel: Channel) {
+        let normalized = Self.normalizedHex(channel.id)
+        guard pendingPullChannelHashes.insert(normalized).inserted else { return }
+        pendingRfedOperations.append(.pull(channel: channel))
+        print("[RfedChannel] queued PULL until RFed stack is ready channel=\(channel.channelName) pending=\(pendingRfedOperations.count)")
+    }
+
+    private func drainPendingRfedOperationsIfReady() {
+        guard canIssueRfedOperations else { return }
+        guard !pendingRfedOperations.isEmpty else { return }
+
+        let queued = pendingRfedOperations
+        pendingRfedOperations.removeAll()
+        pendingPullChannelHashes.removeAll()
+        print("[RfedChannel] draining \(queued.count) queued RFed channel op(s)")
+
+        for operation in queued {
+            switch operation {
+            case .send(let content, let channel, let optimisticId):
+                guard let live = liveChannel(channelHashHex: channel.id) else {
+                    markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
+                    continue
+                }
+                Task { await self.sendMessageAsync(content: content, toChannel: live, optimisticId: optimisticId) }
+            case .pull(let channel):
+                guard let live = liveChannel(channelHashHex: channel.id) else {
+                    pullInFlight[channel.id] = false
+                    continue
+                }
+                Task { _ = await self.pullDeferred(channel: live) }
+            }
+        }
+    }
+
+    func markChannelOpenedForStreaming(channelHashHex: String) {
+        let normalized = Self.normalizedHex(channelHashHex)
+        guard !normalized.isEmpty else { return }
+        let inserted = openedChannelStreamHashes.insert(normalized).inserted
+        guard inserted else { return }
+        reconfigureChannelStreams()
     }
 
     // MARK: - RFed node link status monitor
@@ -344,6 +430,7 @@ final class RfedChannelClient: ObservableObject {
         }
 
         channels.removeAll { $0.id == channelHashHex }
+        openedChannelStreamHashes.remove(Self.normalizedHex(channelHashHex))
         messages[channelHashHex] = nil
         reconfigureChannelStreams()
     }
@@ -432,30 +519,42 @@ final class RfedChannelClient: ObservableObject {
         Task { await self.sendMessageAsync(content: content, toChannel: channel) }
     }
 
-    private func sendMessageAsync(content: String, toChannel channel: Channel) async {
+    private func sendMessageAsync(content: String,
+                                  toChannel channel: Channel,
+                                  optimisticId existingOptimisticId: String? = nil) async {
         // --- Optimistic bubble: insert IMMEDIATELY in `pending` so the user
         // sees the message and a “sending” indicator without waiting on the
         // PoW stamp + FFI hop. We update its state in place once trySend
         // resolves. The id is a synthetic placeholder; on success it’s
         // replaced with the canonical sender_hex+lxmf_ts id so the echo
         // from RFed dedupes against it.
-        let optimisticId = "pending_\(UUID().uuidString)"
-        let optimisticTs = Date().timeIntervalSince1970 * 1000.0
-        let optimisticEntity = ChannelMessageEntity(
-            id: optimisticId, channelHash: channel.id,
-            senderHash: ownHashHex, senderDisplayName: "",
-            content: content, timestamp: optimisticTs, isOutgoing: true,
-            deliveryState: DeliveryState.pending
-        )
-        modelContext?.insert(optimisticEntity)
-        try? modelContext?.save()
-        appendMessage(
-            ChannelMessage(id: optimisticId, channelHash: channel.id,
-                           senderHash: ownHashHex, senderDisplayName: "",
-                           content: content, timestamp: optimisticTs, isOutgoing: true,
-                           deliveryState: DeliveryState.pending),
-            toChannelHash: channel.id
-        )
+        let optimisticId: String
+        if let existingOptimisticId {
+            optimisticId = existingOptimisticId
+        } else {
+            optimisticId = "pending_\(UUID().uuidString)"
+            let optimisticTs = Date().timeIntervalSince1970 * 1000.0
+            let optimisticEntity = ChannelMessageEntity(
+                id: optimisticId, channelHash: channel.id,
+                senderHash: ownHashHex, senderDisplayName: "",
+                content: content, timestamp: optimisticTs, isOutgoing: true,
+                deliveryState: DeliveryState.pending
+            )
+            modelContext?.insert(optimisticEntity)
+            try? modelContext?.save()
+            appendMessage(
+                ChannelMessage(id: optimisticId, channelHash: channel.id,
+                               senderHash: ownHashHex, senderDisplayName: "",
+                               content: content, timestamp: optimisticTs, isOutgoing: true,
+                               deliveryState: DeliveryState.pending),
+                toChannelHash: channel.id
+            )
+        }
+
+        guard canIssueRfedOperations else {
+            enqueuePendingSend(content: content, channel: channel, optimisticId: optimisticId)
+            return
+        }
 
         // Step 1: ensure stampCost is fresh for this session.  No persisted
         // stampCost is trusted across an app launch — operator may have
@@ -594,6 +693,7 @@ final class RfedChannelClient: ObservableObject {
                    predicate: { let oid = optimisticId; return #Predicate { $0.id == oid } }()
                )).first {
                 temp.id = canonicalId
+                temp.senderHash = ownHashHex
                 temp.timestamp = Double(tsMs)
                 temp.deliveryState = DeliveryState.sent
                 try? ctx.save()
@@ -613,18 +713,17 @@ final class RfedChannelClient: ObservableObject {
                     // Echo already arrived; drop optimistic placeholder.
                     list.remove(at: idx)
                 } else {
-                    var upgraded = list[idx]
+                    let upgraded = list[idx]
                     list.remove(at: idx)
                     list.append(ChannelMessage(
                         id: canonicalId, channelHash: upgraded.channelHash,
-                        senderHash: upgraded.senderHash,
+                        senderHash: ownHashHex.isEmpty ? upgraded.senderHash : ownHashHex,
                         senderDisplayName: upgraded.senderDisplayName,
                         content: upgraded.content, timestamp: Double(tsMs),
                         isOutgoing: true,
                         deliveryState: DeliveryState.sent
                     ))
                     list.sort { $0.timestamp < $1.timestamp }
-                    _ = upgraded
                 }
                 messages[channel.id] = list
             }
@@ -649,26 +748,41 @@ final class RfedChannelClient: ObservableObject {
     // otherwise (or on error — caller can retry the next page-load).
     @discardableResult
     func pullDeferred(channel: Channel) async -> Bool {
+        let channelKey = Self.normalizedHex(channel.id)
         let nodeKey = channel.rfedNodeHash
+        await MainActor.run { self.pullInFlight[channelKey] = true }
+
+        guard canIssueRfedOperations else {
+            enqueuePendingPull(channel: channel)
+            return canPullMore[channelKey] ?? true
+        }
+
+        guard let channelHashData = Data(hexString: channelKey) else {
+            await MainActor.run { self.pullInFlight[channelKey] = false }
+            return false
+        }
+
         guard let rfedPullDest = Data(hexString: Self.rfedDestHash(
             identityHashHex: nodeKey,
-            app: "rfed", aspects: ["delivery"]
-        )) else { return false }
+            app: "rfed", aspects: ["channel", "pull"]
+        )) else {
+            await MainActor.run { self.pullInFlight[channelKey] = false }
+            return false
+        }
 
-        await MainActor.run { self.pullInFlight[nodeKey] = true }
         defer {
-            Task { @MainActor in self.pullInFlight[nodeKey] = false }
+            Task { @MainActor in self.pullInFlight[channelKey] = false }
         }
 
         let response = await ConnectionStateManager.shared.appLinkSend(
             destHash: rfedPullDest,
-            app: "rfed", aspects: ["delivery"],
+            app: "rfed", aspects: ["channel", "pull"],
             path: "/rfed/pull",
-            payload: Data()
+            payload: Self.msgpackBin(channelHashData)
         )
 
         guard let data = response else {
-            print("[RfedChannel] PULL: rfed.delivery request failed or no response within 5 s")
+            print("[RfedChannel] PULL: rfed.channel.pull request failed or no response within 5 s")
             return false
         }
 
@@ -685,7 +799,7 @@ final class RfedChannelClient: ObservableObject {
             }
         }
 
-        await MainActor.run { self.canPullMore[nodeKey] = morePending }
+        await MainActor.run { self.canPullMore[channelKey] = morePending }
         return morePending
     }
 
@@ -787,16 +901,19 @@ final class RfedChannelClient: ObservableObject {
         print("[RfedChannel] dispatchVerifiedLxmf DELIVERING sender=\(senderHashHex.prefix(8)) content='\(content.prefix(40))'")
 
         let isOutgoing = senderHashHex == ownHashHex
+        let deliveryState = Self.verifiedChannelMessageDeliveryState(isOutgoing: isOutgoing)
         let entity = ChannelMessageEntity(id: msgId, channelHash: channelHashHex,
                                           senderHash: senderHashHex, senderDisplayName: "",
                                           content: content,
-                                          timestamp: Double(tsMs), isOutgoing: isOutgoing)
+                          timestamp: Double(tsMs), isOutgoing: isOutgoing,
+                          deliveryState: deliveryState)
         modelContext?.insert(entity)
         try? modelContext?.save()
 
         let msg = ChannelMessage(id: msgId, channelHash: channelHashHex,
                                   senderHash: senderHashHex, senderDisplayName: "", content: content,
-                                  timestamp: Double(tsMs), isOutgoing: isOutgoing)
+                      timestamp: Double(tsMs), isOutgoing: isOutgoing,
+                      deliveryState: deliveryState)
         appendMessage(msg, toChannelHash: channelHashHex)
         // updateChannelLastMessage takes seconds; tsMs is wire-format ms.
         updateChannelLastMessage(channelHashHex: channelHashHex, time: Double(tsMs) / 1000.0)
@@ -1004,10 +1121,9 @@ final class RfedChannelClient: ObservableObject {
     private func reconfigureChannelStreams() {
         guard identityHandle != 0 else { return }
 
-        let channelsByNode = Dictionary(grouping: channels.filter { $0.isSubscribed }) {
-            $0.rfedNodeHash.lowercased()
-        }
-        let nodes = Set(channelsByNode.keys).union(trackedChannelStreamNodes)
+        let subscribedChannels = channels.filter { $0.isSubscribed }
+        let nodes = Set(subscribedChannels.map { $0.rfedNodeHash.lowercased() })
+            .union(trackedChannelStreamNodes)
 
         for nodeIdentityHashHex in nodes {
             let streamDestHex = Self.rfedDestHash(
@@ -1018,8 +1134,7 @@ final class RfedChannelClient: ObservableObject {
 
             ensureChannelStreamTracked(nodeIdentityHashHex: nodeIdentityHashHex, streamDest: streamDest)
 
-            let filters = channelsByNode[nodeIdentityHashHex, default: []]
-                .compactMap { Data(hexString: $0.id) }
+            let filters = liveStreamFilterHashes(nodeIdentityHashHex: nodeIdentityHashHex)
             let status = ConnectionStateManager.shared.appLinkStatus(destHash: streamDest)
 
             if filters.isEmpty {
@@ -1068,12 +1183,21 @@ final class RfedChannelClient: ObservableObject {
             app: "rfed",
             aspects: ["channel", "stream"])
         guard let streamDest = Data(hexString: streamDestHex) else { return }
-        let filters = channels
-            .filter { $0.isSubscribed && $0.rfedNodeHash.caseInsensitiveCompare(nodeIdentityHashHex) == .orderedSame }
-            .compactMap { Data(hexString: $0.id) }
+        let filters = liveStreamFilterHashes(nodeIdentityHashHex: nodeIdentityHashHex)
         sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex,
                                 streamDest: streamDest,
                                 filters: filters)
+    }
+
+    private func liveStreamFilterHashes(nodeIdentityHashHex: String) -> [Data] {
+        let normalizedNode = Self.normalizedHex(nodeIdentityHashHex)
+        return channels
+            .filter {
+                $0.isSubscribed &&
+                Self.normalizedHex($0.rfedNodeHash) == normalizedNode &&
+                openedChannelStreamHashes.contains(Self.normalizedHex($0.id))
+            }
+            .compactMap { Data(hexString: $0.id) }
     }
 
     private func sendChannelStreamConfig(nodeIdentityHashHex: String,
@@ -1118,6 +1242,10 @@ final class RfedChannelClient: ObservableObject {
     /// Helper: trim/lowercase a hex string and reject obvious non-hex input.
     private static func normalizedHex(_ s: String) -> String {
         s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func verifiedChannelMessageDeliveryState(isOutgoing: Bool) -> Int {
+        isOutgoing ? DeliveryState.sent : DeliveryState.delivered
     }
 
     // MARK: - Static helpers

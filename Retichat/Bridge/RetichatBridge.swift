@@ -520,14 +520,16 @@ final class RetichatBridge: @unchecked Sendable {
     func handleDelivery(hash: Data, srcHash: Data, destHash: Data,
                         title: String, content: String, timestamp: Double,
                         signatureValid: Bool, fieldsRaw: Data) {
-        // Single hop: schedule directly on the main actor (no intermediate GCD dispatch).
-        let bridge = self
+        // Capture the callback before hopping to MainActor so a transient
+        // lifecycle change cannot nil out the weak reference after Rust has
+        // already accepted the delivery.
+        guard let callback = messageCallback else {
+            print("[RetichatBridge] handleDelivery: DROPPED - messageCallback is nil (ChatRepository deallocated?)")
+            return
+        }
+
         Task { @MainActor in
-            guard let cb = bridge.messageCallback else {
-                print("[RetichatBridge] handleDelivery: DROPPED - messageCallback is nil (ChatRepository deallocated?)")
-                return
-            }
-            cb.onMessage(
+            callback.onMessage(
                 hash: hash, srcHash: srcHash, destHash: destHash,
                 title: title, content: content, timestamp: timestamp,
                 signatureValid: signatureValid, fieldsRaw: fieldsRaw

@@ -72,6 +72,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// Message IDs that already had a propagation fallback dispatched.
     private var propFallbackSent: Set<String> = []
 
+    /// Message-state callbacks can arrive before the send-registration hop
+    /// stores `pendingOutbound[hash]`, especially when Timer P collapses to
+    /// zero for an already-disconnected AppLink. Buffer and replay them once
+    /// registration completes so fallback ordering stays deterministic.
+    private var earlyMessageStates: [String: [UInt8]] = [:]
+
     /// Destination tracked for the live rfed.propagation.stream APP_LINK.
     private var propagationStreamDest: Data?
 
@@ -400,8 +406,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 self?.pollPropagationNode()
             }
         }
-        // Initial poll after 5 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+        // Initial poll after 1 second
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.pollPropagationNode()
         }
     }
@@ -605,6 +611,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         propManager.setUserConfiguredNode(prefs.effectiveLxmfPropagationHash)
 
         if let nodeHash = propManager.currentNode() {
+            _ = client.setPropagationNode(nodeHash: nodeHash)
+
             // PSYNC link establishment needs the propagation node's identity
             // (public key), not just a cached path. On cold start the path
             // table loads from disk while known-destinations is empty until
@@ -824,6 +832,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     title: "",
                     hasAttachments: !attachmentsCopy.isEmpty
                 )
+                self.replayBufferedMessageStatesIfNeeded(for: msgHashHex)
 
                 // The propagation fallback delay is owned by Rust AppLinks
                 // Timer P. It normally uses the 5-second liveness budget, but
@@ -1028,8 +1037,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     private func handleMessageState(hash: Data, state: UInt8) {
-        let hashHex = hash.hexString
-        guard let pending = pendingOutbound[hashHex] else { return }
+        handleMessageState(hashHex: hash.hexString, state: state)
+    }
+
+    private func handleMessageState(hashHex: String, state: UInt8) {
+        guard let pending = pendingOutbound[hashHex] else {
+            earlyMessageStates[hashHex, default: []].append(state)
+            return
+        }
 
         switch state {
 
@@ -1084,8 +1099,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
+    private func replayBufferedMessageStatesIfNeeded(for hashHex: String) {
+        guard let bufferedStates = earlyMessageStates.removeValue(forKey: hashHex) else { return }
+        for state in bufferedStates {
+            handleMessageState(hashHex: hashHex, state: state)
+        }
+    }
+
     private func completePending(hashHex: String, pending: PendingOutbound) {
         pendingOutbound.removeValue(forKey: hashHex)
+        earlyMessageStates.removeValue(forKey: hashHex)
         LxmfClient.messageDestroy(pending.msgHandle)
         // Clean up fallback tracking when a propagated message reaches terminal state.
         if pending.method == LxmfMethod.propagated {
@@ -1143,6 +1166,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     title: original.title,
                     hasAttachments: false
                 )
+                self?.replayBufferedMessageStatesIfNeeded(for: newHashHex)
             }
         }
     }

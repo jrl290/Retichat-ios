@@ -236,6 +236,12 @@ struct RetichatApp: App {
                     handleDeepLink(url)
                 }
                 .onAppear {
+                    channelClient.configure(
+                        modelContext: modelContainer.mainContext,
+                        identityHandle: 0,
+                        ownHashHex: repository.ownHashHex
+                    )
+                    channelClient.start()
                     requestNotificationPermission()
                 }
                 .onReceive(repository.$serviceRunning) { running in
@@ -271,12 +277,12 @@ struct RetichatApp: App {
                 } else {
                     // Import any messages the NSE delivered while backgrounded
                     repository.importNSEMessages()
-                    // Force a PSYNC only if iOS actually suspended us
-                    // (sockets would have been torn down). For quick
-                    // app-switches the throttle keeps us off the network.
-                    let needPsync = repository.psyncNeededOnForeground
+                    // Every foreground appearance issues a propagation-node
+                    // sync via the normal LXMF path. Clear the suspension
+                    // marker here as well so later transitions reflect fresh
+                    // state rather than the previous background event.
                     repository.psyncNeededOnForeground = false
-                    repository.pollPropagationNode(force: needPsync)
+                    repository.pollPropagationNode(force: true)
                     // Re-establish path discovery for the active conversation (if any).
                     ConnectionStateManager.shared.onAppForeground()
                     // Re-open the persistent rfed node link.
