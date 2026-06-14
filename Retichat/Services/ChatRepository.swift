@@ -111,7 +111,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         statusMessage = "Starting…"
 
         let configDir = reticulumConfigDir()
-        let needsFallbackEndpoints = enabledTCPClientInterfaces().isEmpty
+        let needsFallbackEndpoints = enabledTCPClientInterfaces().isEmpty && prefs.defaultTcpEnabled
 
         Task { [weak self] in
             guard let self else { return }

@@ -33,6 +33,7 @@ class SettingsViewModel: ObservableObject {
     @Published var rfedNodeIdentityHash: String
     @Published var rfedLxmfPropOverride: String
     @Published var filterStrangers: Bool
+    @Published var defaultTcpEnabled: Bool
     @Published var pendingInterfaces: [PendingInterface]
 
     // Baseline captured at init; updated after Apply so hasChanges resets.
@@ -42,6 +43,7 @@ class SettingsViewModel: ObservableObject {
     private var originalRfedLxmfPropOverride: String
     private var originalFilterStrangers: Bool
     private var persistedFilterStrangers: Bool
+    private var originalDefaultTcpEnabled: Bool
     private var originalInterfaces: [PendingInterface]
 
     /// True when any setting differs from the values present when the screen opened (or last Apply).
@@ -51,6 +53,7 @@ class SettingsViewModel: ObservableObject {
         rfedNodeIdentityHash != originalRfedNodeIdentityHash ||
         rfedLxmfPropOverride != originalRfedLxmfPropOverride ||
         filterStrangers != persistedFilterStrangers ||
+        defaultTcpEnabled != originalDefaultTcpEnabled ||
         pendingInterfaces != originalInterfaces
     }
 
@@ -72,12 +75,14 @@ class SettingsViewModel: ObservableObject {
         self.rfedNodeIdentityHash = prefs.rfedNodeIdentityHash
         self.rfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.filterStrangers = prefs.filterStrangers
+        self.defaultTcpEnabled = prefs.defaultTcpEnabled
         self.originalDisplayName = prefs.displayName
         self.originalChannelDisplayName = prefs.channelDisplayName
         self.originalRfedNodeIdentityHash = prefs.rfedNodeIdentityHash
         self.originalRfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.originalFilterStrangers = prefs.filterStrangers
         self.persistedFilterStrangers = prefs.filterStrangers
+        self.originalDefaultTcpEnabled = prefs.defaultTcpEnabled
         self.pendingInterfaces = []
         self.originalInterfaces = []
     }
@@ -98,6 +103,7 @@ class SettingsViewModel: ObservableObject {
         let prefs = UserPreferences.shared
         prefs.displayName = displayName
         prefs.channelDisplayName = channelDisplayName
+        prefs.defaultTcpEnabled = defaultTcpEnabled
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
         prefs.rfedNotifyHash = Self.rnsDestHash(
             identityHashHex: rfedNodeIdentityHash, app: "rfed", aspects: ["notify", "register"]
@@ -155,6 +161,8 @@ class SettingsViewModel: ObservableObject {
         filterStrangers = originalFilterStrangers
         UserPreferences.shared.filterStrangers = originalFilterStrangers
         persistedFilterStrangers = originalFilterStrangers
+        defaultTcpEnabled = originalDefaultTcpEnabled
+        UserPreferences.shared.defaultTcpEnabled = originalDefaultTcpEnabled
         pendingInterfaces = originalInterfaces
     }
 
@@ -166,6 +174,7 @@ class SettingsViewModel: ObservableObject {
         originalRfedLxmfPropOverride = rfedLxmfPropOverride
         originalFilterStrangers = filterStrangers
         persistedFilterStrangers = filterStrangers
+        originalDefaultTcpEnabled = defaultTcpEnabled
         originalInterfaces = pendingInterfaces
     }
 

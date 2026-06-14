@@ -411,10 +411,12 @@ struct SettingsView: View {
                 }
 
                 if vm.pendingInterfaces.isEmpty {
-                    Text("Using default endpoints")
-                        .font(.caption)
-                        .foregroundColor(.retichatOnSurfaceVariant)
+                    defaultTcpCard
                 } else {
+                    // Show the default-endpoints row alongside user interfaces
+                    // so it's always visible with the same visual weight.
+                    defaultTcpCard
+
                     // NOTE: We deliberately use ForEach on the *value* collection (not
                     // ForEach($vm.pendingInterfaces)) and synthesize the Toggle binding
                     // by ID lookup. Index-derived bindings produced by ForEach($…) crash
@@ -486,6 +488,57 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    /// Toggle card for the invisible default TCP backbones, mirroring
+    /// Android's `DefaultTcpCard`.  No delete button — the user can only
+    /// enable or disable the feature; the endpoint list is managed internally.
+    /// Shows a connection dot matching the other interface rows.
+    private var defaultTcpCard: some View {
+        HStack {
+            Circle()
+                .fill(defaultTcpDotColor)
+                .frame(width: 8, height: 8)
+
+            Image(systemName: "network")
+                .font(.body)
+                .foregroundColor(.retichatOnSurfaceVariant)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Default Public Endpoints")
+                    .font(.subheadline)
+                    .foregroundColor(.retichatOnSurface)
+                Text("TCP Client")
+                    .font(.caption)
+                    .foregroundColor(.retichatPrimary)
+                Text(DefaultEndpointManager.endpoints
+                    .prefix(DefaultEndpointManager.fallbackEndpointCount)
+                    .map { "\($0.host):\($0.port)" }
+                    .joined(separator: "\n"))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.retichatOnSurfaceVariant)
+                Text("Used only when no other interfaces are configured.")
+                    .font(.caption2)
+                    .foregroundColor(.retichatOnSurfaceVariant)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: $vm.defaultTcpEnabled)
+                .tint(.retichatPrimary)
+                .labelsHidden()
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Dot color for the default-endpoint card.  Green when the service is
+    /// running and defaults are enabled (the backbones are live); gray
+    /// otherwise (disabled or service not running).
+    private var defaultTcpDotColor: Color {
+        guard vm.defaultTcpEnabled else { return .retichatOnSurfaceVariant }
+        guard repository.serviceRunning else { return .retichatOnSurfaceVariant }
+        return .retichatSuccess
     }
 
     /// Subtitle text for an interface row, based on type.

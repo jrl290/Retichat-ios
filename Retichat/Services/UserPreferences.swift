@@ -17,6 +17,7 @@ final class UserPreferences {
     private enum Keys {
         static let displayName = "display_name"
         static let channelDisplayName = "channel_display_name"
+        static let defaultTcpEnabled = "default_tcp_enabled"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
         static let rfedNotifyHash = "rfed_notify_hash"
@@ -42,6 +43,14 @@ final class UserPreferences {
     var channelDisplayName: String {
         get { defaults.string(forKey: Keys.channelDisplayName) ?? "" }
         set { defaults.set(newValue, forKey: Keys.channelDisplayName) }
+    }
+
+    /// When true (default) and no user-configured interfaces are present,
+    /// three invisible fallback TCP backbones are injected at startup.
+    /// Mirrors Android `PREF_KEY_DEFAULT_TCP`.
+    var defaultTcpEnabled: Bool {
+        get { defaults.object(forKey: Keys.defaultTcpEnabled) != nil ? defaults.bool(forKey: Keys.defaultTcpEnabled) : true }
+        set { defaults.set(newValue, forKey: Keys.defaultTcpEnabled) }
     }
 
     var dropAnnounces: Bool {
