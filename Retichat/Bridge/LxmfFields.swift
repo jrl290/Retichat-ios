@@ -15,6 +15,7 @@ import Foundation
 
 enum LxmfFieldKey {
     static let fileAttachments: UInt8 = 0x05
+    static let senderName:      UInt8 = 0x10  // sender display name (UTF-8) — per-message
     // Group chat fields
     static let groupId:        UInt8 = 0xA0  // string: 32-char hex group identifier
     static let groupMembers:   UInt8 = 0xA1  // string: comma-sep hex hashes of ALL members (invite only)
@@ -24,6 +25,7 @@ enum LxmfFieldKey {
     static let groupRelaySeen: UInt8 = 0xA5  // string: comma-sep hashes already delivered to
     static let groupRelayFor:  UInt8 = 0xA6  // string: hash of member being relayed for (relay request)
     static let groupRelayDone: UInt8 = 0xA7  // bool:   relay-complete confirmation signal
+    static let groupMemberKeys: UInt8 = 0xA8 // string: one hash:base64-public-key pair per invite chunk
 }
 
 // MARK: - Group action constants
@@ -55,6 +57,7 @@ enum MemberStatus {
 
 struct LxmfFields {
     var attachments: [(filename: String, data: Data)] = []
+    var senderName: String?  // from FIELD_SENDER_NAME (0x10)
     // Group fields
     var groupId: String?
     var groupMembers: [String]?      // full member list (invite messages only)
@@ -64,6 +67,7 @@ struct LxmfFields {
     var groupRelaySeen: [String]?    // hashes that have already received this relay
     var groupRelayFor: String?       // hash of member requesting relay
     var groupRelayDone: Bool?        // relay-complete signal
+    var groupMemberKeys: [String: String]?
 }
 
 // MARK: - MsgPack decoder
@@ -100,6 +104,9 @@ final class LxmfFieldsDecoder {
                     fields.attachments = attachments
                 }
 
+            case LxmfFieldKey.senderName:
+                fields.senderName = readString(bytes, &offset)
+
             case LxmfFieldKey.groupId:
                 fields.groupId = readString(bytes, &offset)
 
@@ -133,6 +140,16 @@ final class LxmfFieldsDecoder {
 
             case LxmfFieldKey.groupRelayDone:
                 fields.groupRelayDone = readBool(bytes, &offset)
+
+            case LxmfFieldKey.groupMemberKeys:
+                if let raw = readString(bytes, &offset) {
+                    fields.groupMemberKeys = Dictionary(uniqueKeysWithValues: raw.split(separator: ",").compactMap { entry in
+                        let parts = entry.split(separator: ":", maxSplits: 1).map(String.init)
+                        guard parts.count == 2, parts[0].count == 32,
+                            Data(base64Encoded: parts[1])?.count == 64 else { return nil }
+                        return (parts[0].lowercased(), parts[1])
+                    })
+                }
 
             default:
                 skipValue(bytes, &offset)

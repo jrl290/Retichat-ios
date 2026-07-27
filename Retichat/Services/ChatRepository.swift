@@ -98,6 +98,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     func configure(modelContext: ModelContext) {
         self.modelContext = modelContext
+        GroupChatManager.shared.onTracked = { [weak self] hashHex in
+            Task { @MainActor [weak self] in
+                self?.replayBufferedMessageStatesIfNeeded(for: hashHex)
+            }
+        }
     }
 
     // MARK: - Service lifecycle
@@ -272,11 +277,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         pollTimer?.invalidate()
         pollTimer = nil
 
-        // Stop Transport's auto-announce of our delivery destination.
-        if let client = lxmfClient {
-            ffiQueue.async { _ = client.unpublish() }
-        }
-
         // Tear down RNode interfaces before shutting down the LXMF client so
         // the Rust side stops before the callback transports are dropped.
         RNodeInterfaceCoordinator.shared.stop()
@@ -287,10 +287,26 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         pendingOutbound.removeAll()
 
-        lxmfClient?.shutdown()
+        // Clear stale per-session state so the next start is clean.
+        propFallbackSent.removeAll()
+        earlyMessageStates.removeAll()
+        propagationStreamDest = nil
+        lastPollTime = .distantPast
+        psyncNeededOnForeground = false
+
+        // Sequence shutdown through the serial FFI queue so unpublish →
+        // shutdown are ordered and cannot race with other FFI work.
+        let client = lxmfClient
         lxmfClient = nil
         serviceRunning = false
         statusMessage = "Stopped"
+        ConnectionStateManager.shared.deregister()
+        NetworkMonitor.shared.onConnect = nil
+
+        ffiQueue.async {
+            _ = client?.unpublish()
+            client?.shutdown()
+        }
     }
 
     // MARK: - RFed APNs token registration
@@ -533,15 +549,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let fields = LxmfFieldsDecoder.decode(fieldsData)
 
             if let groupId = fields.groupId {
-                // For invites: filter by sender, not groupId (groupId not in allowlist yet)
-                // For all other group actions: filter by groupId (must be a known group)
-                let shouldProcess: Bool
-                if fields.groupAction == GroupAction.invite {
-                    shouldProcess = isAllowlisted(destHash: srcHex)
-                } else {
-                    shouldProcess = isAllowlisted(destHash: groupId)
-                }
-                if shouldProcess {
+                if shouldProcessGroupMessage(groupId: groupId,
+                                             sourceHash: srcHex,
+                                             action: fields.groupAction) {
                     handleGroupMessage(
                         hash: Data(hexString: msg.messageHash) ?? Data(),
                         srcHash: Data(hexString: srcHex) ?? Data(),
@@ -924,6 +934,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         )
         let existingMembers = (try? ctx.fetch(memberDesc)) ?? []
         let allHashes = existingMembers.map { $0.memberHash }
+        let missingKeys = allHashes.filter { hash in
+            guard hash != ownHashHex, let hashData = Data(hexString: hash) else { return false }
+            return !bridge.transportIdentityKnown(destHash: hashData)
+        }
+        guard missingKeys.isEmpty else {
+            print("[GroupChat] accept deferred: still receiving \(missingKeys.count) member key(s)")
+            return
+        }
 
         // Mark ourselves as accepted (add our entry if absent)
         if let selfEntry = existingMembers.first(where: { $0.memberHash == ownHashHex }) {
@@ -1041,8 +1059,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     private func handleMessageState(hashHex: String, state: UInt8) {
+        if let client = lxmfClient,
+           GroupChatManager.shared.handleMessageState(hashHex: hashHex, state: state, client: client) {
+            return
+        }
         guard let pending = pendingOutbound[hashHex] else {
-            earlyMessageStates[hashHex, default: []].append(state)
+            // DELIVERED can arrive after the pending was already completed
+            // (e.g. SENT completed it for a propagated message before this fix).
+            // Update the DB directly so the double-checkmark is not lost.
+            if state == 0x08 {
+                updateDeliveryState(messageId: hashHex, state: DeliveryState.delivered)
+            } else {
+                earlyMessageStates[hashHex, default: []].append(state)
+            }
             return
         }
 
@@ -1050,7 +1079,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         case 0x04:  // SENT — propagated message accepted by the prop node.
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.sent)
-            completePending(hashHex: hashHex, pending: pending)
+            if pending.method != LxmfMethod.propagated {
+                // DIRECT: SENT is terminal — Rust fires only one of SENT/DELIVERED
+                // (else-if in lxm_router.rs). Complete now.
+                // PROPAGATED: DELIVERED will follow as a separate callback.
+                // Keep the pending alive so it can be matched.
+                completePending(hashHex: hashHex, pending: pending)
+            }
 
         case 0x08:  // DELIVERED — recipient downloaded and decrypted the message.
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.delivered)
@@ -1171,15 +1206,34 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
+    /// Update delivery state with sticky-success priority matching Android's
+    /// ChatRepository.kt: DELIVERED upgrades SENT; success states (SENT,
+    /// DELIVERED) are never downgraded by non-success states (pending, failed,
+    /// propagating).
     private func updateDeliveryState(messageId: String, state: Int) {
         guard let ctx = modelContext else { return }
         let descriptor = FetchDescriptor<MessageEntity>(
             predicate: #Predicate { $0.id == messageId }
         )
-        if let msg = try? ctx.fetch(descriptor).first {
-            msg.deliveryState = state
-            try? ctx.save()
+        guard let msg = try? ctx.fetch(descriptor).first else { return }
+
+        let currentState = msg.deliveryState
+        let isCurrentSuccess = currentState == DeliveryState.sent ||
+                               currentState == DeliveryState.delivered
+        let isNewSuccess = state == DeliveryState.sent ||
+                           state == DeliveryState.delivered
+
+        if isCurrentSuccess && !isNewSuccess {
+            // Never downgrade a success state with a non-success state.
+            return
         }
+        if currentState == DeliveryState.delivered && state == DeliveryState.sent {
+            // DELIVERED beats SENT — don't downgrade.
+            return
+        }
+
+        msg.deliveryState = state
+        try? ctx.save()
     }
 
     // MARK: - Flush pending
@@ -1232,14 +1286,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Handle group message
         if let groupId = fields.groupId {
-            // For invites: filter by sender; for other group actions: filter by known groupId
-            let shouldProcess: Bool
-            if fields.groupAction == GroupAction.invite {
-                shouldProcess = isAllowlisted(destHash: srcHex)
-            } else {
-                shouldProcess = isAllowlisted(destHash: groupId)
-            }
-            if shouldProcess {
+            if shouldProcessGroupMessage(groupId: groupId,
+                                         sourceHash: srcHex,
+                                         action: fields.groupAction) {
                 handleGroupMessage(
                     hash: hash, srcHash: srcHash, content: content,
                     timestamp: timestamp, fields: fields, groupId: groupId
@@ -1266,10 +1315,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         RetichatBridge.shared.watchAnnounce(destHash: srcHash)
         lxmfClient?.watch(destHash: srcHash)
 
-        // Attempt to fill in the contact's display name from the Identity
-        // announce cache right now (covers the case where their announce
-        // arrived before they were added to the watch list).
-        if let name = lxmfClient?.recallDisplayName(for: srcHash), !name.isEmpty {
+        // Attempt to fill in the contact's display name from the per-message
+        // FIELD_SENDER_NAME first (privacy-preserving — only message recipients
+        // see it). Fall back to the announce cache if not present.
+        if let name = fields.senderName, !name.isEmpty {
+            updateContactNameIfEmpty(destHash: srcHex, name: name)
+        } else if let name = lxmfClient?.recallDisplayName(for: srcHash), !name.isEmpty {
             updateContactNameIfEmpty(destHash: srcHex, name: name)
         }
 
@@ -1358,25 +1409,45 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
-        let memberList = fields.groupMembers ?? [srcHex]
+        let memberList = Array(Set((fields.groupMembers ?? []) + [srcHex]))
         let groupName = fields.groupName ?? "Group"
 
-        if (try? ctx.fetch(chatDesc).first) == nil {
+        for (memberHash, publicKeyHex) in fields.groupMemberKeys ?? [:] {
+            guard memberList.contains(memberHash),
+                  let hashData = Data(hexString: memberHash),
+                  let publicKey = Data(base64Encoded: publicKeyHex) else { continue }
+            if bridge.rememberLxmfDelivery(destHash: hashData, publicKey: publicKey) {
+                ensureAllowlistedContact(destHash: memberHash)
+            }
+        }
+
+        let existingChat = try? ctx.fetch(chatDesc).first
+        if existingChat == nil {
             // Create a pending chat entry
             let chat = ChatEntity(
                 id: groupId, peerHash: srcHex, isGroup: true,
                 groupName: groupName, groupStatus: "pending"
             )
             ctx.insert(chat)
+        }
 
-            // Populate member list from invite
-            for memberHash in memberList {
+        // The authenticated invite source implicitly accepts the group. The
+        // invite itself proves the creator's intent; a second accept packet
+        // would add redundant ordering and loss sensitivity.
+        let memberDesc = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == groupId }
+        )
+        let existingMembers = (try? ctx.fetch(memberDesc)) ?? []
+        for memberHash in memberList {
+            let status = memberHash == srcHex ? MemberStatus.accepted : MemberStatus.invited
+            if let existing = existingMembers.first(where: { $0.memberHash == memberHash }) {
+                if memberHash == srcHex { existing.inviteStatus = MemberStatus.accepted }
+            } else {
                 let member = GroupMemberEntity(groupId: groupId, memberHash: memberHash,
-                                               inviteStatus: MemberStatus.invited)
+                                               inviteStatus: status)
                 ctx.insert(member)
             }
         }
-
         // Add the inviting sender to our allowlist so we can reply
         ensureAllowlistedContact(destHash: srcHex)
 
@@ -1510,11 +1581,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let msgHashHex = hash.hexString
         let actualSender = fields.groupSender ?? srcHex
 
-        // Only accept messages for groups we actively belong to
+        // Pending invitees still track messages and membership changes. Declining
+        // deletes the local group, after which this guard rejects future traffic.
         let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
-        guard let chat = try? ctx.fetch(chatDesc).first,
-              chat.groupStatus != "pending" else {
-            print("[GroupChat] Dropped msg for unknown/pending group \(groupId.prefix(8))")
+        guard let chat = try? ctx.fetch(chatDesc).first else {
+            print("[GroupChat] Dropped msg for unknown group \(groupId.prefix(8))")
             return
         }
 
@@ -1671,11 +1742,22 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Send invites to everyone except self (fire-and-forget)
         if let client = lxmfClient {
             let selfHash = ownHashHex
+            var memberPublicKeys: [String: String] = [:]
+            for memberHash in allMembers {
+                guard let hashData = Data(hexString: memberHash) else { continue }
+                let publicKey = memberHash == selfHash
+                    ? bridge.identityPublicKey(handle: client.identityHandle)
+                    : bridge.recalledPublicKey(destHash: hashData)
+                if let publicKey, publicKey.count == 64 {
+                    memberPublicKeys[memberHash] = publicKey.hexString
+                }
+            }
             ffiQueue.async {
                 GroupChatManager.shared.sendInvites(
                     groupId: groupId,
                     groupName: name,
                     allMembers: allMembers,
+                    memberPublicKeys: memberPublicKeys,
                     from: selfHash,
                     via: client
                 )
@@ -2090,6 +2172,30 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// Returns true if the given hash is in the contact allowlist.
     private func isAllowlisted(destHash: String) -> Bool {
         allowlistDecision(destHash: destHash).isAllowed
+    }
+
+    private func shouldProcessGroupMessage(groupId: String,
+                                           sourceHash: String,
+                                           action: String?) -> Bool {
+        let inviterAllowed = isAllowlisted(destHash: sourceHash)
+        let groupExists: Bool
+        if let ctx = modelContext {
+            let descriptor = FetchDescriptor<ChatEntity>(
+                predicate: #Predicate { $0.id == groupId && $0.isGroup == true }
+            )
+            groupExists = (try? ctx.fetch(descriptor).first) != nil
+        } else {
+            groupExists = false
+        }
+        return Self.groupMessagePolicy(action: action,
+                                       inviterAllowed: inviterAllowed,
+                                       groupExists: groupExists)
+    }
+
+    nonisolated static func groupMessagePolicy(action: String?,
+                                                inviterAllowed: Bool,
+                                                groupExists: Bool) -> Bool {
+        action == GroupAction.invite ? inviterAllowed : groupExists
     }
 
     func contactDisplayName(for destHash: String) -> String {

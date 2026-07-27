@@ -518,9 +518,6 @@ struct SettingsView: View {
                     .joined(separator: "\n"))
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.retichatOnSurfaceVariant)
-                Text("Used only when no other interfaces are configured.")
-                    .font(.caption2)
-                    .foregroundColor(.retichatOnSurfaceVariant)
             }
 
             Spacer()

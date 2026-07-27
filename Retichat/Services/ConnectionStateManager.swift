@@ -151,6 +151,21 @@ final class ConnectionStateManager {
         startNetworkMonitor()
     }
 
+    /// Tear down registration state so the next `register()` call starts clean.
+    /// Call from `ChatRepository.stopService()` before the LXMF client is shut down.
+    func deregister() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        pathMonitorPrimed = false
+        lxmfClient = nil
+        peerLastSeen.removeAll()
+        degradedPeers.removeAll()
+        activeConversationHexes.removeAll()
+        rfedLinkDestData = nil
+        appLinkStatusHandlers.removeAll()
+        essentialReadyHandlers.removeAll()
+    }
+
     /// Register a handler that fires whenever the APP_LINK to `destHash`
     /// changes status.  Replaces any previous handler for the same dest.
     /// Pass `nil` to remove.

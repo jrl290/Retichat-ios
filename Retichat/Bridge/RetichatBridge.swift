@@ -88,11 +88,17 @@ final class RetichatBridge: @unchecked Sendable {
         self.announceCallback = announceCallback
         self.messageStateCallback = messageStateCallback
         let ctx = Unmanaged.passUnretained(self).toOpaque()
-        client.setDeliveryCallback(deliveryTrampoline, context: ctx)
-        if announceCallback != nil {
-            client.setAnnounceCallback(announceTrampoline, context: ctx)
+        if !client.setDeliveryCallback(deliveryTrampoline, context: ctx) {
+            print("[RetichatBridge] wireCallbacks: setDeliveryCallback FAILED — inbound messages will be silently dropped")
         }
-        client.setMessageStateCallback(messageStateTrampoline, context: ctx)
+        if announceCallback != nil {
+            if !client.setAnnounceCallback(announceTrampoline, context: ctx) {
+                print("[RetichatBridge] wireCallbacks: setAnnounceCallback FAILED")
+            }
+        }
+        if !client.setMessageStateCallback(messageStateTrampoline, context: ctx) {
+            print("[RetichatBridge] wireCallbacks: setMessageStateCallback FAILED")
+        }
     }
 
     func rfedDeliveryStart(identityHandle: UInt64, callback: RfedBlobCallback) -> Bool {
@@ -154,6 +160,31 @@ final class RetichatBridge: @unchecked Sendable {
         return destHash.withUnsafeBytes { buf in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return retichat_identity_known(ptr, UInt32(destHash.count)) == 1
+        }
+    }
+
+    nonisolated func recalledPublicKey(destHash: Data) -> Data? {
+        var output = Data(count: 64)
+        let capacity = output.count
+        let count = output.withUnsafeMutableBytes { outBuf in
+            destHash.withUnsafeBytes { hashBuf in
+                retichat_identity_recall_public_key(
+                    hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(destHash.count),
+                    outBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(capacity)
+                )
+            }
+        }
+        return count == 64 ? output : nil
+    }
+
+    nonisolated func rememberLxmfDelivery(destHash: Data, publicKey: Data) -> Bool {
+        destHash.withUnsafeBytes { hashBuf in
+            publicKey.withUnsafeBytes { keyBuf in
+                retichat_identity_remember_lxmf_delivery(
+                    hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(destHash.count),
+                    keyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(publicKey.count)
+                ) == 0
+            }
         }
     }
 

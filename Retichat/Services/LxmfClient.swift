@@ -752,6 +752,12 @@ final class LxmfClient: @unchecked Sendable {
         return Data(buf[0..<Int(len)])
     }
 
+    /// Clone an existing message as a fresh propagated-method message while
+    /// preserving fields and attachments.
+    static func messageClonePropagated(_ msgHandle: UInt64) -> UInt64 {
+        lxmf_message_clone_propagated(msgHandle)
+    }
+
     /// Destroy a message handle.
     static func messageDestroy(_ msgHandle: UInt64) {
         lxmf_message_destroy(msgHandle)

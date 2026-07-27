@@ -39,6 +39,11 @@ final class GroupChatManager {
     static let shared = GroupChatManager()
     private init() {}
 
+    private let stateLock = NSLock()
+    private var trackedHandles: [String: UInt64] = [:]
+    private var fallbackStarted: Set<UInt64> = []
+    var onTracked: ((String) -> Void)?
+
     // MARK: - Invite
 
     /// Send group invites to all members except the creator (self).
@@ -46,25 +51,38 @@ final class GroupChatManager {
         groupId: String,
         groupName: String,
         allMembers: [String],
+        memberPublicKeys: [String: String],
         from selfHash: String,
         via client: LxmfClient
     ) {
         let membersCSV = allMembers.joined(separator: ",")
+        guard allMembers.allSatisfy({ memberPublicKeys[$0]?.count == 128 }) else {
+            print("[GroupChat] invite aborted: missing member public key")
+            return
+        }
+        let memberKeyEntries = allMembers.sorted().compactMap { hash -> String? in
+            guard let keyData = Data(hexString: memberPublicKeys[hash]!) else { return nil }
+            return "\(hash):\(keyData.base64EncodedString())"
+        }
+        guard memberKeyEntries.count == allMembers.count else { return }
         let invitees = allMembers.filter { $0 != selfHash }
-        let content = "You've been invited to \"\(groupName)\""
+        let content = ""
 
         for target in invitees {
             guard let destData = Data(hexString: target) else { continue }
-            let handle = client.createMessage(
-                to: destData, content: content, title: "", method: LxmfMethod.direct
-            )
-            guard handle != 0 else { continue }
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId,      value: groupId)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupName,    value: groupName)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupMembers, value: membersCSV)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupAction,  value: GroupAction.invite)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender,  value: selfHash)
-            destroyAfterSend(client: client, handle: handle)
+            for memberKeyEntry in memberKeyEntries {
+                let handle = client.createMessage(
+                    to: destData, content: content, title: "", method: LxmfMethod.direct
+                )
+                guard handle != 0 else { continue }
+                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId, value: groupId)
+                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupName, value: groupName)
+                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupMembers, value: membersCSV)
+                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupMemberKeys, value: memberKeyEntry)
+                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupAction, value: GroupAction.invite)
+                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
+                destroyAfterSend(client: client, handle: handle)
+            }
         }
     }
 
@@ -144,6 +162,7 @@ final class GroupChatManager {
             _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
 
             if client.sendMessageViaAppLinks(handle) {
+                track(handle: handle)
                 onHandle?(handle, target)
             } else {
                 LxmfClient.messageDestroy(handle)
@@ -239,12 +258,71 @@ final class GroupChatManager {
 
     private func destroyAfterSend(client: LxmfClient, handle: UInt64) {
         if client.sendMessageViaAppLinks(handle) {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 60) {
-                LxmfClient.messageDestroy(handle)
-            }
+            track(handle: handle)
         } else {
             LxmfClient.messageDestroy(handle)
         }
+    }
+
+    private func track(handle: UInt64) {
+        guard let hash = LxmfClient.messageHash(handle), !hash.isEmpty else {
+            LxmfClient.messageDestroy(handle)
+            return
+        }
+        let hashHex = hash.hexString
+        stateLock.lock()
+        trackedHandles[hashHex] = handle
+        stateLock.unlock()
+        onTracked?(hashHex)
+    }
+
+    /// Consume message-state callbacks for group fanout/control handles.
+    /// Returns true when the hash belongs to GroupChatManager.
+    func handleMessageState(hashHex: String, state: UInt8, client: LxmfClient) -> Bool {
+        stateLock.lock()
+        guard let handle = trackedHandles[hashHex] else {
+            stateLock.unlock()
+            return false
+        }
+
+        if state == 0x10 {
+            let shouldStart = fallbackStarted.insert(handle).inserted
+            stateLock.unlock()
+            if shouldStart {
+                startPropagationFallback(from: handle, client: client)
+            }
+            return true
+        }
+
+        let terminal = state == 0x04 || state == 0x08 || state == 0xFD ||
+            state == 0xFE || state == 0xFF
+        if terminal {
+            trackedHandles.removeValue(forKey: hashHex)
+            fallbackStarted.remove(handle)
+        }
+        stateLock.unlock()
+
+        if terminal {
+            LxmfClient.messageDestroy(handle)
+        }
+        return true
+    }
+
+    private func startPropagationFallback(from directHandle: UInt64, client: LxmfClient) {
+        let propagated = LxmfClient.messageClonePropagated(directHandle)
+        guard propagated != 0 else {
+            print("[GroupChat] propagated clone failed: \(LxmfClient.lastError ?? "unknown")")
+            return
+        }
+        guard client.sendMessageViaAppLinks(propagated) else {
+            print("[GroupChat] propagated send failed: \(LxmfClient.lastError ?? "unknown")")
+            LxmfClient.messageDestroy(propagated)
+            return
+        }
+        // The router retains the message Arc; release the registry handle so it
+        // cannot replace the direct handle under their shared canonical hash.
+        LxmfClient.messageDestroy(propagated)
+        print("[GroupChat] propagation fallback dispatched")
     }
 }
 

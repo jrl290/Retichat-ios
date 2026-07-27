@@ -409,6 +409,9 @@ int32_t lxmf_message_add_field(uint64_t msg, uint8_t key, const char *value);
 int32_t lxmf_message_add_field_bool(uint64_t msg, uint8_t key, int32_t value);
 int32_t lxmf_message_add_attachment(uint64_t msg, const char *filename,
                                      const uint8_t *data, uint32_t data_len);
+/// Clone an existing message as a fresh PROPAGATED message, preserving fields
+/// and attachments. Returns 0 on error.
+uint64_t lxmf_message_clone_propagated(uint64_t msg);
 int32_t lxmf_message_send(uint64_t client, uint64_t msg);
 /// Send via the top-level AppLinks::send pipeline (iface-race + 2 s
 /// liveness cache; no client/router handle required — uses the global
@@ -443,6 +446,10 @@ int32_t retichat_identity_public_key(uint64_t handle, uint8_t *out_buf, uint32_t
 /// Remember a remote destination hash from its public key.
 int32_t retichat_identity_remember_destination(const uint8_t *dest_hash, uint32_t dest_hash_len,
                                                const uint8_t *public_key, uint32_t public_key_len);
+int32_t retichat_identity_recall_public_key(const uint8_t *dest_hash, uint32_t dest_hash_len,
+                                            uint8_t *out_buf, uint32_t buf_len);
+int32_t retichat_identity_remember_lxmf_delivery(const uint8_t *dest_hash, uint32_t dest_hash_len,
+                                                 const uint8_t *public_key, uint32_t public_key_len);
 
 /// Sign data with the identity's Ed25519 signing key. Writes 64-byte sig to out_sig. Returns 64 or -1.
 int32_t retichat_identity_sign(uint64_t handle, const uint8_t *data, uint32_t data_len, uint8_t *out_sig, uint32_t sig_buf_len);

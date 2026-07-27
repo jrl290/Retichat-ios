@@ -169,6 +169,49 @@ pub extern "C" fn retichat_identity_remember_destination(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn retichat_identity_recall_public_key(
+    dest_hash: *const u8,
+    dest_hash_len: u32,
+    out_buf: *mut u8,
+    buf_len: u32,
+) -> i32 {
+    let hash = slice_from_raw(dest_hash, dest_hash_len);
+    let Some(public_key) = Identity::recall_public_key(&hash) else { return -1; };
+    if out_buf.is_null() || buf_len < public_key.len() as u32 { return -1; }
+    unsafe { std::ptr::copy_nonoverlapping(public_key.as_ptr(), out_buf, public_key.len()); }
+    public_key.len() as i32
+}
+
+#[no_mangle]
+pub extern "C" fn retichat_identity_remember_lxmf_delivery(
+    dest_hash: *const u8,
+    dest_hash_len: u32,
+    public_key: *const u8,
+    public_key_len: u32,
+) -> i32 {
+    let claimed_hash = slice_from_raw(dest_hash, dest_hash_len);
+    let public_key = slice_from_raw(public_key, public_key_len);
+    let identity = match Identity::from_public_key(&public_key) {
+        Ok(identity) => identity,
+        Err(error) => { rns::set_error(error); return -1; }
+    };
+    let destination = match Destination::new_outbound(
+        Some(identity), DestinationType::Single, "lxmf".into(), vec!["delivery".into()],
+    ) {
+        Ok(destination) => destination,
+        Err(error) => { rns::set_error(error); return -1; }
+    };
+    if destination.hash != claimed_hash {
+        rns::set_error("public key does not match claimed lxmf.delivery hash".into());
+        return -1;
+    }
+    match Identity::remember_destination(&claimed_hash, &public_key, None) {
+        Ok(()) => 0,
+        Err(error) => { rns::set_error(error); -1 }
+    }
+}
+
 /// Destroy a standalone identity handle.  Returns 0 on success, -1 on error.
 ///
 /// Do **not** call this on the identity owned by an `lxmf_client` — that is
