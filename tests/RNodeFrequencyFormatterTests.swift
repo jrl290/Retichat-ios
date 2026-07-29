@@ -2,7 +2,8 @@
 //
 // Run with:
 //
-//     swift Retichat/Models/RNodeFrequencyFormatter.swift tests/RNodeFrequencyFormatterTests.swift
+//     swiftc Retichat/Models/RNodeFrequencyFormatter.swift tests/RNodeFrequencyFormatterTests.swift \
+//       -o /tmp/rnode-frequency-tests && /tmp/rnode-frequency-tests
 
 import Foundation
 
