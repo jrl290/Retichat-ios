@@ -496,7 +496,7 @@ struct SettingsView: View {
         case .rnode:
             if let p = RNodeInterfaceProfile(jsonString: iface.configJSON) {
                 let dev = p.peripheralName.isEmpty ? "No device paired" : p.peripheralName
-                let mhz = String(format: "%.3f MHz", Double(p.radio.frequency) / 1_000_000)
+                let mhz = "\(RNodeFrequencyFormatter.mhzText(for: p.radio.frequency)) MHz"
                 return "RNode • \(dev) • \(mhz)"
             }
             return "RNode • not configured"
