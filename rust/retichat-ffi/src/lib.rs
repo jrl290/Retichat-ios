@@ -1350,3 +1350,191 @@ pub extern "C" fn retichat_channel_lxm_unpack(
     }
     ptr
 }
+
+// ── Distro ───────────────────────────────────────────────────────────────────
+//
+// Thin FFI over `lxmf_rust::distro`. The payload construction and blob
+// unwrapping live there, once, shared with the Android bridge — wire formats
+// are the one thing that must not be written twice per platform.
+//
+// Every function returns a heap buffer the caller frees with
+// `rns_free_bytes`, matching the channel functions above.
+
+fn distro_identity(handle: u64, label: &str) -> Option<reticulum_rust::identity::Identity> {
+    match rns::get_handle::<reticulum_rust::identity::Identity>(handle) {
+        Some(id) => Some(id),
+        None => {
+            rns::set_error(format!("invalid {label} identity handle"));
+            None
+        }
+    }
+}
+
+fn emit_buffer(bytes: Vec<u8>, out_len: *mut u32) -> *mut u8 {
+    let len = bytes.len() as u32;
+    let mut boxed = bytes.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    unsafe {
+        *out_len = len;
+    }
+    ptr
+}
+
+fn emit_error(out_len: *mut u32, message: String) -> *mut u8 {
+    rns::set_error(message);
+    unsafe {
+        *out_len = 0;
+    }
+    std::ptr::null_mut()
+}
+
+/// msgpack payload for `/rfed/distro/register` and `/rfed/distro/unregister`.
+///
+/// Signed with the DISTRO key over the device public key — that signature is
+/// what proves the caller may enrol a device under this distro.
+#[no_mangle]
+pub extern "C" fn retichat_distro_register_payload(
+    device_handle: u64,
+    distro_handle: u64,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let (Some(device), Some(distro)) = (
+        distro_identity(device_handle, "device"),
+        distro_identity(distro_handle, "distro"),
+    ) else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    };
+
+    match lxmf_rust::distro::register_payload(&device, &distro) {
+        Ok(bytes) => emit_buffer(bytes, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// msgpack payload for `/rfed/distro/list`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_list_payload(distro_handle: u64, out_len: *mut u32) -> *mut u8 {
+    let Some(distro) = distro_identity(distro_handle, "distro") else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    };
+    match lxmf_rust::distro::list_payload(&distro) {
+        Ok(bytes) => emit_buffer(bytes, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// msgpack payload for `/rfed/distro/announce`.
+///
+/// RFed only ever learns the distro public key, so it cannot sign an announce
+/// for the distro address itself. Without this the address resolves nowhere.
+#[no_mangle]
+pub extern "C" fn retichat_distro_announce_payload(
+    distro_handle: u64,
+    app_data: *const u8,
+    app_data_len: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let Some(distro) = distro_identity(distro_handle, "distro") else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    };
+    let app = if app_data.is_null() || app_data_len == 0 {
+        None
+    } else {
+        Some(slice_from_raw(app_data, app_data_len))
+    };
+    match lxmf_rust::distro::announce_payload(&distro, app.as_deref()) {
+        Ok(bytes) => emit_buffer(bytes, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// The distro's `lxmf.delivery` hash — the address senders use. NOT the
+/// identity hash, which is a different value and routes nowhere.
+#[no_mangle]
+pub extern "C" fn retichat_distro_delivery_hash(
+    distro_handle: u64,
+    out_buf: *mut u8,
+    buf_len: u32,
+) -> i32 {
+    if buf_len < 16 {
+        rns::set_error("delivery hash buffer too small (need 16)".into());
+        return -1;
+    }
+    let Some(distro) = distro_identity(distro_handle, "distro") else { return -1 };
+    match lxmf_rust::distro::delivery_hash(&distro) {
+        Ok(hash) => {
+            unsafe { std::ptr::copy_nonoverlapping(hash.as_ptr(), out_buf, 16); }
+            16
+        }
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// Decrypt a distro blob and return the message as JSON.
+///
+/// JSON rather than a struct because this is a client-internal boundary, not a
+/// wire format: Swift decodes it with JSONDecoder and no manual field
+/// marshalling. Returns a zero-length buffer (not an error) when the blob is
+/// addressed to a different distro, which a node may legitimately hand over.
+///
+/// Fields: source_hash (hex), timestamp, title, content,
+/// is_delivery_notification, ticket, distro_transfer_key.
+#[no_mangle]
+pub extern "C" fn retichat_distro_unwrap(
+    distro_handle: u64,
+    blob: *const u8,
+    blob_len: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let Some(mut distro) = distro_identity(distro_handle, "distro") else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    };
+    let data = slice_from_raw(blob, blob_len);
+
+    match lxmf_rust::distro::unwrap_blob(&mut distro, &data) {
+        Ok(None) => emit_buffer(Vec::new(), out_len),
+        Ok(Some(msg)) => {
+            let json = format!(
+                concat!(
+                    r#"{{"source_hash":"{}","timestamp":{},"title":{},"content":{},"#,
+                    r#""is_delivery_notification":{},"ticket":{},"distro_transfer_key":{}}}"#
+                ),
+                msg.source_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                msg.timestamp,
+                json_string(&msg.title),
+                json_string(&msg.content),
+                msg.is_delivery_notification,
+                msg.ticket.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+                msg.distro_transfer_key.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+            );
+            emit_buffer(json.into_bytes(), out_len)
+        }
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}

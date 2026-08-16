@@ -675,3 +675,62 @@ int32_t  rns_rnode_iface_id_beacon_now(uint64_t handle);
 int32_t  rns_rnode_iface_deregister(uint64_t handle);
 
 #endif /* CRetichatFFI_h */
+
+#pragma mark - Distro
+//
+// RFed's distro feature: one LXMF address shared by all of a person's devices.
+// Messages sent to it are fanned out by RFed to every registered device.
+//
+// The payload construction and blob unwrapping live in lxmf_rust::distro,
+// shared with the Android bridge — these are wire formats, and a second copy
+// per platform is how two implementations quietly stop talking to each other.
+//
+// All buffer-returning functions here allocate; free with rns_free_bytes.
+
+/// msgpack payload for /rfed/distro/register and /rfed/distro/unregister:
+///   [ bin(64) device_pubkey, bin(64) distro_pubkey, bin(64) sig(device_pubkey) ]
+/// The signature is made with the DISTRO key: it is what proves the caller may
+/// enrol a device under this distro.
+/// Returns heap bytes (free with rns_free_bytes), or NULL on error.
+uint8_t *retichat_distro_register_payload(uint64_t device_handle,
+                                          uint64_t distro_handle,
+                                          uint32_t *out_len);
+
+/// msgpack payload for /rfed/distro/list:
+///   [ bin(16) distro_identity_hash, bin(64) distro_pubkey, bin(64) sig(hash) ]
+uint8_t *retichat_distro_list_payload(uint64_t distro_handle, uint32_t *out_len);
+
+/// msgpack payload for /rfed/distro/announce:
+///   [ bin value, bin(64) distro_pubkey, bin(64) sig(value) ]
+/// where value = flags(1) || announce_data, bit 0 signalling a ratchet.
+///
+/// RFed only ever learns the distro PUBLIC key, so it cannot sign an announce
+/// for the distro address itself. Without this the address resolves nowhere and
+/// senders cannot reach it. Pass NULL/0 app_data for none.
+uint8_t *retichat_distro_announce_payload(uint64_t distro_handle,
+                                          const uint8_t *app_data,
+                                          uint32_t app_data_len,
+                                          uint32_t *out_len);
+
+/// The distro's lxmf.delivery hash — the address senders actually use.
+/// NOT the identity hash, which is a different value and routes nowhere.
+/// Writes 16 bytes; returns 16 on success, -1 on error.
+int32_t retichat_distro_delivery_hash(uint64_t distro_handle,
+                                      uint8_t *out_buf,
+                                      uint32_t buf_len);
+
+/// Decrypt a distro blob (from rfed.delivery or /rfed/pull) and return the
+/// message as JSON for JSONDecoder:
+///   { source_hash, timestamp, title, content,
+///     is_delivery_notification, ticket, distro_transfer_key }
+///
+/// A ZERO-LENGTH result is not an error: it means the blob is addressed to a
+/// different distro, which a node may legitimately hand over.
+///
+/// Deduplicate on (source_hash, timestamp). The same message arrives more than
+/// once — live fan-out, deferred PULL, and a re-fan whenever a node re-ingests
+/// it — and the framings differ, so the raw bytes are not a usable key.
+uint8_t *retichat_distro_unwrap(uint64_t distro_handle,
+                                const uint8_t *blob,
+                                uint32_t blob_len,
+                                uint32_t *out_len);
