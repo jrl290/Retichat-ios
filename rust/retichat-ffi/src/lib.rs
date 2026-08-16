@@ -760,9 +760,11 @@ pub extern "C" fn retichat_compute_channel_stamp(
     let transient_id = reticulum_rust::identity::full_hash(&data);
     let workblock = LXStamper::stamp_workblock(&transient_id, 16);
     let (stamp, value) = LXStamper::generate_stamp(&transient_id, cost, 16);
-    // generate_stamp may silently return a sub-cost stamp if it exhausts
-    // its internal iteration cap.  Verify against the SAME workblock the
-    // rfed node uses, so we never ship a stamp that will be rejected.
+    // generate_stamp no longer returns a sub-cost stamp when it gives up — it
+    // returns None — so the workaround this comment used to describe is gone.
+    // The check stays: it still catches a workblock mismatch against the SAME
+    // workblock the rfed node uses, rather than letting the node reject it.
+    let stamp = stamp.unwrap_or_default();
     if value < cost || !LXStamper::stamp_valid(&stamp, cost, &workblock) {
         rns::set_error(format!(
             "stamp PoW failed: required cost={} but achieved value={} (payload_len={}). \
