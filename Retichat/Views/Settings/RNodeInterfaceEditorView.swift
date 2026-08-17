@@ -156,7 +156,7 @@ struct RNodeInterfaceEditorView: View {
     // MARK: - Form ↔ profile sync
 
     private func loadFormFromProfile() {
-        freqMHzText = String(format: "%.3f", Double(profile.radio.frequency) / 1_000_000)
+        freqMHzText = RNodeFrequencyFormatter.mhzText(for: profile.radio.frequency)
         if let beacon = profile.radio.idBeacon {
             idEnabled = true
             idCallsign = beacon.callsign
