@@ -734,3 +734,9 @@ uint8_t *retichat_distro_unwrap(uint64_t distro_handle,
                                 const uint8_t *blob,
                                 uint32_t blob_len,
                                 uint32_t *out_len);
+
+/// Generate a fresh distro private key (64 bytes: X25519_priv || Ed25519_priv).
+/// Use this rather than 64 random bytes of your own: the halves are not
+/// interchangeable and a subtly wrong key fails later, at decrypt time.
+/// Returns heap bytes (free with rns_free_bytes), or NULL on error.
+uint8_t *retichat_distro_generate(uint32_t *out_len);

@@ -1538,3 +1538,18 @@ fn json_string(s: &str) -> String {
     out.push('"');
     out
 }
+
+/// Generate a fresh distro private key (64 bytes: X25519_priv || Ed25519_priv).
+///
+/// Goes through Identity::new so key generation matches every other identity in
+/// the stack. Callers must not substitute 64 random bytes of their own — the
+/// halves are not interchangeable and a subtly wrong key fails later, at
+/// decrypt time, far from the mistake.
+#[no_mangle]
+pub extern "C" fn retichat_distro_generate(out_len: *mut u32) -> *mut u8 {
+    let identity = reticulum_rust::identity::Identity::new(true);
+    match identity.get_private_key() {
+        Ok(key) => emit_buffer(key, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
