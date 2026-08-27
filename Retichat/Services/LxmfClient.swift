@@ -85,6 +85,8 @@ fileprivate final class AppLinkPacketCallbackBox {
 /// pointers. Rust replaces link callbacks asynchronously, so releasing a
 /// per-client context during replacement or shutdown can race an in-flight
 /// callback. Reusing one process-lifetime box per destination avoids that race.
+/// TODO: Add a Rust-owned context release callback or synchronous unregister
+/// API so boxes can be reclaimed safely instead of living until process exit.
 fileprivate final class AppLinkPacketCallbackRegistry: @unchecked Sendable {
     static let shared = AppLinkPacketCallbackRegistry()
 
