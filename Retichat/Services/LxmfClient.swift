@@ -59,11 +59,49 @@ fileprivate final class BoolContinuationBox {
     init(cont: CheckedContinuation<Bool, Never>) { self.cont = cont }
 }
 
-/// Heap box retained across the C FFI boundary for persistent APP_LINK
-/// packet callbacks.
+/// Stable callback context passed across the C FFI boundary for persistent
+/// APP_LINK packet callbacks.
 fileprivate final class AppLinkPacketCallbackBox {
-    let callback: @Sendable (Data) -> Void
+    private let lock = NSLock()
+    private var callback: @Sendable (Data) -> Void
+
     init(callback: @escaping @Sendable (Data) -> Void) { self.callback = callback }
+
+    func update(callback: @escaping @Sendable (Data) -> Void) {
+        lock.lock()
+        self.callback = callback
+        lock.unlock()
+    }
+
+    func invoke(with data: Data) {
+        lock.lock()
+        let callback = self.callback
+        lock.unlock()
+        callback(data)
+    }
+}
+
+/// Keeps callback contexts alive for as long as Rust may retain their opaque
+/// pointers. Rust replaces link callbacks asynchronously, so releasing a
+/// per-client context during replacement or shutdown can race an in-flight
+/// callback. Reusing one process-lifetime box per destination avoids that race.
+fileprivate final class AppLinkPacketCallbackRegistry: @unchecked Sendable {
+    static let shared = AppLinkPacketCallbackRegistry()
+
+    private let lock = NSLock()
+    private var boxes: [String: AppLinkPacketCallbackBox] = [:]
+
+    func box(for key: String, callback: @escaping @Sendable (Data) -> Void) -> AppLinkPacketCallbackBox {
+        lock.lock()
+        defer { lock.unlock() }
+        if let box = boxes[key] {
+            box.update(callback: callback)
+            return box
+        }
+        let box = AppLinkPacketCallbackBox(callback: callback)
+        boxes[key] = box
+        return box
+    }
 }
 
 /// Top-level C-compatible trampoline for `lxmf_app_link_request_async`.
@@ -100,7 +138,7 @@ fileprivate let _appLinkPacketTrampoline: lxmf_app_link_packet_callback_t = {
     } else {
         data = Data()
     }
-    box.callback(data)
+    box.invoke(with: data)
 }
 
 /// Manages a complete Reticulum + LXMF stack lifecycle through one opaque
@@ -137,9 +175,6 @@ final class LxmfClient: @unchecked Sendable {
 
     /// Cached 16-byte LXMF delivery destination hash.
     let destHash: Data
-
-    private let appLinkPacketCallbackLock = NSLock()
-    private var appLinkPacketCallbackBoxes: [String: Unmanaged<AppLinkPacketCallbackBox>] = [:]
 
     /// The underlying identity handle for use with transport-level functions.
     var identityHandle: UInt64 {
@@ -433,27 +468,17 @@ final class LxmfClient: @unchecked Sendable {
         callback: @escaping @Sendable (Data) -> Void
     ) -> Bool {
         let key = destHash.map { String(format: "%02x", $0) }.joined()
-        let box = Unmanaged.passRetained(AppLinkPacketCallbackBox(callback: callback))
-        let ok = destHash.withUnsafeBytes { buf -> Bool in
+        let box = AppLinkPacketCallbackRegistry.shared.box(for: key, callback: callback)
+        return destHash.withUnsafeBytes { buf -> Bool in
             let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return lxmf_app_link_register_packet_callback(
                 handle,
                 ptr,
                 UInt32(destHash.count),
                 _appLinkPacketTrampoline,
-                box.toOpaque()
+                Unmanaged.passUnretained(box).toOpaque()
             ) == 0
         }
-        guard ok else {
-            box.release()
-            return false
-        }
-
-        appLinkPacketCallbackLock.lock()
-        let old = appLinkPacketCallbackBoxes.updateValue(box, forKey: key)
-        appLinkPacketCallbackLock.unlock()
-        old?.release()
-        return true
     }
 
     /// Notify the router that the host's network reachability state has
@@ -778,22 +803,7 @@ final class LxmfClient: @unchecked Sendable {
 
     /// Shut down: destroy router, identity, and transport.
     func shutdown() {
-        releaseAppLinkPacketCallbackBoxes()
         lxmf_client_shutdown(handle)
-    }
-
-    deinit {
-        releaseAppLinkPacketCallbackBoxes()
-    }
-
-    private func releaseAppLinkPacketCallbackBoxes() {
-        appLinkPacketCallbackLock.lock()
-        let boxes = Array(appLinkPacketCallbackBoxes.values)
-        appLinkPacketCallbackBoxes.removeAll()
-        appLinkPacketCallbackLock.unlock()
-        for box in boxes {
-            box.release()
-        }
     }
 
     // MARK: - Helpers
