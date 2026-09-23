@@ -234,7 +234,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Hand the delivery destination off to Transport's auto-announce
         // daemon: it will announce immediately, on every interface up-edge,
-        // and every 30 minutes thereafter.  Replaces the previous Timer +
+        // and every 30 minutes thereafter, each held per interface to one
+        // announce per 30 minutes.  Replaces the previous Timer +
         // onConnect re-announce + foreground re-announce pattern.
         let publishClient = lxmfClient
         ffiQueue.async {

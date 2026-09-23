@@ -632,7 +632,9 @@ final class LxmfClient: @unchecked Sendable {
     /// Opt this client's delivery destination into Transport's auto-announce
     /// daemon. Transport will then re-announce automatically on every
     /// interface up-edge and every `refreshSecs` seconds (pass 0 for
-    /// up-edge-only).
+    /// up-edge-only), both held per interface to one announce per period
+    /// (`refreshSecs`, or 30 min when 0) since the last announce there,
+    /// including the app's own `announce()`, which always goes out.
     @discardableResult
     func publish(refreshSecs: TimeInterval) -> Bool {
         lxmf_client_publish(handle, refreshSecs) == 0
