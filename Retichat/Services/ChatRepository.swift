@@ -200,9 +200,18 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Heavy FFI call (TCP connect, transport init, ratchet load) runs off
         // the main thread so the UI stays responsive during startup.
+        //
+        // It runs on ffiQueue, behind any shutdown stopService() queued there.
+        // The Rust stack is a process singleton: a start that overtakes the
+        // previous shutdown fails with "Reticulum is already initialised",
+        // which is what Settings → Apply hit once shutdown began tearing
+        // links down (B31) and so took longer than the start's head start.
+        let ffiQueueRef = ffiQueue
         Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath] in
-            let result: Result<LxmfClient, Error> = Result {
-                try LxmfClient.start(config: config)
+            let result: Result<LxmfClient, Error> = await withCheckedContinuation { cont in
+                ffiQueueRef.async {
+                    cont.resume(returning: Result { try LxmfClient.start(config: config) })
+                }
             }
 
             // Persist the live router state before mirroring files into the App
