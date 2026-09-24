@@ -2308,6 +2308,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     }
                 }
             }
+            // The window above holds the newest messages across ALL chats, so
+            // one busy chat pushes a quieter chat's last message out of it and
+            // that row showed an empty preview. Look those chats up one by one.
+            for id in chatIds where lastMsgByChat[id] == nil {
+                if let m = lastMessage(forChatId: id) {
+                    lastMsgByChat[id] = m
+                }
+            }
         }
 
         // Batch-fetch contact display names for non-group chats
