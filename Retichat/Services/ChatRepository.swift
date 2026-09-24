@@ -10,6 +10,18 @@ import Foundation
 import SwiftData
 import Combine
 
+/// This device's own identity, for the Identity screen.
+struct DeviceIdentityInfo: Equatable {
+    let deliveryHashHex: String
+    let identityHashHex: String
+    /// 128 hex; empty if the Rust side could not return the key.
+    let publicKeyHex: String
+    var contactUri: String? {
+        IdentityShareFormat.encode(destinationHashHex: deliveryHashHex,
+                                   publicKey: Data(hexString: publicKeyHex))
+    }
+}
+
 @MainActor
 final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback, MessageStateCallback {
     // MARK: - Published state
@@ -18,6 +30,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     @Published var serviceRunning = false
     @Published var ownHashHex: String = ""
     @Published var statusMessage: String = "Idle"
+    /// True only after the last start attempt failed (finishStartService's
+    /// .failure branch); reset by startService(). Lets the chat-list status
+    /// line show "Error" as Android does (ChatListScreen.kt:116-135).
+    @Published private(set) var serviceStartFailed = false
 
     // MARK: - Handles
 
@@ -65,6 +81,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let content: String
         let title: String
         let hasAttachments: Bool
+        /// Signed as the distro (source = distro address). Its delivery
+        /// notification goes to the distro and returns only via fan-out, so
+        /// a propagated copy completes on SENT (see handleMessageState 0x04).
+        let sentAsDistro: Bool
     }
 
     private var pendingOutbound: [String: PendingOutbound] = [:]
@@ -98,10 +118,41 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     func configure(modelContext: ModelContext) {
         self.modelContext = modelContext
+        normalizeMillisecondChatTimes()
         GroupChatManager.shared.onTracked = { [weak self] hashHex in
             Task { @MainActor [weak self] in
                 self?.replayBufferedMessageStatesIfNeeded(for: hashHex)
             }
+        }
+        // Distro fan-out lands here as a decoded message (Android
+        // RfedDistroClient.handleBlob → ChatRepository.onDistroMessageReceived).
+        RfedDistroClient.shared.onMessage = { [weak self] message in
+            self?.handleDistroMessage(message)
+        }
+        // Identity-transfer sends are tracked like group fan-out: replay any
+        // state that arrived before the hash was tracked.
+        DistroTransferTracker.shared.onTracked = { [weak self] hashHex in
+            Task { @MainActor [weak self] in
+                self?.replayBufferedMessageStatesIfNeeded(for: hashHex)
+            }
+        }
+    }
+
+    /// Chats created by ensureChat/createGroupChat before 2026-09-24 hold a
+    /// millisecond lastMessageTime. Anything above 1e11 cannot be a
+    /// seconds-epoch value (year 5138+), so it is milliseconds — the same
+    /// rule RfedChannelClient applies to channel times.
+    private func normalizeMillisecondChatTimes() {
+        guard let ctx = modelContext,
+              let chats = try? ctx.fetch(FetchDescriptor<ChatEntity>()) else { return }
+        var fixed = 0
+        for chat in chats where chat.lastMessageTime > 1e11 {
+            chat.lastMessageTime /= 1000.0
+            fixed += 1
+        }
+        if fixed > 0 {
+            try? ctx.save()
+            print("[Retichat] normalized \(fixed) chat time(s) from milliseconds to seconds")
         }
     }
 
@@ -110,6 +161,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     func startService() {
         guard !serviceRunning, !serviceStarting else { return }
         serviceStarting = true
+        serviceStartFailed = false
 
         print("[Retichat] v1.0 build 2 starting")
 
@@ -148,7 +200,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Heavy FFI call (TCP connect, transport init, ratchet load) runs off
         // the main thread so the UI stays responsive during startup.
-        Task.detached(priority: .userInitiated) { [config, idPath, configDir, storagePath] in
+        Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath] in
             let result: Result<LxmfClient, Error> = Result {
                 try LxmfClient.start(config: config)
             }
@@ -165,15 +217,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
             PendingNotification.syncRatchetsToAppGroup(from: storagePath)
 
-            await MainActor.run { [weak self] in
-                self?.finishStartService(result: result, configDir: configDir, storagePath: storagePath)
-            }
+            await self?.finishStartService(result: result, configDir: configDir, storagePath: storagePath)
         }
     }
 
     /// Second half of startup — runs on @MainActor after the FFI call completes.
     ///
     /// Startup ordering (deterministic; do not rearrange casually):
+    ///   0. Load the distro key (Keychain, on a detached task) before anything
+    ///      can send or receive — sendingIdentity and the distro fan-out
+    ///      routing read it (Android StackRuntime 245-249). `serviceStarting`
+    ///      stays true across this await so a second start cannot begin.
     ///   1. Stash client + own-hash so other layers can find them.
     ///   2. Wire up the FFI callbacks (must be before any traffic flows).
     ///   3. Configure announce-drop policy (must be before path discovery).
@@ -186,21 +240,27 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///   6. Start RNode interfaces (independent of the path/link stack).
     ///   7. Hand delivery destination to publish daemon (auto-re-announce).
     ///   8. Side-tasks: ratchet sync, periodic poll, rfed notify register.
+    ///   9. Distro registration with RFed (after ConnectionStateManager is
+    ///      registered; Android StackRuntime 310-313).
     ///
     /// Each step that touches the FFI is hopped to `ffiQueue` (serial) or to
     /// a detached Task; all on-main-actor work above runs synchronously in
     /// the order written, so component callbacks observe a consistent state.
-    private func finishStartService(result: Result<LxmfClient, Error>, configDir: String, storagePath: String) {
-        serviceStarting = false
+    private func finishStartService(result: Result<LxmfClient, Error>, configDir: String, storagePath: String) async {
         let client: LxmfClient
         switch result {
         case .success(let c):
             client = c
         case .failure(let error):
+            serviceStarting = false
             print("[Retichat] Failed to start: \(error.localizedDescription)")
             statusMessage = "Failed to start"
+            serviceStartFailed = true
             return
         }
+
+        await RfedDistroClient.shared.prepareForStackStart()
+        serviceStarting = false
 
         self.lxmfClient = client
         ownHash = client.destHash
@@ -255,6 +315,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Register with rfed notify service so the relay can wake this device.
         registerRfedNotify()
 
+        // Enrol this device under the distro (if one is held): register, hand
+        // RFed the pre-signed announce, pull deferred blobs.
+        RfedDistroClient.shared.onStackStarted(client: client)
+
         // Network reconnect handler.  Transport now auto-re-announces on
         // every interface up-edge, so we no longer need to explicitly call
         // announce() here — just nudge the TCP reconnect loops awake and
@@ -301,6 +365,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         lxmfClient = nil
         serviceRunning = false
         statusMessage = "Stopped"
+        // Before deregister (Android shutdownNow:324): drops in-flight distro
+        // results and the armed ACTIVE handler while CSM still owns it.
+        RfedDistroClient.shared.onStackStopped()
         ConnectionStateManager.shared.deregister()
         NetworkMonitor.shared.onConnect = nil
 
@@ -321,6 +388,29 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         ApnsTokenRegistrar.shared.registerIfNeeded(subscriberHash: ownHash)
         // 2. Register relay hash with rfed (AppLinks DATA → rfed.notify)
         RfedNotifyRegistrar.shared.registerIfNeeded(identityHandle: client.identityHandle)
+    }
+
+    // MARK: - Own identity
+
+    /// This device's own address and keys, for the Identity screen's
+    /// "This device" section (Android IdentityScreen.kt:162-173). nil while
+    /// the stack is down.
+    func deviceIdentityInfo() -> DeviceIdentityInfo? {
+        guard let client = lxmfClient else { return nil }
+        return DeviceIdentityInfo(
+            deliveryHashHex: client.destHashHex,
+            identityHashHex: client.identityHashHex,
+            publicKeyHex: bridge.identityPublicKey(handle: client.identityHandle)?.hexString ?? "")
+    }
+
+    /// True for this device's address or the held distro's address — the
+    /// self-chat checks (QR scan, deep links, new chat) use this.
+    func isOwnAddress(_ hex: String) -> Bool {
+        let h = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !h.isEmpty else { return false }
+        if h == ownHashHex.lowercased() { return true }
+        if let distro = RfedDistroClient.shared.distro, h == distro.deliveryHashHex.lowercased() { return true }
+        return false
     }
 
     // MARK: - Config generation
@@ -466,6 +556,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         propagationStreamDest = streamDest
 
         _ = ConnectionStateManager.shared.registerAppLinkPacketCallback(destHash: streamDest) { [weak self] data in
+            // Distro fan-out. iOS never starts rfed.delivery, so RFed's
+            // distro_fanout (RFed-rust/rfed/src/distro.rs) reaches us on tier 2,
+            // this propagation stream: the bare LXMF blob, whose first 16 bytes
+            // are the distro's lxmf.delivery address. ingestPropagated would
+            // drop it silently (we hold no inbound destination for it), so
+            // route it to the distro client first.
+            // Known RFed gap, not fixed here: PropagationStreamRegistry::dispatch
+            // (stream_registry.rs:135-166) counts send_packet Ok as delivered, so
+            // a blob sent while iOS is suspended and before RFed marks this link
+            // stale is neither deferred nor stored.
+            if data.count > 16, let distroHash = DistroManager.shared.deliveryHash,
+               data.prefix(16) == distroHash {
+                RfedDistroClient.ingestBlob(Data(data))
+                return
+            }
             guard let self else { return }
             self.ffiQueue.async { [weak self] in
                 guard let self, let client = self.lxmfClient else { return }
@@ -545,9 +650,43 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
             let srcHex = msg.senderHash
 
+            // A transfer the NSE fetched: its key was moved to the Keychain
+            // and its fields were not persisted (PendingNotification
+            // .stashDistroTransferKey). Take the key off the main actor
+            // (DistroManager's Keychain rule), then offer it as usual.
+            if let stash = msg.distroTransfer {
+                switch stash {
+                case .keychain:
+                    let msgHash = msg.messageHash
+                    Task {
+                        let key = await Task.detached(priority: .userInitiated) {
+                            PendingNotification.takeDistroTransferKey(messageHash: msgHash)
+                        }.value
+                        if let key {
+                            print("[Retichat] importNSEMessages: distro identity transfer from \(srcHex.prefix(8))")
+                            RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
+                        } else {
+                            RfedDistroClient.shared.post(notice: "A distro identity transfer arrived but could not be read. Send it again from the other device.")
+                        }
+                    }
+                case .lost:
+                    print("[Retichat] importNSEMessages: NSE could not keep a distro transfer from \(srcHex.prefix(8))")
+                    RfedDistroClient.shared.post(notice: "A distro identity transfer arrived but could not be kept. Send it again from the other device.")
+                }
+                continue
+            }
+
             // Decode LXMF fields
             let fieldsData = Data(base64Encoded: msg.fieldsRawBase64) ?? Data()
             let fields = LxmfFieldsDecoder.decode(fieldsData)
+
+            // A distro transfer the NSE fetched is still an offer, not a chat
+            // message — same check as handleIncomingMessage.
+            if let key = fields.distroTransferKey {
+                print("[Retichat] importNSEMessages: distro identity transfer from \(srcHex.prefix(8))")
+                RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
+                continue
+            }
 
             if let groupId = fields.groupId {
                 if shouldProcessGroupMessage(groupId: groupId,
@@ -730,14 +869,36 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // reason to wait here.  We always pass DIRECT if a path or active
         // link exists; Rust falls back to PROPAGATED after its 3-second
         // stagger if the link doesn't materialise in time.
-        let method = ConnectionStateManager.shared.deliveryMethod(for: destData)
-        let methodName = method == LxmfMethod.direct ? "DIRECT" : "PROPAGATED"
-        print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
+        let linkMethod = ConnectionStateManager.shared.deliveryMethod(for: destData)
+
+        // Sending TO a distro (RFed SPEC §17.10): no device answers a direct
+        // link to the distro address, so it goes PROPAGATED at once (Android
+        // ChatRepository.kt:400-411). The stored flag covers a distro whose
+        // announce we heard earlier; the live announce lookup reads the Rust
+        // destination table, so it runs on ffiQueue, not the main actor.
+        let knownDistro = prefs.isDistroContact(destHashHex)
+        let directMethod = LxmfMethod.direct
+        let propagatedMethod = LxmfMethod.propagated
+        // Captured here: sendingIdentity needs the device pair off-main.
+        let deviceHash = client.destHash
+        let deviceHandle = client.identityHandle
+        let bridgeRef = bridge
 
         let ffiQueueRef = ffiQueue
         Task.detached(priority: .userInitiated) { [weak self] in
             ffiQueueRef.async { [weak self] in
-                let msgHandle = client.createMessage(
+                let toDistro = knownDistro || bridgeRef.peerIsDistro(destHash: destData)
+                if toDistro {
+                    print("[Retichat] sendMessage: dest is a distro address — sending PROPAGATED")
+                }
+                let method = toDistro ? propagatedMethod : linkMethod
+                let methodName = method == directMethod ? "DIRECT" : "PROPAGATED"
+                print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
+
+                let (msgHandle, sentAsDistro) = Self.createOutboundMessage(
+                    bridge: bridgeRef,
+                    deviceHash: deviceHash,
+                    deviceHandle: deviceHandle,
                     to: destData,
                     content: content,
                     title: "",
@@ -841,7 +1002,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     msgHandle: msgHandle,
                     content: content,
                     title: "",
-                    hasAttachments: !attachmentsCopy.isEmpty
+                    hasAttachments: !attachmentsCopy.isEmpty,
+                    sentAsDistro: sentAsDistro
                 )
                 self.replayBufferedMessageStatesIfNeeded(for: msgHashHex)
 
@@ -856,6 +1018,25 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
             }  // ffiQueueRef.async
         }  // Task.detached
+    }
+
+    /// Create an outbound DM whose source is the distro when one is held, so
+    /// replies fan out to every device (Android DistroManager.sendingIdentity
+    /// at ChatRepository.kt:426-435 and 666-673; web RnsClient.sendingIdentity).
+    /// Group sends stay device-signed; the optimistic bubble keeps
+    /// senderHash = ownHashHex either way (Android quirk 6).
+    ///
+    /// nonisolated: runs on ffiQueue. Returns handle 0 on failure.
+    nonisolated private static func createOutboundMessage(
+        bridge: RetichatBridge, deviceHash: Data, deviceHandle: UInt64, to dest: Data,
+        content: String, title: String, method: UInt8
+    ) -> (handle: UInt64, asDistro: Bool) {
+        let (src, identity) = DistroManager.shared.sendingIdentity(
+            deviceHash: deviceHash, deviceHandle: deviceHandle)
+        let handle = bridge.messageCreate(
+            destHash: dest, sourceHash: src, content: content, title: title,
+            method: method, identityHandle: identity)
+        return (handle, src != deviceHash)
     }
 
     // MARK: - Group message send (fanout to all accepted members)
@@ -1064,6 +1245,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
            GroupChatManager.shared.handleMessageState(hashHex: hashHex, state: state, client: client) {
             return
         }
+        if let client = lxmfClient,
+           DistroTransferTracker.shared.handleMessageState(hashHex: hashHex, state: state, client: client) {
+            return
+        }
         guard let pending = pendingOutbound[hashHex] else {
             // DELIVERED can arrive after the pending was already completed
             // (e.g. SENT completed it for a propagated message before this fix).
@@ -1080,11 +1265,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         case 0x04:  // SENT — propagated message accepted by the prop node.
             updateDeliveryState(messageId: pending.messageId, state: DeliveryState.sent)
-            if pending.method != LxmfMethod.propagated {
+            if pending.method != LxmfMethod.propagated || pending.sentAsDistro {
                 // DIRECT: SENT is terminal — Rust fires only one of SENT/DELIVERED
                 // (else-if in lxm_router.rs). Complete now.
-                // PROPAGATED: DELIVERED will follow as a separate callback.
-                // Keep the pending alive so it can be matched.
+                // PROPAGATED as the distro: the recipient's delivery
+                // notification is addressed to the distro and comes back only
+                // through RFed fan-out, so DELIVERED never reaches the router.
+                // Complete now rather than hold the handle forever.
+                // PROPAGATED as the device: DELIVERED will follow as a separate
+                // callback. Keep the pending alive so it can be matched.
                 completePending(hashHex: hashHex, pending: pending)
             }
 
@@ -1159,13 +1348,23 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
+        let deviceHash = client.destHash
+        let deviceHandle = client.identityHandle
+        let propagatedMethod = LxmfMethod.propagated
+        let bridgeRef = bridge
+
         // Run FFI calls off the main thread.
         ffiQueue.async { [weak self] in
-            let msgHandle = client.createMessage(
+            // Same source choice as the DIRECT attempt: as the distro when one
+            // is held (Android schedulePropagationFallback, kt:666-673).
+            let (msgHandle, sentAsDistro) = Self.createOutboundMessage(
+                bridge: bridgeRef,
+                deviceHash: deviceHash,
+                deviceHandle: deviceHandle,
                 to: original.peerHash,
                 content: original.content,
                 title: original.title,
-                method: LxmfMethod.propagated
+                method: propagatedMethod
             )
             guard msgHandle != 0 else {
                 Task { @MainActor [weak self] in
@@ -1200,7 +1399,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     msgHandle: msgHandle,
                     content: original.content,
                     title: original.title,
-                    hasAttachments: false
+                    hasAttachments: false,
+                    sentAsDistro: sentAsDistro
                 )
                 self?.replayBufferedMessageStatesIfNeeded(for: newHashHex)
             }
@@ -1285,6 +1485,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Decode LXMF fields
         let fields = LxmfFieldsDecoder.decode(fieldsRaw)
 
+        // Distro identity transfer from another of our devices (SPEC §17.9):
+        // an offer for the user to answer, never a chat message. Checked before
+        // the group and allowlist paths (Android kt:854-862; web app.js 927-935).
+        if let key = fields.distroTransferKey {
+            print("[Retichat] handleIncomingMessage: distro identity transfer from \(srcHex.prefix(8))")
+            RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
+            return
+        }
+
         // Handle group message
         if let groupId = fields.groupId {
             if shouldProcessGroupMessage(groupId: groupId,
@@ -1307,6 +1516,22 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         print("[Retichat] handleIncomingMessage: ACCEPTED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
 
+        storeIncomingDirect(
+            messageId: msgHashHex, srcHash: srcHash, title: title, content: content,
+            timestamp: timestamp, signatureValid: signatureValid,
+            senderName: fields.senderName, attachments: fields.attachments)
+    }
+
+    /// Store an accepted direct message and notify — the tail shared by the
+    /// router delivery path and distro fan-out. The caller has already
+    /// deduplicated and applied (or deliberately skipped) the allowlist.
+    private func storeIncomingDirect(messageId msgHashHex: String, srcHash: Data,
+                                     title: String, content: String, timestamp: Double,
+                                     signatureValid: Bool, senderName: String?,
+                                     attachments: [(filename: String, data: Data)]) {
+        guard let ctx = modelContext else { return }
+        let srcHex = srcHash.hexString
+
         // Direct message — find or create chat
         let chatId = srcHex
         ensureChat(id: chatId, peerHash: srcHex)
@@ -1319,7 +1544,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Attempt to fill in the contact's display name from the per-message
         // FIELD_SENDER_NAME first (privacy-preserving — only message recipients
         // see it). Fall back to the announce cache if not present.
-        if let name = fields.senderName, !name.isEmpty {
+        if let name = senderName, !name.isEmpty {
             updateContactNameIfEmpty(destHash: srcHex, name: name)
         } else if let name = lxmfClient?.recallDisplayName(for: srcHash), !name.isEmpty {
             updateContactNameIfEmpty(destHash: srcHex, name: name)
@@ -1340,7 +1565,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         ctx.insert(msgEntity)
 
         // Handle attachments from fields
-        for (filename, data) in fields.attachments {
+        for (filename, data) in attachments {
             let att = AttachmentEntity(
                 id: UUID().uuidString,
                 messageId: msgHashHex,
@@ -1355,12 +1580,44 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         try? ctx.save()
 
         // Get sender name for notification
-        let senderName = contactDisplayName(for: srcHex)
+        let notifyName = contactDisplayName(for: srcHex)
         notifManager.postMessageNotification(
-            chatId: chatId, senderName: senderName, content: content
+            chatId: chatId, senderName: notifyName, content: content
         )
 
         refreshChats()
+    }
+
+    /// A message fanned out to our distro address by RFed (Android
+    /// ChatRepository.onDistroMessageReceived, kt:894-910).
+    ///
+    /// No allowlist check: mail to the distro is mail to this person, and the
+    /// contact is always created, as on Android. `unwrap_blob` neither verifies
+    /// the signature nor carries attachments, so the bubble is marked
+    /// unverified and an attachment-only message gets a placeholder.
+    private func handleDistroMessage(_ m: DistroMessage) {
+        guard let ctx = modelContext else {
+            print("[Retichat] handleDistroMessage: DROPPED - modelContext is nil")
+            return
+        }
+        let srcHex = m.sourceHash.hexString
+        var content = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if content.isEmpty {
+            content = "[Attachment not available via the distro address]"
+        }
+        // Deterministic id: the same message can arrive via the stream AND a
+        // pull before the seen store records it.
+        let msgId = DistroCodec.messageId(sourceHex: srcHex, timestamp: m.timestamp, content: content)
+        let dup = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == msgId })
+        if let existing = try? ctx.fetch(dup), !existing.isEmpty {
+            print("[Retichat] handleDistroMessage: DROPPED duplicate \(msgId.prefix(8))")
+            return
+        }
+        print("[Retichat] handleDistroMessage: src=\(srcHex.prefix(8)) len=\(content.count)")
+        storeIncomingDirect(
+            messageId: msgId, srcHash: m.sourceHash, title: m.title, content: content,
+            timestamp: m.timestamp, signatureValid: false,
+            senderName: nil, attachments: [])
     }
 
     private func handleGroupMessage(hash: Data, srcHash: Data, content: String,
@@ -1639,8 +1896,23 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Track announce for reachability and link-degradation recovery.
         ConnectionStateManager.shared.didReceiveAnnounce(destHash: destHash)
 
-        guard let ctx = modelContext else { return }
         let hex = destHash.hexString
+        // Remember that this address is a distro (announce app_data carried
+        // SF_RFED_DISTRO, SPEC §17.10) — the ONLY source of that fact; links
+        // never set it. Before any early return: a distro announce carries no
+        // name. Only ever set, never cleared (Android kt:1367-1400). The lookup
+        // reads the Rust destination table, so it runs on ffiQueue.
+        let bridgeRef = bridge
+        ffiQueue.async { [weak self] in
+            guard bridgeRef.peerIsDistro(destHash: destHash) else { return }
+            Task { @MainActor [weak self] in
+                guard let self, !self.prefs.isDistroContact(hex) else { return }
+                self.prefs.setDistroContact(hex, true)
+                print("[Retichat] \(hex.prefix(8)) announced as a distro address")
+            }
+        }
+
+        guard let ctx = modelContext else { return }
 
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == hex }
@@ -1689,7 +1961,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // keep watching announces so backbone-routed peers become reachable.
         if let hashData = Data(hexString: normalizedHash) {
             if let publicKey, publicKey.count == 64 {
-                if bridge.rememberDestination(destHash: hashData, publicKey: publicKey) {
+                // Hash-checked: the key must hash to this lxmf.delivery address
+                // (Android DistroContacts.adopt → identityRememberLxmfDelivery).
+                if bridge.rememberLxmfDelivery(destHash: hashData, publicKey: publicKey) {
                     print("[Retichat] createDirectChat: seeded identity for \(normalizedHash.prefix(8))")
                 } else if let error = bridge.rnsLastError() {
                     print("[Retichat] createDirectChat: failed to seed identity \(normalizedHash.prefix(8)): \(error)")
@@ -1713,9 +1987,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         _ = SecRandomCopyBytes(kSecRandomDefault, 16, &randomBytes)
         let groupId = randomBytes.map { String(format: "%02x", $0) }.joined()
 
-        let nowMs = Date().timeIntervalSince1970 * 1000
+        // Seconds, like every other chat time (ChatListView formats seconds).
+        let now = Date().timeIntervalSince1970
         let chat = ChatEntity(
-            id: groupId, peerHash: "", lastMessageTime: nowMs,
+            id: groupId, peerHash: "", lastMessageTime: now,
             isGroup: true, groupName: name, groupStatus: "active"
         )
         ctx.insert(chat)
@@ -2089,9 +2364,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             predicate: #Predicate { $0.id == id }
         )
         if let existing = try? ctx.fetch(descriptor), existing.isEmpty {
-            let nowMs = Date().timeIntervalSince1970 * 1000
+            // Seconds. This was milliseconds until 2026-09-24, and because
+            // updateChatTimestamp keeps the max, a chat opened by a new
+            // sender kept a far-future time for ever ("Jun 24" in the list).
+            let now = Date().timeIntervalSince1970
             let chat = ChatEntity(
-                id: id, peerHash: peerHash, lastMessageTime: nowMs,
+                id: id, peerHash: peerHash, lastMessageTime: now,
                 isGroup: isGroup, groupName: groupName
             )
             ctx.insert(chat)

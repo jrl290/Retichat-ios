@@ -186,7 +186,9 @@ private struct DirectMessageForm: View {
             errorMessage = "Enter a 32-char hash or lxma://<hash>:<pubkey> URI"
             return
         }
-        if peer.destinationHashHex == repository.ownHashHex { errorMessage = "Cannot chat with yourself"; return }
+        // Own address = this device OR the held distro (Android/web treat the
+        // distro as "me" too): a chat to it would loop back through RFed fan-out.
+        if repository.isOwnAddress(peer.destinationHashHex) { errorMessage = "Cannot chat with yourself"; return }
         let chatId = repository.createDirectChat(destHash: peer.destinationHashHex, publicKey: peer.publicKey)
         selectedChatId = chatId
         dismiss()

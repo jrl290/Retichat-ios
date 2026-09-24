@@ -26,6 +26,22 @@ enum LxmfFieldKey {
     static let groupRelayFor:  UInt8 = 0xA6  // string: hash of member being relayed for (relay request)
     static let groupRelayDone: UInt8 = 0xA7  // bool:   relay-complete confirmation signal
     static let groupMemberKeys: UInt8 = 0xA8 // string: one hash:base64-public-key pair per invite chunk
+    // Custom-type fields (LXMF FIELD_CUSTOM_TYPE / FIELD_CUSTOM_DATA). nonisolated
+    // so the distro services, which run off the main actor, can read them.
+    nonisolated static let customType: UInt8 = 0xFB  // string: application-defined message type
+    nonisolated static let customData: UInt8 = 0xFC  // str or bin: payload for customType
+}
+
+// MARK: - Distro identity transfer
+//
+// RFed SPEC §17.9: a distro identity is handed to another device as an LXMF
+// message signed as the SENDING DEVICE, with FIELD_CUSTOM_TYPE (0xFB) =
+// "rfed.distro.transfer" and FIELD_CUSTOM_DATA (0xFC) = the 128-hex private
+// key. Mirrors Android LxmfFields.kt:91-100. Field 0x0D is never used: until
+// 2026-09-24 the transfer rode on it, but LXMF 1.1.1 defines 0x0D as FIELD_EVENT.
+
+nonisolated enum DistroTransfer {
+    static let customType = "rfed.distro.transfer"
 }
 
 // MARK: - Group action constants
@@ -68,6 +84,16 @@ struct LxmfFields {
     var groupRelayFor: String?       // hash of member requesting relay
     var groupRelayDone: Bool?        // relay-complete signal
     var groupMemberKeys: [String: String]?
+    // Custom-type fields
+    var customType: String?          // FIELD_CUSTOM_TYPE (0xFB)
+    var customData: String?          // FIELD_CUSTOM_DATA (0xFC), decoded from msgpack str OR bin (UTF-8)
+
+    /// The 128-hex distro private key when this message is an identity
+    /// transfer (SPEC §17.9), else nil. Both fields must match: a 0xFC payload
+    /// under any other custom type is someone else's data, not a key.
+    var distroTransferKey: String? {
+        customType == DistroTransfer.customType ? customData : nil
+    }
 }
 
 // MARK: - MsgPack decoder
@@ -86,6 +112,14 @@ final class LxmfFieldsDecoder {
 
         for _ in 0..<mapCount {
             guard let key = readUInt(bytes, &offset) else { break }
+            // Field keys above 0xFF exist (LXMF reserves the range above 0xFF
+            // for experimental fields) and none is ours: skip the value. A
+            // plain UInt8(key) trapped here, so one such field in any received
+            // message crashed the app.
+            guard key <= 0xFF else {
+                skipValue(bytes, &offset)
+                continue
+            }
 
             switch UInt8(key) {
             case LxmfFieldKey.fileAttachments:
@@ -150,6 +184,14 @@ final class LxmfFieldsDecoder {
                         return (parts[0].lowercased(), parts[1])
                     })
                 }
+
+            case LxmfFieldKey.customType:
+                fields.customType = readStringOrBin(bytes, &offset)
+
+            case LxmfFieldKey.customData:
+                // The web client may send 0xFC as bin rather than str
+                // (Retichat-js), so both decode to the same UTF-8 string.
+                fields.customData = readStringOrBin(bytes, &offset)
 
             default:
                 skipValue(bytes, &offset)
@@ -273,6 +315,50 @@ final class LxmfFieldsDecoder {
         let data = Data(bytes[offset..<(offset + len)])
         offset += len
         return data
+    }
+
+    /// Read one msgpack str (fixstr/str8/str16/str32) or bin (bin8/bin16/bin32)
+    /// value as UTF-8. Unlike readString, this ALWAYS consumes exactly one value:
+    /// a value of any other type is skipped and yields nil, so a malformed or
+    /// unexpected field can never desynchronise the keys that follow it. A
+    /// length running past the buffer ends the parse (offset = end) rather than
+    /// reading the next key out of the middle of this value.
+    private static func readStringOrBin(_ bytes: [UInt8], _ offset: inout Int) -> String? {
+        guard offset < bytes.count else { return nil }
+        let b = bytes[offset]
+        let headerLen: Int
+        let lenBytes: Int
+
+        if b & 0xE0 == 0xA0 {                 // fixstr
+            headerLen = 1; lenBytes = 0
+        } else if b == 0xD9 || b == 0xC4 {    // str8 / bin8
+            headerLen = 2; lenBytes = 1
+        } else if b == 0xDA || b == 0xC5 {    // str16 / bin16
+            headerLen = 3; lenBytes = 2
+        } else if b == 0xDB || b == 0xC6 {    // str32 / bin32
+            headerLen = 5; lenBytes = 4
+        } else {
+            skipValue(bytes, &offset)
+            return nil
+        }
+
+        guard offset + headerLen <= bytes.count else {
+            offset = bytes.count
+            return nil
+        }
+        var len = 0
+        if lenBytes == 0 {
+            len = Int(b & 0x1F)
+        } else {
+            for i in 1...lenBytes { len = (len << 8) | Int(bytes[offset + i]) }
+        }
+        let start = offset + headerLen
+        guard len <= bytes.count - start else {
+            offset = bytes.count
+            return nil
+        }
+        offset = start + len
+        return String(data: Data(bytes[start..<(start + len)]), encoding: .utf8)
     }
 
     private static func readBool(_ bytes: [UInt8], _ offset: inout Int) -> Bool? {

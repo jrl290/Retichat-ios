@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Bridge between the main app and the Notification Service Extension via the
 /// shared App Group container.
@@ -28,6 +29,26 @@ nonisolated enum PendingNotification {
         let timestamp: Double
         let signatureValid: Bool
         let fieldsRawBase64: String   // base64-encoded raw LXMF fields
+        /// Set when this message was a distro identity transfer (SPEC §17.9).
+        /// Its fields are then NOT persisted — see stashDistroTransferKey.
+        /// Optional so files written by older builds still decode.
+        var distroTransfer: DistroTransferStash? = nil
+
+        /// The same message without its fields, for a transfer whose key has
+        /// been moved out (or could not be kept).
+        func strippedForDistroTransfer(_ stash: DistroTransferStash) -> NSEMessage {
+            NSEMessage(messageHash: messageHash, senderHash: senderHash, destHash: destHash,
+                       title: title, content: content, timestamp: timestamp,
+                       signatureValid: signatureValid, fieldsRawBase64: "",
+                       distroTransfer: stash)
+        }
+    }
+
+    enum DistroTransferStash: String, Codable {
+        /// The key is in the shared Keychain under the message hash.
+        case keychain
+        /// The Keychain refused it; the key was dropped, not written to disk.
+        case lost
     }
 
     /// Append a message delivered by the NSE.
@@ -67,6 +88,60 @@ nonisolated enum PendingNotification {
             let f = dir.appendingPathComponent(name)
             try? FileManager.default.removeItem(at: f)
         }
+    }
+
+    // MARK: - Distro transfer keys (Keychain, never the container)
+    //
+    // A transfer's FIELD_CUSTOM_DATA (0xFC) is the 128-hex distro private
+    // key. nse_messages.json is a plain file in the App Group container
+    // (included in device backups), so the NSE moves the key into a Keychain
+    // item in the App Group's access group — app groups are valid keychain
+    // access groups, so both targets reach it without a new entitlement —
+    // and persists the message without its fields. The app takes (reads and
+    // deletes) the item when it imports the message. DistroManager's rule:
+    // the key lives only in the Keychain, ThisDeviceOnly (never iCloud).
+
+    private static let transferKeychainService = "com.newendian.Retichat.distro.transfer-inbox"
+
+    private static func transferQuery(messageHash: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: transferKeychainService,
+            kSecAttrAccount as String: messageHash,
+            kSecAttrAccessGroup as String: appGroup,
+        ]
+    }
+
+    /// NSE side. Returns the Keychain status; anything but errSecSuccess
+    /// means the key was not kept (the caller must not write it elsewhere).
+    static func stashDistroTransferKey(_ keyHex: String, messageHash: String) -> OSStatus {
+        guard let data = keyHex.data(using: .utf8) else { return errSecParam }
+        let query = transferQuery(messageHash: messageHash)
+        // The same message fetched twice (a second NSE run) replaces, not fails.
+        SecItemDelete(query as CFDictionary)
+        var add = query
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(add as CFDictionary, nil)
+    }
+
+    /// App side: read the stashed key and delete it. nil if absent or
+    /// unreadable (the status is logged). Call off the main actor.
+    static func takeDistroTransferKey(messageHash: String) -> String? {
+        var query = transferQuery(messageHash: messageHash)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &out)
+        guard status == errSecSuccess, let data = out as? Data else {
+            print("[Distro] NSE transfer key for \(messageHash.prefix(8)) not readable (\(status))")
+            return nil
+        }
+        let del = SecItemDelete(transferQuery(messageHash: messageHash) as CFDictionary)
+        if del != errSecSuccess {
+            print("[Distro] NSE transfer key for \(messageHash.prefix(8)) read but not deleted (\(del))")
+        }
+        return String(data: data, encoding: .utf8)
     }
 
     // MARK: - Shared Reticulum data (for NSE stack)

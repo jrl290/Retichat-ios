@@ -1553,3 +1553,150 @@ pub extern "C" fn retichat_distro_generate(out_len: *mut u32) -> *mut u8 {
         Err(e) => emit_error(out_len, e),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Distro: sending identity and flags
+// ---------------------------------------------------------------------------
+//
+// The Swift side needs two things the `lxmf_*` layer cannot give it: to ask
+// whether a destination is a distro (so a send can propagate at once instead
+// of waiting on a direct link nothing answers), and to create a message whose
+// source is the distro rather than the device (so replies reach every device).
+// Both are thin wrappers over lxmf_rust::ffi, exactly as Android exposes them
+// in Retichat-android/rust/retichat-jni/src/lib.rs.
+
+/// 1 if `dest_hash`'s last `lxmf.delivery` announce carried `SF_RFED_DISTRO`
+/// (0xD0), else 0 — RFed SPEC §17.10.
+///
+/// The announce flag is the only way an address is known to be a distro:
+/// `lxma://` links carry a key, never distro-ness. An unknown destination is
+/// therefore not a distro, and a wrong-length hash is not one either rather
+/// than an error, so the caller's send path has a single boolean to act on.
+/// Mirrors Android `nativePeerIsDistro` (retichat-jni lib.rs:866-879).
+#[no_mangle]
+pub extern "C" fn retichat_peer_is_distro(dest_hash: *const u8, dest_len: u32) -> u8 {
+    if dest_len != 16 {
+        return 0;
+    }
+    let h = slice_from_raw(dest_hash, dest_len);
+    if h.len() != 16 {
+        return 0;
+    }
+    lxmf_rust::ffi::peer_is_distro(&h) as u8
+}
+
+/// Create an outbound message with a caller-chosen source address and signing
+/// identity. Returns a message handle, or 0 with `rns_last_error` set.
+///
+/// iOS counterpart of Android `nativeMessageCreate` (retichat-jni
+/// lib.rs:766-783). `lxmf_message_new` always signs as the client's device
+/// identity; a device holding a distro must instead send AS the distro
+/// (source = distro `lxmf.delivery` hash, signed with the distro key) so the
+/// recipient's reply is addressed to the distro and fans out to every device.
+///
+/// The handle lives in the same global HANDLES store as every other message,
+/// so all `lxmf_message_*` functions (add_field, send_via_app_links, hash,
+/// clone_propagated, destroy) accept it.
+///
+/// `method` is the raw LXMF constant: 0x01 opportunistic, 0x02 direct,
+/// 0x03 propagated. (The "0/1/2" doc on lxmf_rust::ffi::message_create is
+/// stale — the value is passed straight through as `desired_method`.)
+#[no_mangle]
+pub extern "C" fn retichat_message_create(
+    dest_hash: *const u8,
+    dest_len: u32,
+    src_hash: *const u8,
+    src_len: u32,
+    content: *const c_char,
+    title: *const c_char,
+    method: u8,
+    source_identity_handle: u64,
+) -> u64 {
+    // Checked here rather than left to LXMessage: a wrong-length source hash
+    // would otherwise produce a message that packs but never verifies at the
+    // recipient, a failure far from its cause.
+    if dest_len != 16 || src_len != 16 {
+        rns::set_error(format!(
+            "message_create: hashes must be 16 bytes (dest {dest_len}, src {src_len})"
+        ));
+        return 0;
+    }
+    let d = slice_from_raw(dest_hash, dest_len);
+    let s = slice_from_raw(src_hash, src_len);
+    if d.len() != 16 || s.len() != 16 {
+        rns::set_error("message_create: null destination or source hash".into());
+        return 0;
+    }
+    let c = unsafe { cstr_to_string(content) };
+    let t = unsafe { cstr_to_string(title) };
+
+    match lxmf_rust::ffi::message_create(&d, &s, &c, &t, method, source_identity_handle) {
+        Ok(h) => h,
+        Err(e) => {
+            rns::set_error(e);
+            0
+        }
+    }
+}
+
+#[cfg(test)]
+mod distro_send_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn distro_handle_and_delivery() -> (u64, [u8; 16]) {
+        let mut key_len: u32 = 0;
+        let key_ptr = retichat_distro_generate(&mut key_len);
+        assert!(!key_ptr.is_null() && key_len == 64, "distro key generation");
+        let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len as usize).to_vec() };
+        rns_free_bytes(key_ptr, key_len);
+
+        let handle = retichat_identity_from_bytes(key.as_ptr(), key.len() as u32);
+        assert_ne!(handle, 0, "identity_from_bytes on a distro private key");
+
+        let mut delivery = [0u8; 16];
+        assert_eq!(retichat_distro_delivery_hash(handle, delivery.as_mut_ptr(), 16), 16);
+        (handle, delivery)
+    }
+
+    /// message_create needs no running stack: it only builds an LXMessage
+    /// from a stored identity handle, so this runs offline.
+    #[test]
+    fn message_create_signs_as_distro_and_accepts_fields() {
+        let (identity, delivery) = distro_handle_and_delivery();
+        let dest = [0x11u8; 16];
+        let content = CString::new("x").unwrap();
+        let title = CString::new("").unwrap();
+
+        let msg = retichat_message_create(
+            dest.as_ptr(), 16,
+            delivery.as_ptr(), 16,
+            content.as_ptr(), title.as_ptr(),
+            0x03, identity,
+        );
+        assert_ne!(msg, 0, "message_create failed");
+
+        let ty = CString::new("rfed.distro.transfer").unwrap();
+        assert_eq!(lxmf_message_add_field(msg, 0xFB, ty.as_ptr()), 0,
+            "message handle is not in the shared lxmf_message_* store");
+
+        let bad = retichat_message_create(
+            dest.as_ptr(), 16,
+            delivery.as_ptr(), 15,
+            content.as_ptr(), title.as_ptr(),
+            0x03, identity,
+        );
+        assert_eq!(bad, 0, "a 15-byte source hash must be rejected");
+
+        assert_eq!(lxmf_message_destroy(msg), 0);
+        assert_eq!(retichat_identity_destroy(identity), 0);
+    }
+
+    #[test]
+    fn peer_is_distro_is_false_for_unknown_and_bad_length() {
+        let unknown = [0x22u8; 16];
+        assert_eq!(retichat_peer_is_distro(unknown.as_ptr(), 16), 0);
+        assert_eq!(retichat_peer_is_distro(unknown.as_ptr(), 15), 0);
+        assert_eq!(retichat_peer_is_distro(std::ptr::null(), 16), 0);
+    }
+}

@@ -60,6 +60,12 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .tint(.retichatPrimary)
+        // Distro transfer offers and distro notices are app-wide, hosted once
+        // at the root like Android's DistroTransferOfferDialog (NavGraph.kt:55-56).
+        // Both are drawn by UIKit (the offer alert from the top-most
+        // controller, notices in their own window) so they appear over sheets.
+        .distroTransferOfferPresenter()
+        .distroNoticePresenter()
         .onReceive(NotificationCenter.default.publisher(for: .openChatFromNotification)) { notif in
             if let chatId = notif.object as? String {
                 showNewConversation = false

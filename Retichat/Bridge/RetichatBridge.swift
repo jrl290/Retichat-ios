@@ -130,7 +130,10 @@ final class RetichatBridge: @unchecked Sendable {
         return str
     }
 
-    func rnsLastError() -> String? {
+    /// nonisolated because the Rust side keeps the last error THREAD-LOCAL
+    /// (reticulum_rust::ffi::set_error): it must be read on the thread whose
+    /// FFI call failed, which for the nonisolated wrappers below is not main.
+    nonisolated func rnsLastError() -> String? {
         guard let ptr = rns_last_error() else { return nil }
         let str = String(cString: ptr)
         rns_free_string(ptr)
@@ -508,6 +511,58 @@ final class RetichatBridge: @unchecked Sendable {
             title: title,
             content: content
         )
+    }
+
+    // MARK: - Distro
+
+    // Mirrors Android RetichatBridge.peerIsDistro and
+    // messageCreate(destHash, srcHash, …, identityHandle)
+    // (Retichat-android rust/retichat-jni nativePeerIsDistro / nativeMessageCreate).
+    // The retichat_distro_* payload functions are deliberately not wrapped
+    // here: RfedDistroClient/DistroManager call them directly.
+
+    /// True when `destHash`'s last lxmf.delivery announce carried the distro
+    /// flag (RFed SPEC §17.10). The announce is the ONLY source of this fact —
+    /// an lxma:// link carries a key, never distro-ness — so an unknown
+    /// destination reads false. A send to a distro should go PROPAGATED at
+    /// once: no device answers a direct link to the distro address.
+    nonisolated func peerIsDistro(destHash: Data) -> Bool {
+        guard destHash.count == 16 else { return false }
+        return destHash.withUnsafeBytes { buf in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return retichat_peer_is_distro(ptr, UInt32(destHash.count)) == 1
+        }
+    }
+
+    /// Create an outbound message whose source address and signing identity
+    /// the caller chooses. `lxmf_message_new` always signs as the device; a
+    /// device holding a distro sends AS the distro (source = distro delivery
+    /// hash, identity = distro handle) so replies fan out to every device.
+    ///
+    /// `method` is the raw LXMF constant (0x01 opportunistic, 0x02 direct,
+    /// 0x03 propagated). The returned handle is an ordinary message handle:
+    /// every lxmf_message_* function accepts it. Returns 0 on failure.
+    nonisolated func messageCreate(destHash: Data, sourceHash: Data, content: String, title: String,
+                                   method: UInt8, identityHandle: UInt64) -> UInt64 {
+        let handle = destHash.withUnsafeBytes { destBuf in
+            sourceHash.withUnsafeBytes { srcBuf in
+                content.withCString { cContent in
+                    title.withCString { cTitle in
+                        retichat_message_create(
+                            destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(destHash.count),
+                            srcBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(sourceHash.count),
+                            cContent, cTitle,
+                            method, identityHandle
+                        )
+                    }
+                }
+            }
+        }
+        if handle == 0 {
+            // Read on this thread: the Rust error slot is thread-local.
+            print("[RetichatBridge] messageCreate failed: \(rnsLastError() ?? "?")")
+        }
+        return handle
     }
 
     // MARK: - Link request

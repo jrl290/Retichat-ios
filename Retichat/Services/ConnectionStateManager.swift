@@ -131,6 +131,12 @@ final class ConnectionStateManager {
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.propagation.stream")
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify.register")
         lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify.unregister")
+        // Distro (RFed SPEC §17): the rfed.distro.register ACTIVE edge is what
+        // re-runs a pending RfedDistroClient registration. Android
+        // ConnectionStateManager.kt:138-140.
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.distro.register")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.distro.unregister")
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.distro.list")
         lxmfClient.appLinkRegisterReconnect(aspect: "apns.relay")
         lxmfClient.appLinkRegisterReconnect(aspect: "apns.register")
         lxmfClient.appLinkRegisterReconnect(aspect: "apns.unregister")
@@ -757,6 +763,10 @@ final class ConnectionStateManager {
                 ("rfed.channel.pull",        ["channel", "pull"]),
                 ("rfed.channel.stream",      ["channel", "stream"]),
                 ("rfed.propagation.stream",  ["propagation", "stream"]),
+                // Distro destinations (Android ConnectionStateManager.kt:697-699).
+                ("rfed.distro.register",   ["distro", "register"]),
+                ("rfed.distro.unregister", ["distro", "unregister"]),
+                ("rfed.distro.list",       ["distro", "list"]),
             ]
             for (label, aspects) in splitAspects {
                 let hex = RfedChannelClient.rfedDestHash(

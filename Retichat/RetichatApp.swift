@@ -128,12 +128,20 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
             if isActive {
                 if self.repository.serviceRunning {
                     self.repository.pollPropagationNode(force: true)
+                    // iOS has no rfed.delivery, so RFed's deferred distro queue
+                    // drains only through /rfed/pull (Android WakeWorker.kt:78-81).
+                    // pull() coalesces and is a no-op without a distro. A cold
+                    // start pulls after registering instead.
+                    Task { await RfedDistroClient.shared.pull() }
                 } else {
                     self.repository.startService()
                 }
             } else {
                 if !self.repository.serviceRunning {
                     self.repository.startService()
+                } else {
+                    // See above: the distro's deferred queue drains only by pull.
+                    Task { await RfedDistroClient.shared.pull() }
                 }
                 self.beginBackgroundExecution(repository: self.repository, forcePoll: true)
             }
@@ -283,6 +291,10 @@ struct RetichatApp: App {
                     // state rather than the previous background event.
                     repository.psyncNeededOnForeground = false
                     repository.pollPropagationNode(force: true)
+                    // iOS has no rfed.delivery, so RFed's deferred distro queue
+                    // drains only through /rfed/pull (Android WakeWorker.kt:78-81).
+                    // pull() coalesces and is a no-op without a distro.
+                    Task { await RfedDistroClient.shared.pull() }
                     // Re-establish path discovery for the active conversation (if any).
                     ConnectionStateManager.shared.onAppForeground()
                     // Re-open the persistent rfed node link.
@@ -312,6 +324,9 @@ struct RetichatApp: App {
 
         if repository.serviceRunning {
             repository.pollPropagationNode(force: true)
+            // Deferred distro blobs drain only by /rfed/pull on iOS (no
+            // rfed.delivery; Android WakeWorker.kt:78-81). No-op without a distro.
+            Task { await RfedDistroClient.shared.pull() }
         } else {
             repository.startService()
         }
@@ -321,6 +336,12 @@ struct RetichatApp: App {
 
     private func handleDeepLink(_ url: URL) {
         guard let peer = IdentityShareFormat.parse(url.absoluteString) else { return }
+        // A link to this device's or our distro's own address would open a
+        // chat with ourselves (and, for the distro, send to our own fan-out).
+        if repository.isOwnAddress(peer.destinationHashHex) {
+            print("[Retichat] deep link to own address ignored")
+            return
+        }
         let chatId = repository.createDirectChat(
             destHash: peer.destinationHashHex,
             publicKey: peer.publicKey

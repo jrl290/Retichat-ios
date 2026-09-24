@@ -1,6 +1,7 @@
 import UserNotifications
 import Intents
 import UIKit
+import Security
 
 // MARK: - Hex helper
 
@@ -239,8 +240,25 @@ class NotificationService: UNNotificationServiceExtension {
             best.categoryIdentifier = "MESSAGE"
             best.userInfo["chatId"] = msg.senderHash
 
-            // Store in App Group for main app to import on next open
-            PendingNotification.appendNSEMessage(msg)
+            // Store in App Group for main app to import on next open.
+            // A distro identity transfer carries the distro private key in
+            // field 0xFC: move it to the Keychain first and persist the
+            // message without its fields, so the key never sits in the
+            // container file (PendingNotification.stashDistroTransferKey).
+            var toStore = msg
+            let fields = LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data())
+            if let key = fields.distroTransferKey {
+                let status = PendingNotification.stashDistroTransferKey(key, messageHash: msg.messageHash)
+                if status == errSecSuccess {
+                    toStore = msg.strippedForDistroTransfer(.keychain)
+                } else {
+                    // Dropped, not written to disk: the app reports it so the
+                    // user can send it again from the other device.
+                    NSLog("[NSE] distro transfer key not stored (Keychain %d); dropped", status)
+                    toStore = msg.strippedForDistroTransfer(.lost)
+                }
+            }
+            PendingNotification.appendNSEMessage(toStore)
 
             // Wrap with INSendMessageIntent so iOS shows the avatar to the left
             // of the notification (Communication Notification, iOS 15+).

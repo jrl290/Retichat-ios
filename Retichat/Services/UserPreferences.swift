@@ -30,6 +30,7 @@ final class UserPreferences {
         static let channelNotificationsOn = "channel_notifications_on"
         static let channelPushEnabled = "channel_push_enabled"
         static let channelLastOpened = "channel_last_opened"
+        static let distroContacts = "distro_contacts"
     }
 
     var displayName: String {
@@ -218,6 +219,24 @@ final class UserPreferences {
 
     func isChannelPushEnabled(_ channelId: String) -> Bool {
         channelPushEnabled.contains(channelId)
+    }
+
+    // MARK: - Distro contacts
+
+    /// Destination hashes (lowercase hex) whose lxmf.delivery announce carried
+    /// the distro flag SF_RFED_DISTRO (RFed SPEC §17.10). Written ONLY from that
+    /// announce flag (ChatRepository.handleAnnounce), never from lxma:// links:
+    /// a link carries a key, not distro-ness. A send to one of these goes
+    /// PROPAGATED at once. Android UserPreferences.kt:186-193.
+    func isDistroContact(_ hex: String) -> Bool {
+        (defaults.stringArray(forKey: Keys.distroContacts) ?? []).contains(hex.lowercased())
+    }
+
+    func setDistroContact(_ hex: String, _ isDistro: Bool) {
+        let key = hex.lowercased()
+        var set = Set(defaults.stringArray(forKey: Keys.distroContacts) ?? [])
+        if isDistro { set.insert(key) } else { set.remove(key) }
+        defaults.set(Array(set).sorted(), forKey: Keys.distroContacts)
     }
 
     /// Per-channel "last opened" timestamp in **seconds** (Apple epoch).

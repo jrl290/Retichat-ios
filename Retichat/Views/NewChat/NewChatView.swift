@@ -144,7 +144,9 @@ struct NewChatView: View {
             return
         }
 
-        if peer.destinationHashHex == repository.ownHashHex {
+        // Own address = this device OR the held distro (Android/web treat the
+        // distro as "me" too): a chat to it would loop back through RFed fan-out.
+        if repository.isOwnAddress(peer.destinationHashHex) {
             errorMessage = "Cannot chat with yourself"
             return
         }

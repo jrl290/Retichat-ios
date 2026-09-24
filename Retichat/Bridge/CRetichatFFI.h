@@ -674,8 +674,6 @@ int32_t  rns_rnode_iface_id_beacon_now(uint64_t handle);
 /// calling rns_rnode_iface_feed before invoking this. Returns 0 on success, -1 on error.
 int32_t  rns_rnode_iface_deregister(uint64_t handle);
 
-#endif /* CRetichatFFI_h */
-
 #pragma mark - Distro
 //
 // RFed's distro feature: one LXMF address shared by all of a person's devices.
@@ -740,3 +738,21 @@ uint8_t *retichat_distro_unwrap(uint64_t distro_handle,
 /// interchangeable and a subtly wrong key fails later, at decrypt time.
 /// Returns heap bytes (free with rns_free_bytes), or NULL on error.
 uint8_t *retichat_distro_generate(uint32_t *out_len);
+
+#pragma mark - Distro: sending identity and flags
+
+/// RFed SPEC §17.10.
+/// Returns 1 if dest_hash's last lxmf.delivery announce carried SF_RFED_DISTRO (0xD0).
+/// Returns 0 otherwise, including when the destination is unknown or dest_len != 16.
+uint8_t  retichat_peer_is_distro(const uint8_t *dest_hash, uint32_t dest_len);
+
+/// Like lxmf_message_new, but the caller chooses the source address and the signing identity.
+/// method takes the raw LXMF value: 0x01 opportunistic, 0x02 direct, 0x03 propagated.
+/// Returns a handle that every lxmf_message_* function accepts (add_field, send_via_app_links,
+/// hash, clone_propagated, destroy), or 0 on error. On error, read rns_last_error.
+uint64_t retichat_message_create(const uint8_t *dest_hash, uint32_t dest_len,
+                                 const uint8_t *src_hash,  uint32_t src_len,
+                                 const char *content, const char *title,
+                                 uint8_t method, uint64_t source_identity_handle);
+
+#endif /* CRetichatFFI_h */

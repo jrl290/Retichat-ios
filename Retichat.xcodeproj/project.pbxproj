@@ -63,6 +63,7 @@
 		1AE372A52F81A243005F533B /* Exceptions for "Retichat" folder in "NotificationService" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				Bridge/LxmfFields.swift,
 				RetichatFFI.xcframework,
 				Services/LxmfClient.swift,
 				Services/PendingNotification.swift,

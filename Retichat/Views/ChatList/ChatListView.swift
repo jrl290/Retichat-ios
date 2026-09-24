@@ -51,7 +51,13 @@ struct ChatListView: View {
     @Binding var showSettings: Bool
     @Binding var showQRCode: Bool
 
+    /// The status line prefers the distro address (Android ChatListScreen.kt:130).
+    @StateObject private var distroClient = RfedDistroClient.shared
     @State private var searchText = ""
+
+    private var showsStatusLine: Bool {
+        repository.serviceRunning || repository.serviceStartFailed
+    }
 
     private var entries: [ListEntry] {
         let chatEntries: [ListEntry] = (searchText.isEmpty
@@ -99,6 +105,7 @@ struct ChatListView: View {
                             .font(.system(size: 20))
                             .foregroundColor(.retichatPrimary)
                     }
+                    .accessibilityLabel("My QR code")
 
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
@@ -108,7 +115,24 @@ struct ChatListView: View {
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
-                .padding(.bottom, 8)
+                .padding(.bottom, showsStatusLine ? 4 : 8)
+
+                // Own-address status line under the search bar, as on Android
+                // (ChatListScreen.kt:116-135): the distro address when this
+                // device holds one — the address to give out — else the device's.
+                // Informational only, not tappable.
+                if showsStatusLine {
+                    HStack {
+                        Text(repository.serviceRunning
+                             ? "• " + String((distroClient.distro?.deliveryHashHex ?? repository.ownHashHex).prefix(16))
+                             : "○ Error")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor((repository.serviceRunning ? Color.retichatPrimary : Color.retichatError).opacity(0.7))
+                        Spacer()
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 4)
+                }
 
                 // Chat list
                 if entries.isEmpty {

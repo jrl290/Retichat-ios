@@ -815,6 +815,20 @@ final class RfedChannelClient: ObservableObject {
         }
         let channelHashData = blob.prefix(16)
         let innerBlob = blob.dropFirst(16)
+
+        // Distro fan-out shares rfed.delivery with channels, told apart only by
+        // the 16-byte prefix: the distro's lxmf.delivery hash instead of a
+        // channel hash (RFed distro_fanout tier 3). Mirrors Android
+        // RfedChannelClient.kt:848-855 and web _handleChannelPacket →
+        // _handleDistroBlob. INERT on iOS today: onRfedBlob is fed only by
+        // rfed.channel.stream and iOS does not start rfed.delivery — live
+        // distro fan-out arrives on rfed.propagation.stream and is routed in
+        // ChatRepository.configurePropagationStream. Kept for parity.
+        if let distroHash = DistroManager.shared.deliveryHash, channelHashData == distroHash {
+            print("[RfedChannel] onRfedBlob distro prefix → RfedDistroClient inner_bytes=\(innerBlob.count)")
+            RfedDistroClient.ingestBlob(Data(innerBlob))
+            return
+        }
         let channelHashHex = channelHashData.hexString
         print("[RfedChannel] onRfedBlob channel_hash=\(channelHashHex) inner_bytes=\(innerBlob.count)")
 

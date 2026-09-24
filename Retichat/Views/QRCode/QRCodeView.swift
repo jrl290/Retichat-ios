@@ -2,7 +2,8 @@
 //  QRCodeView.swift
 //  Retichat
 //
-//  Display own destination hash as QR code, or scan another user's QR code.
+//  Display own destination hash as QR code (the distro address when this
+//  device holds one), or scan another user's QR code.
 //  Mirrors Android QrCodeScreen.kt.
 //  Uses CoreImage for QR generation and AVFoundation camera for scanning.
 //
@@ -27,7 +28,13 @@ struct QRCodeView: View {
     var mode: QRMode = .display
     var onScanned: ((SharedPeerIdentity) -> Void)?
 
+    @StateObject private var distroClient = RfedDistroClient.shared
+
     @State private var currentTab: QRMode = .display
+    /// "Copied!" feedback on the copy buttons, as on Android QrCodeScreen.kt.
+    @State private var copiedHash = false
+    @State private var copiedUri = false
+    @State private var showSelfScan = false
 
     var body: some View {
         NavigationStack {
@@ -65,6 +72,24 @@ struct QRCodeView: View {
             .onAppear {
                 currentTab = mode
             }
+            .alert("Cannot chat with yourself", isPresented: $showSelfScan) {
+                // Back to our own code: the scanner has already reported once
+                // and would not scan again.
+                Button("OK", role: .cancel) { currentTab = .display }
+            }
+            // Presentation timing only — how long "Copied!" stays up.
+            .task(id: copiedHash) {
+                guard copiedHash else { return }
+                try? await Task.sleep(for: .seconds(1.5))
+                guard !Task.isCancelled else { return }
+                copiedHash = false
+            }
+            .task(id: copiedUri) {
+                guard copiedUri else { return }
+                try? await Task.sleep(for: .seconds(1.5))
+                guard !Task.isCancelled else { return }
+                copiedUri = false
+            }
         }
     }
 
@@ -72,7 +97,11 @@ struct QRCodeView: View {
 
     private var displayView: some View {
         VStack(spacing: 24) {
-            let hash = repository.ownHashHex
+            // The distro address is the one to share when this device holds
+            // one — replies then reach every device (Android NavGraph.kt:145-163;
+            // retichat.com sidebar shows distroLxmfHash || ownHash).
+            let distro = distroClient.distro
+            let hash = distro?.deliveryHashHex ?? repository.ownHashHex
             if hash.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")
@@ -83,9 +112,10 @@ struct QRCodeView: View {
                         .foregroundColor(.retichatOnSurfaceVariant)
                 }
             } else {
-                let publicKey = repository.lxmfClient.flatMap {
-                    RetichatBridge.shared.identityPublicKey(handle: $0.identityHandle)
-                }
+                let publicKey = distro.flatMap { Data(hexString: $0.publicKeyHex) }
+                    ?? repository.lxmfClient.flatMap {
+                        RetichatBridge.shared.identityPublicKey(handle: $0.identityHandle)
+                    }
                 let shareUri = IdentityShareFormat.encode(
                     destinationHashHex: hash,
                     publicKey: publicKey
@@ -110,16 +140,18 @@ struct QRCodeView: View {
 
                 Button {
                     UIPasteboard.general.string = hash
+                    copiedHash = true
                 } label: {
-                    Label("Copy Hash", systemImage: "doc.on.doc")
+                    Label(copiedHash ? "Copied!" : "Copy Hash", systemImage: "doc.on.doc")
                 }
                 .buttonStyle(.bordered)
                 .tint(.retichatPrimary)
 
                 Button {
                     UIPasteboard.general.string = shareUri
+                    copiedUri = true
                 } label: {
-                    Label("Copy Contact URI", systemImage: "link")
+                    Label(copiedUri ? "Copied!" : "Copy Contact URI", systemImage: "link")
                 }
                 .buttonStyle(.bordered)
                 .tint(.retichatPrimary)
@@ -132,8 +164,8 @@ struct QRCodeView: View {
 
     private var scanView: some View {
         QRScannerView { scannedString in
-            if let peer = IdentityShareFormat.parse(scannedString) {
-                handleScannedPeer(peer)
+            if let peer = IdentityShareFormat.parse(scannedString),
+               handleScannedPeer(peer) {
                 dismiss()
             }
         }
@@ -148,10 +180,17 @@ struct QRCodeView: View {
         }
     }
 
-    private func handleScannedPeer(_ peer: SharedPeerIdentity) {
+    /// Returns false when the scan was refused and the sheet should stay up.
+    private func handleScannedPeer(_ peer: SharedPeerIdentity) -> Bool {
         if let onScanned {
             onScanned(peer)
-            return
+            return true
+        }
+        // Our own device or distro code (plan critique 12): no chat with
+        // ourselves — the same check as NewChat/NewConversation.
+        if repository.isOwnAddress(peer.destinationHashHex) {
+            showSelfScan = true
+            return false
         }
 
         let chatId = repository.createDirectChat(
@@ -162,6 +201,7 @@ struct QRCodeView: View {
             name: .openChatFromNotification,
             object: chatId
         )
+        return true
     }
 
     // MARK: QR Generation

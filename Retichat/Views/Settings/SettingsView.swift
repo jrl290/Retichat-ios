@@ -2,7 +2,7 @@
 //  SettingsView.swift
 //  Retichat
 //
-//  Full settings screen: service control, identity display, display name,
+//  Full settings screen: service control, identity (→ IdentityView), display name,
 //  connection preferences, network interface management.
 //  Mirrors Android SettingsScreen.kt.
 //
@@ -23,7 +23,12 @@ struct SettingsView: View {
     @StateObject private var rnodeCoord = RNodeInterfaceCoordinator.shared
     @Environment(\.dismiss) private var dismiss
 
-    @State private var showQR = false
+    /// Drives the Identity row's subtitle (distro held or not).
+    @StateObject private var distroClient = RfedDistroClient.shared
+    @State private var showIdentity = false
+    /// onAppear also fires when returning from the pushed Identity screen;
+    /// reloading interfaces then would discard unapplied interface edits.
+    @State private var didLoadInterfaces = false
     @State private var showRevertAlert = false
     @State private var showAddInterface = false
     @State private var showInterfaceTypeChooser = false
@@ -51,7 +56,7 @@ struct SettingsView: View {
 
                 ScrollView {
                     VStack(spacing: 20) {
-                        identitySection
+                        identityNavRow
                         profileSection
                         privacySection
                         rfedSection
@@ -61,8 +66,11 @@ struct SettingsView: View {
                     }
                     .padding()
                 }
-                .blur(radius: (showQR || showAddInterface || showEditInterface || showInterfaceTypeChooser) ? 8 : 0)
-                .animation(.easeInOut(duration: 0.25), value: showQR || showAddInterface || showEditInterface || showInterfaceTypeChooser)
+                .blur(radius: (showAddInterface || showEditInterface || showInterfaceTypeChooser) ? 8 : 0)
+                .animation(.easeInOut(duration: 0.25), value: showAddInterface || showEditInterface || showInterfaceTypeChooser)
+            }
+            .navigationDestination(isPresented: $showIdentity) {
+                IdentityView()
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -94,9 +102,6 @@ struct SettingsView: View {
             } message: {
                 Text("Revert to your original settings and go back?")
             }
-            .sheet(isPresented: $showQR) {
-                QRCodeView(mode: .display)
-            }
             .sheet(isPresented: $showInterfaceTypeChooser) {
                 interfaceTypeChooser
             }
@@ -109,7 +114,10 @@ struct SettingsView: View {
                 }
             }
             .onAppear {
-                vm.loadInterfaces(from: repository)
+                if !didLoadInterfaces {
+                    didLoadInterfaces = true
+                    vm.loadInterfaces(from: repository)
+                }
                 refreshNotificationStatus()
                 channelClient.startRfedLinkMonitor()
                 refreshInterfaceStatus()
@@ -160,46 +168,39 @@ struct SettingsView: View {
 
     // MARK: - Identity
 
-    private var identitySection: some View {
-        GlassCard {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Identity")
-                    .font(.headline)
-                    .foregroundColor(.retichatOnSurface)
-
-                let hash = repository.ownHashHex
-                if hash.isEmpty {
-                    Text("Not loaded")
+    /// Opens Settings → Identity (device + distro addresses and keys).
+    /// Android IdentityNavRow (IdentityScreen.kt:63-86); retichat.com Settings
+    /// "Identity" row (app.js ~4702). The device hash and QR shortcut that used
+    /// to sit here now live on the Identity screen and the chat-list QR button.
+    private var identityNavRow: some View {
+        Button {
+            showIdentity = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "person.text.rectangle")
+                    .font(.title3)
+                    .foregroundColor(.retichatPrimary)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Identity")
+                        .font(.headline)
+                        .foregroundColor(.retichatOnSurface)
+                    Text(distroClient.hasDistro
+                         ? "Device + distro addresses and keys"
+                         : "Device address and keys · no distro yet")
+                        .font(.caption)
                         .foregroundColor(.retichatOnSurfaceVariant)
-                } else {
-                    HStack {
-                        Text(hash)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.retichatOnSurfaceVariant)
-                            .textSelection(.enabled)
-                            .lineLimit(1)
-
-                        Spacer()
-
-                        Button {
-                            UIPasteboard.general.string = hash
-                        } label: {
-                            Image(systemName: "doc.on.doc")
-                                .font(.caption)
-                        }
-                        .tint(.retichatPrimary)
-
-                        Button {
-                            showQR = true
-                        } label: {
-                            Image(systemName: "qrcode")
-                                .font(.caption)
-                        }
-                        .tint(.retichatPrimary)
-                    }
+                        .multilineTextAlignment(.leading)
                 }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundColor(.retichatOnSurfaceVariant)
             }
+            .padding(14)
+            .glassBackground(cornerRadius: 12)
         }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Profile
@@ -303,7 +304,7 @@ struct SettingsView: View {
                     .glassBackground(cornerRadius: 8)
                 }
 
-                Text("Enter the RFed Node's public identity hash. Notify, channel, delivery, and LXMF propagation hashes are derived automatically. Leave the propagation field empty to use the derived address, or enter a different one to override it. Changes take effect on next service restart.")
+                Text("Enter the RFed Node's public identity hash. Notify, channel, delivery, distro and LXMF propagation hashes are derived automatically. Leave the propagation field empty to use the derived address, or enter a different one to override it. Changes take effect on next service restart.")
                     .font(.caption)
                     .foregroundColor(.retichatOnSurfaceVariant)
             }
