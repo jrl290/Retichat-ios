@@ -30,6 +30,7 @@ enum LxmfFieldKey {
     // so the distro services, which run off the main actor, can read them.
     nonisolated static let customType: UInt8 = 0xFB  // string: application-defined message type
     nonisolated static let customData: UInt8 = 0xFC  // str or bin: payload for customType
+    nonisolated static let customMeta: UInt8 = 0xFD  // str or bin: metadata for customType
 }
 
 // MARK: - Distro identity transfer
@@ -42,6 +43,20 @@ enum LxmfFieldKey {
 
 nonisolated enum DistroTransfer {
     static let customType = "rfed.distro.transfer"
+}
+
+// MARK: - Distro sent-message sync
+//
+// RFed SPEC §17.11: a message this device sends AS the distro is also sent,
+// PROPAGATED, to the distro itself, so every sibling device files it as a
+// message the user sent. The copy is signed as the distro and carries
+// FIELD_CUSTOM_TYPE (0xFB) = "rfed.distro.sent", FIELD_CUSTOM_DATA (0xFC) =
+// the recipient's address and FIELD_CUSTOM_META (0xFD) = the sending
+// device's own address (both 32 lowercase hex). Mirrors lxmf_rust
+// distro::DISTRO_SENT_TYPE, read for received copies by unwrap_blob.
+
+nonisolated enum DistroSent {
+    static let customType = "rfed.distro.sent"
 }
 
 // MARK: - Group action constants
@@ -87,12 +102,21 @@ struct LxmfFields {
     // Custom-type fields
     var customType: String?          // FIELD_CUSTOM_TYPE (0xFB)
     var customData: String?          // FIELD_CUSTOM_DATA (0xFC), decoded from msgpack str OR bin (UTF-8)
+    var customMeta: String?          // FIELD_CUSTOM_META (0xFD), str OR bin, like customData
 
     /// The 128-hex distro private key when this message is an identity
     /// transfer (SPEC §17.9), else nil. Both fields must match: a 0xFC payload
     /// under any other custom type is someone else's data, not a key.
     var distroTransferKey: String? {
         customType == DistroTransfer.customType ? customData : nil
+    }
+
+    /// A distro sent-message copy (SPEC §17.11). Genuine copies only ever
+    /// arrive as distro fan-out, which RfedDistroClient unwraps; one reaching
+    /// the router or the NSE as an ordinary message is not the user's and
+    /// must not become an incoming bubble.
+    var isDistroSentCopy: Bool {
+        customType == DistroSent.customType
     }
 }
 
@@ -192,6 +216,9 @@ final class LxmfFieldsDecoder {
                 // The web client may send 0xFC as bin rather than str
                 // (Retichat-js), so both decode to the same UTF-8 string.
                 fields.customData = readStringOrBin(bytes, &offset)
+
+            case LxmfFieldKey.customMeta:
+                fields.customMeta = readStringOrBin(bytes, &offset)
 
             default:
                 skipValue(bytes, &offset)

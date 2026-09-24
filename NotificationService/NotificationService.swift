@@ -217,7 +217,19 @@ class NotificationService: UNNotificationServiceExtension {
               finalState,
               elapsed)
 
-        if let msg = NSEDelivery.message {
+        if let msg = NSEDelivery.message,
+           LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data()).isDistroSentCopy {
+            // RFed SPEC §17.11: a distro sent copy is the user's own message,
+            // and is filed only from distro fan-out (RfedDistroClient). One
+            // reaching this device's address is not stored and not shown —
+            // never an incoming bubble or a notification.
+            NSLog("[NSE] distro sent-copy marker from %@ outside fan-out — dropped, suppressing after %ds",
+                  String(msg.senderHash.prefix(8)), elapsed)
+            best.title = ""
+            best.body  = ""
+            best.sound = nil
+
+        } else if let msg = NSEDelivery.message {
             NSLog("[NSE] delivered after %ds", elapsed)
 
             let chatNames = PendingNotification.readChatNames()

@@ -1485,7 +1485,10 @@ pub extern "C" fn retichat_distro_delivery_hash(
 /// addressed to a different distro, which a node may legitimately hand over.
 ///
 /// Fields: source_hash (hex), timestamp, title, content,
-/// is_delivery_notification, ticket, distro_transfer_key.
+/// is_delivery_notification, ticket, distro_transfer_key, sent_to, sent_by.
+/// sent_to/sent_by are the RFed SPEC §17.11 sent-message sync marker (null
+/// unless the message is a sync copy; a non-null sent_by with a null sent_to
+/// is a copy with a malformed 0xFC) — same keys as Android's nativeDistroUnwrap.
 #[no_mangle]
 pub extern "C" fn retichat_distro_unwrap(
     distro_handle: u64,
@@ -1505,7 +1508,8 @@ pub extern "C" fn retichat_distro_unwrap(
             let json = format!(
                 concat!(
                     r#"{{"source_hash":"{}","timestamp":{},"title":{},"content":{},"#,
-                    r#""is_delivery_notification":{},"ticket":{},"distro_transfer_key":{}}}"#
+                    r#""is_delivery_notification":{},"ticket":{},"distro_transfer_key":{},"#,
+                    r#""sent_to":{},"sent_by":{}}}"#
                 ),
                 msg.source_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 msg.timestamp,
@@ -1514,6 +1518,8 @@ pub extern "C" fn retichat_distro_unwrap(
                 msg.is_delivery_notification,
                 msg.ticket.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
                 msg.distro_transfer_key.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+                msg.sent_to.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+                msg.sent_by.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
             );
             emit_buffer(json.into_bytes(), out_len)
         }

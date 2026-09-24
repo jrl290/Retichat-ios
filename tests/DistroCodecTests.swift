@@ -95,6 +95,54 @@ enum DistroCodecTests {
               "identityHashHex of a known key")
         check(DistroCodec.identityHashHex(publicKey: Data(count: 32)) == nil, "identityHashHex rejects 32 bytes")
 
+        // Sent-message sync (RFed SPEC §17.11)
+        let distro = String(repeating: "d", count: 32)
+        let device = String(repeating: "a", count: 32)
+        let sibling = String(repeating: "b", count: 32)
+        let peer = String(repeating: "c", count: 32)
+
+        check(DistroCodec.isAddressHex(peer), "isAddressHex: 32 lowercase hex")
+        check(!DistroCodec.isAddressHex(peer.uppercased()), "isAddressHex: rejects upper case")
+        check(!DistroCodec.isAddressHex(String(peer.dropLast())), "isAddressHex: rejects 31 chars")
+        check(!DistroCodec.isAddressHex(String(peer.dropLast()) + "g"), "isAddressHex: rejects non-hex")
+
+        check(DistroCodec.needsSentCopy(sentAsDistro: true, destHex: peer, distroHex: distro),
+              "sent copy: as distro to a peer")
+        check(!DistroCodec.needsSentCopy(sentAsDistro: false, destHex: peer, distroHex: distro),
+              "no sent copy: signed as the device")
+        check(!DistroCodec.needsSentCopy(sentAsDistro: true, destHex: peer, distroHex: nil),
+              "no sent copy: no distro loaded")
+        check(!DistroCodec.needsSentCopy(sentAsDistro: true, destHex: distro.uppercased(), distroHex: distro),
+              "no sent copy: destination is the distro itself (any case)")
+
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: peer,
+                                              sentBy: sibling, ownDeviceHex: device) == .store(recipientHex: peer),
+              "sibling's copy is stored for the recipient")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: peer,
+                                              sentBy: device.uppercased(), ownDeviceHex: device) == .ownEcho,
+              "own echo (any case) is dropped")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: nil,
+                                              sentBy: device, ownDeviceHex: device) == .ownEcho,
+              "own echo is dropped even with a malformed recipient")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: nil,
+                                              sentBy: sibling, ownDeviceHex: device) == .malformedRecipient,
+              "sibling's copy without a valid 0xFC is malformed")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: "zz",
+                                              sentBy: sibling, ownDeviceHex: device) == .malformedRecipient,
+              "non-hex 0xFC is malformed")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: peer,
+                                              sentBy: "", ownDeviceHex: device) == .store(recipientHex: peer),
+              "missing 0xFD is not an echo")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: peer,
+                                              sentBy: "", ownDeviceHex: "") == .store(recipientHex: peer),
+              "unknown own address never matches an empty 0xFD")
+        check(DistroCodec.sentCopyDisposition(sourceHex: peer, distroHex: distro, sentTo: peer,
+                                              sentBy: device, ownDeviceHex: device) == .foreignSource,
+              "marker from another source is foreign, even claiming our device")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro.uppercased(), distroHex: distro, sentTo: peer.uppercased(),
+                                              sentBy: sibling, ownDeviceHex: device) == .store(recipientHex: peer),
+              "source and recipient compare case-insensitively; recipient stored lowercase")
+
         if failures.isEmpty {
             print("all tests passed")
             exit(0)

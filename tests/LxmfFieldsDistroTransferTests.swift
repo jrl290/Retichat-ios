@@ -2,7 +2,8 @@
 //
 // Regression tests for decoding the distro identity transfer (RFed SPEC §17.9):
 // FIELD_CUSTOM_TYPE (0xFB) = "rfed.distro.transfer", FIELD_CUSTOM_DATA (0xFC)
-// = the 128-hex private key, as str (Android) or bin (web). Field maps are
+// = the 128-hex private key, as str (Android) or bin (web); and the
+// sent-message copy marker (SPEC §17.11, 0xFB "rfed.distro.sent" + 0xFD). Field maps are
 // hand-encoded with uint8 keys (0xCC 0xFB), exactly as lxmf_message_add_field
 // writes them, so these bytes are what the decoder meets on the wire.
 //
@@ -113,6 +114,27 @@ enum LxmfFieldsDistroTransferTests {
             key(0xFC) + str(keyHex),
         ]))
         check(wideKey.distroTransferKey == keyHex, "a key above 0xFF is skipped and later fields still decode")
+
+        // 5. Sent-message copy (SPEC §17.11): 0xFB/0xFC/0xFD, 0xFD as str or bin.
+        let peerHex = String(repeating: "c", count: 32)
+        let deviceHex = String(repeating: "a", count: 32)
+        check(key(LxmfFieldKey.customMeta) == [0xCC, 0xFD], "customMeta key encodes as 0xCC 0xFD")
+        let sentCopy = LxmfFieldsDecoder.decode(map([
+            key(0xFB) + str(DistroSent.customType),
+            key(0xFC) + str(peerHex),
+            key(0xFD) + str(deviceHex),
+        ]))
+        check(sentCopy.isDistroSentCopy, "rfed.distro.sent marks a sent copy")
+        check(sentCopy.customData == peerHex && sentCopy.customMeta == deviceHex,
+              "sent copy decodes recipient (0xFC) and sending device (0xFD)")
+        check(sentCopy.distroTransferKey == nil, "a sent copy is not a transfer")
+        let sentCopyBin = LxmfFieldsDecoder.decode(map([
+            key(0xFD) + bin8(deviceHex),
+            key(0xFB) + str(DistroSent.customType),
+        ]))
+        check(sentCopyBin.customMeta == deviceHex && sentCopyBin.isDistroSentCopy,
+              "bin8 0xFD decodes, and the marker is read in any order")
+        check(!asStr.isDistroSentCopy, "a transfer is not a sent copy")
 
         if failures.isEmpty {
             print("all tests passed")

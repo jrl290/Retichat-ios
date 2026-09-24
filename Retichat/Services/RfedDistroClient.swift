@@ -35,6 +35,21 @@ nonisolated struct DistroMessage: Sendable {
     let timestamp: Double
 }
 
+/// A message a SIBLING device sent as the distro, reported to this device by
+/// its sent copy (RFed SPEC §17.11), ready to be stored as an outgoing DM.
+/// Already checked: signed by our own distro, not our own echo, recipient a
+/// 32-hex address.
+nonisolated struct DistroSentCopy: Sendable {
+    /// The distro's lxmf.delivery hash: the stored message's sender ("me").
+    let distroHash: Data
+    /// 32 hex, lowercase: the conversation the message belongs to.
+    let recipientHex: String
+    let title: String
+    let content: String
+    /// The copy's LXMF timestamp.
+    let timestamp: Double
+}
+
 /// Speaks RFed's distro protocol on behalf of this device.
 ///
 /// Mirrors Android service/RfedDistroClient.kt and the web client's
@@ -80,6 +95,10 @@ final class RfedDistroClient: ObservableObject {
     /// Sink for decrypted distro messages (ChatRepository.handleDistroMessage).
     /// A blob is recorded as seen only once this has taken it.
     var onMessage: ((DistroMessage) -> Void)?
+
+    /// Sink for siblings' sent copies (ChatRepository.handleDistroSentCopy),
+    /// recorded as seen under the same rule as onMessage.
+    var onSentCopy: ((DistroSentCopy) -> Void)?
 
     /// Up to this many `/rfed/pull` rounds per pull (Android PULL_ROUNDS_MAX).
     private static let pullRoundsMax = 8
@@ -438,6 +457,20 @@ final class RfedDistroClient: ObservableObject {
         case transfer(fromHex: String, keyHex: String)
         case notification
         case message(DistroMessage)
+        /// Carries the sent marker (SPEC §17.11); judged on the main actor,
+        /// where this device's own address is known.
+        case sentCopy(SentCopyCandidate)
+    }
+
+    private nonisolated struct SentCopyCandidate: Sendable {
+        let source: Data
+        /// Our distro's delivery hash, read with the handle that unwrapped it.
+        let distroHex: String
+        let sentTo: String?
+        let sentBy: String
+        let title: String
+        let content: String
+        let timestamp: Double
     }
 
     /// Handle one distro blob, from the propagation stream, a pull, or (for
@@ -458,6 +491,7 @@ final class RfedDistroClient: ObservableObject {
             print("[Distro] blob dropped: no distro loaded")
             return
         }
+        let distroHex = DistroManager.shared.deliveryHashHex ?? ""
         var outLen: UInt32 = 0
         let ptr = blob.withUnsafeBytes { raw -> UnsafeMutablePointer<UInt8>? in
             retichat_distro_unwrap(h, raw.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -487,6 +521,15 @@ final class RfedDistroClient: ObservableObject {
         if let transfer = parsed.distro_transfer_key, !transfer.isEmpty {
             // An offer to act on, not a message to display.
             inbound = .transfer(fromHex: srcHex, keyHex: transfer)
+        } else if let sentBy = parsed.sent_by {
+            // SPEC §17.11 sent copy. unwrap_blob sets sent_by whenever the
+            // marker is present (sent_to only when 0xFC is 32 hex), so a copy
+            // with a bad recipient is still recognised here and dropped,
+            // never shown as a message from the distro.
+            inbound = .sentCopy(SentCopyCandidate(
+                source: src, distroHex: distroHex, sentTo: parsed.sent_to, sentBy: sentBy,
+                title: parsed.title ?? "", content: parsed.content ?? "",
+                timestamp: parsed.timestamp))
         } else if parsed.is_delivery_notification {
             // This device signs as the distro, so recipients' delivery
             // notifications come back via fan-out. Storing them posts empty bubbles.
@@ -517,6 +560,42 @@ final class RfedDistroClient: ObservableObject {
             }
             onMessage(m)
             return true
+        case .sentCopy(let c):
+            return deliverSentCopy(c)
+        }
+    }
+
+    /// SPEC §17.11 receive rules. Every drop returns true so the copy is
+    /// recorded as seen and a later pull does not bring it back; only a copy
+    /// with nowhere to go yet (no stack, no sink) stays unrecorded.
+    private func deliverSentCopy(_ c: SentCopyCandidate) -> Bool {
+        // The echo test needs this device's own lxmf.delivery address.
+        guard let ownHex = client?.destHashHex else {
+            print("[Distro] sent copy: stack not running; not recorded")
+            return false
+        }
+        switch DistroCodec.sentCopyDisposition(
+            sourceHex: c.source.hexString, distroHex: c.distroHex,
+            sentTo: c.sentTo, sentBy: c.sentBy, ownDeviceHex: ownHex) {
+        case .foreignSource:
+            // Only the distro key can produce a genuine copy; anyone else
+            // using the marker would be filing words into our conversations.
+            print("[Distro] sent copy from \(c.source.hexString.prefix(8)) ignored: not our distro")
+            return true
+        case .ownEcho:
+            // This device sent it; the original bubble is already there.
+            return true
+        case .malformedRecipient:
+            print("[Distro] sent copy from device \(c.sentBy.prefix(8)) dropped: recipient (0xFC) is not a 32-hex address")
+            return true
+        case .store(let recipientHex):
+            guard let onSentCopy else {
+                print("[Distro] no sent-copy sink; not recorded")
+                return false
+            }
+            onSentCopy(DistroSentCopy(distroHash: c.source, recipientHex: recipientHex,
+                                      title: c.title, content: c.content, timestamp: c.timestamp))
+            return true
         }
     }
 
@@ -528,6 +607,11 @@ final class RfedDistroClient: ObservableObject {
         let is_delivery_notification: Bool
         let ticket: String?
         let distro_transfer_key: String?
+        /// SPEC §17.11: 0xFC when the marker is present and 32 hex, else nil.
+        let sent_to: String?
+        /// SPEC §17.11: non-nil exactly when the marker is present ("" when
+        /// 0xFD is missing). Optional so an older FFI build still decodes.
+        let sent_by: String?
     }
 
     // MARK: - Identity transfer (receive)

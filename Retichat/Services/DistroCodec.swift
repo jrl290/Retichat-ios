@@ -109,6 +109,53 @@ nonisolated enum DistroCodec {
         return hexEncode(Data(SHA256.hash(data: publicKey)).prefix(16))
     }
 
+    // MARK: - Sent-message sync (RFed SPEC §17.11)
+    //
+    // The receive rules every client applies (Android and the web client
+    // implement the same SPEC section); the marker itself is read by
+    // lxmf_rust distro::unwrap_blob (sent_to / sent_by in the unwrap JSON).
+
+    /// 32 lowercase hex: an lxmf.delivery address as §17.11 writes it into
+    /// fields 0xFC and 0xFD.
+    static func isAddressHex(_ s: String) -> Bool {
+        s.utf8.count == 32 && s.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
+    }
+
+    /// Whether a direct message just submitted also needs its sent copy.
+    ///
+    /// Only a message signed as the distro has one (a device-signed message
+    /// is not the distro's to report), and never one addressed to the distro
+    /// itself: every device already receives that by fan-out, and a copy of
+    /// it would file the distro as a conversation with itself.
+    static func needsSentCopy(sentAsDistro: Bool, destHex: String, distroHex: String?) -> Bool {
+        guard sentAsDistro, let distroHex else { return false }
+        return destHex.lowercased() != distroHex.lowercased()
+    }
+
+    /// What to do with a fan-out message that carries the sent marker
+    /// (`sent_by` non-nil in the unwrap JSON).
+    enum SentCopyDisposition: Equatable {
+        /// Not signed by our own distro: someone else claiming the marker.
+        case foreignSource
+        /// This device sent it; the original is already in the chat.
+        case ownEcho
+        /// 0xFC is not a 32-hex address (unwrap_blob leaves sent_to nil).
+        case malformedRecipient
+        /// A sibling's message to `recipientHex`: file it as outgoing.
+        case store(recipientHex: String)
+    }
+
+    /// Checked in the order SPEC §17.11 lists them: provenance first, so a
+    /// forged copy can never be mistaken for our echo or filed; then the
+    /// echo, which is dropped whatever its 0xFC says.
+    static func sentCopyDisposition(sourceHex: String, distroHex: String, sentTo: String?,
+                                    sentBy: String, ownDeviceHex: String) -> SentCopyDisposition {
+        guard sourceHex.lowercased() == distroHex.lowercased() else { return .foreignSource }
+        if !ownDeviceHex.isEmpty && sentBy.lowercased() == ownDeviceHex.lowercased() { return .ownEcho }
+        guard let to = sentTo?.lowercased(), isAddressHex(to) else { return .malformedRecipient }
+        return .store(recipientHex: to)
+    }
+
     // MARK: - Private hex helpers
     //
     // Own copies rather than Data.hexString: this file must compile alone
