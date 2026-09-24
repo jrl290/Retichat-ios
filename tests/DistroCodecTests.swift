@@ -130,6 +130,9 @@ enum DistroCodecTests {
         check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: "zz",
                                               sentBy: sibling, ownDeviceHex: device) == .malformedRecipient,
               "non-hex 0xFC is malformed")
+        check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: distro.uppercased(),
+                                              sentBy: sibling, ownDeviceHex: device) == .malformedRecipient,
+              "0xFC naming the distro itself is malformed (rule 4)")
         check(DistroCodec.sentCopyDisposition(sourceHex: distro, distroHex: distro, sentTo: peer,
                                               sentBy: "", ownDeviceHex: device) == .store(recipientHex: peer),
               "missing 0xFD is not an echo")

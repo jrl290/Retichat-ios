@@ -152,7 +152,11 @@ nonisolated enum DistroCodec {
                                     sentBy: String, ownDeviceHex: String) -> SentCopyDisposition {
         guard sourceHex.lowercased() == distroHex.lowercased() else { return .foreignSource }
         if !ownDeviceHex.isEmpty && sentBy.lowercased() == ownDeviceHex.lowercased() { return .ownEcho }
-        guard let to = sentTo?.lowercased(), isAddressHex(to) else { return .malformedRecipient }
+        // SPEC §17.11 rule 4: 32 hex, and never D itself (no copy is sent for
+        // a message to D; filing one would open a chat with the distro).
+        guard let to = sentTo?.lowercased(), isAddressHex(to), to != distroHex.lowercased() else {
+            return .malformedRecipient
+        }
         return .store(recipientHex: to)
     }
 

@@ -104,6 +104,25 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// in the log. Removed on SENT or failure, cleared on stop.
     private var distroSentCopies: Set<String> = []
 
+    /// Chat-list preview per chat id: the content of the chat's newest
+    /// message as refreshChats() last saw it, "" when the chat has none.
+    ///
+    /// refreshChats() takes previews from a window of the newest messages
+    /// across ALL chats; a chat outside it needs a `chatId == X` fetch, and
+    /// MessageEntity has no index on chatId, so without this every refresh
+    /// (each send/receive/announce burst) ran one full-table scan per quiet
+    /// chat on the main actor.
+    ///
+    /// Invariant: a chat's newest message changes only when a message is
+    /// inserted into that chat or one of its messages is deleted (a stored
+    /// message's content, timestamp and chatId are never rewritten). An
+    /// insert need NOT land in the window: inbound, NSE-imported, distro
+    /// sent copies (§17.11) and group relays carry the sender's timestamp,
+    /// which can be older than the whole window yet newer than the chat's
+    /// last message. So every MessageEntity insert goes through
+    /// insertMessage(_:into:) and every delete path drops the chat's entry.
+    private var chatPreviewMemo: [String: String] = [:]
+
     /// Destination tracked for the live rfed.propagation.stream APP_LINK.
     private var propagationStreamDest: Data?
 
@@ -124,6 +143,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     func configure(modelContext: ModelContext) {
         self.modelContext = modelContext
+        chatPreviewMemo.removeAll()  // describes the previous store, if any
         normalizeMillisecondChatTimes()
         GroupChatManager.shared.onTracked = { [weak self] hashHex in
             Task { @MainActor [weak self] in
@@ -755,7 +775,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 deliveryState: DeliveryState.delivered,
                 signatureValid: msg.signatureValid
             )
-            ctx.insert(entity)
+            insertMessage(entity, into: ctx)
 
             for (filename, data) in fields.attachments {
                 let att = AttachmentEntity(
@@ -876,7 +896,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             isOutgoing: true,
             deliveryState: DeliveryState.pending
         )
-        ctx.insert(msgEntity)
+        insertMessage(msgEntity, into: ctx)
         for (filename, data) in attachments {
             ctx.insert(AttachmentEntity(
                 id: UUID().uuidString,
@@ -1001,7 +1021,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     }
                 } else {
                     // Fallback: optimistic entity was lost — insert fresh.
-                    ctx.insert(MessageEntity(
+                    self.insertMessage(MessageEntity(
                         id: msgHashHex,
                         chatId: chatId,
                         senderHash: ownHex,
@@ -1010,7 +1030,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                         isOutgoing: true,
                         deliveryState: DeliveryState.pending,
                         nativeHandle: msgHandle
-                    ))
+                    ), into: ctx)
                     for (filename, data) in attachmentsCopy {
                         ctx.insert(AttachmentEntity(
                             id: UUID().uuidString,
@@ -1178,7 +1198,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             isOutgoing: true,
             deliveryState: DeliveryState.sent   // fanout is fire-and-forget
         )
-        ctx.insert(msgEntity)
+        insertMessage(msgEntity, into: ctx)
 
         for (filename, data) in attachments {
             ctx.insert(AttachmentEntity(
@@ -1695,7 +1715,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             deliveryState: DeliveryState.delivered,
             signatureValid: signatureValid
         )
-        ctx.insert(msgEntity)
+        insertMessage(msgEntity, into: ctx)
 
         // Handle attachments from fields
         for (filename, data) in attachments {
@@ -1791,7 +1811,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             lxmfClient?.watch(destHash: peer)
         }
 
-        ctx.insert(MessageEntity(
+        insertMessage(MessageEntity(
             id: msgId,
             chatId: chatId,
             senderHash: distroHex,
@@ -1800,7 +1820,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             timestamp: c.timestamp,
             isOutgoing: true,
             deliveryState: DeliveryState.sent
-        ))
+        ), into: ctx)
         updateChatTimestamp(chatId: chatId, timestamp: c.timestamp)
         try? ctx.save()
         refreshChats()
@@ -1904,7 +1924,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 content: "Group invite from \(contactDisplayName(for: srcHex)): \"\(groupName)\"",
                 timestamp: timestamp, isOutgoing: false, deliveryState: DeliveryState.delivered
             )
-            ctx.insert(msg)
+            insertMessage(msg, into: ctx)
         }
 
         updateChatTimestamp(chatId: groupId, timestamp: timestamp)
@@ -1947,7 +1967,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 timestamp: Date().timeIntervalSince1970,
                 isOutgoing: false, deliveryState: DeliveryState.delivered
             )
-            ctx.insert(msg)
+            insertMessage(msg, into: ctx)
         }
 
         try? ctx.save()
@@ -1975,7 +1995,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 content: "\(contactDisplayName(for: memberHex)) left the group",
                 timestamp: timestamp, isOutgoing: false, deliveryState: DeliveryState.delivered
             )
-            ctx.insert(msg)
+            insertMessage(msg, into: ctx)
         }
         updateChatTimestamp(chatId: groupId, timestamp: timestamp)
         try? ctx.save()
@@ -2048,7 +2068,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             isOutgoing: actualSender == ownHashHex,
             deliveryState: DeliveryState.delivered
         )
-        ctx.insert(msg)
+        insertMessage(msg, into: ctx)
 
         for (filename, data) in fields.attachments {
             ctx.insert(AttachmentEntity(
@@ -2294,6 +2314,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 ctx.delete(msg)
             }
         }
+        chatPreviewMemo[chatId] = nil  // its messages are gone (see chatPreviewMemo)
 
         // Delete group members if applicable
         let memberDescriptor = FetchDescriptor<GroupMemberEntity>(
@@ -2340,7 +2361,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             guard displayName.localizedCaseInsensitiveContains(lower) ||
                   entity.peerHash.localizedCaseInsensitiveContains(lower) else { return nil }
 
-            let lastMsg = lastMessage(forChatId: entity.id)
+            let lastMsg = try? lastMessage(forChatId: entity.id)
             return Chat(
                 id: entity.id,
                 peerHash: entity.peerHash,
@@ -2469,7 +2490,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Batch-fetch the latest message per chat in ONE query instead of N
         let chatIds = chatEntities.map { $0.id }
-        var lastMsgByChat: [String: MessageEntity] = [:]
+        var previewByChat: [String: String] = [:]
         if !chatIds.isEmpty {
             // Fetch the most recent messages; we only need the newest per chat
             var msgDesc = FetchDescriptor<MessageEntity>(
@@ -2480,17 +2501,32 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             if let msgs = try? ctx.fetch(msgDesc) {
                 let idSet = Set(chatIds)
                 for m in msgs where idSet.contains(m.chatId) {
-                    if lastMsgByChat[m.chatId] == nil {
-                        lastMsgByChat[m.chatId] = m
+                    if previewByChat[m.chatId] == nil {
+                        // Sorted newest first, so a chat's first hit here is
+                        // its newest message: remember it for when it drops out.
+                        previewByChat[m.chatId] = m.content
+                        chatPreviewMemo[m.chatId] = m.content
                     }
                 }
             }
             // The window above holds the newest messages across ALL chats, so
             // one busy chat pushes a quieter chat's last message out of it and
-            // that row showed an empty preview. Look those chats up one by one.
-            for id in chatIds where lastMsgByChat[id] == nil {
-                if let m = lastMessage(forChatId: id) {
-                    lastMsgByChat[id] = m
+            // that row showed an empty preview. Those chats take the memo;
+            // only a chat never seen, or changed since (see chatPreviewMemo),
+            // is looked up, and "no messages" is remembered as "" too.
+            for id in chatIds where previewByChat[id] == nil {
+                if let memo = chatPreviewMemo[id] {
+                    previewByChat[id] = memo
+                } else {
+                    do {
+                        let preview = try lastMessage(forChatId: id)?.content ?? ""
+                        chatPreviewMemo[id] = preview
+                        previewByChat[id] = preview
+                    } catch {
+                        // Not memoized, so a failed read is never remembered
+                        // as an empty chat.
+                        print("[Retichat] refreshChats: last-message fetch for \(id.prefix(8)) failed: \(error)")
+                    }
                 }
             }
         }
@@ -2500,7 +2536,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let nameCache = batchContactDisplayNames(hashes: peerHashes)
 
         chats = chatEntities.map { entity in
-            let lastMsg = lastMsgByChat[entity.id]
             let displayName: String
             if entity.isGroup {
                 displayName = entity.groupName ?? "Group"
@@ -2512,7 +2547,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 id: entity.id,
                 peerHash: entity.peerHash,
                 displayName: displayName,
-                lastMessage: lastMsg?.content ?? "",
+                lastMessage: previewByChat[entity.id] ?? "",
                 lastMessageTime: entity.lastMessageTime,
                 unreadCount: 0,
                 isArchived: entity.isArchived,
@@ -2753,14 +2788,22 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
-    private func lastMessage(forChatId chatId: String) -> MessageEntity? {
+    /// The one way a MessageEntity enters the store: it drops that chat's
+    /// memoized preview in the same step, so no insert path can leave a stale
+    /// chat-list preview behind (see chatPreviewMemo).
+    private func insertMessage(_ message: MessageEntity, into ctx: ModelContext) {
+        ctx.insert(message)
+        chatPreviewMemo[message.chatId] = nil
+    }
+
+    private func lastMessage(forChatId chatId: String) throws -> MessageEntity? {
         guard let ctx = modelContext else { return nil }
         var descriptor = FetchDescriptor<MessageEntity>(
             predicate: #Predicate { $0.chatId == chatId },
             sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
         )
         descriptor.fetchLimit = 1
-        return try? ctx.fetch(descriptor).first
+        return try ctx.fetch(descriptor).first
     }
 
     private func unreadCount(forChatId chatId: String) -> Int {
