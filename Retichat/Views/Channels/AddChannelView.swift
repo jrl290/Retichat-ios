@@ -12,7 +12,8 @@ struct AddChannelView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var channelName = ""
-    @State private var rfedIdentityHash = UserPreferences.shared.rfedNodeIdentityHash
+    /// The node in use, the default included, shown in the field.
+    @State private var rfedIdentityHash = UserPreferences.shared.effectiveRfedNodeIdentityHash
     @State private var isJoining = false
     @State private var errorMessage: String?
 

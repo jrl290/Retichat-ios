@@ -10,9 +10,22 @@ import CryptoKit
 
 final class UserPreferences {
     static let shared = UserPreferences()
-    private static let hiddenDefaultRfedNodeIdentityHash = "7e5ff856dc2aa0fbc9fc8831b62d2834"
+    /// The RFed node used when none is set. Settings shows it in the field
+    /// rather than leaving the field blank over a hidden fallback.
+    static let defaultRfedNodeIdentityHash = "7e5ff856dc2aa0fbc9fc8831b62d2834"
 
     private let defaults = UserDefaults.standard
+
+    private init() {
+        // Until 2026-09-24 Settings saved copies of the rfed.notify and
+        // lxmf.propagation hashes derived from the RFed node, and those copies
+        // won over the node: a node changed any other way left them pointing
+        // at the old one (the simulator, switched back from staging, sent every
+        // propagated message to the staging node). Both are derived at use time
+        // now; drop the copies so none can come back.
+        defaults.removeObject(forKey: Keys.rfedNotifyHash)
+        defaults.removeObject(forKey: Keys.lxmfPropagationHash)
+    }
 
     private enum Keys {
         static let displayName = "display_name"
@@ -20,8 +33,10 @@ final class UserPreferences {
         static let defaultTcpEnabled = "default_tcp_enabled"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
+        /// No longer written; removed at init (see init).
         static let rfedNotifyHash = "rfed_notify_hash"
         static let apnsDeviceToken = "apns_device_token"
+        /// No longer written; removed at init (see init).
         static let lxmfPropagationHash = "lxmf_propagation_hash"
         static let rfedNodeIdentityHash = "rfed_node_identity_hash"
         static let rfedLxmfPropOverride = "rfed_lxmf_prop_override"
@@ -64,26 +79,15 @@ final class UserPreferences {
         set { defaults.set(newValue, forKey: Keys.identityPath) }
     }
 
-    /// 32-char hex destination hash of the rfed.notify destination.
-    /// Used to register this device's notify relay with the rfed server.
-    /// Leave empty to disable rfed notify registration.
-    var rfedNotifyHash: String {
-        get { defaults.string(forKey: Keys.rfedNotifyHash) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.rfedNotifyHash) }
-    }
-
-    /// Runtime RFed notify-register destination.
-    /// Falls back to the app's hidden default RFed node when no explicit
-    /// value has been saved in Settings.
+    /// Runtime RFed notify-register destination, derived from the RFed node
+    /// in use, so it always follows the node.
     ///
     /// After the rfed.notify aspect split this is the canonical probe used
     /// for UI reachability indicators and as the target for the register
     /// op. Unregister derives its own hash via `["notify", "unregister"]`.
     var effectiveRfedNotifyHash: String {
-        let configured = Self.normalizedHex(rfedNotifyHash)
-        if !configured.isEmpty { return configured }
-        return Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
-                                app: "rfed", aspects: ["notify", "register"]) ?? ""
+        Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
+                         app: "rfed", aspects: ["notify", "register"]) ?? ""
     }
 
 
@@ -94,19 +98,14 @@ final class UserPreferences {
         set { defaults.set(newValue, forKey: Keys.apnsDeviceToken) }
     }
 
-    /// 32-char hex destination hash of a preferred LXMF propagation node.
-    /// When non-empty it is tried first on every poll cycle; falls back to
-    /// the built-in rotated pool on failure.  Leave empty to use the pool.
-    var lxmfPropagationHash: String {
-        get { defaults.string(forKey: Keys.lxmfPropagationHash) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.lxmfPropagationHash) }
-    }
-
-    /// Runtime LXMF propagation destination.
-    /// When the override field is blank, derive from the effective RFed node.
+    /// Runtime LXMF propagation destination, tried first on every poll cycle
+    /// (the built-in rotated pool follows on failure): the Settings override
+    /// when one is set, otherwise derived from the RFed node in use, at the
+    /// moment it is asked for, so it always follows the node (Android
+    /// ChatRepository.selectPropagationNode derives it the same way).
     var effectiveLxmfPropagationHash: String {
-        let configured = Self.normalizedHex(lxmfPropagationHash)
-        if !configured.isEmpty { return configured }
+        let override = Self.normalizedHex(rfedLxmfPropOverride)
+        if !override.isEmpty { return override }
         return Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
                                 app: "lxmf", aspects: ["propagation"]) ?? ""
     }
@@ -119,12 +118,12 @@ final class UserPreferences {
         set { defaults.set(newValue, forKey: Keys.rfedNodeIdentityHash) }
     }
 
-    /// Runtime RFed identity hash.
-    /// Uses the hidden fallback only when Settings is blank.
+    /// Runtime RFed identity hash: the one saved in Settings, or the default
+    /// when none is saved.
     var effectiveRfedNodeIdentityHash: String {
         let configured = Self.normalizedHex(rfedNodeIdentityHash)
         if !configured.isEmpty { return configured }
-        return Self.hiddenDefaultRfedNodeIdentityHash
+        return Self.defaultRfedNodeIdentityHash
     }
 
     /// Optional override for the LXMF propagation hash.
@@ -273,7 +272,7 @@ final class UserPreferences {
         channelLastOpened = map
     }
 
-    private static func normalizedHex(_ value: String) -> String {
+    static func normalizedHex(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 

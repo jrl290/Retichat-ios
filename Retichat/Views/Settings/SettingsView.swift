@@ -142,8 +142,12 @@ struct SettingsView: View {
     private func applySettings() {
         // Capture old rfed identity hash before prefs are overwritten so we
         // can derive the OLD unregister destination after vm.apply().
-        let oldRfedIdentityHash = UserPreferences.shared.rfedNodeIdentityHash
-        let rfedNodeChanged = vm.rfedNodeIdentityHash != UserPreferences.shared.rfedNodeIdentityHash
+        // Compared as the nodes in use: the field shows the default when none
+        // is saved, which is not a change.
+        let oldRfedIdentityHash = UserPreferences.shared.effectiveRfedNodeIdentityHash
+        let newRfedIdentityHash = UserPreferences.normalizedHex(vm.rfedNodeIdentityHash)
+        let rfedNodeChanged = (newRfedIdentityHash.isEmpty
+            ? UserPreferences.defaultRfedNodeIdentityHash : newRfedIdentityHash) != oldRfedIdentityHash
 
         // Persist all settings to UserDefaults.
         vm.apply()

@@ -72,13 +72,15 @@ class SettingsViewModel: ObservableObject {
         let prefs = UserPreferences.shared
         self.displayName = prefs.displayName
         self.channelDisplayName = prefs.channelDisplayName
-        self.rfedNodeIdentityHash = prefs.rfedNodeIdentityHash
+        // The node in use, the default included, is shown in the field: no
+        // hidden fallback behind a blank one.
+        self.rfedNodeIdentityHash = prefs.effectiveRfedNodeIdentityHash
         self.rfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.filterStrangers = prefs.filterStrangers
         self.defaultTcpEnabled = prefs.defaultTcpEnabled
         self.originalDisplayName = prefs.displayName
         self.originalChannelDisplayName = prefs.channelDisplayName
-        self.originalRfedNodeIdentityHash = prefs.rfedNodeIdentityHash
+        self.originalRfedNodeIdentityHash = prefs.effectiveRfedNodeIdentityHash
         self.originalRfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.originalFilterStrangers = prefs.filterStrangers
         self.persistedFilterStrangers = prefs.filterStrangers
@@ -105,12 +107,10 @@ class SettingsViewModel: ObservableObject {
         prefs.channelDisplayName = channelDisplayName
         prefs.defaultTcpEnabled = defaultTcpEnabled
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
-        prefs.rfedNotifyHash = Self.rnsDestHash(
-            identityHashHex: rfedNodeIdentityHash, app: "rfed", aspects: ["notify", "register"]
-        ) ?? ""
+        // rfed.notify and lxmf.propagation are derived from the node when they
+        // are used (UserPreferences); only the explicit override is saved.
         prefs.rfedLxmfPropOverride = rfedLxmfPropOverride
         prefs.filterStrangers = filterStrangers
-        updateLxmfPropagationHash()
     }
 
     /// Persist the stranger-filter toggle immediately. This gate is enforced
@@ -185,18 +185,6 @@ class SettingsViewModel: ObservableObject {
     }
 
     // MARK: - Private
-
-    private func updateLxmfPropagationHash() {
-        let prefs = UserPreferences.shared
-        let override = rfedLxmfPropOverride.trimmingCharacters(in: .whitespaces)
-        if !override.isEmpty {
-            prefs.lxmfPropagationHash = override
-        } else {
-            prefs.lxmfPropagationHash = Self.rnsDestHash(
-                identityHashHex: rfedNodeIdentityHash, app: "lxmf", aspects: ["propagation"]
-            ) ?? ""
-        }
-    }
 
     /// Compute an RNS SINGLE-destination hash given a 32-char hex identity hash.
     ///
