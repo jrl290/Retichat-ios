@@ -69,34 +69,37 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - Outbound message state tracking
     //
     // Keyed by LXMF message hash hex.  Populated at send time, removed when
-    // the message reaches a terminal state (delivered, sent-to-prop, or failed).
+    // no attempt is left to hear from (delivered, sent-to-prop, or failed).
     // The message_state_callback from Rust drives all state transitions.
+    // One entry per message: the propagated copy is a clone with the same
+    // hash, so it reports under the entry of the DIRECT attempt it follows.
 
     private struct PendingOutbound {
-        let messageId: String      // DB record primary key (= original msg hash hex)
+        let messageId: String      // DB record primary key (= msg hash hex)
         let chatId: String
         let peerHash: Data
-        let method: UInt8          // LxmfMethod.direct or .propagated
+        /// The first attempt's handle. The propagated copy is cloned from
+        /// it, so it is released only when the message completes.
         let msgHandle: UInt64
-        let content: String
-        let title: String
-        let hasAttachments: Bool
-        /// Signed as the distro (source = distro address). Its delivery
-        /// notification goes to the distro and returns only via fan-out, so
-        /// a propagated copy completes on SENT (see handleMessageState 0x04).
-        let sentAsDistro: Bool
+        /// Attempts in flight and whether the copy has started.
+        var attempts: OutboundAttempts
     }
 
     private var pendingOutbound: [String: PendingOutbound] = [:]
-
-    /// Message IDs that already had a propagation fallback dispatched.
-    private var propFallbackSent: Set<String> = []
 
     /// Message-state callbacks can arrive before the send-registration hop
     /// stores `pendingOutbound[hash]`, especially when Timer P collapses to
     /// zero for an already-disconnected AppLink. Buffer and replay them once
     /// registration completes so fallback ordering stays deterministic.
     private var earlyMessageStates: [String: [UInt8]] = [:]
+
+    /// Hashes of messages that completed, newest last, bounded. The other
+    /// attempt of a message that completed (the copy's SENT or FAILED after
+    /// the DIRECT attempt's DELIVERED) still reports under its hash; that is
+    /// not an early state, and buffering it would keep it until stop.
+    private var completedHashes: [String] = []
+    private var completedHashSet: Set<String> = []
+    private static let completedHashCapacity = 256
 
     /// Hashes of distro sent copies in flight (RFed SPEC §17.11). A copy has
     /// no bubble and no pending entry; this keeps its states out of
@@ -417,8 +420,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         pendingOutbound.removeAll()
 
         // Clear stale per-session state so the next start is clean.
-        propFallbackSent.removeAll()
         earlyMessageStates.removeAll()
+        completedHashes.removeAll()
+        completedHashSet.removeAll()
         distroSentCopies.removeAll()
         propagationStreamDest = nil
         lastPollTime = .distantPast
@@ -1107,12 +1111,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     messageId: msgHashHex,
                     chatId: chatId,
                     peerHash: destData,
-                    method: method,
                     msgHandle: msgHandle,
-                    content: content,
-                    title: "",
-                    hasAttachments: !attachmentsCopy.isEmpty,
-                    sentAsDistro: sentAsDistro
+                    attempts: OutboundAttempts(direct: method == directMethod)
                 )
                 self.replayBufferedMessageStatesIfNeeded(for: msgHashHex)
 
@@ -1523,78 +1523,81 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
             return
         }
-        guard let pending = pendingOutbound[hashHex] else {
-            // DELIVERED can arrive after the pending was already completed
-            // (e.g. SENT completed it for a propagated message before this fix).
-            // Update the DB directly so the double-checkmark is not lost.
+        guard var pending = pendingOutbound[hashHex] else {
+            // DELIVERED can arrive after the pending was already completed:
+            // SENT completed it (the node holds the copy), or it is the late
+            // proof of a DIRECT attempt that failed (LXMF-rust 9ef5174). The
+            // row id is the hash, so update the DB directly and the
+            // double-checkmark is not lost.
             if state == 0x08 {
                 updateDeliveryState(messageId: hashHex, state: DeliveryState.delivered)
-            } else {
+            } else if !completedHashSet.contains(hashHex) {
                 earlyMessageStates[hashHex, default: []].append(state)
             }
             return
         }
 
+        // The DIRECT attempt and its propagated copy report under this one
+        // hash, so a state cannot be traced to either; OutboundAttempts
+        // counts the attempts in flight and says what to do.
+        let step: OutboundAttempts.Step
         switch state {
 
-        case 0x04:  // SENT — propagated message accepted by the prop node.
-            updateDeliveryState(messageId: pending.messageId, state: DeliveryState.sent)
-            if pending.method != LxmfMethod.propagated || pending.sentAsDistro {
-                // DIRECT: SENT is terminal — Rust fires only one of SENT/DELIVERED
-                // (else-if in lxm_router.rs). Complete now.
-                // PROPAGATED as the distro: the recipient's delivery
-                // notification is addressed to the distro and comes back only
-                // through RFed fan-out, so DELIVERED never reaches the router.
-                // Complete now rather than hold the handle forever.
-                // PROPAGATED as the device: DELIVERED will follow as a separate
-                // callback. Keep the pending alive so it can be matched.
-                completePending(hashHex: hashHex, pending: pending)
-            }
+        case 0x04:  // SENT — the propagation node accepted the copy (or the only, PROPAGATED, attempt).
+            // That attempt is over. As the device, DELIVERED may follow and
+            // finds the row by hash (above). As the distro it never reaches
+            // the router: the recipient's notification goes to the distro and
+            // comes back only through RFed fan-out.
+            step = pending.attempts.sent()
 
         case 0x08:  // DELIVERED — recipient downloaded and decrypted the message.
-            updateDeliveryState(messageId: pending.messageId, state: DeliveryState.delivered)
-            completePending(hashHex: hashHex, pending: pending)
+            step = pending.attempts.delivered()
 
         case 0x10:  // PROP_FALLBACK_REQUESTED — Rust Timer P fired after its current delay.
-            // The direct send is still running; start propagation in parallel.
-            // LXMF dedup on the receiver handles any double-delivery.
-            if pending.method == LxmfMethod.direct && !pending.hasAttachments {
-                if !propFallbackSent.contains(pending.messageId) {
-                    propFallbackSent.insert(pending.messageId)
-                    updateDeliveryState(messageId: pending.messageId, state: DeliveryState.propagating)
-                    retrySendViaPropNode(pending)
-                }
-            }
+            // The direct send is still running; the copy runs beside it and
+            // the recipient drops whichever arrives second (same hash).
+            // Until 2026-09-24 a message with attachments got no copy.
+            step = pending.attempts.propagationRequested()
 
         case 0xFD, 0xFE, 0xFF:  // REJECTED, CANCELLED, FAILED.
-            if pending.method == LxmfMethod.direct && !pending.hasAttachments {
-                if propFallbackSent.contains(pending.messageId) {
-                    // Prop fallback already dispatched — just clean up this direct entry.
-                    print("[Retichat] Direct FAILED but prop fallback already in flight for \(pending.messageId.prefix(8))")
-                    completePending(hashHex: hashHex, pending: pending)
-                } else {
-                    // No fallback yet — retry now via prop node.
-                    ConnectionStateManager.shared.markPeerDegraded(
-                        destHex: pending.peerHash.hexString
-                    )
-                    propFallbackSent.insert(pending.messageId)
-                    pendingOutbound.removeValue(forKey: hashHex)
-                    LxmfClient.messageDestroy(pending.msgHandle)
-                    retrySendViaPropNode(pending)
-                }
-            } else if pending.method == LxmfMethod.propagated {
-                // Propagated terminal failure — clean up fallback tracking.
-                propFallbackSent.remove(pending.messageId)
-                updateDeliveryState(messageId: pending.messageId, state: DeliveryState.failed)
-                completePending(hashHex: hashHex, pending: pending)
-            } else {
-                // Has attachments or other — final failure.
-                updateDeliveryState(messageId: pending.messageId, state: DeliveryState.failed)
-                completePending(hashHex: hashHex, pending: pending)
+            // Before any copy, the DIRECT attempt failed and the copy goes
+            // now, the bubble showing propagating (until 2026-09-24 it stayed
+            // pending). After, one attempt ended; the message fails when none
+            // is left and none succeeded.
+            step = pending.attempts.failed()
+            if step.startCopy {
+                ConnectionStateManager.shared.markPeerDegraded(
+                    destHex: pending.peerHash.hexString
+                )
             }
 
         default:
-            break  // Intermediate states (e.g. SENDING=0x02) — no DB update.
+            return  // Intermediate states (e.g. SENDING=0x02) — no DB update.
+        }
+        pendingOutbound[hashHex] = pending
+        apply(step, hashHex: hashHex, pending: pending)
+    }
+
+    /// Do what OutboundAttempts decided for `pending`, whose updated
+    /// attempts are already stored.
+    private func apply(_ step: OutboundAttempts.Step, hashHex: String, pending: PendingOutbound) {
+        if let shown = step.show {
+            updateDeliveryState(messageId: pending.messageId, state: Self.deliveryState(shown))
+        }
+        if step.startCopy {
+            retrySendViaPropNode(hashHex: hashHex, directHandle: pending.msgHandle)
+        }
+        if step.complete {
+            completePending(hashHex: hashHex, pending: pending)
+        }
+    }
+
+    private static func deliveryState(_ shown: OutboundAttempts.Shown) -> Int {
+        switch shown {
+        case .propagating: return DeliveryState.propagating
+        case .sent: return DeliveryState.sent
+        case .delivered: return DeliveryState.delivered
+        case .failed: return DeliveryState.failed
         }
     }
 
@@ -1605,80 +1608,88 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
+    /// No attempt is left to hear from. The DIRECT handle goes last: the
+    /// copy is cloned from it.
     private func completePending(hashHex: String, pending: PendingOutbound) {
         pendingOutbound.removeValue(forKey: hashHex)
         earlyMessageStates.removeValue(forKey: hashHex)
+        if completedHashSet.insert(hashHex).inserted {
+            completedHashes.append(hashHex)
+            if completedHashes.count > Self.completedHashCapacity {
+                completedHashSet.remove(completedHashes.removeFirst())
+            }
+        }
         LxmfClient.messageDestroy(pending.msgHandle)
-        // Clean up fallback tracking when a propagated message reaches terminal state.
-        if pending.method == LxmfMethod.propagated {
-            propFallbackSent.remove(pending.messageId)
+    }
+
+    /// Send the propagated copy of the message whose DIRECT attempt is
+    /// `directHandle`: a clone (message_clone_propagated) with its source,
+    /// content, fields, attachments and packed timestamp, and so its message
+    /// hash. The copy's states reach the same pending entry and the
+    /// recipient keeps only one of the two. Until 2026-09-24 this built a new
+    /// message without the attachments: a new hash, a second pending entry,
+    /// and a recipient that got both attempts showed the message twice.
+    ///
+    /// The clone is made on ffiQueue, off the main actor (§6): it takes the
+    /// message's lock, which the router holds while it reports 0x10 and
+    /// FAILED. The DIRECT handle is released only when the message
+    /// completes, so it is still registered unless the message completed
+    /// (delivered, or the stack stopped) before the clone ran — and then no
+    /// copy is needed.
+    private func retrySendViaPropNode(hashHex: String, directHandle: UInt64) {
+        guard lxmfClient != nil else {
+            propagatedCopyNotStarted(hashHex: hashHex)
+            return
+        }
+        ffiQueue.async { [weak self] in
+            if Self.submitPropagatedCopy(of: directHandle, hashHex: hashHex) { return }
+            Task { @MainActor [weak self] in
+                self?.propagatedCopyNotStarted(hashHex: hashHex)
+            }
         }
     }
 
-    /// Retry a failed direct-mode message via the propagation node.
-    private func retrySendViaPropNode(_ original: PendingOutbound) {
-        guard let client = lxmfClient else {
-            updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
+    /// Clone, submit and release the copy. The router keeps its own
+    /// reference to a submitted message and every state arrives by hash, so
+    /// nothing needs the copy's registry handle: it is released at once, as
+    /// GroupChatManager does. Returns false (logged) when no copy we can
+    /// follow went out.
+    ///
+    /// nonisolated: runs on ffiQueue, so it uses DistroMessageFFI's
+    /// nonisolated wrappers (LxmfClient's statics are main-actor isolated).
+    nonisolated private static func submitPropagatedCopy(of directHandle: UInt64, hashHex: String) -> Bool {
+        let copy = DistroMessageFFI.clonePropagated(directHandle)
+        guard copy != 0 else {
+            print("[Retichat] propagated copy of \(hashHex.prefix(8)) not cloned: \(DistroMessageFFI.lastError())")
+            return false
+        }
+        defer { DistroMessageFFI.destroy(copy) }
+        guard DistroMessageFFI.sendViaAppLinks(copy) else {
+            print("[Retichat] propagated copy of \(hashHex.prefix(8)) not sent: \(DistroMessageFFI.lastError())")
+            return false
+        }
+        // The clone keeps the hash (LXMF-rust propagated_copy); a copy under
+        // another would report where no pending entry hears it.
+        if let copyHash = DistroMessageFFI.hash(copy), copyHash.hexString != hashHex {
+            print("[Retichat] propagated copy of \(hashHex.prefix(8)) went out as \(copyHash.hexString.prefix(8)): its states cannot reach the bubble")
+            return false
+        }
+        print("[Retichat] propagated copy of \(hashHex.prefix(8)) submitted")
+        return true
+    }
+
+    /// The copy of `hashHex` did not go out (logged on ffiQueue), so no
+    /// report will come for it: an attempt that ended failed. With no
+    /// pending entry the message completed, or the stack stopped, before
+    /// the clone ran.
+    private func propagatedCopyNotStarted(hashHex: String) {
+        guard var pending = pendingOutbound[hashHex] else {
+            print("[Retichat] propagated copy of \(hashHex.prefix(8)) not needed: the message completed (or the stack stopped) first")
             return
         }
-
-        let deviceHash = client.destHash
-        let deviceHandle = client.identityHandle
-        let propagatedMethod = LxmfMethod.propagated
-        let bridgeRef = bridge
-
-        // Run FFI calls off the main thread.
-        ffiQueue.async { [weak self] in
-            // Same source choice as the DIRECT attempt: as the distro when one
-            // is held (Android schedulePropagationFallback, kt:666-673).
-            let (msgHandle, sentAsDistro) = Self.createOutboundMessage(
-                bridge: bridgeRef,
-                deviceHash: deviceHash,
-                deviceHandle: deviceHandle,
-                to: original.peerHash,
-                content: original.content,
-                title: original.title,
-                method: propagatedMethod
-            )
-            guard msgHandle != 0 else {
-                Task { @MainActor [weak self] in
-                    self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
-                }
-                return
-            }
-
-            guard client.sendMessageViaAppLinks(msgHandle) else {
-                LxmfClient.messageDestroy(msgHandle)
-                Task { @MainActor [weak self] in
-                    self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
-                }
-                return
-            }
-
-            guard let hashData = LxmfClient.messageHash(msgHandle), !hashData.isEmpty else {
-                LxmfClient.messageDestroy(msgHandle)
-                Task { @MainActor [weak self] in
-                    self?.updateDeliveryState(messageId: original.messageId, state: DeliveryState.failed)
-                }
-                return
-            }
-
-            let newHashHex = hashData.hexString
-            Task { @MainActor [weak self] in
-                self?.pendingOutbound[newHashHex] = PendingOutbound(
-                    messageId: original.messageId,
-                    chatId: original.chatId,
-                    peerHash: original.peerHash,
-                    method: LxmfMethod.propagated,
-                    msgHandle: msgHandle,
-                    content: original.content,
-                    title: original.title,
-                    hasAttachments: false,
-                    sentAsDistro: sentAsDistro
-                )
-                self?.replayBufferedMessageStatesIfNeeded(for: newHashHex)
-            }
-        }
+        let step = pending.attempts.copyNotStarted()
+        pendingOutbound[hashHex] = pending
+        apply(step, hashHex: hashHex, pending: pending)
     }
 
     /// Update delivery state with sticky-success priority matching Android's
@@ -2545,9 +2556,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return entities.reversed().map { entity in
             let attachments = attachmentsByMsg[entity.id] ?? []
             var progress: Float? = nil
+            // Not while propagating: the row still points at the DIRECT
+            // attempt, whose progress the router reset when it failed, and
+            // the copy's transfer has no handle here — a bar would sit at 0%.
             if entity.isOutgoing && entity.nativeHandle != 0 && !attachments.isEmpty
                && entity.deliveryState != DeliveryState.delivered
-               && entity.deliveryState != DeliveryState.failed {
+               && entity.deliveryState != DeliveryState.failed
+               && entity.deliveryState != DeliveryState.propagating {
                 let p = LxmfClient.messageProgress(entity.nativeHandle)
                 if p >= 0 && p < 1.0 {
                     progress = p

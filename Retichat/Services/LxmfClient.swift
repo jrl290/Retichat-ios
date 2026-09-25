@@ -755,7 +755,11 @@ final class LxmfClient: @unchecked Sendable {
     }
 
     /// Clone an existing message as a fresh propagated-method message while
-    /// preserving fields and attachments.
+    /// preserving fields and attachments. It keeps the packed timestamp too,
+    /// so the copy has the original's message hash and a recipient that gets
+    /// both keeps one. Clone only after the original was submitted (it is
+    /// packed then), and never on the thread of a state callback: the clone
+    /// takes the original's lock, which the router holds while reporting.
     static func messageClonePropagated(_ msgHandle: UInt64) -> UInt64 {
         lxmf_message_clone_propagated(msgHandle)
     }

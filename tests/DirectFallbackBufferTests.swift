@@ -53,9 +53,14 @@ func testSourceContainsEarlyStateBuffering() {
             source.contains("self.replayBufferedMessageStatesIfNeeded(for: msgHashHex)"),
             "replays buffered states after direct send registration"
         )
+        // The propagated copy is a clone with the DIRECT message's hash
+        // (2026-09-24): its states reach the direct registration's pending
+        // entry, so it registers and replays nothing of its own
+        // (OutboundAttemptsTests.swift covers the rest).
         check(
-            source.contains("self?.replayBufferedMessageStatesIfNeeded(for: newHashHex)"),
-            "replays buffered states after propagated resend registration"
+            source.contains("DistroMessageFFI.clonePropagated(directHandle)")
+                && !source.contains("self?.replayBufferedMessageStatesIfNeeded(for: newHashHex)"),
+            "the propagated copy reports under the direct registration's hash, no second registration"
         )
         check(
             source.contains("earlyMessageStates.removeValue(forKey: hashHex)"),
@@ -106,23 +111,25 @@ func testBufferedStatesPreserveTimerPOrdering() {
     queue.push(0x10, for: "msg")
     queue.push(0xFF, for: "msg")
 
-    var propFallbackSent = false
+    // OutboundAttempts in miniature: a failure after the copy started is
+    // one attempt ending; before, it starts the copy.
+    var copyStarted = false
     var eventLog: [String] = []
 
     for state in queue.drain(for: "msg") {
         switch state {
         case 0x10:
-            propFallbackSent = true
+            copyStarted = true
             eventLog.append("fallback")
         case 0xFF:
-            eventLog.append(propFallbackSent ? "cleanup" : "late-fallback")
+            eventLog.append(copyStarted ? "attempt-ended" : "late-fallback")
         default:
             break
         }
     }
 
     check(
-        eventLog == ["fallback", "cleanup"],
+        eventLog == ["fallback", "attempt-ended"],
         "buffered Timer P replay precedes terminal direct failure",
         "got \(eventLog)"
     )
