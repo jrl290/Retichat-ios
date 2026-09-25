@@ -104,6 +104,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// in the log. Removed on SENT or failure, cleared on stop.
     private var distroSentCopies: Set<String> = []
 
+    /// A send made before the stack could carry it: everything the send path
+    /// needs, plus the id of the bubble already in the chat so the release
+    /// reuses it rather than inserting a second one.
+    private enum HeldSend {
+        case direct(chatId: String, destHashHex: String, destData: Data, content: String,
+                    attachments: [(String, Data)], tempId: String, optimisticTimestamp: TimeInterval)
+        case group(chatId: String, content: String, attachments: [(String, Data)], messageId: String)
+    }
+
+    /// Sends made while the stack is starting or stopped. Released in order
+    /// by releaseHeldSends(), the last step of finishStartService; stopService
+    /// closes the gate but keeps what is held. In memory only: a process
+    /// death leaves the held bubbles pending.
+    private var heldSends = HeldSends<HeldSend>()
+
     /// Chat-list preview per chat id: the content of the chat's newest
     /// message as refreshChats() last saw it, "" when the chat has none.
     ///
@@ -279,9 +294,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///      `.onReceive` handler wire up `RfedChannelClient` exactly once.
     ///   6. Start RNode interfaces (independent of the path/link stack).
     ///   7. Hand delivery destination to publish daemon (auto-re-announce).
-    ///   8. Side-tasks: ratchet sync, periodic poll, rfed notify register.
+    ///   8. Side-tasks: ratchet sync, periodic poll (seeds the router's
+    ///      propagation node at once), rfed notify register.
     ///   9. Distro registration with RFed (after ConnectionStateManager is
     ///      registered; Android StackRuntime 310-313).
+    ///  10. Release the sends held while the stack was starting — last, so
+    ///      each goes out with everything above in place: the message-state
+    ///      callback (2), or its 0x10/FAILED is lost and its propagated
+    ///      fallback never starts, and the propagation node seeded in (8),
+    ///      or that fallback fails at once.
     ///
     /// Each step that touches the FFI is hopped to `ffiQueue` (serial) or to
     /// a detached Task; all on-main-actor work above runs synchronously in
@@ -375,6 +396,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Import any messages the NSE delivered while we were dead
         importNSEMessages()
 
+        // Last: everything a send depends on is in place (see step 10).
+        releaseHeldSends()
+
         print("[Retichat] Service started. Hash: \(ownHashHex)")
     }
 
@@ -404,6 +428,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // shutdown are ordered and cannot race with other FFI work.
         let client = lxmfClient
         lxmfClient = nil
+        // Sends made from here on are held; any already held stay held and
+        // go after the next start (releaseHeldSends).
+        heldSends.close()
         serviceRunning = false
         statusMessage = "Stopped"
         // Before deregister (Android shutdownNow:324): drops in-flight distro
@@ -545,6 +572,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private func startPropagationPolling() {
         // Apply user-configured node before the first poll fires.
         propManager.setUserConfiguredNode(prefs.effectiveLxmfPropagationHash)
+
+        // Give the router its outbound propagation node now, not at the
+        // first poll a second from now: until it has one, every propagated
+        // send (a distro recipient, a direct send's fallback, a send held
+        // through startup) fails at once (lxm_router.rs). On ffiQueue, so it
+        // lands ahead of every send submitted after startup.
+        if let client = lxmfClient, let nodeHash = propManager.currentNode() {
+            ffiQueue.async {
+                _ = client.setPropagationNode(nodeHash: nodeHash)
+            }
+        }
 
         // Share propagation node list with NSE so it can sync on its own.
         syncPropagationNodesToAppGroup()
@@ -869,11 +907,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
-        guard let client = lxmfClient else {
-            print("[Retichat] sendMessage: ABORT - lxmfClient is nil")
-            return
-        }
-
         // Decide delivery method at send time from live link state.
         //
         // If a link to this peer is currently being established (we just
@@ -909,6 +942,31 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         try? ctx.save()
         refreshChats()
 
+        // Stack still starting (or stopped): the bubble stays pending and the
+        // send waits for the end of startup, behind any sends held before it.
+        guard heldSends.isOpen, let client = lxmfClient else {
+            heldSends.hold(.direct(chatId: chatId, destHashHex: destHashHex, destData: destData,
+                                   content: content, attachments: attachments, tempId: tempId,
+                                   optimisticTimestamp: optimisticTimestamp))
+            print("[Retichat] sendMessage: stack not started — held until it is (\(heldSends.count) held)")
+            return
+        }
+
+        submitDirectMessage(client: client, chatId: chatId, destHashHex: destHashHex, destData: destData,
+                            content: content, attachments: attachments, tempId: tempId,
+                            optimisticTimestamp: optimisticTimestamp)
+    }
+
+    /// Hand a 1:1 message to the router. Its pending bubble (`tempId`) is
+    /// already in the chat; this renames it to the message hash and
+    /// registers the pending entry that handleMessageState drives. Called
+    /// once per message: straight from sendMessage, or from
+    /// releaseHeldSends for a send held through startup.
+    private func submitDirectMessage(
+        client: LxmfClient, chatId: String, destHashHex: String, destData: Data,
+        content: String, attachments: [(String, Data)], tempId: String,
+        optimisticTimestamp: TimeInterval
+    ) {
         // Capture values for the background closure
         let ownHex = ownHashHex
         let attachmentsCopy = attachments
@@ -933,26 +991,28 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let deviceHandle = client.identityHandle
         let bridgeRef = bridge
 
-        let ffiQueueRef = ffiQueue
-        Task.detached(priority: .userInitiated) { [weak self] in
-            ffiQueueRef.async { [weak self] in
-                let toDistro = knownDistro || bridgeRef.peerIsDistro(destHash: destData)
-                if toDistro {
-                    print("[Retichat] sendMessage: dest is a distro address — sending PROPAGATED")
-                }
-                let method = toDistro ? propagatedMethod : linkMethod
-                let methodName = method == directMethod ? "DIRECT" : "PROPAGATED"
-                print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
+        // Enqueued on the serial ffiQueue straight from the main actor, so
+        // messages reach the router in the order they were sent. A detached
+        // Task per message (as before) could reorder them — sends released
+        // together by releaseHeldSends would not keep their order.
+        ffiQueue.async { [weak self] in
+            let toDistro = knownDistro || bridgeRef.peerIsDistro(destHash: destData)
+            if toDistro {
+                print("[Retichat] sendMessage: dest is a distro address — sending PROPAGATED")
+            }
+            let method = toDistro ? propagatedMethod : linkMethod
+            let methodName = method == directMethod ? "DIRECT" : "PROPAGATED"
+            print("[Retichat] sendMessage: method=\(methodName) dest=\(destHashHex.prefix(8))")
 
-                let (msgHandle, sentAsDistro) = Self.createOutboundMessage(
-                    bridge: bridgeRef,
-                    deviceHash: deviceHash,
-                    deviceHandle: deviceHandle,
-                    to: destData,
-                    content: content,
-                    title: "",
-                    method: method
-                )
+            let (msgHandle, sentAsDistro) = Self.createOutboundMessage(
+                bridge: bridgeRef,
+                deviceHash: deviceHash,
+                deviceHandle: deviceHandle,
+                to: destData,
+                content: content,
+                title: "",
+                method: method
+            )
             guard msgHandle != 0 else {
                 print("[Retichat] Failed to create message: \(LxmfClient.lastError ?? "")")
                 Task { @MainActor [weak self] in
@@ -1067,12 +1127,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
 
             // RFed SPEC §17.11: M went out as the distro, so tell the
-            // distro's other devices. Here, once per sendMessage call and
-            // only after M was submitted: retrySendViaPropNode, the only
-            // other sender of this message, never reaches this point, so a
-            // DIRECT attempt plus its propagated fallback is still one copy.
-            // Group sends return before this function reaches the FFI, and
-            // transfers and channel messages use their own send paths.
+            // distro's other devices. Here, once per sendMessage call (a held
+            // send reaches this function once, on release) and only after M
+            // was submitted: retrySendViaPropNode, the only other sender of
+            // this message, never reaches this point, so a DIRECT attempt
+            // plus its propagated fallback is still one copy.
+            // Group sends never call this function, and transfers and
+            // channel messages use their own send paths.
             if DistroCodec.needsSentCopy(sentAsDistro: sentAsDistro, destHex: destHashHex,
                                          distroHex: DistroManager.shared.deliveryHashHex),
                let copyHash = Self.sendDistroSentCopy(
@@ -1085,8 +1146,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     self.replayBufferedMessageStatesIfNeeded(for: copyHash)
                 }
             }
-            }  // ffiQueueRef.async
-        }  // Task.detached
+        }  // ffiQueue.async
     }
 
     /// Send the sent copy of a message just sent as the distro (RFed SPEC
@@ -1174,21 +1234,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private func sendGroupMessage(
         chat: ChatEntity, chatId: String, content: String, attachments: [(String, Data)]
     ) {
-        guard let ctx = modelContext, let client = lxmfClient else { return }
-
-        // Get accepted members excluding self
-        let memberDesc = FetchDescriptor<GroupMemberEntity>(
-            predicate: #Predicate { $0.groupId == chatId }
-        )
-        let allMembers = (try? ctx.fetch(memberDesc)) ?? []
-        let targets = allMembers
-            .filter { $0.inviteStatus == MemberStatus.accepted && $0.memberHash != ownHashHex }
-            .map { $0.memberHash }
+        guard let ctx = modelContext else { return }
+        // nil while the stack is starting or stopped: the send is held.
+        let client = heldSends.isOpen ? lxmfClient : nil
 
         // Generate a stable local ID for this outbound group message
         let msgId = "grp_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(8))"
 
-        // Insert optimistically
+        // Insert optimistically. A held send is pending until it is fanned
+        // out, so it never shows sent before it has left the device.
         let msgEntity = MessageEntity(
             id: msgId,
             chatId: chatId,
@@ -1196,7 +1250,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             content: content,
             timestamp: Date().timeIntervalSince1970,
             isOutgoing: true,
-            deliveryState: DeliveryState.sent   // fanout is fire-and-forget
+            deliveryState: client == nil
+                ? DeliveryState.pending
+                : DeliveryState.sent   // fanout is fire-and-forget
         )
         insertMessage(msgEntity, into: ctx)
 
@@ -1209,8 +1265,38 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         chat.lastMessageTime = msgEntity.timestamp
         try? ctx.save()
 
+        guard let client else {
+            heldSends.hold(.group(chatId: chatId, content: content, attachments: attachments,
+                                  messageId: msgId))
+            print("[GroupChat] send held until the stack has started (\(heldSends.count) held)")
+            refreshChats()
+            return
+        }
+
+        fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
+                           content: content, attachments: attachments, via: client)
+        refreshChats()
+    }
+
+    /// Fan a group message out to the accepted members. Members are read
+    /// here rather than when the message was typed: a send held through a
+    /// cold start had no own address yet to leave out of the list.
+    private func fanOutGroupMessage(
+        chatId: String, groupName: String, content: String, attachments: [(String, Data)],
+        via client: LxmfClient
+    ) {
+        guard let ctx = modelContext else { return }
+
+        // Get accepted members excluding self
+        let memberDesc = FetchDescriptor<GroupMemberEntity>(
+            predicate: #Predicate { $0.groupId == chatId }
+        )
+        let allMembers = (try? ctx.fetch(memberDesc)) ?? []
+        let targets = allMembers
+            .filter { $0.inviteStatus == MemberStatus.accepted && $0.memberHash != ownHashHex }
+            .map { $0.memberHash }
+
         // Fan out to accepted members — FFI calls run off the main thread.
-        let groupName = chat.groupName ?? "Group"
         let selfHash = ownHashHex
         ffiQueue.async {
             GroupChatManager.shared.fanoutMessage(
@@ -1223,7 +1309,51 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 via: client
             )
         }
+    }
 
+    // MARK: - Sends held through startup
+
+    /// Open the send gate and hand every held send to the normal send path,
+    /// oldest first: finishStartService's last step (§5). Each goes through
+    /// submitDirectMessage or fanOutGroupMessage exactly once and keeps the
+    /// bubble inserted when it was typed.
+    private func releaseHeldSends() {
+        guard let client = lxmfClient else { return }
+        let sends = heldSends.open()
+        guard !sends.isEmpty, let ctx = modelContext else { return }
+        print("[Retichat] releasing \(sends.count) send(s) held while the stack started")
+
+        for send in sends {
+            switch send {
+            case let .direct(chatId, destHashHex, destData, content, attachments, tempId, optimisticTimestamp):
+                let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == tempId })
+                guard let bubble = try? ctx.fetch(desc).first else {
+                    // Deleting the chat deleted the bubble: not wanted any more.
+                    print("[Retichat] held send to \(destHashHex.prefix(8)) dropped: its chat was deleted")
+                    continue
+                }
+                // Typed before the first start, it has no own address yet.
+                bubble.senderHash = ownHashHex
+                submitDirectMessage(client: client, chatId: chatId, destHashHex: destHashHex,
+                                    destData: destData, content: content, attachments: attachments,
+                                    tempId: tempId, optimisticTimestamp: optimisticTimestamp)
+
+            case let .group(chatId, content, attachments, messageId):
+                let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == messageId })
+                let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
+                guard let bubble = try? ctx.fetch(desc).first,
+                      let chat = try? ctx.fetch(chatDesc).first else {
+                    print("[GroupChat] held send to \(chatId.prefix(8)) dropped: its chat was deleted")
+                    continue
+                }
+                bubble.senderHash = ownHashHex
+                bubble.deliveryState = DeliveryState.sent   // fanout is fire-and-forget
+                fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
+                                   content: content, attachments: attachments, via: client)
+            }
+        }
+
+        try? ctx.save()
         refreshChats()
     }
 
