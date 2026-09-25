@@ -524,13 +524,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         lines.append("")
         lines.append("[interfaces]")
 
-        // Keep AutoInterface enabled so peers on the same local network can
-        // discover each other directly while the configured TCP backbones stay
-        // available for routed connectivity.
+        // AutoInterface on Mac Catalyst only. Its peer discovery is IPv6
+        // multicast, which iOS allows only with Apple's
+        // com.apple.developer.networking.multicast entitlement; the app does
+        // not carry it, so on iOS the interface could only fail. macOS needs
+        // no such entitlement. TCP to a local address needs just the Local
+        // Network permission, which Info.plist declares. The NSE copies this
+        // config, so it follows.
+        #if targetEnvironment(macCatalyst)
         lines.append("")
         lines.append("  [[AutoInterface]]")
         lines.append("    type = AutoInterface")
         lines.append("    enabled = Yes")
+        #endif
 
         // Get user-configured interfaces from database (TCP client only —
         // RNode rows are realised through the BLE bridge + rns_rnode_iface_*
