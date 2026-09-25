@@ -23,22 +23,60 @@ private extension Data {
 
 // MARK: - Delivery synchronization
 //
-// The Rust delivery callback fires on a background thread.  It stores the
-// message here and signals the semaphore so the main NSE thread can pick
-// it up without polling.
+// The Rust delivery callback fires on a background thread.  It stores every
+// message in the App Group as it arrives (PendingNotification.NSERun).  The
+// sync-complete callback signals the semaphore: the router raises it only
+// after the run's last delivery, so the main NSE thread then has them all.
+//
+// This state is static, so two requests iOS runs at once in one process
+// share it, and the second reset() replaces the first's run (older than
+// U2; left for H5). The hand-off file's lock is per process, so both
+// runs' writes are kept.
 
 private enum NSEDelivery {
-    static var message: PendingNotification.NSEMessage?
+    static var run = newRun()
     static var semaphore = DispatchSemaphore(value: 0)
-    static var delivered = false      // accept only the first callback per run
     static var syncComplete = false   // prop sync finished (0 or N messages)
     static func reset() {
-        message = nil
-        delivered = false
+        run = newRun()
         syncComplete = false
         // Replace semaphore to drain any stale signals from prior runs
         semaphore = DispatchSemaphore(value: 0)
     }
+    /// The only place a run is built: every delivery goes through
+    /// nseHandOffForm, which keeps a distro transfer's private key out of
+    /// the container file and drops sent copies.
+    private static func newRun() -> PendingNotification.NSERun {
+        PendingNotification.NSERun(prepare: nseHandOffForm)
+    }
+}
+
+/// The form a delivered message is stored in for the app, or nil when it is
+/// not stored.
+private func nseHandOffForm(_ msg: PendingNotification.NSEMessage) -> PendingNotification.NSEMessage? {
+    let fields = LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data())
+    if fields.isDistroSentCopy {
+        // RFed SPEC §17.11: a distro sent copy is the user's own message,
+        // and is filed only from distro fan-out (RfedDistroClient). One
+        // reaching this device's address is not stored and not shown —
+        // never an incoming bubble or a notification.
+        NSLog("[NSE] distro sent-copy marker from %@ outside fan-out — dropped",
+              String(msg.senderHash.prefix(8)))
+        return nil
+    }
+    // A distro identity transfer carries the distro private key in field
+    // 0xFC: move it to the Keychain first and persist the message without
+    // its fields, so the key never sits in the container file
+    // (PendingNotification.stashDistroTransferKey).
+    guard let key = fields.distroTransferKey else { return msg }
+    let status = PendingNotification.stashDistroTransferKey(key, messageHash: msg.messageHash)
+    if status == errSecSuccess {
+        return msg.strippedForDistroTransfer(.keychain)
+    }
+    // Dropped, not written to disk: the app reports it so the user can
+    // send it again from the other device.
+    NSLog("[NSE] distro transfer key not stored (Keychain %d); dropped", status)
+    return msg.strippedForDistroTransfer(.lost)
 }
 
 // MARK: - C callback trampoline
@@ -64,14 +102,10 @@ private func nseDeliveryTrampoline(
 
     NSLog("[NSE-CB] message: sender=%@ content_len=%d", String(srcHex.prefix(8)), contentStr.count)
 
-    // Accept only the first delivered message per NSE run
-    guard !NSEDelivery.delivered else {
-        NSLog("[NSE-CB] ignoring extra delivery")
-        return
-    }
-    NSEDelivery.delivered = true
-
-    NSEDelivery.message = PendingNotification.NSEMessage(
+    // Every delivery is written to the hand-off before this returns, and so
+    // before the router acknowledges it to the propagation node (U2). A
+    // failed write is logged and counted, and not shown.
+    NSEDelivery.run.deliver(PendingNotification.NSEMessage(
         messageHash:     msgHash.map { String(format: "%02x", $0) }.joined(),
         senderHash:      srcHex,
         destHash:        dest.map { String(format: "%02x", $0) }.joined(),
@@ -80,8 +114,7 @@ private func nseDeliveryTrampoline(
         timestamp:       timestamp,
         signatureValid:  signatureValid != 0,
         fieldsRawBase64: fields.base64EncodedString()
-    )
-    NSEDelivery.semaphore.signal()
+    ))
 }
 
 // MARK: - C callback trampoline for sync-complete
@@ -92,10 +125,7 @@ private func nseSyncCompleteTrampoline(
 ) {
     NSLog("[NSE-CB] sync complete, %d messages", messageCount)
     NSEDelivery.syncComplete = true
-    // Only signal if no message was delivered (delivery callback already signalled)
-    if !NSEDelivery.delivered {
-        NSEDelivery.semaphore.signal()
-    }
+    NSEDelivery.semaphore.signal()
 }
 
 // MARK: - Avatar image generation
@@ -161,9 +191,11 @@ private func makeAvatarImage(name: String, size: CGFloat = 60) -> UIImage? {
 ///
 /// 1. Start a lightweight Reticulum stack using shared App Group config.
 /// 2. Connect to interfaces, sync from the propagation node.
-/// 3. Wait for the delivery callback (semaphore, no polling).
-/// 4. Rewrite the notification with real sender + content.
-/// 5. Store the full message in the App Group for main-app import.
+/// 3. Store every delivered message in the App Group for main-app import,
+///    as each one arrives.
+/// 4. Wait for the sync-complete callback, when a sync started (semaphore,
+///    no polling).
+/// 5. Rewrite the notification with the newest message, plus how many more.
 class NotificationService: UNNotificationServiceExtension {
 
     private var contentHandler: ((UNNotificationContent) -> Void)?
@@ -201,36 +233,38 @@ class NotificationService: UNNotificationServiceExtension {
         NSLog("[NSE] awake, prop state=0x%02x", lxmfClient?.propagationState ?? -1)
 
         // Request messages from propagation node
-        requestPropagation()
+        let syncStarted = requestPropagation()
         NSLog("[NSE] after requestPropagation, prop state=0x%02x", lxmfClient?.propagationState ?? -1)
 
-        // Wait for delivery or sync-complete callback — keep ~3s margin before iOS kills at 30s
-        let budget = max(27.0 - Date().timeIntervalSince(start), 1.0)
-        NSLog("[NSE] waiting %.1fs for callback...", budget)
-        let waitResult = NSEDelivery.semaphore.wait(timeout: .now() + budget)
+        // Wait for the sync-complete callback — keep ~3s margin before iOS kills at 30s.
+        // With no sync started it can never come, so there is nothing to
+        // wait for: anything delivered during the sleep has already been
+        // through the run.
+        var waitResult = DispatchTimeoutResult.timedOut
+        if syncStarted {
+            let budget = max(27.0 - Date().timeIntervalSince(start), 1.0)
+            NSLog("[NSE] waiting %.1fs for callback...", budget)
+            waitResult = NSEDelivery.semaphore.wait(timeout: .now() + budget)
+        } else {
+            NSLog("[NSE] no sync started, so no sync-complete to wait for")
+        }
         let elapsed = Int(Date().timeIntervalSince(start))
         let finalState = lxmfClient?.propagationState ?? -1
-        NSLog("[NSE] wait done: signaled=%d delivered=%d syncComplete=%d state=0x%02x elapsed=%ds",
+        let summary = NSEDelivery.run.summary()
+        let stored = summary.newest == nil ? 0 : summary.others + 1
+        NSLog("[NSE] wait done: syncStarted=%d signaled=%d stored=%d failed=%d dropped=%d syncComplete=%d state=0x%02x elapsed=%ds",
+              syncStarted ? 1 : 0,
               waitResult == .success ? 1 : 0,
-              NSEDelivery.delivered ? 1 : 0,
+              stored,
+              summary.failed,
+              summary.dropped,
               NSEDelivery.syncComplete ? 1 : 0,
               finalState,
               elapsed)
 
-        if let msg = NSEDelivery.message,
-           LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data()).isDistroSentCopy {
-            // RFed SPEC §17.11: a distro sent copy is the user's own message,
-            // and is filed only from distro fan-out (RfedDistroClient). One
-            // reaching this device's address is not stored and not shown —
-            // never an incoming bubble or a notification.
-            NSLog("[NSE] distro sent-copy marker from %@ outside fan-out — dropped, suppressing after %ds",
-                  String(msg.senderHash.prefix(8)), elapsed)
-            best.title = ""
-            best.body  = ""
-            best.sound = nil
-
-        } else if let msg = NSEDelivery.message {
-            NSLog("[NSE] delivered after %ds", elapsed)
+        if let msg = summary.newest {
+            NSLog("[NSE] delivered after %ds: %d stored, %d not stored, showing the newest",
+                  elapsed, stored, summary.failed)
 
             let chatNames = PendingNotification.readChatNames()
             let chatName = chatNames[msg.senderHash]
@@ -245,38 +279,38 @@ class NotificationService: UNNotificationServiceExtension {
             // --- Explicit APNs push receipt log ---
             NSLog("[NSE] APNs push received and processed: sender=%@ hash=%@", senderName, msg.messageHash)
 
+            // The newest message, and "+N more" in the body when the run
+            // stored others (all of them are already in the App Group for
+            // the app's import). The count goes in the body, and in the
+            // intent's content below, so it shows whatever the
+            // communication-notification rewrite does with the header.
             best.title = senderName
-            best.body  = msg.content
+            best.body  = summary.body
             best.subtitle = ""
             best.threadIdentifier = msg.senderHash
             best.categoryIdentifier = "MESSAGE"
             best.userInfo["chatId"] = msg.senderHash
 
-            // Store in App Group for main app to import on next open.
-            // A distro identity transfer carries the distro private key in
-            // field 0xFC: move it to the Keychain first and persist the
-            // message without its fields, so the key never sits in the
-            // container file (PendingNotification.stashDistroTransferKey).
-            var toStore = msg
-            let fields = LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data())
-            if let key = fields.distroTransferKey {
-                let status = PendingNotification.stashDistroTransferKey(key, messageHash: msg.messageHash)
-                if status == errSecSuccess {
-                    toStore = msg.strippedForDistroTransfer(.keychain)
-                } else {
-                    // Dropped, not written to disk: the app reports it so the
-                    // user can send it again from the other device.
-                    NSLog("[NSE] distro transfer key not stored (Keychain %d); dropped", status)
-                    toStore = msg.strippedForDistroTransfer(.lost)
-                }
-            }
-            PendingNotification.appendNSEMessage(toStore)
-
             // Wrap with INSendMessageIntent so iOS shows the avatar to the left
             // of the notification (Communication Notification, iOS 15+).
-            let updated = attachAvatar(to: best, senderName: senderName, senderHash: msg.senderHash, content: msg.content)
+            let updated = attachAvatar(to: best, senderName: senderName, senderHash: msg.senderHash, content: summary.body)
             finishWithContent(updated)
             return
+
+        } else if summary.failed > 0 {
+            // Messages arrived but none could be written for the app (each
+            // failure is logged in appendNSEMessage). That is not "0 new":
+            // keep the original alert rather than suppress it.
+            NSLog("[NSE] %d message(s) not stored — showing generic alert after %ds",
+                  summary.failed, elapsed)
+            best.subtitle = "[NSE not stored]"
+
+        } else if summary.dropped > 0 {
+            // Only distro sent copies arrived (nseHandOffForm): nothing to show.
+            NSLog("[NSE] only distro sent copies arrived — suppressing after %ds", elapsed)
+            best.title = ""
+            best.body  = ""
+            best.sound = nil
 
         } else if NSEDelivery.syncComplete {
             // Prop node had nothing — main app already got it. Suppress.
@@ -349,10 +383,11 @@ class NotificationService: UNNotificationServiceExtension {
         }
     }
 
-    private func requestPropagation() {
+    /// Whether a sync started: only then can sync-complete come.
+    private func requestPropagation() -> Bool {
         guard let client = lxmfClient else {
             NSLog("[NSE] requestPropagation: no client")
-            return
+            return false
         }
         let nodes = PendingNotification.readPropagationNodes()
         NSLog("[NSE] propagation nodes: %@", nodes.joined(separator: ", "))
@@ -364,11 +399,12 @@ class NotificationService: UNNotificationServiceExtension {
             }
             if client.sync(nodeHash: data) {
                 NSLog("[NSE] sync started for %@", String(hex.prefix(8)))
-                return
+                return true
             }
             NSLog("[NSE] sync failed for %@", String(hex.prefix(8)))
         }
         NSLog("[NSE] no propagation nodes succeeded")
+        return false
     }
 
     private func tearDown() {

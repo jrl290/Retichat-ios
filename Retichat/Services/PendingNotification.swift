@@ -51,32 +51,216 @@ nonisolated enum PendingNotification {
         case lost
     }
 
-    /// Append a message delivered by the NSE.
-    static func appendNSEMessage(_ message: NSEMessage) {
-        guard let dir = containerURL else { return }
-        let file = dir.appendingPathComponent("nse_messages.json")
-        var messages = loadMessages(from: file)
-        messages.append(message)
-        if let data = try? JSONEncoder().encode(messages) {
-            try? data.write(to: file, options: .atomic)
+    private static let nseMessagesFile = "nse_messages.json"
+
+    /// One lock per process for the hand-off file: an append replaces the
+    /// file with an extended copy, and iOS can run two NSE requests in one
+    /// process, each with its own NSERun, so a lock per run would still
+    /// lose one of two writes. It does not reach the other process: the
+    /// app's import and the NSE's appends are still uncoordinated (C3 puts
+    /// both under the catch-up lease).
+    private static let nseMessagesLock = NSLock()
+
+    /// Append a message delivered by the NSE. Returns whether it was
+    /// written; a failure is logged.
+    @discardableResult
+    static func appendNSEMessage(_ message: NSEMessage) -> Bool {
+        guard let dir = containerURL else {
+            NSLog("[NSE] hand-off: no App Group container, message %@ not stored",
+                  String(message.messageHash.prefix(8)))
+            return false
         }
+        return appendNSEMessage(message, in: dir)
+    }
+
+    /// `appendNSEMessage` against a given directory (tests use a scratch one).
+    @discardableResult
+    static func appendNSEMessage(_ message: NSEMessage, in dir: URL) -> Bool {
+        let file = dir.appendingPathComponent(nseMessagesFile)
+        nseMessagesLock.lock()
+        defer { nseMessagesLock.unlock() }
+        do {
+            if try appendEntry(JSONEncoder().encode(message), to: file) { return true }
+            // No file yet, or not one appendEntry can extend: write it whole.
+            var messages = loadMessages(from: file)
+            messages.append(message)
+            try JSONEncoder().encode(messages).write(to: file, options: .atomic)
+            return true
+        } catch {
+            NSLog("[NSE] hand-off: message %@ not stored: %@",
+                  String(message.messageHash.prefix(8)), error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Adds one encoded message to the file's array without decoding what is
+    /// already there. An NSE run appends once per delivery, and decoding and
+    /// re-encoding the whole file each time peaks at six to eight times its
+    /// size: three 1 MB attachments went past the NSE's memory limit
+    /// (measured 2026-09-25). The file is cloned, the clone's closing "]"
+    /// becomes ",<entry>]", and the clone is renamed over the file, so a
+    /// reader sees the old file or the new one, never part of one. False,
+    /// with the file untouched, when there is no file or it does not end
+    /// the way JSONEncoder writes a non-empty array.
+    private static func appendEntry(_ entry: Data, to file: URL) throws -> Bool {
+        let fm = FileManager.default
+        // A fixed name: appends are serialised by nseMessagesLock and only
+        // the NSE appends, so one left behind by a killed NSE is replaced.
+        let clone = file.deletingLastPathComponent().appendingPathComponent(".\(nseMessagesFile).append")
+        try? fm.removeItem(at: clone)
+        defer { try? fm.removeItem(at: clone) }
+        guard (try? fm.copyItem(at: file, to: clone)) != nil else { return false }
+        let handle = try FileHandle(forUpdating: clone)
+        do {
+            defer { try? handle.close() }
+            let size = try handle.seekToEnd()
+            guard size >= 3 else { return false }
+            try handle.seek(toOffset: 0)
+            let first = try handle.read(upToCount: 1)
+            try handle.seek(toOffset: size - 2)
+            let last = try handle.read(upToCount: 2)
+            guard first == Data("[".utf8), last == Data("}]".utf8) else { return false }
+            try handle.seek(toOffset: size - 1)
+            // Three writes, not one concatenated copy of the entry.
+            try handle.write(contentsOf: Data(",".utf8))
+            try handle.write(contentsOf: entry)
+            try handle.write(contentsOf: Data("]".utf8))
+        }
+        guard rename(clone.path, file.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return true
     }
 
     /// Read and remove all NSE-delivered messages.
     static func readAndClearNSEMessages() -> [NSEMessage] {
         guard let dir = containerURL else { return [] }
-        let file = dir.appendingPathComponent("nse_messages.json")
+        return readAndClearNSEMessages(in: dir)
+    }
+
+    /// `readAndClearNSEMessages` against a given directory.
+    static func readAndClearNSEMessages(in dir: URL) -> [NSEMessage] {
+        let file = dir.appendingPathComponent(nseMessagesFile)
+        nseMessagesLock.lock()
+        defer { nseMessagesLock.unlock() }
         let messages = loadMessages(from: file)
         try? FileManager.default.removeItem(at: file)
         return messages
     }
 
     private static func loadMessages(from file: URL) -> [NSEMessage] {
-        guard let data = try? Data(contentsOf: file),
-              let msgs = try? JSONDecoder().decode([NSEMessage].self, from: data) else {
+        guard let data = try? Data(contentsOf: file) else { return [] }
+        guard let entries = try? JSONDecoder().decode([OneEntry].self, from: data) else {
+            // Not an array at all: whatever it held is lost.
+            NSLog("[NSE] hand-off: %@ (%d bytes) does not decode; its messages are lost",
+                  file.lastPathComponent, data.count)
             return []
         }
+        let msgs = entries.compactMap(\.message)
+        if msgs.count < entries.count {
+            NSLog("[NSE] hand-off: %d of %d entries in %@ do not decode; they are lost",
+                  entries.count - msgs.count, entries.count, file.lastPathComponent)
+        }
         return msgs
+    }
+
+    /// One entry of the file, or nil if it does not decode. appendEntry
+    /// extends the file without decoding it, so one bad entry must not take
+    /// the entries after it down with it.
+    private struct OneEntry: Decodable {
+        let message: NSEMessage?
+        init(from decoder: Decoder) throws {
+            message = try? NSEMessage(from: decoder)
+        }
+    }
+
+    // MARK: - One NSE run's deliveries
+    //
+    // The sync an NSE run starts acknowledges every fetched message to the
+    // propagation node, which deletes them. Until 2026-09-25 the NSE kept
+    // only the first delivery of a run, so with two or more messages
+    // waiting, messages 2..N were deleted from the node and stored nowhere
+    // (CONNECTIVITY_READINESS.md U2). Every delivery is now written as it
+    // arrives: the router calls the delivery callback for each message
+    // before it sends the acknowledgement, so each one is in the file
+    // before the node is told to delete it, or its failed write is logged
+    // and counted. The notification summarises what was written.
+
+    /// Collects one NSE run's deliveries. `deliver` is called on the
+    /// stack's thread; the NSE reads `summary()` after sync-complete, which
+    /// the router raises only after the run's last delivery.
+    nonisolated final class NSERun: @unchecked Sendable {
+        private let lock = NSLock()
+        private let prepare: (NSEMessage) -> NSEMessage?
+        private let store: (NSEMessage) -> Bool
+        private var newest: NSEMessage?
+        private var stored = 0
+        private var failed = 0
+        private var dropped = 0
+
+        /// `prepare` gives the form a delivered message is stored in, or
+        /// nil when it is not stored (a distro sent copy). `store` writes
+        /// it for the app's import and says whether it did.
+        init(prepare: @escaping (NSEMessage) -> NSEMessage?,
+             store: @escaping (NSEMessage) -> Bool = { PendingNotification.appendNSEMessage($0) }) {
+            self.prepare = prepare
+            self.store = store
+        }
+
+        func deliver(_ message: NSEMessage) {
+            guard let toStore = prepare(message) else {
+                lock.lock()
+                dropped += 1
+                lock.unlock()
+                return
+            }
+            // The file has its own lock (nseMessagesLock); this one guards
+            // only the run's counts.
+            let written = store(toStore)
+            lock.lock()
+            defer { lock.unlock() }
+            guard written else {
+                // Not in the file, so the app will never import it: it is
+                // neither shown nor counted in "+N more".
+                failed += 1
+                return
+            }
+            stored += 1
+            // Only the newest is kept in memory (the NSE's budget is small);
+            // a tie goes to the later delivery.
+            if newest.map({ toStore.timestamp >= $0.timestamp }) ?? true {
+                newest = toStore
+            }
+        }
+
+        func summary() -> NSERunSummary {
+            lock.lock()
+            defer { lock.unlock() }
+            return NSERunSummary(newest: newest, others: max(stored - 1, 0),
+                                 failed: failed, dropped: dropped)
+        }
+    }
+
+    /// What an NSE run's notification shows: the newest message written,
+    /// and how many others were written with it.
+    struct NSERunSummary {
+        let newest: NSEMessage?
+        let others: Int
+        /// Delivered but not written. The router acknowledges them to the
+        /// node all the same, so they are lost (U3 acknowledges only what
+        /// the host stored).
+        let failed: Int
+        /// Delivered but not stored (distro sent copies).
+        let dropped: Int
+
+        /// The newest message's text, then "+N more" on its own line when
+        /// the run stored others.
+        var body: String {
+            guard let newest else { return "" }
+            guard others > 0 else { return newest.content }
+            let more = "+\(others) more"
+            return newest.content.isEmpty ? more : newest.content + "\n" + more
+        }
     }
 
     /// Clean up stale files (call on app launch, after importing NSE messages).
