@@ -11,7 +11,7 @@ struct RNodeSettingsView: View {
 
     @StateObject private var ble = RNodeBluetoothManager()
 
-    @State private var freqMHz: String = "867.500"
+    @State private var freqMHz: String = RNodeRadioConfig.megahertzText(forHz: RNodeRadioConfig.default.frequency)
     @State private var bandwidth: LoRaBandwidth = .bw125
     @State private var sf: LoRaSpreadingFactor = .sf8
     @State private var cr: LoRaCodingRate = .cr45
@@ -73,11 +73,21 @@ struct RNodeSettingsView: View {
                     .frame(width: 120)
                 Text("MHz").foregroundStyle(.secondary)
             }
+            if RNodeRadioConfig.frequencyHz(fromMegahertz: freqMHz) == nil {
+                Text("Frequency must be \(RNodeRadioConfig.frequencyRequirement)")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
             Picker("Bandwidth", selection: $bandwidth) {
                 ForEach(LoRaBandwidth.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             Picker("Spreading Factor", selection: $sf) {
                 ForEach(LoRaSpreadingFactor.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+            if let caveat = sf.radioCaveat {
+                Text(caveat)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Picker("Coding Rate", selection: $cr) {
                 ForEach(LoRaCodingRate.allCases, id: \.self) { Text($0.label).tag($0) }
@@ -136,7 +146,8 @@ struct RNodeSettingsView: View {
                             Text("\(dev.rssi) dBm").font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    .disabled(isConnected || isConnecting)
+                    .disabled(isConnected || isConnecting
+                              || RNodeRadioConfig.frequencyHz(fromMegahertz: freqMHz) == nil)
                 }
             }
         }
@@ -212,7 +223,7 @@ struct RNodeSettingsView: View {
     }
 
     private func applyConfigToManager() {
-        let freqHz = UInt64((Double(freqMHz) ?? 867.5) * 1_000_000)
+        let freqHz = RNodeRadioConfig.frequencyHz(fromMegahertz: freqMHz) ?? RNodeRadioConfig.default.frequency
         var cfg = RNodeRadioConfig(
             frequency: freqHz,
             bandwidth: bandwidth,

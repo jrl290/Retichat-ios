@@ -25,11 +25,22 @@ enum LoRaCodingRate: Int, CaseIterable, Codable {
     }
 }
 
-/// LoRa spreading factor (7..12).
+/// LoRa spreading factor (5..12, the range RNodeInterface accepts in RNS
+/// 1.5.2 and Reticulum-rust).
 enum LoRaSpreadingFactor: Int, CaseIterable, Codable {
-    case sf7 = 7, sf8, sf9, sf10, sf11, sf12
+    case sf5 = 5, sf6, sf7, sf8, sf9, sf10, sf11, sf12
 
     var label: String { "SF\(rawValue)" }
+
+    /// Shown under the picker for SF5 and SF6. An SX127x takes SF6 only in
+    /// implicit-header mode, which RNS never selects, and RNode firmware
+    /// (1.85) clamps SF5 there to SF6 but reports back the SF5 it was sent,
+    /// so neither RNS nor this app can see the difference.
+    var radioCaveat: String? {
+        guard rawValue < LoRaSpreadingFactor.sf7.rawValue else { return nil }
+        return "SF5 and SF6 need an SX126x or SX128x radio. An SX127x RNode cannot use SF5 "
+            + "(its firmware substitutes SF6 and still reports SF5)."
+    }
 }
 
 /// Common LoRa bandwidth selections (Hz). RNode supports the standard LoRa
@@ -88,6 +99,52 @@ struct RNodeRadioConfig: Codable, Equatable {
         longTermAirtimeLimit: nil,
         idBeacon: nil
     )
+
+    // MARK: - Frequency text (MHz)
+
+    /// Carrier frequencies RNodeInterface accepts, in Hz (FREQ_MIN/FREQ_MAX
+    /// in RNS 1.5.2 and Reticulum-rust): anything outside fails the
+    /// interface's config validation.
+    static let frequencyRange: ClosedRange<UInt64> = 137_000_000...3_000_000_000
+
+    /// Decimal places the frequency is shown and entered with, in MHz
+    /// (4: 100 Hz resolution).
+    static let frequencyDecimals = 4
+
+    /// What `frequencyHz(fromMegahertz:)` accepts, for the editor to show.
+    static var frequencyRequirement: String {
+        "\(frequencyRange.lowerBound / 1_000_000) to \(frequencyRange.upperBound / 1_000_000) MHz, "
+            + "at most \(frequencyDecimals) decimal places"
+    }
+
+    /// `hz` in MHz with `frequencyDecimals` places, e.g. "868.1234". Integer
+    /// arithmetic, rounded to the nearest 100 Hz, so it round-trips through
+    /// `frequencyHz(fromMegahertz:)`.
+    static func megahertzText(forHz hz: UInt64) -> String {
+        let units = (hz + 50) / 100
+        return String(format: "%llu.%04llu", units / 10_000, units % 10_000)
+    }
+
+    /// Hz for MHz text such as "868.1234" (a comma is taken as the decimal
+    /// point, as the decimal pad types it in many locales). Built from the
+    /// digits, never from a binary floating-point product: UInt64(256.0001 *
+    /// 1_000_000) is 256000099. nil unless the text is a plain number with at
+    /// most `frequencyDecimals` places, inside `frequencyRange`.
+    static func frequencyHz(fromMegahertz text: String) -> UInt64? {
+        let parts = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+            .split(separator: ".", omittingEmptySubsequences: false)
+        let digits = Set("0123456789")
+        guard parts.count <= 2,
+              let whole = parts.first, !whole.isEmpty, whole.allSatisfy(digits.contains),
+              let mhz = UInt64(whole), mhz <= frequencyRange.upperBound / 1_000_000 else { return nil }
+        let fraction = parts.count == 2 ? parts[1] : ""
+        guard fraction.count <= frequencyDecimals, fraction.allSatisfy(digits.contains),
+              let subMHz = UInt64(fraction + String(repeating: "0", count: 6 - fraction.count))
+        else { return nil }
+        let hz = mhz * 1_000_000 + subMHz
+        return frequencyRange.contains(hz) ? hz : nil
+    }
 
     /// Build the C ABI `RnsRNodeRadioConfig` and pass it to `body`. The
     /// callsign byte buffer's lifetime is bounded by the closure.

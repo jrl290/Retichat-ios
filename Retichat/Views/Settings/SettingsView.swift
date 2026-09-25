@@ -551,7 +551,12 @@ struct SettingsView: View {
         case .rnode:
             if let p = RNodeInterfaceProfile(jsonString: iface.configJSON) {
                 let dev = p.peripheralName.isEmpty ? "No device paired" : p.peripheralName
-                let mhz = String(format: "%.3f MHz", Double(p.radio.frequency) / 1_000_000)
+                let mhz = RNodeRadioConfig.megahertzText(forHz: p.radio.frequency) + " MHz"
+                // Profiles saved before the editor checked the range can
+                // hold one the interface rejects; say so on the row.
+                guard RNodeRadioConfig.frequencyRange.contains(p.radio.frequency) else {
+                    return "RNode • \(dev) • \(mhz) • frequency out of range"
+                }
                 return "RNode • \(dev) • \(mhz)"
             }
             return "RNode • not configured"

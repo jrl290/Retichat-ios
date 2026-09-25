@@ -73,7 +73,7 @@ struct RNodeInterfaceEditorView: View {
                     flushFormToProfile()
                     onSave()
                 }
-                .disabled(name.isEmpty)
+                .disabled(name.isEmpty || frequencyHz == nil)
             }
         }
         .sheet(isPresented: $showScanner) {
@@ -106,11 +106,21 @@ struct RNodeInterfaceEditorView: View {
                     .frame(width: 120)
                 Text("MHz").foregroundStyle(.secondary)
             }
+            if frequencyHz == nil {
+                Text("Frequency must be \(RNodeRadioConfig.frequencyRequirement)")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
             Picker("Bandwidth", selection: $profile.radio.bandwidth) {
                 ForEach(LoRaBandwidth.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             Picker("Spreading Factor", selection: $profile.radio.spreadingFactor) {
                 ForEach(LoRaSpreadingFactor.allCases, id: \.self) { Text($0.label).tag($0) }
+            }
+            if let caveat = profile.radio.spreadingFactor.radioCaveat {
+                Text(caveat)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Picker("Coding Rate", selection: $profile.radio.codingRate) {
                 ForEach(LoRaCodingRate.allCases, id: \.self) { Text($0.label).tag($0) }
@@ -155,8 +165,14 @@ struct RNodeInterfaceEditorView: View {
 
     // MARK: - Form ↔ profile sync
 
+    /// The frequency field in Hz; nil while the text is one the RNode
+    /// interface would reject (the row says why and Save stays disabled).
+    private var frequencyHz: UInt64? {
+        RNodeRadioConfig.frequencyHz(fromMegahertz: freqMHzText)
+    }
+
     private func loadFormFromProfile() {
-        freqMHzText = String(format: "%.3f", Double(profile.radio.frequency) / 1_000_000)
+        freqMHzText = RNodeRadioConfig.megahertzText(forHz: profile.radio.frequency)
         if let beacon = profile.radio.idBeacon {
             idEnabled = true
             idCallsign = beacon.callsign
@@ -169,8 +185,8 @@ struct RNodeInterfaceEditorView: View {
     }
 
     private func flushFormToProfile() {
-        if let mhz = Double(freqMHzText) {
-            profile.radio.frequency = UInt64(mhz * 1_000_000)
+        if let hz = frequencyHz {
+            profile.radio.frequency = hz
         }
         if idEnabled, !idCallsign.isEmpty {
             profile.radio.idBeacon = .init(
