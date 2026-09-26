@@ -619,7 +619,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let queue = ffiQueue
         Task.detached(priority: .utility) {
             PendingNotification.writePropagationNodes(hashSnapshot)
-            queue.async { client?.persist() }
+            queue.async {
+                client?.persist()
+                if let target = PendingNotification.nseKnownDestinationsPath() {
+                    RetichatBridge.shared.snapshotKnownDestinations(to: target)
+                }
+            }
             PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
             PendingNotification.syncRatchetsToAppGroup(from: configDir + "/lxmf_storage")
         }

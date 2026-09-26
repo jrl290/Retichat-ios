@@ -468,6 +468,9 @@ int32_t retichat_transport_path_interface_online(const uint8_t *dest_hash, uint3
 int32_t retichat_transport_drop_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_clone_path_and_identity(const uint8_t *source_hash, uint32_t source_len,
                                                    const uint8_t *dest_hash, uint32_t dest_len);
+/// Write a consistent copy of the known destinations database to `path`
+/// (the NSE's storage). Returns 1 on success, 0 on error (rns_last_error).
+int32_t retichat_known_destinations_snapshot(const char *path);
 int32_t retichat_transport_save_paths(void);
 
 #pragma mark - Settings

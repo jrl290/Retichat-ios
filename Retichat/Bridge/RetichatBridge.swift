@@ -215,6 +215,17 @@ final class RetichatBridge: @unchecked Sendable {
     /// Clone a live path entry from one destination hash to another and
     /// seed the destination hash with the source destination's public key
     /// when available.
+    /// Write a consistent copy of the known destinations database to `path`
+    /// (the NSE's storage; PendingNotification.nseKnownDestinationsPath).
+    @discardableResult
+    nonisolated func snapshotKnownDestinations(to path: String) -> Bool {
+        let ok = path.withCString { retichat_known_destinations_snapshot($0) } == 1
+        if !ok {
+            print("[Retichat] known destinations snapshot for the NSE failed: \(rnsLastError() ?? "unknown error")")
+        }
+        return ok
+    }
+
     nonisolated func transportClonePathAndIdentity(from sourceHash: Data, to destHash: Data) -> Bool {
         return sourceHash.withUnsafeBytes { sourceBuf in
             destHash.withUnsafeBytes { destBuf in

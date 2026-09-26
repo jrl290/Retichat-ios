@@ -310,6 +310,26 @@ pub extern "C" fn retichat_transport_drop_path(dest_hash: *const u8, len: u32) -
     if Transport::expire_path(&h) { 1 } else { 0 }
 }
 
+/// Write a consistent copy of the known destinations database (Reticulum-rust
+/// known_destinations.rs) to `path`, for the notification extension's own
+/// storage. A plain file copy of a live SQLite database can capture it
+/// half-written. Returns 1 on success, 0 on error (see rns_last_error).
+#[no_mangle]
+pub extern "C" fn retichat_known_destinations_snapshot(path: *const c_char) -> i32 {
+    let target = unsafe { cstr_to_string(path) };
+    if target.is_empty() {
+        rns::set_error("empty snapshot path".into());
+        return 0;
+    }
+    match Identity::snapshot_known_destinations(std::path::Path::new(&target)) {
+        Ok(()) => 1,
+        Err(e) => {
+            rns::set_error(e);
+            0
+        }
+    }
+}
+
 /// Clone a live path entry from `source_hash` to `dest_hash` and, when the
 /// source destination's public key is known, remember that same public key for
 /// the destination hash. This is used for sibling SINGLE destinations on the

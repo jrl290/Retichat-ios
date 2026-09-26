@@ -354,15 +354,30 @@ nonisolated enum PendingNotification {
         try? FileManager.default.copyItem(atPath: sourcePath, toPath: dest.path)
     }
 
-    /// Sync the Reticulum storage directory (path table + known identities)
-    /// into the App Group so the NSE stack can find routes immediately.
-    static func syncStorageToAppGroup(from storageDir: String) {
-        guard let nseDir = nseReticulumDir() else { return }
-        let fm = FileManager.default
-        let destStorage = URL(fileURLWithPath: nseDir).appendingPathComponent("storage")
-        try? fm.createDirectory(at: destStorage, withIntermediateDirectories: true)
+    /// The NSE stack's storage directory in the App Group.
+    static func nseStorageDir() -> String? {
+        guard let nseDir = nseReticulumDir() else { return nil }
+        let dir = URL(fileURLWithPath: nseDir).appendingPathComponent("storage")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
+    }
 
-        for name in ["destination_table", "known_destinations"] {
+    /// Where the app writes its known destinations snapshot for the NSE
+    /// (RetichatBridge.snapshotKnownDestinations). Since 2026-09-26 they are a
+    /// SQLite database, which a file copy can catch half-written.
+    static func nseKnownDestinationsPath() -> String? {
+        nseStorageDir().map { $0 + "/known_destinations.sqlite3" }
+    }
+
+    /// Sync the Reticulum path table into the App Group so the NSE stack can
+    /// find routes immediately. Known identities go by
+    /// RetichatBridge.snapshotKnownDestinations.
+    static func syncStorageToAppGroup(from storageDir: String) {
+        guard let dir = nseStorageDir() else { return }
+        let fm = FileManager.default
+        let destStorage = URL(fileURLWithPath: dir)
+
+        for name in ["destination_table"] {
             let src = URL(fileURLWithPath: storageDir).appendingPathComponent(name)
             let dst = destStorage.appendingPathComponent(name)
             guard fm.fileExists(atPath: src.path) else { continue }
