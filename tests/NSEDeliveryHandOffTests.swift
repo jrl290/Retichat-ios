@@ -433,8 +433,11 @@ func testNotificationServiceWiring() {
             && !syncComplete.contains("if "),
           "sync-complete always wakes the NSE (the router raises it after the last delivery)")
 
+    // Since 2026-09-26 the body also counts the distro messages the NSE
+    // pulled (NSEDistroPullTests.swift): the run's stored messages plus those.
     check(source.contains("let summary = NSEDelivery.run.summary()")
-            && source.contains("best.body  = summary.body"),
+            && source.contains("let others = stored + distro.shown.count - 1")
+            && source.contains("best.body  = body"),
           "the notification is built from the run's summary")
     check(!source.contains("PendingNotification.appendNSEMessage("),
           "the NSE stores only through the run, at delivery")

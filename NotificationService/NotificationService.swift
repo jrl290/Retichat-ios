@@ -236,6 +236,14 @@ class NotificationService: UNNotificationServiceExtension {
         let syncStarted = requestPropagation()
         NSLog("[NSE] after requestPropagation, prop state=0x%02x", lxmfClient?.propagationState ?? -1)
 
+        // Distro messages wait in RFed's queue, not the propagation node's:
+        // pull them while the sync runs (NSEDistroPull).
+        let distro = lxmfClient.map {
+            NSEDistroPull.run(identityHandle: $0.identityHandle, deadline: start.addingTimeInterval(20))
+        } ?? NSEDistroPull.Result()
+        NSLog("[NSE] distro pull: noDistro=%d pulled=%d shown=%d failed=%d",
+              distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0)
+
         // Wait for the sync-complete callback — keep ~3s margin before iOS kills at 30s.
         // With no sync started it can never come, so there is nothing to
         // wait for: anything delivered during the sleep has already been
@@ -262,38 +270,48 @@ class NotificationService: UNNotificationServiceExtension {
               finalState,
               elapsed)
 
-        if let msg = summary.newest {
-            NSLog("[NSE] delivered after %ds: %d stored, %d not stored, showing the newest",
-                  elapsed, stored, summary.failed)
+        // The newest message of the run, from the sync or the distro pull,
+        // and how many others came with it.
+        var candidates: [(sender: String, title: String, content: String, timestamp: Double, hash: String)] = []
+        if let m = summary.newest {
+            candidates.append((m.senderHash, m.title, m.content, m.timestamp, m.messageHash))
+        }
+        candidates += distro.shown.map { ($0.senderHash, $0.title, $0.content, $0.timestamp, "distro") }
+        if let msg = candidates.max(by: { $0.timestamp < $1.timestamp }) {
+            let others = stored + distro.shown.count - 1
+            let body = others == 0 ? msg.content
+                : (msg.content.isEmpty ? "+\(others) more" : msg.content + "\n+\(others) more")
+            NSLog("[NSE] delivered after %ds: %d stored, %d from the distro, %d not stored, showing the newest",
+                  elapsed, stored, distro.shown.count, summary.failed)
 
             let chatNames = PendingNotification.readChatNames()
-            let chatName = chatNames[msg.senderHash]
+            let chatName = chatNames[msg.sender]
             let senderName: String
             if let name = chatName, !name.isEmpty {
                 senderName = name
             } else if !msg.title.isEmpty {
                 senderName = msg.title
             } else {
-                senderName = String(msg.senderHash.prefix(8)) + "\u{2026}"
+                senderName = String(msg.sender.prefix(8)) + "\u{2026}"
             }
             // --- Explicit APNs push receipt log ---
-            NSLog("[NSE] APNs push received and processed: sender=%@ hash=%@", senderName, msg.messageHash)
+            NSLog("[NSE] APNs push received and processed: sender=%@ hash=%@", senderName, msg.hash)
 
             // The newest message, and "+N more" in the body when the run
-            // stored others (all of them are already in the App Group for
+            // brought others (all of them are already in the App Group for
             // the app's import). The count goes in the body, and in the
             // intent's content below, so it shows whatever the
             // communication-notification rewrite does with the header.
             best.title = senderName
-            best.body  = summary.body
+            best.body  = body
             best.subtitle = ""
-            best.threadIdentifier = msg.senderHash
+            best.threadIdentifier = msg.sender
             best.categoryIdentifier = "MESSAGE"
-            best.userInfo["chatId"] = msg.senderHash
+            best.userInfo["chatId"] = msg.sender
 
             // Wrap with INSendMessageIntent so iOS shows the avatar to the left
             // of the notification (Communication Notification, iOS 15+).
-            let updated = attachAvatar(to: best, senderName: senderName, senderHash: msg.senderHash, content: summary.body)
+            let updated = attachAvatar(to: best, senderName: senderName, senderHash: msg.sender, content: body)
             finishWithContent(updated)
             return
 
@@ -305,9 +323,15 @@ class NotificationService: UNNotificationServiceExtension {
                   summary.failed, elapsed)
             best.subtitle = "[NSE not stored]"
 
-        } else if summary.dropped > 0 {
-            // Only distro sent copies arrived (nseHandOffForm): nothing to show.
-            NSLog("[NSE] only distro sent copies arrived — suppressing after %ds", elapsed)
+        } else if distro.failed {
+            // This device has a distro and its pull did not complete: the
+            // push may be for a message still waiting in RFed. Not "0 new".
+            NSLog("[NSE] distro pull incomplete — showing generic alert after %ds", elapsed)
+
+        } else if summary.dropped > 0 || distro.pulled > 0 {
+            // Only distro sent copies, transfers or receipts arrived:
+            // nothing to show (the app files them on import).
+            NSLog("[NSE] nothing to show among what arrived — suppressing after %ds", elapsed)
             best.title = ""
             best.body  = ""
             best.sound = nil

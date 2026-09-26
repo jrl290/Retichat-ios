@@ -725,6 +725,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// Import messages that the NSE delivered while the app was not running.
     func importNSEMessages() {
+        // Distro blobs the NSE pulled go through the distro client.
+        RfedDistroClient.importNSEBlobs()
         let messages = PendingNotification.readAndClearNSEMessages()
         guard !messages.isEmpty, let ctx = modelContext else { return }
         print("[Retichat] importing \(messages.count) NSE message(s)")

@@ -438,4 +438,133 @@ nonisolated enum PendingNotification {
         guard let content = try? String(contentsOf: file, encoding: .utf8) else { return [] }
         return content.components(separatedBy: "\n").filter { !$0.isEmpty }
     }
+
+    // MARK: - Distro, for the NSE (2026-09-26)
+    //
+    // A push for a distro message wakes the NSE, which must pull the blob from
+    // RFed (/rfed/pull) and unwrap it to show it: the distro key and the pull
+    // destination are shared through the App Group. The app keeps the NSE's
+    // copy of the key in step with its own (DistroManager). The NSE saves every
+    // pulled blob here before anything else, since the pull drains RFed's
+    // queue, and the app ingests them as a pull of its own
+    // (RfedDistroClient.importNSEBlobs).
+
+    private static let sharedDistroKeyService = "com.newendian.Retichat.distro.nse"
+
+    private static func sharedDistroKeyQuery() -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: sharedDistroKeyService,
+            kSecAttrAccount as String: "distro",
+            kSecAttrAccessGroup as String: appGroup,
+        ]
+    }
+
+    /// App side: the NSE's copy of the distro private key. Replaces any
+    /// previous copy. The app's own item (DistroManager) stays the one of
+    /// record; this copy only lets the NSE read the key.
+    @discardableResult
+    static func storeSharedDistroKey(_ key: Data) -> OSStatus {
+        SecItemDelete(sharedDistroKeyQuery() as CFDictionary)
+        var add = sharedDistroKeyQuery()
+        add[kSecValueData as String] = key
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(add as CFDictionary, nil)
+    }
+
+    /// App side: the distro was forgotten.
+    @discardableResult
+    static func deleteSharedDistroKey() -> OSStatus {
+        SecItemDelete(sharedDistroKeyQuery() as CFDictionary)
+    }
+
+    /// NSE side: the distro private key, or nil when this device has none.
+    static func readSharedDistroKey() -> Data? {
+        var query = sharedDistroKeyQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &out)
+        guard status == errSecSuccess, let data = out as? Data, data.count == 64 else { return nil }
+        return data
+    }
+
+    /// App side: the `rfed.distro.register` destination the NSE pulls from
+    /// (nil: this device has no distro).
+    static func writeDistroPullDestination(_ hex: String?) {
+        guard let dir = containerURL else { return }
+        let file = dir.appendingPathComponent("distro_pull_destination.txt")
+        guard let hex, hex.count == 32 else {
+            try? FileManager.default.removeItem(at: file)
+            return
+        }
+        try? Data(hex.utf8).write(to: file, options: .atomic)
+    }
+
+    /// NSE side.
+    static func readDistroPullDestination() -> String? {
+        guard let dir = containerURL,
+              let hex = try? String(contentsOf: dir.appendingPathComponent("distro_pull_destination.txt"),
+                                    encoding: .utf8),
+              hex.count == 32 else { return nil }
+        return hex
+    }
+
+    private static var nseDistroBlobDir: URL? {
+        guard let dir = containerURL else { return nil }
+        let blobs = dir.appendingPathComponent("nse_distro_blobs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        return blobs
+    }
+
+    /// NSE side: save the blobs of one pull round, as one file written
+    /// atomically (never a partial file for the app to read). Each blob is
+    /// `u32 big-endian length | blob`. Returns whether they were written.
+    @discardableResult
+    static func saveNSEDistroBlobs(_ blobs: [Data], in dir: URL? = nil) -> Bool {
+        guard !blobs.isEmpty else { return true }
+        guard let dir = dir ?? nseDistroBlobDir else { return false }
+        var out = Data()
+        for blob in blobs {
+            var len = UInt32(blob.count).bigEndian
+            out.append(Data(bytes: &len, count: 4))
+            out.append(blob)
+        }
+        let file = dir.appendingPathComponent(UUID().uuidString + ".blobs")
+        do {
+            try out.write(to: file, options: .atomic)
+            return true
+        } catch {
+            NSLog("[NSE] distro blobs not saved: %@", error.localizedDescription)
+            return false
+        }
+    }
+
+    /// App side: every blob the NSE saved, oldest file first; the files are
+    /// deleted once read.
+    static func readAndClearNSEDistroBlobs(in dir: URL? = nil) -> [Data] {
+        guard let dir = dir ?? nseDistroBlobDir,
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.creationDateKey]) else { return [] }
+        let ordered = files.filter { $0.pathExtension == "blobs" }.sorted {
+            let a = (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let b = (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return a < b
+        }
+        var blobs: [Data] = []
+        for file in ordered {
+            guard let data = try? Data(contentsOf: file) else { continue }
+            var i = 0
+            while i + 4 <= data.count {
+                let len = data[data.startIndex + i ..< data.startIndex + i + 4]
+                    .reduce(0) { ($0 << 8) | Int($1) }
+                i += 4
+                guard i + len <= data.count else { break }
+                blobs.append(data.subdata(in: data.startIndex + i ..< data.startIndex + i + len))
+                i += len
+            }
+            try? FileManager.default.removeItem(at: file)
+        }
+        return blobs
+    }
 }

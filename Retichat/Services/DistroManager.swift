@@ -233,6 +233,7 @@ nonisolated final class DistroManager: @unchecked Sendable {
         state = .absent
         stateLock.unlock()
 
+        shareWithNSE(nil)
         let status = SecItemDelete(baseQuery(account: keychainAccount) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             print("[Distro] forget: Keychain delete failed (\(status)) — the key may reload on next launch")
@@ -334,7 +335,23 @@ nonisolated final class DistroManager: @unchecked Sendable {
         setLoadedLocked(derived, key: key)
         stateLock.unlock()
         print("[Distro] distro loaded: \(derived.deliveryHash.hexString)")
+        shareWithNSE(key)
         return .ok
+    }
+
+    /// The NSE pulls and unwraps distro blobs for a push (PendingNotification
+    /// "Distro, for the NSE"): keep its App Group copy of the key in step with
+    /// ours. Outside stateLock, like every Keychain call here.
+    private func shareWithNSE(_ key: Data?) {
+        if let key {
+            let status = PendingNotification.storeSharedDistroKey(key)
+            if status != errSecSuccess {
+                print("[Distro] NSE copy of the key not stored (\(status)); distro pushes will show no text")
+            }
+        } else {
+            PendingNotification.deleteSharedDistroKey()
+            PendingNotification.writeDistroPullDestination(nil)
+        }
     }
 
     // MARK: - Load
@@ -355,8 +372,11 @@ nonisolated final class DistroManager: @unchecked Sendable {
             setLoadedLocked(derived, key: data)
             stateLock.unlock()
             print("[Distro] distro loaded: \(derived.deliveryHash.hexString)")
+            // Also the copy for a device whose key predates the NSE's.
+            shareWithNSE(data)
         case errSecItemNotFound:
             stateLock.lock(); clearCachesLocked(); state = .absent; stateLock.unlock()
+            shareWithNSE(nil)
         default:
             print("[Distro] Keychain read failed (\(status)); will retry when protected data becomes available")
             stateLock.lock(); state = .unavailable(status); stateLock.unlock()

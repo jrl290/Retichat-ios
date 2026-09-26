@@ -312,6 +312,8 @@ final class RfedDistroClient: ObservableObject {
         status.registered = true
         status.lastError = nil
         print("[Distro] registered with RFed")
+        // Where the NSE pulls from when a push comes for the distro.
+        PendingNotification.writeDistroPullDestination(registerDestHex)
 
         // Pre-signed announce (Android publishAnnounce, kt:104-117).
         guard let announce = Self.announcePayload(distro: k.handle) else {
@@ -483,6 +485,19 @@ final class RfedDistroClient: ObservableObject {
     /// both the stream and a pull is caught by ChatRepository's msgId check.
     nonisolated static func ingestBlob(_ blob: Data) {
         blobQueue.async { unwrapAndDeliver(blob) }
+    }
+
+    /// Distro blobs the NSE pulled for a push while the app was not running
+    /// (PendingNotification "Distro, for the NSE"): ingested as a pull of our
+    /// own, so dedupe, sent copies and transfers are handled once, here. Left
+    /// in the App Group until the distro is loaded: a blob ingested without
+    /// it is dropped.
+    nonisolated static func importNSEBlobs() {
+        guard DistroManager.shared.handle != 0 else { return }
+        let blobs = PendingNotification.readAndClearNSEDistroBlobs()
+        guard !blobs.isEmpty else { return }
+        print("[Distro] importing \(blobs.count) blob(s) the NSE pulled")
+        for blob in blobs { ingestBlob(blob) }
     }
 
     nonisolated private static func unwrapAndDeliver(_ blob: Data) {
