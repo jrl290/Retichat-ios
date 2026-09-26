@@ -20,18 +20,15 @@
 //
 
 import Foundation
+import CryptoKit
 
 final class ApnsTokenRegistrar {
     static let shared = ApnsTokenRegistrar()
 
     private let prefs  = UserPreferences.shared
 
-    /// Last APNs registration tuple successfully accepted during this app run.
-    /// Failed sends must not latch success, or a later APP_LINK ACTIVE event
-    /// would be unable to retry the same tuple.
-    private var lastRegistrationKey: String? = nil
-    private var pendingRegistrationKey: String? = nil
-    private let stateQueue = DispatchQueue(label: "chat.retichat.apns.state")
+    /// One per `apns.register` destination (it changes with the bridge config).
+    @MainActor private var registrations: [String: HeldLinkRegistrations] = [:]
 
     private init() {}
 
@@ -40,11 +37,10 @@ final class ApnsTokenRegistrar {
     /// Call after service starts (and identity is known) whenever the APNs token
     /// or the `apns.register` hash changes.
     ///
-    /// The registration is a one-shot DATA send via the ephemeral
-    /// `apns.register` AppLink. We fire one immediate attempt and leave an
-    /// ACTIVE-status handler installed so a later readiness event can drive
-    /// the same send without Swift owning path polling or retry timing.
-    /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    /// Owes the bridge this device's token: it is sent on a held link to
+    /// `apns.register` once that link is established, with its delivery
+    /// proof, and owed until then (see `HeldLinkRegistrations`). A token
+    /// already registered in this app run is not sent again.
     func registerIfNeeded(subscriberHash: Data) {
         guard !prefs.effectiveRfedNodeIdentityHash.isEmpty else {
             print("[APNsRegistrar] No RFed node configured; skipping APNs registration")
@@ -69,104 +65,18 @@ final class ApnsTokenRegistrar {
             return
         }
 
-        let registrationKey = subscriberHash.hexString + ":" + apnsToken
-                              + ":" + Self.currentApsEnvironment()
-        guard shouldAttempt(registrationKey) else { return }
-
-        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: destHash) { [weak self] status in
-            guard status == 3 else { return }
-            self?.attemptRegistrationIfNeeded(
-                registrationKey,
-                destHash: destHash,
-                payload: payload,
-                subscriberHashHex: subscriberHash.hexString
-            )
-        }
-
-        _ = ConnectionStateManager.shared.appLinkPrime(
-            destHash: destHash,
-            app: "apns",
-            aspects: ["register"]
-        )
-
-        attemptRegistrationIfNeeded(
-            registrationKey,
-            destHash: destHash,
-            payload: payload,
-            subscriberHashHex: subscriberHash.hexString
-        )
-    }
-
-    // MARK: - Private
-
-    /// Single-attempt registration via a plain DATA send on the ephemeral
-    /// `apns.register` AppLink.
-    private func sendOnce(destHash: Data,
-                          payload: Data,
-                          subscriberHashHex: String) async -> Bool {
-        let delivered = await ConnectionStateManager.shared.appLinkSendData(
-            destHash: destHash,
-            app: "apns",
-            aspects: ["register"],
-            payload: payload
-        )
-
-        if delivered {
-            print("[APNsRegistrar] Token registered for \(subscriberHashHex.prefix(8))…")
-            return true
-        } else {
-            print("[APNsRegistrar] Registration: no delivery proof within budget")
-            return false
-        }
-    }
-
-    private func attemptRegistrationIfNeeded(_ key: String,
-                                             destHash: Data,
-                                             payload: Data,
-                                             subscriberHashHex: String) {
-        guard shouldAttempt(key) else { return }
-        markPending(key)
-        Task.detached(priority: .background) { [weak self] in
-            guard let self else { return }
-            let success = await self.sendOnce(
-                destHash: destHash,
-                payload: payload,
-                subscriberHashHex: subscriberHashHex
-            )
-            if success {
-                self.markRegistrationSucceeded(key)
-            } else {
-                self.clearPendingRegistration(key)
-            }
-        }
-    }
-
-    private func shouldAttempt(_ key: String) -> Bool {
-        stateQueue.sync {
-            lastRegistrationKey != key && pendingRegistrationKey != key
-        }
-    }
-
-    private func markPending(_ key: String) {
-        stateQueue.sync {
-            pendingRegistrationKey = key
-        }
-    }
-
-    private func clearPendingRegistration(_ key: String) {
-        stateQueue.sync {
-            if pendingRegistrationKey == key {
-                pendingRegistrationKey = nil
-            }
-        }
-    }
-
-    private func markRegistrationSucceeded(_ key: String) {
-        stateQueue.sync {
-            lastRegistrationKey = key
-            if pendingRegistrationKey == key {
-                pendingRegistrationKey = nil
-            }
+        // The token itself stays out of the key, which is logged.
+        let tokenTag = SHA256.hash(data: Data(apnsToken.utf8)).prefix(4)
+            .map { String(format: "%02x", $0) }.joined()
+        let key = "token \(subscriberHash.hexString.prefix(8))/\(tokenTag)/\(Self.currentApsEnvironment())"
+        Task { @MainActor in
+            let registration = self.registrations[destHash.hexString] ?? {
+                let created = HeldLinkRegistrations(destHash: destHash, app: "apns", aspects: ["register"],
+                                                    ops: LiveHeldLinkOps.shared)
+                self.registrations[destHash.hexString] = created
+                return created
+            }()
+            registration.owe(key: key, payload: payload)
         }
     }
 

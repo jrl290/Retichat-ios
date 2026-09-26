@@ -415,6 +415,33 @@ final class ConnectionStateManager {
         return client.appLinkOpen(destHash, app: app, aspects: normalizedAspects)
     }
 
+    /// Open a held APP_LINK to `destHash`: AppLinks builds the link and holds
+    /// it, and reports ACTIVE only once the link is established (not merely
+    /// once a path is known, as for a one-shot link). Establishment is bounded
+    /// by the RNS protocol's own timeout, not by the 5 s send budget.
+    @discardableResult
+    func openHeldAppLink(destHash: Data, app: String, aspects: [String]) -> Bool {
+        guard let client = lxmfClient else { return false }
+        return client.appLinkOpenPersistent(destHash, app: app,
+                                            aspects: normalizedAspectSegments(app: app, aspects: aspects))
+    }
+
+    /// Close the APP_LINK to `destHash` and tear down any link it holds.
+    func closeAppLink(destHash: Data) {
+        _ = lxmfClient?.appLinkClose(destHash)
+    }
+
+    /// Send a DATA packet on the APP_LINK to `destHash`, which must already be
+    /// ACTIVE, and await its delivery proof. Unlike `appLinkSendData` it never
+    /// opens anything: it is for a held link whose ACTIVE edge the caller saw.
+    func sendDataOnActiveLink(destHash: Data, app: String, aspects: [String],
+                              payload: Data) async -> Bool {
+        guard let client = lxmfClient, appLinkStatus(destHash: destHash) == 3 else { return false }
+        return await client.appLinkSendAsync(destHash: destHash, app: app,
+                                             aspects: normalizedAspectSegments(app: app, aspects: aspects),
+                                             payload: payload)
+    }
+
     /// Send a plain DATA packet via AppLinks and suspend until Reticulum
     /// delivery proof arrives or the tier chain fails.
     func appLinkSendData(destHash: Data,
@@ -904,3 +931,126 @@ final class ConnectionStateManager {
         }
     }
 }
+
+/// `HeldLinkOps` on the live stack, through `ConnectionStateManager`.
+@MainActor
+final class LiveHeldLinkOps: HeldLinkOps {
+    static let shared = LiveHeldLinkOps()
+    func status(_ destHash: Data) -> Int32 { ConnectionStateManager.shared.appLinkStatus(destHash: destHash) }
+    func openHeld(_ destHash: Data, app: String, aspects: [String]) {
+        ConnectionStateManager.shared.openHeldAppLink(destHash: destHash, app: app, aspects: aspects)
+    }
+    func close(_ destHash: Data) { ConnectionStateManager.shared.closeAppLink(destHash: destHash) }
+    func setStatusHandler(_ destHash: Data, _ handler: @escaping (UInt8) -> Void) {
+        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: destHash, handler: handler)
+    }
+    func sendData(_ destHash: Data, app: String, aspects: [String], payload: Data) async -> Bool {
+        await ConnectionStateManager.shared.sendDataOnActiveLink(destHash: destHash, app: app,
+                                                                 aspects: aspects, payload: payload)
+    }
+}
+
+// BEGIN HeldLinkRegistrations
+// Foundation only: tests/HeldLinkRegistrationsTests.swift compiles this block
+// on its own. Port of Retichat-android HeldLinkRegistrations.kt.
+
+/// What `HeldLinkRegistrations` needs from AppLinks.
+@MainActor
+protocol HeldLinkOps: AnyObject {
+    func status(_ destHash: Data) -> Int32
+    func openHeld(_ destHash: Data, app: String, aspects: [String])
+    func close(_ destHash: Data)
+    func setStatusHandler(_ destHash: Data, _ handler: @escaping (UInt8) -> Void)
+    func sendData(_ destHash: Data, app: String, aspects: [String], payload: Data) async -> Bool
+}
+
+/// Registrations owed to one destination (`apns.register`,
+/// `rfed.notify.register`), each sent once, on an established link, with its
+/// delivery proof.
+///
+/// Until 2026-09-26 each registrar sent on a one-shot APP_LINK, whose ACTIVE
+/// means only that a path is known: the send built its link inside the 5 s
+/// budget, and the registrar's ACTIVE handler skipped any edge that came
+/// while that attempt was pending. A link slower than 5 s (the Android phone
+/// on 2026-09-26: 5.24 s) left the registration unsent until the next app
+/// start. Now a held link is opened, whose ACTIVE edge means established
+/// (DESIGN_PRINCIPLES §5: the link before the send), each ACTIVE edge sends
+/// what is owed, an edge that comes mid-send runs another round after it, an
+/// unproved registration stays owed for the next edge (no timer, §3), and the
+/// link is closed once nothing is owed.
+@MainActor
+final class HeldLinkRegistrations {
+    private let destHash: Data
+    private let app: String
+    private let aspects: [String]
+    private let ops: HeldLinkOps
+    private let log: (String) -> Void
+    private var owed: [(key: String, payload: Data)] = []
+    private var delivered = Set<String>()
+    private var sending = false
+    private var edgeWhileSending = false
+
+    init(destHash: Data, app: String, aspects: [String], ops: HeldLinkOps,
+         log: @escaping (String) -> Void = { print($0) }) {
+        self.destHash = destHash
+        self.app = app
+        self.aspects = aspects
+        self.ops = ops
+        self.log = log
+    }
+
+    /// Owe `payload` under `key`, sent on the next ACTIVE edge of the held
+    /// link (at once if it is up). A key already delivered is not sent again.
+    func owe(key: String, payload: Data) {
+        guard !delivered.contains(key) else { return }
+        if let i = owed.firstIndex(where: { $0.key == key }) {
+            owed[i].payload = payload
+        } else {
+            owed.append((key, payload))
+        }
+        // Installed on every call: ConnectionStateManager.deregister (a stack
+        // stop) clears the status handlers.
+        ops.setStatusHandler(destHash) { [weak self] status in
+            guard status == 3 else { return }
+            Task { @MainActor in await self?.onActive() }
+        }
+        if ops.status(destHash) == 3 {
+            Task { @MainActor in await self.onActive() }
+        } else {
+            ops.openHeld(destHash, app: app, aspects: aspects)
+        }
+    }
+
+    /// An ACTIVE edge: the held link is established. Send what is owed.
+    func onActive() async {
+        if sending {
+            edgeWhileSending = true
+            return
+        }
+        sending = true
+        repeat {
+            edgeWhileSending = false
+            for entry in owed {
+                if await ops.sendData(destHash, app: app, aspects: aspects, payload: entry.payload) {
+                    owed.removeAll { $0.key == entry.key }
+                    delivered.insert(entry.key)
+                    log("[HeldLinkReg] \(app).\(aspects.joined(separator: ".")): \(entry.key) delivered")
+                } else {
+                    log("[HeldLinkReg] \(app).\(aspects.joined(separator: ".")): \(entry.key) not proved; owed until the link is next established")
+                }
+            }
+        } while edgeWhileSending && !owed.isEmpty
+        sending = false
+        if owed.isEmpty { ops.close(destHash) }
+    }
+
+    /// Withdraw `key`: an owed registration is no longer sent (the channel
+    /// was left before it went out), and a delivered one may be owed again.
+    func forget(key: String) {
+        owed.removeAll { $0.key == key }
+        delivered.remove(key)
+    }
+
+    var owedKeys: [String] { owed.map(\.key) }
+}
+// END HeldLinkRegistrations

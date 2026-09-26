@@ -562,6 +562,13 @@ pub extern "C" fn retichat_rfed_delivery_start(
             return -1;
         }
     };
+    // Prove every packet RFed delivers here, so RFed can count a delivery
+    // only when it is proved and queue and push the rest (RFed SPEC §7).
+    // Until 2026-09-26 nothing was proved.
+    if let Err(e) = dest.set_proof_strategy(reticulum_rust::destination::PROVE_ALL) {
+        rns::set_error(e);
+        return -1;
+    }
 
     *RFED_DELIVERY_CB.lock().unwrap() = Some(RfedDeliveryCallbackState {
         callback,
