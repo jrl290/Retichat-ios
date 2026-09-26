@@ -92,6 +92,19 @@ func testTheWiring() {
           "the NSE has a path to rfed.distro.register before its link request (the iPad, 2026-09-26)")
     check(pull.contains("retichat_transport_clone_path_and_identity("),
           "the path is seeded from the node's destinations, as the app does")
+    // The iPad, 2026-09-26 20:17 and 22:20: a stored path, trusted, led to a
+    // transport node that no longer knew rfed.distro.register after an RFed
+    // restart. The NSE asks for the path first and waits for the answer.
+    let ensure = pull.range(of: "private static func ensurePath(")
+    let ask = pull.range(of: "requestPath(dest)\n        let budget")
+    let wait = pull.range(of: "if waitForVerifiedPath(dest, budget: budget)")
+    let stored = pull.range(of: "if hasPath(dest) {\n            NSLog(\"[NSE-Distro] path request unanswered; using the stored path\")")
+    check(ensure != nil && ask != nil && wait != nil && stored != nil
+            && ensure!.lowerBound < ask!.lowerBound && ask!.lowerBound < wait!.lowerBound
+            && wait!.lowerBound < stored!.lowerBound,
+          "the NSE requests the path and waits for a confirmed one before it falls back to a stored path")
+    check(pull.contains("retichat_transport_wait_for_path_verified("),
+          "the wait is the stack's event-driven one, not a polling loop")
     let save = pull.range(of: "PendingNotification.saveNSEDistroBlobs(blobs)")
     let unwrap = pull.range(of: "unwrapToShow(blob, distroHandle: distroHandle)")
     check(save != nil && unwrap != nil && save!.lowerBound < unwrap!.lowerBound,

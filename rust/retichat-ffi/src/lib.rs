@@ -258,6 +258,26 @@ pub extern "C" fn retichat_transport_path_verified_this_session(
     }
 }
 
+/// Block until the destination has a path verified in this process (a path
+/// response or announce seen now, not a route loaded from disk), or
+/// `budget_secs` pass. Event-driven (Transport::wait_for_path_verified_this_session),
+/// no polling. Returns 1 when verified, 0 otherwise. For a caller that has no
+/// run loop to wait on, such as the notification extension.
+#[no_mangle]
+pub extern "C" fn retichat_transport_wait_for_path_verified(
+    dest_hash: *const u8,
+    len: u32,
+    budget_secs: f64,
+) -> i32 {
+    let h = slice_from_raw(dest_hash, len);
+    let budget = std::time::Duration::from_secs_f64(budget_secs.max(0.0));
+    if Transport::wait_for_path_verified_this_session(&h, budget) {
+        1
+    } else {
+        0
+    }
+}
+
 /// Check whether the destination's identity (public key) is in the
 /// known-destinations table. Outbound encrypted send needs identity,
 /// not just a path.  Returns 1/0.

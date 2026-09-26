@@ -461,6 +461,9 @@ int32_t retichat_identity_destroy(uint64_t handle);
 
 int32_t retichat_transport_has_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_path_verified_this_session(const uint8_t *dest_hash, uint32_t len);
+/// Block until the path is verified in this process (not loaded from disk) or
+/// budget_secs pass. Returns 1 when verified, 0 otherwise.
+int32_t retichat_transport_wait_for_path_verified(const uint8_t *dest_hash, uint32_t len, double budget_secs);
 int32_t retichat_identity_known(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_request_path(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_transport_hops_to(const uint8_t *dest_hash, uint32_t len);

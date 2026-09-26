@@ -103,31 +103,49 @@ enum NSEDistroPull {
 
     // MARK: - Path
 
-    /// A path to `dest`: the one this stack has, or one seeded from an RFed
-    /// node destination it has a path to (they share the node's transport
-    /// path and identity), as the app seeds its RFed destinations
-    /// (ConnectionStateManager.requestEssentialPaths). With none of them
-    /// known, their paths are requested once, and the first to arrive is
-    /// used; the propagation sync running meanwhile brings the path to the
-    /// node's lxmf.propagation.
+    /// A path to `dest` the network confirmed in this run, not one loaded from
+    /// disk. RFed does not announce its service destinations, so the transport
+    /// nodes on the way learn them only from a path request, and lose them when
+    /// RFed restarts (its links to them are rebuilt). A stored path then leads
+    /// to a node that drops the link request: the iPad, 2026-09-26 20:17 and
+    /// 22:20, each a minute or two after an RFed restart (the 10 s link
+    /// timeout, nothing reached RFed). So the NSE asks for the path, as the app
+    /// does on every start (ConnectionStateManager.requestEssentialPaths), and
+    /// waits up to 5 s for the answer, which teaches every node on the way.
+    /// Unanswered: seed from an RFed node destination confirmed in this run
+    /// (the propagation sync's), else use what is stored.
     private static func ensurePath(to dest: Data, from sources: [Data], deadline: Date) -> Bool {
-        var requested = false
-        while Date() < deadline {
-            if hasPath(dest) { return true }
-            for source in sources where hasPath(source) {
-                if clonePath(from: source, to: dest), hasPath(dest) {
-                    NSLog("[NSE-Distro] path seeded from %@", String(hexString(source).prefix(8)))
-                    return true
-                }
+        requestPath(dest)
+        let budget = min(5, max(deadline.timeIntervalSinceNow - 1, 0))
+        if waitForVerifiedPath(dest, budget: budget) {
+            NSLog("[NSE-Distro] path to rfed.distro.register confirmed")
+            return true
+        }
+        for source in sources where hasPath(source) && pathVerified(source) {
+            if clonePath(from: source, to: dest), hasPath(dest) {
+                NSLog("[NSE-Distro] path request unanswered; seeded from %@", String(hexString(source).prefix(8)))
+                return true
             }
-            if !requested {
-                for hash in [dest] + sources { requestPath(hash) }
-                requested = true
-                NSLog("[NSE-Distro] no path yet; requested for %d destination(s)", sources.count + 1)
-            }
-            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if hasPath(dest) {
+            NSLog("[NSE-Distro] path request unanswered; using the stored path")
+            return true
         }
         return false
+    }
+
+    private static func waitForVerifiedPath(_ hash: Data, budget: TimeInterval) -> Bool {
+        hash.withUnsafeBytes {
+            retichat_transport_wait_for_path_verified(
+                $0.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(hash.count), budget) == 1
+        }
+    }
+
+    private static func pathVerified(_ hash: Data) -> Bool {
+        hash.withUnsafeBytes {
+            retichat_transport_path_verified_this_session(
+                $0.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(hash.count)) == 1
+        }
     }
 
     private static func hasPath(_ hash: Data) -> Bool {
