@@ -489,25 +489,51 @@ nonisolated enum PendingNotification {
         return data
     }
 
-    /// App side: the `rfed.distro.register` destination the NSE pulls from
-    /// (nil: this device has no distro).
-    static func writeDistroPullDestination(_ hex: String?) {
+    /// Where the NSE pulls from: the `rfed.distro.register` destination, and
+    /// the RFed node's destinations its path can be seeded from (rfed.node,
+    /// the node's lxmf.propagation). RFed does not announce its service
+    /// destinations, so a fresh stack has no path to them: the app seeds
+    /// them from these (ConnectionStateManager.requestEssentialPaths), and
+    /// the NSE must too (NSEDistroPull.ensurePath). Found on the iPad
+    /// 2026-09-26: without it the pull's link request left with no path and
+    /// never reached RFed.
+    struct DistroPullRoute: Equatable {
+        let destination: String
+        let sources: [String]
+    }
+
+    /// One hex hash per line: the destination, then the sources.
+    static func encodeDistroPullRoute(_ route: DistroPullRoute) -> String {
+        ([route.destination] + route.sources).joined(separator: "\n")
+    }
+
+    static func decodeDistroPullRoute(_ text: String) -> DistroPullRoute? {
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        guard let destination = lines.first, isHash(destination) else { return nil }
+        return DistroPullRoute(destination: destination, sources: lines.dropFirst().filter(isHash))
+    }
+
+    private static func isHash(_ hex: String) -> Bool {
+        hex.count == 32 && hex.allSatisfy(\.isHexDigit)
+    }
+
+    /// App side (nil: this device has no distro).
+    static func writeDistroPullRoute(_ route: DistroPullRoute?) {
         guard let dir = containerURL else { return }
-        let file = dir.appendingPathComponent("distro_pull_destination.txt")
-        guard let hex, hex.count == 32 else {
+        let file = dir.appendingPathComponent("distro_pull_route.txt")
+        guard let route, isHash(route.destination) else {
             try? FileManager.default.removeItem(at: file)
             return
         }
-        try? Data(hex.utf8).write(to: file, options: .atomic)
+        try? Data(encodeDistroPullRoute(route).utf8).write(to: file, options: .atomic)
     }
 
     /// NSE side.
-    static func readDistroPullDestination() -> String? {
+    static func readDistroPullRoute() -> DistroPullRoute? {
         guard let dir = containerURL,
-              let hex = try? String(contentsOf: dir.appendingPathComponent("distro_pull_destination.txt"),
-                                    encoding: .utf8),
-              hex.count == 32 else { return nil }
-        return hex
+              let text = try? String(contentsOf: dir.appendingPathComponent("distro_pull_route.txt"),
+                                     encoding: .utf8) else { return nil }
+        return decodeDistroPullRoute(text)
     }
 
     private static var nseDistroBlobDir: URL? {

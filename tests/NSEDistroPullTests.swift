@@ -74,8 +74,24 @@ func testSavedBlobsComeBackOnceInOrder() {
     check(PendingNotification.readAndClearNSEDistroBlobs(in: dir).isEmpty, "and only once")
 }
 
+func testThePullRouteRoundTrips() {
+    let dest = String(repeating: "d7", count: 16)
+    let node = String(repeating: "87", count: 16), prop = String(repeating: "0f", count: 16)
+    let route = PendingNotification.DistroPullRoute(destination: dest, sources: [node, prop])
+    check(PendingNotification.decodeDistroPullRoute(PendingNotification.encodeDistroPullRoute(route)) == route,
+          "the route (destination, then its seed sources) round-trips")
+    check(PendingNotification.decodeDistroPullRoute(dest)?.sources == [], "a route without sources still names the destination")
+    check(PendingNotification.decodeDistroPullRoute("not a hash\n" + node) == nil, "no destination, no route")
+}
+
 func testTheWiring() {
     let pull = source("NotificationService/NSEDistroPull.swift")
+    let path = pull.range(of: "guard ensurePath(to: dest, from: route.sources")
+    let request = pull.range(of: "pullRequest(dest: dest")
+    check(path != nil && request != nil && path!.lowerBound < request!.lowerBound,
+          "the NSE has a path to rfed.distro.register before its link request (the iPad, 2026-09-26)")
+    check(pull.contains("retichat_transport_clone_path_and_identity("),
+          "the path is seeded from the node's destinations, as the app does")
     let save = pull.range(of: "PendingNotification.saveNSEDistroBlobs(blobs)")
     let unwrap = pull.range(of: "unwrapToShow(blob, distroHandle: distroHandle)")
     check(save != nil && unwrap != nil && save!.lowerBound < unwrap!.lowerBound,
@@ -97,8 +113,10 @@ func testTheWiring() {
     check(manager.components(separatedBy: "shareWithNSE(nil)").count == 3, "and withdrawn when absent or forgotten")
 
     let client = source("Retichat/Services/RfedDistroClient.swift")
-    check(client.contains("PendingNotification.writeDistroPullDestination(registerDestHex)"),
-          "the pull destination is written once RFed accepts the registration")
+    check(client.contains("destination: registerDestHex, sources: pullRouteSources"),
+          "the pull route, with its seed sources, is written once RFed accepts the registration")
+    check(client.contains("aspects: [\"node\"]") && client.contains("app: \"lxmf\", aspects: [\"propagation\"]"),
+          "the seed sources are rfed.node and the node's lxmf.propagation")
     check(source("Retichat/Services/ChatRepository.swift").contains("RfedDistroClient.importNSEBlobs()"),
           "the app ingests the NSE's blobs with its NSE import")
 }
@@ -109,6 +127,7 @@ enum NSEDistroPullTests {
         testDecodesPairsAndMore()
         testAnErrorCodeOrTruncationIsNotAPull()
         testSavedBlobsComeBackOnceInOrder()
+        testThePullRouteRoundTrips()
         testTheWiring()
         if failures.isEmpty {
             print("all NSE distro pull tests passed")

@@ -350,7 +350,7 @@ nonisolated final class DistroManager: @unchecked Sendable {
             }
         } else {
             PendingNotification.deleteSharedDistroKey()
-            PendingNotification.writeDistroPullDestination(nil)
+            PendingNotification.writeDistroPullRoute(nil)
         }
     }
 

@@ -46,8 +46,8 @@ enum NSEDistroPull {
     static func run(identityHandle: UInt64, deadline: Date) -> Result {
         var result = Result()
         guard let key = PendingNotification.readSharedDistroKey(),
-              let destHex = PendingNotification.readDistroPullDestination(),
-              let dest = hexData(destHex), dest.count == 16 else {
+              let route = PendingNotification.readDistroPullRoute(),
+              let dest = hexData(route.destination), dest.count == 16 else {
             result.noDistro = true
             return result
         }
@@ -60,6 +60,14 @@ enum NSEDistroPull {
             return result
         }
         defer { _ = retichat_identity_destroy(distroHandle) }
+
+        // A link request with no path leaves on no route and is never
+        // answered (the iPad, 2026-09-26: 10 s, nothing reached RFed).
+        guard ensurePath(to: dest, from: route.sources.compactMap(hexData), deadline: deadline) else {
+            NSLog("[NSE-Distro] no path to rfed.distro.register %@", String(route.destination.prefix(8)))
+            result.failed = true
+            return result
+        }
 
         for round in 1...roundsMax {
             let left = deadline.timeIntervalSinceNow
@@ -91,6 +99,61 @@ enum NSEDistroPull {
             if !more { break }
         }
         return result
+    }
+
+    // MARK: - Path
+
+    /// A path to `dest`: the one this stack has, or one seeded from an RFed
+    /// node destination it has a path to (they share the node's transport
+    /// path and identity), as the app seeds its RFed destinations
+    /// (ConnectionStateManager.requestEssentialPaths). With none of them
+    /// known, their paths are requested once, and the first to arrive is
+    /// used; the propagation sync running meanwhile brings the path to the
+    /// node's lxmf.propagation.
+    private static func ensurePath(to dest: Data, from sources: [Data], deadline: Date) -> Bool {
+        var requested = false
+        while Date() < deadline {
+            if hasPath(dest) { return true }
+            for source in sources where hasPath(source) {
+                if clonePath(from: source, to: dest), hasPath(dest) {
+                    NSLog("[NSE-Distro] path seeded from %@", String(hexString(source).prefix(8)))
+                    return true
+                }
+            }
+            if !requested {
+                for hash in [dest] + sources { requestPath(hash) }
+                requested = true
+                NSLog("[NSE-Distro] no path yet; requested for %d destination(s)", sources.count + 1)
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return false
+    }
+
+    private static func hasPath(_ hash: Data) -> Bool {
+        hash.withUnsafeBytes {
+            retichat_transport_has_path($0.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(hash.count)) == 1
+        }
+    }
+
+    private static func requestPath(_ hash: Data) {
+        _ = hash.withUnsafeBytes {
+            retichat_transport_request_path($0.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(hash.count))
+        }
+    }
+
+    private static func clonePath(from source: Data, to dest: Data) -> Bool {
+        source.withUnsafeBytes { s in
+            dest.withUnsafeBytes { d in
+                retichat_transport_clone_path_and_identity(
+                    s.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(source.count),
+                    d.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(dest.count)) == 1
+            }
+        }
+    }
+
+    private static func hexString(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Request

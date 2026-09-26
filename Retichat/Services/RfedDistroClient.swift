@@ -165,6 +165,17 @@ final class RfedDistroClient: ObservableObject {
             app: "rfed", aspects: ["distro", "register"])
     }
 
+    /// The RFed node's destinations the NSE can seed its path to
+    /// rfed.distro.register from, as ConnectionStateManager does for the app.
+    private var pullRouteSources: [String] {
+        let identityHex = UserPreferences.shared.effectiveRfedNodeIdentityHash
+        guard !identityHex.isEmpty else { return [] }
+        return [
+            RfedChannelClient.rfedDestHash(identityHashHex: identityHex, app: "rfed", aspects: ["node"]),
+            RfedChannelClient.rfedDestHash(identityHashHex: identityHex, app: "lxmf", aspects: ["propagation"]),
+        ].filter { $0.count == 32 }
+    }
+
     private var unregisterDestHex: String {
         RfedChannelClient.rfedDestHash(
             identityHashHex: UserPreferences.shared.effectiveRfedNodeIdentityHash,
@@ -312,8 +323,10 @@ final class RfedDistroClient: ObservableObject {
         status.registered = true
         status.lastError = nil
         print("[Distro] registered with RFed")
-        // Where the NSE pulls from when a push comes for the distro.
-        PendingNotification.writeDistroPullDestination(registerDestHex)
+        // Where the NSE pulls from when a push comes for the distro, and the
+        // node destinations it seeds that path from.
+        PendingNotification.writeDistroPullRoute(PendingNotification.DistroPullRoute(
+            destination: registerDestHex, sources: pullRouteSources))
 
         // Pre-signed announce (Android publishAnnounce, kt:104-117).
         guard let announce = Self.announcePayload(distro: k.handle) else {
