@@ -126,11 +126,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// death leaves the held bubbles pending.
     private var heldSends = HeldSends<HeldSend>()
 
-    /// Chat-list preview per chat id: the content and sender of the chat's
-    /// newest message as refreshChats() last saw it, content "" when the
-    /// chat has none. The sender is kept so a system message's subject is
-    /// named when the list is built (DisplayNames.subjectToken), not when
-    /// the memo was filled.
+    /// Chat-list preview per chat id: the id, content and sender of the
+    /// chat's newest message as refreshChats() last saw it, content "" when
+    /// the chat has none. The id and sender are kept so a system message's
+    /// subject is named when the list is built (DisplayNames.systemText),
+    /// not when the memo was filled.
     ///
     /// refreshChats() takes previews from a window of the newest messages
     /// across ALL chats; a chat outside it needs a `chatId == X` fetch, and
@@ -146,7 +146,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// which can be older than the whole window yet newer than the chat's
     /// last message. So every MessageEntity insert goes through
     /// insertMessage(_:into:) and every delete path drops the chat's entry.
-    private var chatPreviewMemo: [String: (content: String, senderHash: String)] = [:]
+    private var chatPreviewMemo: [String: (id: String, content: String, senderHash: String)] = [:]
+
+    /// Announces handled per destination hash (handleAnnounce), so a
+    /// lookup in the announce cache that an announce overtook is dropped
+    /// (refreshAnnounceNameFromCache). In memory only: lookups do not
+    /// outlive the process.
+    private var announceGeneration: [String: Int] = [:]
 
     /// Destination tracked for the live rfed.propagation.stream APP_LINK.
     private var propagationStreamDest: Data?
@@ -263,10 +269,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // which is what Settings → Apply hit once shutdown began tearing
         // links down (B31) and so took longer than the start's head start.
         let ffiQueueRef = ffiQueue
-        Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath] in
+        let announceName = prefs.announceDisplayName
+        Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath, announceName] in
             let result: Result<LxmfClient, Error> = await withCheckedContinuation { cont in
                 ffiQueueRef.async {
-                    cont.resume(returning: Result { try LxmfClient.start(config: config) })
+                    let result = Result { try LxmfClient.start(config: config) }
+                    // The Announce Display Name in the same ffiQueue turn as
+                    // the start: Transport answers path requests for the
+                    // delivery destination from its registration on, with
+                    // the router's app_data (DISPLAY_NAMES.md §2.2). Step 7
+                    // of finishStartService sets it again, with any change
+                    // saved meanwhile.
+                    if case .success(let client) = result, !client.setAnnounceDisplayName(announceName) {
+                        print("[Retichat] Announce Display Name not set at start: \(LxmfClient.lastError ?? "unknown error")")
+                    }
+                    cont.resume(returning: result)
                 }
             }
 
@@ -475,11 +492,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// stack restart (the router's setters). The Channel Display Name is
     /// read when a channel post is packed, so it needs nothing here. With
     /// the stack down, the next start reads them from the preferences.
+    /// The Announce Display Name is also mirrored to the App Group, stack
+    /// or not, for the NSE's copy of the delivery destination
+    /// (PendingNotification.writeAnnounceDisplayName); on ffiQueue, so two
+    /// saves land in order.
     func applyDisplayNames(announceChanged: Bool) {
-        guard let client = lxmfClient else { return }
         let message = prefs.messageDisplayName
         let announce = prefs.announceDisplayName
+        let running = lxmfClient
         ffiQueue.async {
+            PendingNotification.writeAnnounceDisplayName(announce)
+            guard let client = running else { return }
             if !client.setMessageDisplayName(message) {
                 print("[Retichat] Message Display Name not set: \(LxmfClient.lastError ?? "unknown error")")
             }
@@ -489,7 +512,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         // The distro's announce is pre-signed and handed to RFed (§2.2:
         // every delivery destination carries the change).
-        if announceChanged {
+        if announceChanged && running != nil {
             RfedDistroClient.shared.republishAnnounce()
         }
     }
@@ -2062,8 +2085,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         case GroupAction.accept:
             handleGroupAccept(memberHex: actualSender, groupId: groupId)
         case GroupAction.leave:
+            // "left_": a system message (DisplayNames.isSystemMessageId)
             handleGroupLeave(memberHex: actualSender, groupId: groupId,
-                             timestamp: timestamp, msgId: hash.hexString)
+                             timestamp: timestamp, msgId: "left_" + hash.hexString)
         case GroupAction.relayRequest:
             handleGroupRelayRequest(srcHex: srcHex, content: content,
                                     fields: fields, groupId: groupId)
@@ -2343,6 +2367,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
         }
 
+        // Counted before anything can return early: a cache lookup begun
+        // before this announce must not overwrite what it carries
+        // (refreshAnnounceNameFromCache).
+        announceGeneration[hex, default: 0] &+= 1
+
         guard let ctx = modelContext else { return }
 
         let descriptor = FetchDescriptor<ContactEntity>(
@@ -2599,7 +2628,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 id: entity.id,
                 peerHash: entity.peerHash,
                 displayName: displayName,
-                lastMessage: lastMsg.map { shownText($0.content, senderHash: $0.senderHash, names: names) } ?? "",
+                lastMessage: lastMsg.map { shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names) } ?? "",
                 lastMessageTime: entity.lastMessageTime,
                 unreadCount: 0,
                 isArchived: entity.isArchived,
@@ -2664,7 +2693,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 id: entity.id,
                 senderHash: entity.senderHash,
                 senderName: senderName,
-                content: DisplayNames.systemText(entity.content, subject: senderName),
+                content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: senderName),
                 timestamp: entity.timestamp,
                 isOutgoing: entity.isOutgoing,
                 deliveryState: entity.deliveryState,
@@ -2732,7 +2761,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Batch-fetch the latest message per chat in ONE query instead of N
         let chatIds = chatEntities.map { $0.id }
-        var previewByChat: [String: (content: String, senderHash: String)] = [:]
+        var previewByChat: [String: (id: String, content: String, senderHash: String)] = [:]
         if !chatIds.isEmpty {
             // Fetch the most recent messages; we only need the newest per chat
             var msgDesc = FetchDescriptor<MessageEntity>(
@@ -2746,8 +2775,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     if previewByChat[m.chatId] == nil {
                         // Sorted newest first, so a chat's first hit here is
                         // its newest message: remember it for when it drops out.
-                        previewByChat[m.chatId] = (m.content, m.senderHash)
-                        chatPreviewMemo[m.chatId] = (m.content, m.senderHash)
+                        previewByChat[m.chatId] = (m.id, m.content, m.senderHash)
+                        chatPreviewMemo[m.chatId] = (m.id, m.content, m.senderHash)
                     }
                 }
             }
@@ -2762,7 +2791,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 } else {
                     do {
                         let last = try lastMessage(forChatId: id)
-                        let preview = (last?.content ?? "", last?.senderHash ?? "")
+                        let preview = (last?.id ?? "", last?.content ?? "", last?.senderHash ?? "")
                         chatPreviewMemo[id] = preview
                         previewByChat[id] = preview
                     } catch {
@@ -2785,7 +2814,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 displayName = label(for: entity.peerHash, in: names)
             }
             let preview = previewByChat[entity.id].map {
-                shownText($0.content, senderHash: $0.senderHash, names: names)
+                shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names)
             } ?? ""
 
             return Chat(
@@ -3013,8 +3042,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// A stored message's text as shown: a system message's subject named now.
-    private func shownText(_ content: String, senderHash: String, names: [String: String?]) -> String {
-        DisplayNames.systemText(content, subject: label(for: senderHash, in: names))
+    private func shownText(_ content: String, id: String, senderHash: String, names: [String: String?]) -> String {
+        DisplayNames.systemText(content, messageId: id, subject: label(for: senderHash, in: names))
     }
 
     /// A contact's name slots changed: the chat list, open conversations
@@ -3071,21 +3100,29 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         namesChanged()
     }
 
-    /// Fill an empty announceName from the announce cache (the Rust side's
-    /// record of the last announce): for a contact whose announce arrived
-    /// before the contact existed, so handleAnnounce never saw it. It only
-    /// fills: announces themselves replace (handleAnnounce), and a cache
-    /// miss is not an announce without a name. The lookup runs on ffiQueue.
+    /// Bring a contact's announceName up to the announce cache (the Rust
+    /// side's record of the last validated announce, DISPLAY_NAMES.md §5.1):
+    /// for a contact whose announce arrived before the contact existed, or
+    /// before the callbacks were wired, so handleAnnounce never saw it. A
+    /// hit that differs replaces the stored name; a miss changes nothing
+    /// (DisplayNames.announceNameFromCache). The lookup runs on ffiQueue; an
+    /// announce handled meanwhile is at least as new, so it wins.
     private func refreshAnnounceNameFromCache(destHash: String) {
         guard let client = lxmfClient, let hashData = Data(hexString: destHash) else { return }
+        let generation = announceGeneration[destHash, default: 0]
         ffiQueue.async { [weak self] in
-            guard let name = client.recallDisplayName(for: hashData) else { return }
+            let recalled = client.recallDisplayName(for: hashData)
+            guard recalled != nil else { return }
             Task { @MainActor [weak self] in
                 guard let self, let ctx = self.modelContext else { return }
                 let descriptor = FetchDescriptor<ContactEntity>(
                     predicate: #Predicate { $0.destHash == destHash }
                 )
-                guard let contact = try? ctx.fetch(descriptor).first, contact.announceName == nil else { return }
+                guard let contact = try? ctx.fetch(descriptor).first else { return }
+                let announcedSince = self.announceGeneration[destHash, default: 0] != generation
+                guard case .set(let name) = DisplayNames.announceNameFromCache(
+                    recalled: recalled, stored: contact.announceName,
+                    announcedSinceLookup: announcedSince) else { return }
                 contact.announceName = name
                 try? ctx.save()
                 self.namesChanged()

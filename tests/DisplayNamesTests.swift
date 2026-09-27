@@ -13,6 +13,7 @@
 //   swiftc -o /private/tmp/claude-501/display-names \
 //     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
 //     Retichat-ios/Retichat/Services/UserPreferences.swift \
+//     Retichat-ios/Retichat/Services/PendingNotification.swift \
 //     Retichat-ios/tests/DisplayNamesTests.swift && \
 //     /private/tmp/claude-501/display-names
 //
@@ -23,6 +24,7 @@
 // the FFI, so it is asserted on the source, like NSEChannelPullTests.swift.
 
 import Foundation
+import Combine
 
 // UserPreferences.swift uses the app's Data hex helpers
 // (PropagationNodeManager.swift), which need the whole app; the same two here.
@@ -156,9 +158,20 @@ func testTheResolver() {
     check(DisplayNames.channelName(afterPost: .absent, stored: "Old") == "Old", "a post without 0xD1 keeps it")
 
     let token = DisplayNames.subjectToken
-    check(DisplayNames.systemText("\(token) joined the group", subject: "Alice") == "Alice joined the group",
-          "a system message is named when shown")
-    check(DisplayNames.systemText("hello", subject: "Alice") == "hello", "other text is untouched")
+    for id in ["inv_0123456789abcdef", "acc_01234567_89abcdef", "left_" + alice] {
+        check(DisplayNames.systemText("\(token) joined the group", messageId: id, subject: "Alice") == "Alice joined the group",
+              "a system message (\(id.prefix(4))) is named when shown")
+    }
+    check(DisplayNames.systemText("hello", messageId: "inv_0123", subject: "Alice") == "hello", "other text is untouched")
+    // Review IOS-DN-2: iOS keeps U+FFFC where an attachment was in text
+    // copied from Notes or Mail, so a received message can hold the token.
+    check(DisplayNames.systemText("see \(token) below", messageId: alice, subject: "Alice") == "see \(token) below",
+          "a message's own U+FFFC is never replaced by its sender's name")
+    check(DisplayNames.systemText("Group invite from \(token): \"a\(token)b\"", messageId: "inv_0123", subject: "Alice")
+            == "Group invite from Alice: \"a\(token)b\"",
+          "only the subject's token is named, not one in the inviter's group name")
+    check(!DisplayNames.isSystemMessageId(alice) && !DisplayNames.isSystemMessageId(""),
+          "a message hash is never a system message id")
 }
 
 func testTheNotificationServiceTitle() {
@@ -335,12 +348,17 @@ func testTheSurfaces() {
             && repo.contains("content: \"\\(DisplayNames.subjectToken) joined the group\"")
             && repo.contains("content: \"\\(DisplayNames.subjectToken) left the group\""),
           "system messages store the subject's hash (senderHash) and a token, never a name (audit L2)")
+    check(repo.contains("let inviteMsgId = \"inv_\\(groupId.prefix(16))\"")
+            && repo.contains("let sysId = \"acc_\\(memberHex.prefix(8))_\\(groupId.prefix(8))\"")
+            && repo.contains("msgId: \"left_\" + hash.hexString)"),
+          "each system message's id has a DisplayNames.systemMessageIdPrefixes prefix (review IOS-DN-2)")
     let messages = body(repo, "func messages(forChatId chatId: String")
-    check(messages.contains("content: DisplayNames.systemText(entity.content, subject: senderName)"),
-          "bubbles name the subject when shown")
+    check(messages.contains("content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: senderName)"),
+          "bubbles name the subject when shown, system messages only")
     let refresh = body(repo, "func refreshChats()")
-    check(refresh.contains("shownText($0.content, senderHash: $0.senderHash, names: names)"),
-          "so does the chat-list preview")
+    check(refresh.contains("shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names)")
+            && refresh.contains("previewByChat[m.chatId] = (m.id, m.content, m.senderHash)"),
+          "so does the chat-list preview, by the message's id")
     check(refresh.contains("let snapshot = names.compactMapValues { $0 }") && !refresh.contains("chatNameMap[chat.peerHash]"),
           "chat_names.json holds every named contact's resolved name, keyed by contact, never a placeholder (audit M3)")
     let contacts = body(repo, "func contacts() -> [Contact]")
@@ -361,7 +379,12 @@ func testTheSurfaces() {
     let view = source("Retichat/Views/Conversation/ConversationView.swift")
     check(view.contains("case .dm:              return repository.chats.first(where: { $0.id == chatId })?.displayName"),
           "the header follows the chat list's resolved name, not a copy taken on appear (audit L3)")
-    check(view.contains(".onReceive(repository.$namesVersion)"), "an open chat reloads its bubbles on a name change")
+    check(view.contains(".onReceive(repository.$namesVersion) { version in")
+            && view.contains("viewModel.refreshMessages(chatId: id, repository: repository, namesVersion: version)"),
+          "an open chat reloads its bubbles on a name change, with the version it was sent (review IOS-DN-3)")
+    check(source("Retichat/Views/Conversation/ConversationViewModel.swift").contains(
+            "let currentNames = sent ?? repository.namesVersion"),
+          "which the refresh compares, not the repository's, still the old one in willSet")
     check(source("Retichat/Views/Conversation/ConversationViewModel.swift").contains(
             "let changed = namesChanged || page.count != messages.count"),
           "and the 3 s refresh does too")
@@ -432,9 +455,76 @@ func testTheSettings() {
     let apply = body(repo, "func applyDisplayNames(")
     check(before(apply, "ffiQueue.async {", "client.setAnnounceDisplayName(announce)"),
           "the setters run on ffiQueue, in order with the publish, never on the main thread")
+    check(before(apply, "PendingNotification.writeAnnounceDisplayName(announce)", "guard let client = running else { return }"),
+          "the Announce Display Name is shared with the NSE, stack or not (review IOS-DN-1)")
+    let start = body(repo, "private func continueStartService(")
+    check(before(start, "let result = Result { try LxmfClient.start(config: config) }", "!client.setAnnounceDisplayName(announceName)")
+            && before(start, "!client.setAnnounceDisplayName(announceName)", "cont.resume(returning: result)"),
+          "the app sets it in the start's own ffiQueue turn: path responses carry it from registration on")
+    let service = source("NotificationService/NotificationService.swift")
+    let nseStart = body(service, "private func startStack()")
+    check(before(nseStart, "let client = try LxmfClient.start(config: config)",
+                 "client.setAnnounceDisplayName(PendingNotification.readAnnounceDisplayName())")
+            && before(nseStart, "client.setAnnounceDisplayName(PendingNotification.readAnnounceDisplayName())",
+                      "client.setDeliveryCallback(nseDeliveryTrampoline)"),
+          "the NSE's copy of the delivery destination answers path requests with the name (review IOS-DN-1)")
     check(source("Retichat/Services/RfedDistroClient.swift").contains(
             "announceName: UserPreferences.shared.announceDisplayName"),
           "the distro's pre-signed announce carries it too (§2.2)")
+}
+
+// MARK: - Review fixes
+
+/// IOS-DN-1: the Announce Display Name reaches the NSE through the App Group.
+func testTheAnnounceNameIsSharedWithTheNSE() {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("display-names-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    check(PendingNotification.readAnnounceDisplayName(in: dir) == "", "none until the app shares one")
+    check(PendingNotification.writeAnnounceDisplayName("Ålice 👩‍💻", in: dir)
+            && PendingNotification.readAnnounceDisplayName(in: dir) == "Ålice 👩‍💻", "the NSE reads what the app wrote")
+    check(PendingNotification.writeAnnounceDisplayName("", in: dir)
+            && PendingNotification.readAnnounceDisplayName(in: dir) == "", "an emptied name is shared too")
+    check(!PendingNotification.writeAnnounceDisplayName("x", in: dir.appendingPathComponent("missing")),
+          "a failed write is reported")
+}
+
+/// IOS-DN-3: why the conversation passes the version it was sent. This is
+/// what @Published does: subscribers run in willSet.
+final class Versioned: ObservableObject { @Published var version = 0 }
+
+func testPublishedSendsBeforeTheValueChanges() {
+    let model = Versioned()
+    var seen: [(sent: Int, stored: Int)] = []
+    let sub = model.$version.dropFirst().sink { seen.append(($0, model.version)) }
+    model.version &+= 1
+    check(seen.count == 1 && seen[0].sent == 1 && seen[0].stored == 0,
+          "a subscriber is sent the new version while the property still holds the old one")
+    _ = sub
+}
+
+/// IOS-DN-4: an announce-cache hit brings a stale announceName up to date.
+func testTheAnnounceCacheReplacesAStaleName() {
+    check(DisplayNames.announceNameFromCache(recalled: "Robert", stored: "Bob", announcedSinceLookup: false) == .set("Robert"),
+          "a newer cached announce name replaces the stored one (§5.1)")
+    check(DisplayNames.announceNameFromCache(recalled: "Robert", stored: nil, announcedSinceLookup: false) == .set("Robert"),
+          "and fills an empty one, as before")
+    check(DisplayNames.announceNameFromCache(recalled: "Bob", stored: "Bob", announcedSinceLookup: false) == .keep,
+          "the same name changes nothing")
+    check(DisplayNames.announceNameFromCache(recalled: nil, stored: "Bob", announcedSinceLookup: false) == .keep,
+          "a miss is not an announce without a name")
+    check(DisplayNames.announceNameFromCache(recalled: "Bob", stored: "Robert", announcedSinceLookup: true) == .keep,
+          "an announce handled after the lookup began wins")
+    let repo = source("Retichat/Services/ChatRepository.swift")
+    let refresh = body(repo, "private func refreshAnnounceNameFromCache(")
+    check(before(refresh, "let generation = announceGeneration[destHash, default: 0]", "ffiQueue.async")
+            && refresh.contains("DisplayNames.announceNameFromCache(")
+            && !refresh.contains("contact.announceName == nil else"),
+          "the refresh replaces through that rule, and no longer only fills")
+    let announce = body(repo, "private func handleAnnounce(")
+    check(before(announce, "announceGeneration[hex, default: 0] &+= 1", "guard let ctx = modelContext else { return }"),
+          "every handled announce is counted before any early return")
 }
 
 @main
@@ -455,6 +545,9 @@ enum DisplayNamesTests {
         testTheSurfaces()
         testTheChannelSend()
         testTheSettings()
+        testTheAnnounceNameIsSharedWithTheNSE()
+        testPublishedSendsBeforeTheValueChanges()
+        testTheAnnounceCacheReplacesAStaleName()
         if failures.isEmpty {
             print("all display name tests passed")
             exit(0)

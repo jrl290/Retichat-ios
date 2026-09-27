@@ -658,6 +658,19 @@ nonisolated enum DisplayNames {
         return shortHash(hash)
     }
 
+    /// What a lookup in the announce cache does to a contact's announceName
+    /// (§5.1). The cache is the Rust side's record of the last validated
+    /// announce, written before the announce callback runs, so a hit that
+    /// differs is a newer announce the app missed (one heard before the
+    /// callbacks were wired) and replaces the stored name. A miss is not an
+    /// announce without a name (the recall cannot tell the two apart), so it
+    /// changes nothing. Neither does a hit when an announce from the contact
+    /// was handled after the lookup began: that announce is at least as new.
+    static func announceNameFromCache(recalled: String?, stored: String?, announcedSinceLookup: Bool) -> Change {
+        guard !announcedSinceLookup, let recalled, !recalled.isEmpty, recalled != stored else { return .keep }
+        return .set(recalled)
+    }
+
     /// A sender's channelName once a post is seen: the post's own name or
     /// clear wins, a post without 0xD1 leaves the stored one.
     static func channelName(afterPost post: NameField, stored: String?) -> String? {
@@ -699,11 +712,25 @@ nonisolated enum DisplayNames {
     /// shown, never frozen into the stored text (§5.3).
     static let subjectToken = "\u{FFFC}"
 
-    /// A system message's text with its subject in place of the token.
-    static func systemText(_ template: String, subject: String) -> String {
-        template.contains(subjectToken)
-            ? template.replacingOccurrences(of: subjectToken, with: subject)
-            : template
+    /// Id prefixes of the system messages that hold a subjectToken: the
+    /// group invite, accept and leave notices. Only these are named when
+    /// shown. A received message can contain U+FFFC itself (iOS leaves one
+    /// where an attachment was in text copied from Notes or Mail), and a
+    /// message id is its hex hash, which never has one of these prefixes.
+    static let systemMessageIdPrefixes = ["inv_", "acc_", "left_"]
+
+    static func isSystemMessageId(_ id: String) -> Bool {
+        systemMessageIdPrefixes.contains { id.hasPrefix($0) }
+    }
+
+    /// A system message's text with its subject in place of the token: the
+    /// first one only, the subject's place in every template (an invite's
+    /// group name, which the inviter chose, follows it). Any other message
+    /// is returned as stored.
+    static func systemText(_ template: String, messageId: String, subject: String) -> String {
+        guard isSystemMessageId(messageId),
+              let range = template.range(of: subjectToken) else { return template }
+        return template.replacingCharacters(in: range, with: subject)
     }
 }
 

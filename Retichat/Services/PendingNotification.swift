@@ -464,6 +464,43 @@ nonisolated enum PendingNotification {
         return names
     }
 
+    // MARK: - Announce Display Name (for the NSE stack)
+    //
+    // The NSE starts its own copy of this device's lxmf.delivery destination,
+    // and Transport answers a path request for it with that destination's
+    // announce. Without the Announce Display Name the answer carries nil, and
+    // every peer that takes path responses drops the user's public name until
+    // the app's next announce (DISPLAY_NAMES.md §2.2, §5.1). The name lives in
+    // the app's own UserDefaults, which the NSE cannot read, so the app
+    // mirrors it here whenever it applies the names.
+
+    static let announceDisplayNameFile = "announce_display_name.txt"
+
+    /// Mirror the Announce Display Name (already cleaned; "" = none).
+    /// Returns false, and says why, when it could not be written.
+    @discardableResult
+    static func writeAnnounceDisplayName(_ name: String, in dir: URL? = nil) -> Bool {
+        guard let dir = dir ?? containerURL else {
+            print("[Retichat] announce name not shared with the NSE: no App Group container")
+            return false
+        }
+        do {
+            try Data(name.utf8).write(to: dir.appendingPathComponent(announceDisplayNameFile), options: .atomic)
+            return true
+        } catch {
+            print("[Retichat] announce name not shared with the NSE: \(error)")
+            return false
+        }
+    }
+
+    /// The Announce Display Name the app last mirrored; "" when none, or
+    /// when the app has not mirrored one yet.
+    static func readAnnounceDisplayName(in dir: URL? = nil) -> String {
+        guard let dir = dir ?? containerURL,
+              let data = try? Data(contentsOf: dir.appendingPathComponent(announceDisplayNameFile)) else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     // MARK: - Propagation node hashes (for NSE stack)
 
     /// Write the list of propagation node hashes so the NSE can sync.

@@ -40,17 +40,21 @@ final class ConversationViewModel: ObservableObject {
         canLoadMore = page.count >= pageSize
     }
 
-    func refreshMessages(chatId: String, repository: ChatRepository) {
+    /// `namesVersion`: the version a `repository.$namesVersion` subscriber
+    /// was sent, which the repository does not hold yet (@Published sends
+    /// in willSet). nil reads the repository's (the 3 s timer).
+    func refreshMessages(chatId: String, repository: ChatRepository, namesVersion sent: Int? = nil) {
         // Lightweight check: only re-query if the message count or latest
         // delivery states may have changed.  This avoids the heavy attachment
         // fetch + SwiftUI diff every tick when nothing is happening.
         let page = repository.messagesSummary(forChatId: chatId, limit: pageSize + currentOffset)
-        let namesChanged = repository.namesVersion != namesVersion
+        let currentNames = sent ?? repository.namesVersion
+        let namesChanged = currentNames != namesVersion
         let changed = namesChanged || page.count != messages.count
             || zip(page, messages).contains(where: { $0.0 != $1.id || $0.1 != $1.deliveryState })
         guard changed else { return }
         if namesChanged {
-            namesVersion = repository.namesVersion
+            namesVersion = currentNames
             if !isGroup { chatTitle = repository.contactDisplayName(for: chatId) }
         }
 

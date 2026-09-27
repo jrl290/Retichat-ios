@@ -334,10 +334,13 @@ struct ConversationView: View {
             }
         }
         // A name learned while the chat is open shows at once in the
-        // bubbles, sender labels and system messages.
-        .onReceive(repository.$namesVersion) { _ in
+        // bubbles, sender labels and system messages. @Published sends in
+        // willSet, before repository.namesVersion holds the new value, so
+        // the version sent is passed on: read from the repository here, it
+        // is the old one and the refresh finds nothing changed.
+        .onReceive(repository.$namesVersion) { version in
             if case .dm(let id) = mode {
-                viewModel.refreshMessages(chatId: id, repository: repository)
+                viewModel.refreshMessages(chatId: id, repository: repository, namesVersion: version)
             }
         }
     }

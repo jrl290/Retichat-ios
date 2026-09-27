@@ -460,6 +460,17 @@ class NotificationService: UNNotificationServiceExtension {
             let idHex = client.identityHashHex
             NSLog("[NSE] identity: %@", idHex)
 
+            // This stack holds a copy of the device's lxmf.delivery
+            // destination, and Transport answers path requests for it with
+            // that destination's announce. Its app_data must carry the user's
+            // Announce Display Name, as the app's does, or peers that take
+            // path responses drop the name (DISPLAY_NAMES.md §2.2, §5.1).
+            // Set first, before anything else runs on this stack. The NSE
+            // sends no messages, so the Message Display Name stays unset.
+            if !client.setAnnounceDisplayName(PendingNotification.readAnnounceDisplayName()) {
+                NSLog("[NSE] announce name not set: %@", LxmfClient.lastError ?? "unknown error")
+            }
+
             client.setDeliveryCallback(nseDeliveryTrampoline)
             client.setSyncCompleteCallback(nseSyncCompleteTrampoline)
             self.lxmfClient = client
