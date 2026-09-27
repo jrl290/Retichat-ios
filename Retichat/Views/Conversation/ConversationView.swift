@@ -775,6 +775,13 @@ struct ChatInfoSheet: View {
                                         .foregroundColor(.retichatOnSurface)
                                         .padding(10)
                                         .glassBackground(cornerRadius: 8)
+                                        .submitLabel(.done)
+                                        // Return saves, as the Save button
+                                        // does, under the same rule.
+                                        .onSubmit {
+                                            guard !renameUnchanged else { return }
+                                            applyRename()
+                                        }
                                     Button("Save") {
                                         applyRename()
                                     }
