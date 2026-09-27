@@ -73,6 +73,13 @@ func testAPrivatePasteFillsBothFields() {
     check(more.root == "abc" && more.name == "team.opsx",
           "Private: editing a dotted name part leaves the root alone", "\(more)")
 
+    let over = edit("team.ops", "zz.foo", private: true, root: "abc")
+    check(over.root == "zz" && over.name == "foo",
+          "Private: a root.name pasted over a dotted name fills both fields", "\(over)")
+    let dotMore = edit("team.ops", "team.ops.x", private: true, root: "abc")
+    check(dotMore.root == "abc" && dotMore.name == "team.ops.x",
+          "Private: another dot typed into a dotted name leaves the root alone", "\(dotMore)")
+
     let typed = edit("team", "team.", private: true)
     check(typed.root == "team" && typed.name == "",
           "Private: typing root then a dot moves it into the root", "\(typed)")

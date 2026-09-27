@@ -41,12 +41,14 @@ enum ChannelNameRules {
 
     /// What an edit of the NAME field leaves in the root and name fields.
     ///
-    /// Private: an edit that brings a "." into a name that had none moves
-    /// everything before the first "." into the root and keeps the rest as the
-    /// name, so a shared "root.name" can be pasted (or typed) in one go. A name
-    /// that already holds a "." (the rest of a pasted "root.team.ops") is left
+    /// Private: an edit that brings a "." into a name that had none, or pastes
+    /// text holding a "." over the start of the name, moves everything before
+    /// the first "." into the root and keeps the rest as the name, so a shared
+    /// "root.name" can be pasted (or typed) in one go. Other edits of a name
+    /// that already holds a "." (the rest of a pasted "root.team.ops") leave it
     /// alone, so editing it does not move another segment into the root, and
     /// the form's own write-back of the rest is not split a second time.
+    /// An empty part before the first "." keeps the current root.
     ///
     /// Public: a pasted "public.name" drops the duplicate "public." prefix;
     /// any other "x.y" stays in the name part as typed.
@@ -55,8 +57,8 @@ enum ChannelNameRules {
     {
         let filtered = filterName(new)
         if isPrivate {
-            guard !filterName(old).contains("."),
-                  let dot = filtered.firstIndex(of: ".") else {
+            guard let dot = filtered.firstIndex(of: "."),
+                  editSplitsTheRoot(old: filterName(old), new: filtered) else {
                 return (root, filtered)
             }
             let head = filterRoot(String(filtered[..<dot]))
@@ -68,6 +70,21 @@ enum ChannelNameRules {
             return (root, String(filtered.dropFirst(dup.count)))
         }
         return (root, filtered)
+    }
+
+    /// Whether a Private name edit moves a root out of the name: the text the
+    /// edit inserted holds a ".", and either the old name had none or the edit
+    /// replaced its start (a paste over the old value). The same rule as
+    /// Retichat-android's ChannelNameForm.onNameInput.
+    static func editSplitsTheRoot(old: String, new: String) -> Bool {
+        let o = Array(old), n = Array(new)
+        var prefix = 0
+        while prefix < o.count, prefix < n.count, o[prefix] == n[prefix] { prefix += 1 }
+        var suffix = 0
+        while suffix < o.count - prefix, suffix < n.count - prefix,
+              o[o.count - 1 - suffix] == n[n.count - 1 - suffix] { suffix += 1 }
+        let inserted = n[prefix..<(n.count - suffix)]
+        return inserted.contains(".") && (!o.contains(".") || prefix == 0)
     }
 
     // MARK: Validation
