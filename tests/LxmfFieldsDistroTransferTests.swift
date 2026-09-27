@@ -84,14 +84,14 @@ enum LxmfFieldsDistroTransferTests {
         // 4. wrong-typed 0xFC is skipped and the parse stays in step
         let wrongType = LxmfFieldsDecoder.decode(map([
             key(0xFC) + [0x05],                       // positive fixint 5
-            key(LxmfFieldKey.groupId) + str("g"),
+            key(GroupEntry.id.legacyField) + str("g"),
         ]))
         check(wrongType.customData == nil, "int 0xFC leaves customData nil")
         check(wrongType.groupId == "g", "field after int 0xFC still decodes (parse in sync)")
 
         // Order reversed: a transfer after an unrelated known field.
         let afterGroup = LxmfFieldsDecoder.decode(map([
-            key(LxmfFieldKey.groupId) + str("g"),
+            key(GroupEntry.id.legacyField) + str("g"),
             key(0xFC) + bin8(keyHex),
             key(0xFB) + str("rfed.distro.transfer"),
         ]))

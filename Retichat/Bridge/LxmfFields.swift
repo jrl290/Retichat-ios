@@ -18,23 +18,95 @@ enum LxmfFieldKey {
     static let fileAttachments: UInt8 = 0x05
     // 0x10 (FIELD_SENDER_NAME) is retired (DISPLAY_NAMES.md §2.1): never sent,
     // never read, skipped like any unknown field. MeshChatX and Columba put
-    // dicts there. The sender's name is field 0xD1, which the Rust side
-    // decodes (LxmfClient.decodeDisplayName, DisplayNames below).
-    // Group chat fields
-    static let groupId:        UInt8 = 0xA0  // string: 32-char hex group identifier
-    static let groupMembers:   UInt8 = 0xA1  // string: comma-sep hex hashes of ALL members (invite only)
-    static let groupName:      UInt8 = 0xA2  // string: human-readable group name
-    static let groupAction:    UInt8 = 0xA3  // string: "invite"|"accept"|"leave"|"relay_req"|"relay_done"
-    static let groupSender:    UInt8 = 0xA4  // string: original sender hex (may differ from LXMF src)
-    static let groupRelaySeen: UInt8 = 0xA5  // string: comma-sep hashes already delivered to
-    static let groupRelayFor:  UInt8 = 0xA6  // string: hash of member being relayed for (relay request)
-    static let groupRelayDone: UInt8 = 0xA7  // bool:   relay-complete confirmation signal
-    static let groupMemberKeys: UInt8 = 0xA8 // string: one hash:base64-public-key pair per invite chunk
+    // dicts there. The sender's name is key 0 of the Retichat field 0xD1
+    // (RetichatField below), which the Rust side decodes
+    // (LxmfClient.decodeDisplayName, DisplayNames below).
+    // The group fields 0xA0-0xA8 are GroupEntry.legacyField: group entries
+    // are written only through LxmfClient.messageSetGroupEntry, which picks
+    // the form (DISPLAY_NAMES.md §10).
     // Custom-type fields (LXMF FIELD_CUSTOM_TYPE / FIELD_CUSTOM_DATA). nonisolated
     // so the distro services, which run off the main actor, can read them.
     nonisolated static let customType: UInt8 = 0xFB  // string: application-defined message type
     nonisolated static let customData: UInt8 = 0xFC  // str or bin: payload for customType
     nonisolated static let customMeta: UInt8 = 0xFD  // str or bin: metadata for customType
+}
+
+// MARK: - The Retichat field 0xD1 (DISPLAY_NAMES.md §2.1, §10)
+//
+// Retichat owns one LXMF field number, 0xD1 (FIELD_RETICHAT). Its value is a
+// msgpack map with small integer keys: 0 is the display name (written by the
+// Rust router only, decoded by lxmf_display_name_decode), 1-9 the group
+// entries. A 0xD1 that is not a map is ignored whole; unknown keys are
+// ignored. Mirrors lxmf_rust::retichat_field.
+
+nonisolated enum RetichatField {
+    /// FIELD_RETICHAT.
+    static let field: UInt8 = 0xD1
+    /// RF_DISPLAY_NAME: the router's; apps never set it (§4.1).
+    static let displayNameKey: UInt8 = 0
+    /// RF_MAX_KEY: keys are positive fixints, one byte on the wire.
+    static let maxKey: UInt8 = 127
+
+    /// §10, GROUP_ENTRIES_IN_RETICHAT_FIELD in Rust, Kotlin and JS: where
+    /// this client writes group entries. false until the switch (around
+    /// 2026-10-26, with the proof re-enable): released apps read only the
+    /// old top-level fields 0xA0-0xA8. At the switch this becomes true in
+    /// every client; readers take both forms already.
+    static let groupEntriesInRetichatField = false
+}
+
+/// The group entries (§10): Retichat field key 1-9, the old top-level field
+/// 0xA0-0xA8 each replaces, and its type (all str but relayDone, a bool).
+/// Group semantics: RFed Group.md.
+nonisolated enum GroupEntry: UInt8, CaseIterable {
+    case id = 1         // RF_GROUP_ID, 0xA0: 32-hex group identifier
+    case members        // RF_GROUP_MEMBERS, 0xA1: comma-sep hex hashes of ALL members (invite only)
+    case name           // RF_GROUP_NAME, 0xA2: human-readable group name
+    case action         // RF_GROUP_ACTION, 0xA3: "invite"|"accept"|"leave"|"relay_req"|"relay_done"
+    case sender         // RF_GROUP_SENDER, 0xA4: original sender hex (may differ from LXMF src)
+    case relaySeen      // RF_GROUP_RELAY_SEEN, 0xA5: comma-sep hashes already delivered to
+    case relayFor       // RF_GROUP_RELAY_FOR, 0xA6: hash of member being relayed for
+    case relayDone      // RF_GROUP_RELAY_DONE, 0xA7: bool, relay-complete signal
+    case memberKeys     // RF_GROUP_MEMBER_KEYS, 0xA8: one hash:base64-public-key pair per invite chunk
+
+    /// The key inside the Retichat field.
+    var key: UInt8 { rawValue }
+    /// The old top-level field number (0xA0 + key - 1).
+    var legacyField: UInt8 { 0x9F + rawValue }
+    /// The entry holds a bool (only relayDone); the rest hold a str.
+    var isBool: Bool { self == .relayDone }
+
+    init?(legacyField: UInt8) {
+        guard legacyField >= 0xA0 else { return nil }
+        self.init(rawValue: legacyField - 0x9F)
+    }
+}
+
+/// A group entry's value: each keeps exactly the type it had as a top-level
+/// field (§10).
+nonisolated enum GroupValue: Equatable {
+    case str(String)
+    case bool(Bool)
+
+    var isBool: Bool { if case .bool = self { return true }; return false }
+}
+
+/// One group entry to write: the pure part of LxmfClient.messageSetGroupEntry.
+nonisolated enum GroupFieldWrite: Equatable {
+    /// The old form: top-level field 0xA0-0xA8 (lxmf_message_add_field[_bool]).
+    case topLevel(field: UInt8, value: GroupValue)
+    /// The new form: key 1-9 of the Retichat field (lxmf_message_set_retichat_*).
+    case retichat(key: UInt8, value: GroupValue)
+
+    /// Where `entry` = `value` goes, by `inRetichatField` (the constant
+    /// unless a test asks for the other form); nil when the value has the
+    /// wrong type for the entry.
+    static func of(_ entry: GroupEntry, _ value: GroupValue,
+                   inRetichatField: Bool = RetichatField.groupEntriesInRetichatField) -> GroupFieldWrite? {
+        guard entry.isBool == value.isBool else { return nil }
+        return inRetichatField ? .retichat(key: entry.key, value: value)
+                               : .topLevel(field: entry.legacyField, value: value)
+    }
 }
 
 // MARK: - Distro identity transfer
@@ -92,6 +164,10 @@ enum MemberStatus {
 
 struct LxmfFields {
     var attachments: [(filename: String, data: Data)] = []
+    /// The group entries as sent (§10): from the Retichat field 0xD1 when it
+    /// holds the entry with its type, else from the old field 0xA0-0xA8.
+    /// The group fields below are read from these.
+    var groupEntries: [GroupEntry: GroupValue] = [:]
     // Group fields
     var groupId: String?
     var groupMembers: [String]?      // full member list (invite messages only)
@@ -137,22 +213,49 @@ final class LxmfFieldsDecoder {
         // Expect a map at top level
         guard let mapCount = readMapLength(bytes, &offset) else { return fields }
 
+        // §10: each group entry from the Retichat field when it holds it
+        // with its type, else from its old top-level field. Both are kept
+        // as first seen (as lxmf_rust::retichat_field reads them) and
+        // resolved after the walk, since the forms may come in any order.
+        var legacyGroup: [GroupEntry: Scalar] = [:]
+        var retichatGroup: [GroupEntry: Scalar] = [:]
+        var sawRetichatField = false
+
         for _ in 0..<mapCount {
-            guard let key = readUInt(bytes, &offset) else { break }
-            // Field keys above 0xFF exist (LXMF reserves the range above 0xFF
-            // for experimental fields) and none is ours: skip the value. A
-            // plain UInt8(key) trapped here, so one such field in any received
+            guard offset < bytes.count else { break }
+            // Keys are integers of any msgpack width; a string or negative
+            // key is no field of ours, and its value is skipped. Field keys
+            // above 0xFF exist (LXMF reserves the range above 0xFF for
+            // experimental fields) and none is ours either. A plain
+            // UInt8(key) trapped here, so one such field in any received
             // message crashed the app.
-            guard key <= 0xFF else {
+            guard let key = readKey(bytes, &offset), key <= 0xFF else {
                 skipValue(bytes, &offset)
                 continue
             }
+            let field = UInt8(key)
 
-            switch UInt8(key) {
+            if field == RetichatField.field {
+                if sawRetichatField {
+                    skipValue(bytes, &offset)
+                } else {
+                    sawRetichatField = true
+                    retichatGroup = readRetichatGroupEntries(bytes, &offset)
+                }
+                continue
+            }
+            if let entry = GroupEntry(legacyField: field) {
+                let value = readScalar(bytes, &offset)
+                if legacyGroup[entry] == nil { legacyGroup[entry] = value }
+                continue
+            }
+
+            switch field {
             case LxmfFieldKey.fileAttachments:
                 if let arrLen = readArrayLength(bytes, &offset) {
                     var attachments: [(String, Data)] = []
                     for _ in 0..<arrLen {
+                        guard offset < bytes.count else { break }
                         // Each attachment is [filename, data]
                         if let innerLen = readArrayLength(bytes, &offset), innerLen >= 2 {
                             let filename = readString(bytes, &offset) ?? ""
@@ -163,50 +266,8 @@ final class LxmfFieldsDecoder {
                         }
                     }
                     fields.attachments = attachments
-                }
-
-            case LxmfFieldKey.groupId:
-                fields.groupId = readString(bytes, &offset)
-
-            case LxmfFieldKey.groupMembers:
-                // Encoded as a comma-separated string (Android-compatible)
-                if let raw = readString(bytes, &offset) {
-                    fields.groupMembers = raw.split(separator: ",")
-                        .map { String($0).trimmingCharacters(in: .whitespaces) }
-                        .filter { !$0.isEmpty }
-                }
-
-            case LxmfFieldKey.groupName:
-                fields.groupName = readString(bytes, &offset)
-
-            case LxmfFieldKey.groupAction:
-                fields.groupAction = readString(bytes, &offset)
-
-            case LxmfFieldKey.groupSender:
-                fields.groupSender = readString(bytes, &offset)
-
-            case LxmfFieldKey.groupRelaySeen:
-                // Comma-separated list of hashes already delivered to
-                if let raw = readString(bytes, &offset) {
-                    fields.groupRelaySeen = raw.split(separator: ",")
-                        .map { String($0).trimmingCharacters(in: .whitespaces) }
-                        .filter { !$0.isEmpty }
-                }
-
-            case LxmfFieldKey.groupRelayFor:
-                fields.groupRelayFor = readString(bytes, &offset)
-
-            case LxmfFieldKey.groupRelayDone:
-                fields.groupRelayDone = readBool(bytes, &offset)
-
-            case LxmfFieldKey.groupMemberKeys:
-                if let raw = readString(bytes, &offset) {
-                    fields.groupMemberKeys = Dictionary(uniqueKeysWithValues: raw.split(separator: ",").compactMap { entry in
-                        let parts = entry.split(separator: ":", maxSplits: 1).map(String.init)
-                        guard parts.count == 2, parts[0].count == 32,
-                            Data(base64Encoded: parts[1])?.count == 64 else { return nil }
-                        return (parts[0].lowercased(), parts[1])
-                    })
+                } else {
+                    skipValue(bytes, &offset)
                 }
 
             case LxmfFieldKey.customType:
@@ -225,7 +286,163 @@ final class LxmfFieldsDecoder {
             }
         }
 
+        fields.groupEntries = resolveGroupEntries(retichat: retichatGroup, legacy: legacyGroup)
+        applyGroupEntries(&fields)
         return fields
+    }
+
+    // MARK: - Group entries (§10)
+
+    /// One msgpack value as far as a group entry cares: a str (nil when it
+    /// is not UTF-8), a bool, or anything else.
+    enum Scalar: Equatable {
+        case str(String?)
+        case bool(Bool)
+        case other
+    }
+
+    /// §10's reader rule, entry by entry: the Retichat field's value when it
+    /// has the entry's type (an empty str or false included), else the old
+    /// field's when it has the type, else none. A str is a msgpack str (bin
+    /// is not), relayDone a msgpack bool.
+    static func resolveGroupEntries(retichat: [GroupEntry: Scalar],
+                                    legacy: [GroupEntry: Scalar]) -> [GroupEntry: GroupValue] {
+        func typed(_ scalar: Scalar?, _ entry: GroupEntry) -> GroupValue? {
+            switch (scalar, entry.isBool) {
+            case (.str(let s?)?, false): return .str(s)
+            case (.bool(let b)?, true):  return .bool(b)
+            default:                     return nil
+            }
+        }
+        var out: [GroupEntry: GroupValue] = [:]
+        for entry in GroupEntry.allCases {
+            if let value = typed(retichat[entry], entry) ?? typed(legacy[entry], entry) {
+                out[entry] = value
+            }
+        }
+        return out
+    }
+
+    /// The typed group fields of `fields`, from its resolved groupEntries.
+    private static func applyGroupEntries(_ fields: inout LxmfFields) {
+        let entries = fields.groupEntries
+        func str(_ entry: GroupEntry) -> String? {
+            if case .str(let s)? = entries[entry] { return s }
+            return nil
+        }
+        func csv(_ raw: String) -> [String] {
+            raw.split(separator: ",")
+                .map { String($0).trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+        }
+        fields.groupId = str(.id)
+        // Comma-separated strings (Android-compatible).
+        fields.groupMembers = str(.members).map(csv)
+        fields.groupName = str(.name)
+        fields.groupAction = str(.action)
+        fields.groupSender = str(.sender)
+        fields.groupRelaySeen = str(.relaySeen).map(csv)
+        fields.groupRelayFor = str(.relayFor)
+        if case .bool(let done)? = entries[.relayDone] { fields.groupRelayDone = done }
+        if let raw = str(.memberKeys) {
+            fields.groupMemberKeys = Dictionary(raw.split(separator: ",").compactMap { entry in
+                let parts = entry.split(separator: ":", maxSplits: 1).map(String.init)
+                guard parts.count == 2, parts[0].count == 32,
+                    Data(base64Encoded: parts[1])?.count == 64 else { return nil }
+                return (parts[0].lowercased(), parts[1])
+            }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
+    /// The Retichat field's value: its group entries (keys 1-9, first of
+    /// each), consuming exactly the one value. A value that is not a map is
+    /// ignored whole (§2.1); keys that are not integers 1-9 are ignored. Key
+    /// 0, the name, is the Rust side's (lxmf_display_name_decode).
+    private static func readRetichatGroupEntries(_ bytes: [UInt8], _ offset: inout Int) -> [GroupEntry: Scalar] {
+        var entries: [GroupEntry: Scalar] = [:]
+        guard let count = readMapLength(bytes, &offset) else {
+            skipValue(bytes, &offset)
+            return entries
+        }
+        for _ in 0..<count {
+            guard offset < bytes.count else { break }
+            let key = readKey(bytes, &offset)
+            let value = readScalar(bytes, &offset)
+            if let key, key <= UInt64(RetichatField.maxKey),
+               let entry = GroupEntry(rawValue: UInt8(key)), entries[entry] == nil {
+                entries[entry] = value
+            }
+        }
+        return entries
+    }
+
+    /// One map key, consuming exactly one value: the integer when it is one
+    /// of any msgpack width holding a non-negative value, else nil (a str,
+    /// a negative int or anything else never matches a field or entry).
+    static func readKey(_ bytes: [UInt8], _ offset: inout Int) -> UInt64? {
+        guard offset < bytes.count else { return nil }
+        let b = bytes[offset]
+        if b <= 0x7F { offset += 1; return UInt64(b) }        // positive fixint
+        let width: Int
+        let signed: Bool
+        switch b {
+        case 0xCC: width = 1; signed = false
+        case 0xCD: width = 2; signed = false
+        case 0xCE: width = 4; signed = false
+        case 0xCF: width = 8; signed = false
+        case 0xD0: width = 1; signed = true
+        case 0xD1: width = 2; signed = true
+        case 0xD2: width = 4; signed = true
+        case 0xD3: width = 8; signed = true
+        default:
+            skipValue(bytes, &offset)
+            return nil
+        }
+        guard width < bytes.count - offset else {
+            offset = bytes.count
+            return nil
+        }
+        let value = bytes[(offset + 1)...(offset + width)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        offset += 1 + width
+        // A signed int with its top bit set is negative.
+        if signed && value >> (UInt64(width) * 8 - 1) & 1 == 1 { return nil }
+        return value
+    }
+
+    /// One value as a Scalar, consuming exactly that value whatever it is.
+    static func readScalar(_ bytes: [UInt8], _ offset: inout Int) -> Scalar {
+        guard offset < bytes.count else { return .other }
+        let b = bytes[offset]
+        if b == 0xC2 || b == 0xC3 { offset += 1; return .bool(b == 0xC3) }
+        let headerLen: Int
+        let lenBytes: Int
+        if b & 0xE0 == 0xA0 {          // fixstr
+            headerLen = 1; lenBytes = 0
+        } else if b == 0xD9 {          // str8
+            headerLen = 2; lenBytes = 1
+        } else if b == 0xDA {          // str16
+            headerLen = 3; lenBytes = 2
+        } else if b == 0xDB {          // str32
+            headerLen = 5; lenBytes = 4
+        } else {
+            skipValue(bytes, &offset)
+            return .other
+        }
+        guard headerLen <= bytes.count - offset else {
+            offset = bytes.count
+            return .other
+        }
+        var len = lenBytes == 0 ? Int(b & 0x1F) : 0
+        if lenBytes > 0 {
+            for i in 1...lenBytes { len = (len << 8) | Int(bytes[offset + i]) }
+        }
+        let start = offset + headerLen
+        guard len <= bytes.count - start else {
+            offset = bytes.count
+            return .other
+        }
+        offset = start + len
+        return .str(String(bytes: bytes[start..<(start + len)], encoding: .utf8))
     }
 
     // MARK: - MsgPack primitives
@@ -233,14 +450,14 @@ final class LxmfFieldsDecoder {
     private static func readMapLength(_ bytes: [UInt8], _ offset: inout Int) -> Int? {
         guard offset < bytes.count else { return nil }
         let b = bytes[offset]
-        if b & 0x80 == 0x80 && b & 0xF0 == 0x80 { // fixmap
+        if b & 0xF0 == 0x80 { // fixmap
             offset += 1
             return Int(b & 0x0F)
-        } else if b == 0xDE { // map16
-            offset += 1
-            guard offset + 2 <= bytes.count else { return nil }
-            let len = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
-            offset += 2
+        } else if b == 0xDE || b == 0xDF { // map16 / map32
+            let n = b == 0xDE ? 2 : 4
+            guard n < bytes.count - offset else { return nil }
+            let len = bytes[(offset + 1)...(offset + n)].reduce(0) { ($0 << 8) | Int($1) }
+            offset += 1 + n
             return len
         }
         return nil
@@ -258,28 +475,6 @@ final class LxmfFieldsDecoder {
             let len = (Int(bytes[offset]) << 8) | Int(bytes[offset + 1])
             offset += 2
             return len
-        }
-        return nil
-    }
-
-    private static func readUInt(_ bytes: [UInt8], _ offset: inout Int) -> UInt64? {
-        guard offset < bytes.count else { return nil }
-        let b = bytes[offset]
-        if b & 0x80 == 0 { // positive fixint
-            offset += 1
-            return UInt64(b)
-        } else if b == 0xCC { // uint8
-            offset += 1
-            guard offset < bytes.count else { return nil }
-            let v = UInt64(bytes[offset])
-            offset += 1
-            return v
-        } else if b == 0xCD { // uint16
-            offset += 1
-            guard offset + 2 <= bytes.count else { return nil }
-            let v = (UInt64(bytes[offset]) << 8) | UInt64(bytes[offset + 1])
-            offset += 2
-            return v
         }
         return nil
     }
@@ -388,78 +583,71 @@ final class LxmfFieldsDecoder {
         return String(data: Data(bytes[start..<(start + len)]), encoding: .utf8)
     }
 
-    private static func readBool(_ bytes: [UInt8], _ offset: inout Int) -> Bool? {
-        guard offset < bytes.count else { return nil }
-        let b = bytes[offset]
-        offset += 1
-        if b == 0xC3 { return true }
-        if b == 0xC2 { return false }
-        return nil
-    }
-
-    private static func skipValue(_ bytes: [UInt8], _ offset: inout Int) {
-        guard offset < bytes.count else { return }
-        let b = bytes[offset]
-
-        // nil
-        if b == 0xC0 { offset += 1; return }
-        // bool
-        if b == 0xC2 || b == 0xC3 { offset += 1; return }
-        // positive fixint
-        if b & 0x80 == 0 { offset += 1; return }
-        // negative fixint
-        if b & 0xE0 == 0xE0 { offset += 1; return }
-        // fixstr
-        if b & 0xE0 == 0xA0 {
-            let len = Int(b & 0x1F)
-            offset += 1 + len; return
-        }
-        // fixmap
-        if b & 0xF0 == 0x80 {
-            let count = Int(b & 0x0F)
-            offset += 1
-            for _ in 0..<(count * 2) { skipValue(bytes, &offset) }
-            return
-        }
-        // fixarray
-        if b & 0xF0 == 0x90 {
-            let count = Int(b & 0x0F)
-            offset += 1
-            for _ in 0..<count { skipValue(bytes, &offset) }
-            return
-        }
-
-        switch b {
-        case 0xCC: offset += 2  // uint8
-        case 0xCD: offset += 3  // uint16
-        case 0xCE: offset += 5  // uint32
-        case 0xCF: offset += 9  // uint64
-        case 0xD0: offset += 2  // int8
-        case 0xD1: offset += 3  // int16
-        case 0xD2: offset += 5  // int32
-        case 0xD3: offset += 9  // int64
-        case 0xCA: offset += 5  // float32
-        case 0xCB: offset += 9  // float64
-        case 0xD9: // str8
-            offset += 1
-            guard offset < bytes.count else { return }
-            offset += 1 + Int(bytes[offset])
-        case 0xDA: // str16
-            offset += 1
-            guard offset + 2 <= bytes.count else { return }
-            let len = (Int(bytes[offset]) << 8) | Int(bytes[offset+1])
-            offset += 2 + len
-        case 0xC4: // bin8
-            offset += 1
-            guard offset < bytes.count else { return }
-            offset += 1 + Int(bytes[offset])
-        case 0xC5: // bin16
-            offset += 1
-            guard offset + 2 <= bytes.count else { return }
-            let len = (Int(bytes[offset]) << 8) | Int(bytes[offset+1])
-            offset += 2 + len
-        default:
-            offset += 1 // skip unknown
+    /// Skip exactly one msgpack value of any type, containers included,
+    /// without recursion (a deeply nested value cannot exhaust the stack). A
+    /// length running past the buffer ends the parse (offset = end).
+    static func skipValue(_ bytes: [UInt8], _ offset: inout Int) {
+        var pending = 1
+        while pending > 0 {
+            guard offset < bytes.count else { offset = bytes.count; return }
+            pending -= 1
+            let b = bytes[offset]
+            /// A big-endian length of `n` bytes after the type byte, or nil
+            /// when it runs past the buffer.
+            func length(_ n: Int) -> Int? {
+                guard n < bytes.count - offset else { return nil }
+                return bytes[(offset + 1)...(offset + n)].reduce(0) { ($0 << 8) | Int($1) }
+            }
+            var advance: Int
+            switch b {
+            case 0x00...0x7F, 0xE0...0xFF, 0xC0, 0xC1, 0xC2, 0xC3:
+                advance = 1                                  // fixints, nil, bools
+            case 0x80...0x8F:                                // fixmap
+                advance = 1; pending += 2 * Int(b & 0x0F)
+            case 0x90...0x9F:                                // fixarray
+                advance = 1; pending += Int(b & 0x0F)
+            case 0xA0...0xBF:                                // fixstr
+                advance = 1 + Int(b & 0x1F)
+            case 0xC4, 0xD9:                                 // bin8, str8
+                guard let n = length(1) else { offset = bytes.count; return }
+                advance = 2 + n
+            case 0xC5, 0xDA:                                 // bin16, str16
+                guard let n = length(2) else { offset = bytes.count; return }
+                advance = 3 + n
+            case 0xC6, 0xDB:                                 // bin32, str32
+                guard let n = length(4) else { offset = bytes.count; return }
+                advance = 5 + n
+            case 0xC7:                                       // ext8
+                guard let n = length(1) else { offset = bytes.count; return }
+                advance = 3 + n
+            case 0xC8:                                       // ext16
+                guard let n = length(2) else { offset = bytes.count; return }
+                advance = 4 + n
+            case 0xC9:                                       // ext32
+                guard let n = length(4) else { offset = bytes.count; return }
+                advance = 6 + n
+            case 0xCA: advance = 5                           // float32
+            case 0xCB: advance = 9                           // float64
+            case 0xCC, 0xD0: advance = 2                     // uint8, int8
+            case 0xCD, 0xD1: advance = 3                     // uint16, int16
+            case 0xCE, 0xD2: advance = 5                     // uint32, int32
+            case 0xCF, 0xD3: advance = 9                     // uint64, int64
+            case 0xD4: advance = 3                           // fixext1
+            case 0xD5: advance = 4                           // fixext2
+            case 0xD6: advance = 6                           // fixext4
+            case 0xD7: advance = 10                          // fixext8
+            case 0xD8: advance = 18                          // fixext16
+            case 0xDC, 0xDD:                                 // array16, array32
+                guard let n = length(b == 0xDC ? 2 : 4) else { offset = bytes.count; return }
+                advance = b == 0xDC ? 3 : 5; pending += n
+            case 0xDE, 0xDF:                                 // map16, map32
+                guard let n = length(b == 0xDE ? 2 : 4) else { offset = bytes.count; return }
+                advance = b == 0xDE ? 3 : 5; pending += 2 * n
+            default:
+                advance = 1
+            }
+            guard advance <= bytes.count - offset else { offset = bytes.count; return }
+            offset += advance
         }
     }
 }

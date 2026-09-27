@@ -75,12 +75,12 @@ final class GroupChatManager {
                     to: destData, content: content, title: "", method: LxmfMethod.direct
                 )
                 guard handle != 0 else { continue }
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId, value: groupId)
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupName, value: groupName)
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupMembers, value: membersCSV)
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupMemberKeys, value: memberKeyEntry)
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupAction, value: GroupAction.invite)
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
+                _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
+                _ = LxmfClient.messageSetGroupEntry(handle, .name, .str(groupName))
+                _ = LxmfClient.messageSetGroupEntry(handle, .members, .str(membersCSV))
+                _ = LxmfClient.messageSetGroupEntry(handle, .memberKeys, .str(memberKeyEntry))
+                _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.invite))
+                _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
                 destroyAfterSend(client: client, handle: handle)
             }
         }
@@ -101,9 +101,9 @@ final class GroupChatManager {
                 to: destData, content: "", title: "", method: LxmfMethod.direct
             )
             guard handle != 0 else { continue }
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId,     value: groupId)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupAction, value: GroupAction.accept)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
+            _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
+            _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.accept))
+            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
             destroyAfterSend(client: client, handle: handle)
         }
     }
@@ -123,9 +123,9 @@ final class GroupChatManager {
                 to: destData, content: "", title: "", method: LxmfMethod.direct
             )
             guard handle != 0 else { continue }
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId,     value: groupId)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupAction, value: GroupAction.leave)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
+            _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
+            _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.leave))
+            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
             destroyAfterSend(client: client, handle: handle)
         }
     }
@@ -157,9 +157,9 @@ final class GroupChatManager {
             for (filename, data) in attachments {
                 _ = LxmfClient.messageAddAttachment(handle, filename: filename, data: data)
             }
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId,     value: groupId)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupName,   value: groupName)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
+            _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
+            _ = LxmfClient.messageSetGroupEntry(handle, .name, .str(groupName))
+            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
 
             if client.sendMessageViaAppLinks(handle) {
                 track(handle: handle)
@@ -190,13 +190,13 @@ final class GroupChatManager {
             to: destData, content: content, title: "", method: LxmfMethod.direct
         )
         guard handle != 0 else { return }
-        _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId,       value: groupId)
-        _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupAction,   value: GroupAction.relayRequest)
-        _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender,   value: originalSender)
-        _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupRelayFor, value: originalSender)
+        _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
+        _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.relayRequest))
+        _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(originalSender))
+        _ = LxmfClient.messageSetGroupEntry(handle, .relayFor, .str(originalSender))
         let seenCSV = alreadySeen.joined(separator: ",")
         if !seenCSV.isEmpty {
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupRelaySeen, value: seenCSV)
+            _ = LxmfClient.messageSetGroupEntry(handle, .relaySeen, .str(seenCSV))
         }
         destroyAfterSend(client: client, handle: handle)
     }
@@ -228,12 +228,11 @@ final class GroupChatManager {
                 to: destData, content: content, title: "", method: LxmfMethod.direct
             )
             guard handle != 0 else { continue }
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId,      value: groupId)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupName,    value: groupName)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender,  value: originalSender)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupRelayFor, value: originalSender)
-            _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupRelaySeen,
-                                           value: newSeen.joined(separator: ","))
+            _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
+            _ = LxmfClient.messageSetGroupEntry(handle, .name, .str(groupName))
+            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(originalSender))
+            _ = LxmfClient.messageSetGroupEntry(handle, .relayFor, .str(originalSender))
+            _ = LxmfClient.messageSetGroupEntry(handle, .relaySeen, .str(newSeen.joined(separator: ",")))
             destroyAfterSend(client: client, handle: handle)
         }
 
@@ -243,10 +242,10 @@ final class GroupChatManager {
                 to: destData, content: "", title: "", method: LxmfMethod.direct
             )
             if handle != 0 {
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupId,     value: groupId)
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupAction, value: GroupAction.relayDone)
-                _ = LxmfClient.messageAddField(handle, key: LxmfFieldKey.groupSender, value: selfHash)
-                _ = LxmfClient.messageAddFieldBool(handle, key: LxmfFieldKey.groupRelayDone, value: true)
+                _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
+                _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.relayDone))
+                _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
+                _ = LxmfClient.messageSetGroupEntry(handle, .relayDone, .bool(true))
                 destroyAfterSend(client: client, handle: handle)
             }
         }

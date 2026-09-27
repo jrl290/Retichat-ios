@@ -915,6 +915,41 @@ extension LxmfClient {
         lxmf_message_add_field_bool(msgHandle, key, value ? 1 : 0) == 0
     }
 
+    /// Set a str entry of the Retichat field 0xD1 (DISPLAY_NAMES.md §10):
+    /// key 1-127, merged into the map. Key 0 (the name), keys out of range
+    /// and the wrong type for keys 1-9 are refused, changing nothing.
+    @discardableResult
+    static func messageSetRetichatString(_ msgHandle: UInt64, key: UInt8, value: String) -> Bool {
+        value.withCString { lxmf_message_set_retichat_string(msgHandle, Int32(key), $0) == 0 }
+    }
+
+    /// As messageSetRetichatString, for a bool entry (key 8, relay done).
+    @discardableResult
+    static func messageSetRetichatBool(_ msgHandle: UInt64, key: UInt8, value: Bool) -> Bool {
+        lxmf_message_set_retichat_bool(msgHandle, Int32(key), value ? 1 : 0) == 0
+    }
+
+    /// Set a group entry on an outbound message: the one way group entries
+    /// are written (DISPLAY_NAMES.md §10). The form is
+    /// RetichatField.groupEntriesInRetichatField's: the old top-level field
+    /// 0xA0-0xA8 until the switch, then key 1-9 of the Retichat field.
+    @discardableResult
+    static func messageSetGroupEntry(_ msgHandle: UInt64, _ entry: GroupEntry, _ value: GroupValue) -> Bool {
+        guard let write = GroupFieldWrite.of(entry, value) else {
+            print("[LxmfClient] group entry \(entry) refused: wrong type (\(value.isBool ? "bool" : "str"))")
+            return false
+        }
+        let ok: Bool
+        switch write {
+        case .topLevel(let field, .str(let s)):  ok = messageAddField(msgHandle, key: field, value: s)
+        case .topLevel(let field, .bool(let b)): ok = messageAddFieldBool(msgHandle, key: field, value: b)
+        case .retichat(let key, .str(let s)):    ok = messageSetRetichatString(msgHandle, key: key, value: s)
+        case .retichat(let key, .bool(let b)):   ok = messageSetRetichatBool(msgHandle, key: key, value: b)
+        }
+        if !ok { print("[LxmfClient] group entry \(entry) not set: \(lastError ?? "unknown")") }
+        return ok
+    }
+
     /// Add a file attachment to an outbound message.
     @discardableResult
     static func messageAddAttachment(_ msgHandle: UInt64, filename: String, data: Data) -> Bool {
