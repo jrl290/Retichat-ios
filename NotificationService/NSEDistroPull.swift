@@ -114,21 +114,23 @@ enum NSEDistroPull {
     /// waits up to 5 s for the answer, which teaches every node on the way.
     /// Unanswered: seed from an RFed node destination confirmed in this run
     /// (the propagation sync's), else use what is stored.
-    private static func ensurePath(to dest: Data, from sources: [Data], deadline: Date) -> Bool {
+    /// Shared with NSEChannelPull; `label` names the destination in the log.
+    static func ensurePath(to dest: Data, from sources: [Data], deadline: Date,
+                           label: String = "rfed.distro.register") -> Bool {
         requestPath(dest)
         let budget = min(5, max(deadline.timeIntervalSinceNow - 1, 0))
         if waitForVerifiedPath(dest, budget: budget) {
-            NSLog("[NSE-Distro] path to rfed.distro.register confirmed")
+            NSLog("[NSE-Pull] path to %@ confirmed", label)
             return true
         }
         for source in sources where hasPath(source) && pathVerified(source) {
             if clonePath(from: source, to: dest), hasPath(dest) {
-                NSLog("[NSE-Distro] path request unanswered; seeded from %@", String(hexString(source).prefix(8)))
+                NSLog("[NSE-Pull] %@: path request unanswered; seeded from %@", label, String(hexString(source).prefix(8)))
                 return true
             }
         }
         if hasPath(dest) {
-            NSLog("[NSE-Distro] path request unanswered; using the stored path")
+            NSLog("[NSE-Pull] %@: path request unanswered; using the stored path", label)
             return true
         }
         return false
@@ -177,12 +179,20 @@ enum NSEDistroPull {
     // MARK: - Request
 
     private static func pullRequest(dest: Data, identityHandle: UInt64, timeoutSecs: Double) -> Data? {
-        let payload = Data([0xC0])   // msgpack nil: a pull carries no data
-        return dest.withUnsafeBytes { destBuf in
+        // msgpack nil: a distro pull carries no data
+        linkRequest(dest: dest, aspects: "distro,register", path: "/rfed/pull", payload: Data([0xC0]),
+                    identityHandle: identityHandle, timeoutSecs: timeoutSecs)
+    }
+
+    /// One request on a fresh link identified as `identityHandle` (the RFed
+    /// pulls take the caller from the link). Shared with NSEChannelPull.
+    static func linkRequest(dest: Data, aspects: String, path: String, payload: Data,
+                            identityHandle: UInt64, timeoutSecs: Double) -> Data? {
+        dest.withUnsafeBytes { destBuf in
             payload.withUnsafeBytes { payBuf in
                 "rfed".withCString { app in
-                    "distro,register".withCString { aspects in
-                        "/rfed/pull".withCString { path in
+                    aspects.withCString { aspects in
+                        path.withCString { path in
                             var outLen: UInt32 = 0
                             guard let ptr = retichat_link_request(
                                 destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(dest.count),
@@ -231,7 +241,7 @@ enum NSEDistroPull {
                      content: m.content ?? "", timestamp: m.timestamp)
     }
 
-    private static func hexData(_ hex: String) -> Data? {
+    static func hexData(_ hex: String) -> Data? {
         guard hex.count.isMultiple(of: 2) else { return nil }
         var out = Data(capacity: hex.count / 2)
         var index = hex.startIndex

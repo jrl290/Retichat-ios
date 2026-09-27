@@ -436,7 +436,7 @@ func testNotificationServiceWiring() {
     // Since 2026-09-26 the body also counts the distro messages the NSE
     // pulled (NSEDistroPullTests.swift): the run's stored messages plus those.
     check(source.contains("let summary = NSEDelivery.run.summary()")
-            && source.contains("let others = stored + distro.shown.count - 1")
+            && source.contains("let others = stored + distro.shown.count + channelPull.shown.count - 1")
             && source.contains("best.body  = body"),
           "the notification is built from the run's summary")
     check(!source.contains("PendingNotification.appendNSEMessage("),

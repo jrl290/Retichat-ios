@@ -95,10 +95,10 @@ func testTheWiring() {
     // The iPad, 2026-09-26 20:17 and 22:20: a stored path, trusted, led to a
     // transport node that no longer knew rfed.distro.register after an RFed
     // restart. The NSE asks for the path first and waits for the answer.
-    let ensure = pull.range(of: "private static func ensurePath(")
+    let ensure = pull.range(of: "static func ensurePath(to dest: Data")
     let ask = pull.range(of: "requestPath(dest)\n        let budget")
     let wait = pull.range(of: "if waitForVerifiedPath(dest, budget: budget)")
-    let stored = pull.range(of: "if hasPath(dest) {\n            NSLog(\"[NSE-Distro] path request unanswered; using the stored path\")")
+    let stored = pull.range(of: "if hasPath(dest) {\n            NSLog(\"[NSE-Pull] %@: path request unanswered; using the stored path\", label)")
     check(ensure != nil && ask != nil && wait != nil && stored != nil
             && ensure!.lowerBound < ask!.lowerBound && ask!.lowerBound < wait!.lowerBound
             && wait!.lowerBound < stored!.lowerBound,
@@ -116,7 +116,7 @@ func testTheWiring() {
     check(pulls != nil && shows != nil && pulls!.lowerBound < shows!.lowerBound,
           "the NSE pulls the distro before it builds the notification")
     let failed = nse.range(of: "} else if distro.failed {")
-    let suppress = nse.range(of: "} else if summary.dropped > 0 || distro.pulled > 0 {")
+    let suppress = nse.range(of: "} else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {")
     check(failed != nil && suppress != nil && failed!.lowerBound < suppress!.lowerBound,
           "an incomplete distro pull keeps the alert: it is decided before any suppression")
 

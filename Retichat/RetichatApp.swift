@@ -124,6 +124,7 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
             // Import any message the NSE already fetched before we decide
             // whether we also need to wake the full stack.
             self.repository.importNSEMessages()
+            self.channelClient.importNSEBlobs()
 
             if isActive {
                 if self.repository.serviceRunning {
@@ -285,6 +286,7 @@ struct RetichatApp: App {
                 } else {
                     // Import any messages the NSE delivered while backgrounded
                     repository.importNSEMessages()
+                    channelClient.importNSEBlobs()
                     // Every foreground appearance issues a propagation-node
                     // sync via the normal LXMF path. Clear the suspension
                     // marker here as well so later transitions reflect fresh
@@ -321,6 +323,7 @@ struct RetichatApp: App {
     @MainActor
     private func handleRfedPushReceived() {
         repository.importNSEMessages()
+        channelClient.importNSEBlobs()
 
         if repository.serviceRunning {
             repository.pollPropagationNode(force: true)

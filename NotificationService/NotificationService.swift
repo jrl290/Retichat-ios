@@ -236,13 +236,27 @@ class NotificationService: UNNotificationServiceExtension {
         let syncStarted = requestPropagation()
         NSLog("[NSE] after requestPropagation, prop state=0x%02x", lxmfClient?.propagationState ?? -1)
 
-        // Distro messages wait in RFed's queue, not the propagation node's:
-        // pull them while the sync runs (NSEDistroPull).
-        let distro = lxmfClient.map {
-            NSEDistroPull.run(identityHandle: $0.identityHandle, deadline: start.addingTimeInterval(20))
-        } ?? NSEDistroPull.Result()
-        NSLog("[NSE] distro pull: noDistro=%d pulled=%d shown=%d failed=%d",
-              distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0)
+        // Distro and channel messages wait in RFed's queue, not the
+        // propagation node's: pull them while the sync runs. A push for a
+        // channel names it (apns-bridge payload rfed.channel) and pulls that
+        // channel (NSEChannelPull); any other push pulls the distro
+        // (NSEDistroPull). One of the two, so each has the budget.
+        let channelHex = (request.content.userInfo["rfed"] as? [String: Any])?["channel"] as? String
+        var distro = NSEDistroPull.Result()
+        var channelPull = NSEChannelPull.Result()
+        if let client = lxmfClient {
+            if let channelHex, !channelHex.isEmpty {
+                channelPull = NSEChannelPull.run(channelHex: channelHex, identityHandle: client.identityHandle,
+                                                 deadline: start.addingTimeInterval(20))
+                NSLog("[NSE] channel pull %@: unknown=%d pulled=%d shown=%d notify=%d failed=%d",
+                      String(channelHex.prefix(8)), channelPull.unknownChannel ? 1 : 0, channelPull.pulled,
+                      channelPull.shown.count, channelPull.notify ? 1 : 0, channelPull.failed ? 1 : 0)
+            } else {
+                distro = NSEDistroPull.run(identityHandle: client.identityHandle, deadline: start.addingTimeInterval(20))
+                NSLog("[NSE] distro pull: noDistro=%d pulled=%d shown=%d failed=%d",
+                      distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0)
+            }
+        }
 
         // Wait for the sync-complete callback — keep ~3s margin before iOS kills at 30s.
         // With no sync started it can never come, so there is nothing to
@@ -270,24 +284,36 @@ class NotificationService: UNNotificationServiceExtension {
               finalState,
               elapsed)
 
-        // The newest message of the run, from the sync or the distro pull,
-        // and how many others came with it.
-        var candidates: [(sender: String, title: String, content: String, timestamp: Double, hash: String)] = []
+        // The newest message of the run, from the sync, the distro pull or
+        // the channel pull, and how many others came with it. `thread` is the
+        // conversation it opens (chatId): the sender, or the channel; a
+        // channel message is named as the app names it in its own channel
+        // notifications (RfedChannelClient: "#<channel> (<sender8>…)").
+        var candidates: [(sender: String, title: String, content: String, timestamp: Double, hash: String,
+                          thread: String, display: String?)] = []
         if let m = summary.newest {
-            candidates.append((m.senderHash, m.title, m.content, m.timestamp, m.messageHash))
+            candidates.append((m.senderHash, m.title, m.content, m.timestamp, m.messageHash, m.senderHash, nil))
         }
-        candidates += distro.shown.map { ($0.senderHash, $0.title, $0.content, $0.timestamp, "distro") }
+        candidates += distro.shown.map {
+            ($0.senderHash, $0.title, $0.content, $0.timestamp, "distro", $0.senderHash, nil)
+        }
+        candidates += channelPull.shown.map {
+            ($0.senderHash, "", $0.content, $0.timestamp, "channel", channelPull.channelHex,
+             "#\(channelPull.channelName) (\($0.senderHash.prefix(8))\u{2026})")
+        }
         if let msg = candidates.max(by: { $0.timestamp < $1.timestamp }) {
-            let others = stored + distro.shown.count - 1
+            let others = stored + distro.shown.count + channelPull.shown.count - 1
             let body = others == 0 ? msg.content
                 : (msg.content.isEmpty ? "+\(others) more" : msg.content + "\n+\(others) more")
-            NSLog("[NSE] delivered after %ds: %d stored, %d from the distro, %d not stored, showing the newest",
-                  elapsed, stored, distro.shown.count, summary.failed)
+            NSLog("[NSE] delivered after %ds: %d stored, %d from the distro, %d from the channel, %d not stored, showing the newest",
+                  elapsed, stored, distro.shown.count, channelPull.shown.count, summary.failed)
 
             let chatNames = PendingNotification.readChatNames()
             let chatName = chatNames[msg.sender]
             let senderName: String
-            if let name = chatName, !name.isEmpty {
+            if let display = msg.display {
+                senderName = display
+            } else if let name = chatName, !name.isEmpty {
                 senderName = name
             } else if !msg.title.isEmpty {
                 senderName = msg.title
@@ -305,13 +331,13 @@ class NotificationService: UNNotificationServiceExtension {
             best.title = senderName
             best.body  = body
             best.subtitle = ""
-            best.threadIdentifier = msg.sender
+            best.threadIdentifier = msg.thread
             best.categoryIdentifier = "MESSAGE"
-            best.userInfo["chatId"] = msg.sender
+            best.userInfo["chatId"] = msg.thread
 
             // Wrap with INSendMessageIntent so iOS shows the avatar to the left
             // of the notification (Communication Notification, iOS 15+).
-            let updated = attachAvatar(to: best, senderName: senderName, senderHash: msg.sender, content: body)
+            let updated = attachAvatar(to: best, senderName: senderName, senderHash: msg.thread, content: body)
             finishWithContent(updated)
             return
 
@@ -328,9 +354,16 @@ class NotificationService: UNNotificationServiceExtension {
             // push may be for a message still waiting in RFed. Not "0 new".
             NSLog("[NSE] distro pull incomplete — showing generic alert after %ds", elapsed)
 
-        } else if summary.dropped > 0 || distro.pulled > 0 {
-            // Only distro sent copies, transfers or receipts arrived:
-            // nothing to show (the app files them on import).
+        } else if channelPull.failed {
+            // The channel's pull did not complete: its message may still be
+            // waiting in RFed. Not "0 new".
+            NSLog("[NSE] channel pull incomplete — showing generic alert after %ds", elapsed)
+
+        } else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {
+            // Only distro sent copies, transfers or receipts, or channel
+            // messages that are not to be shown (the channel's Notifications
+            // toggle is off, or no signature verified), arrived: nothing to
+            // show (the app files them on import).
             NSLog("[NSE] nothing to show among what arrived — suppressing after %ds", elapsed)
             best.title = ""
             best.body  = ""

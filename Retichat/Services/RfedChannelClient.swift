@@ -430,9 +430,48 @@ final class RfedChannelClient: ObservableObject {
         }
 
         channels.removeAll { $0.id == channelHashHex }
+        publishPushDirectory()
         openedChannelStreamHashes.remove(Self.normalizedHex(channelHashHex))
         messages[channelHashHex] = nil
         reconfigureChannelStreams()
+    }
+
+    // MARK: - Channel push, for the NSE
+
+    /// Share with the NSE, per channel with push on, what its pull needs
+    /// (PendingNotification.ChannelPushEntry): the name the message key
+    /// derives from, the rfed.channel.pull destination of the channel's node
+    /// and the node destinations its path can be seeded from, and the
+    /// channel's Notifications toggle. Written whenever one of those changes.
+    func publishPushDirectory() {
+        let entries: [PendingNotification.ChannelPushEntry] = channels.compactMap { channel in
+            guard UserPreferences.shared.isChannelPushEnabled(channel.id) else { return nil }
+            let node = channel.rfedNodeHash
+            let pull = Self.rfedDestHash(identityHashHex: node, app: "rfed", aspects: ["channel", "pull"])
+            guard pull.count == 32 else { return nil }
+            let sources = [
+                Self.rfedDestHash(identityHashHex: node, app: "rfed", aspects: ["node"]),
+                Self.rfedDestHash(identityHashHex: node, app: "lxmf", aspects: ["propagation"]),
+            ].filter { $0.count == 32 }
+            return PendingNotification.ChannelPushEntry(
+                channel: Self.normalizedHex(channel.id), name: channel.channelName, pull: pull,
+                sources: sources, notify: UserPreferences.shared.isChannelNotificationsEnabled(channel.id))
+        }
+        PendingNotification.writeChannelPushDirectory(entries)
+    }
+
+    /// Channel blobs the NSE pulled for a push while the app was not running,
+    /// dispatched as a pull of our own (dedupe, signature check, storage).
+    /// Left in the App Group until the channels are loaded: dispatchBlob
+    /// drops a blob for a channel it does not know.
+    func importNSEBlobs() {
+        guard !channels.isEmpty else { return }
+        let pairs = PendingNotification.readAndClearNSEChannelBlobs()
+        guard !pairs.isEmpty else { return }
+        print("[RfedChannel] importing \(pairs.count) blob(s) the NSE pulled")
+        for pair in pairs {
+            dispatchBlob(channelHashHex: pair.channel.hexString, blob: pair.blob)
+        }
     }
 
     // MARK: - Per-channel push toggle
@@ -440,6 +479,7 @@ final class RfedChannelClient: ObservableObject {
     /// Enable push wakeups for a channel: saves the pref and registers with rfed.notify.register.
     func enableChannelPush(channelHashHex: String) {
         UserPreferences.shared.enableChannelPush(channelHashHex)
+        publishPushDirectory()
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
         let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
                                                    app: "rfed", aspects: ["notify", "register"])
@@ -452,9 +492,15 @@ final class RfedChannelClient: ObservableObject {
     /// Disable push wakeups for a channel: saves the pref and deregisters via rfed.notify.unregister.
     func disableChannelPush(channelHashHex: String) {
         UserPreferences.shared.disableChannelPush(channelHashHex)
+        publishPushDirectory()
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
+        // The REGISTER hash: deregisterForChannel forgets the owed or
+        // delivered registration under it, and derives the unregister
+        // destination itself. Until 2026-09-26 this passed the unregister
+        // hash, so the registration was never forgotten and switching push
+        // back on in the same run sent nothing (leaveChannel was right).
         let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                                                   app: "rfed", aspects: ["notify", "unregister"])
+                                                   app: "rfed", aspects: ["notify", "register"])
         guard !rfedNotifyHashHex.isEmpty else { return }
         RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashData,
                                                          rfedNotifyHashHex: rfedNotifyHashHex,
@@ -1075,6 +1121,8 @@ final class RfedChannelClient: ObservableObject {
             print("[RfedChannel] Migrated ChannelEntity.rfedNodeHash from legacy rfed.channel dest hash to rfed identity hex")
         }
         try? ctx.save()
+        publishPushDirectory()
+        importNSEBlobs()
     }
 
     /// Re-subscribe to every persisted-subscribed channel once the rfed.channel

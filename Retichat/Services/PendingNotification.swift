@@ -576,7 +576,7 @@ nonisolated enum PendingNotification {
             try out.write(to: file, options: .atomic)
             return true
         } catch {
-            NSLog("[NSE] distro blobs not saved: %@", error.localizedDescription)
+            NSLog("[NSE] pulled blobs not saved: %@", error.localizedDescription)
             return false
         }
     }
@@ -607,5 +607,79 @@ nonisolated enum PendingNotification {
             try? FileManager.default.removeItem(at: file)
         }
         return blobs
+    }
+
+    // MARK: - Channels, for the NSE (2026-09-26)
+    //
+    // A channel with "Push All Messages" on is woken like LXMF, and the push
+    // names the channel (userInfo["rfed"]["channel"]). The NSE pulls that
+    // channel from RFed (NSEChannelPull) and needs, for it, what the app
+    // knows: its name (the channel message key derives from it), the
+    // rfed.channel.pull destination of the channel's node, the node
+    // destinations that path can be seeded from, and whether the channel's
+    // "Notifications" toggle is on. The app writes them here; the NSE saves
+    // every pulled blob here for the app to ingest (RfedChannelClient.importNSEBlobs).
+
+    struct ChannelPushEntry: Codable, Equatable {
+        /// Channel hash, lowercase hex.
+        let channel: String
+        let name: String
+        /// rfed.channel.pull destination of the channel's RFed node, hex.
+        let pull: String
+        /// rfed.node and the node's lxmf.propagation, hex (path seeding).
+        let sources: [String]
+        /// The channel's "Notifications" toggle: off, the NSE saves and shows nothing.
+        let notify: Bool
+    }
+
+    static func encodeChannelPushDirectory(_ entries: [ChannelPushEntry]) -> Data? {
+        try? JSONEncoder().encode(entries)
+    }
+
+    static func decodeChannelPushDirectory(_ data: Data) -> [String: ChannelPushEntry] {
+        guard let entries = try? JSONDecoder().decode([ChannelPushEntry].self, from: data) else { return [:] }
+        return Dictionary(entries.map { ($0.channel.lowercased(), $0) }, uniquingKeysWith: { _, last in last })
+    }
+
+    /// App side: the channels with push on (an empty list removes the file).
+    static func writeChannelPushDirectory(_ entries: [ChannelPushEntry]) {
+        guard let dir = containerURL else { return }
+        let file = dir.appendingPathComponent("channel_push_directory.json")
+        guard !entries.isEmpty, let data = encodeChannelPushDirectory(entries) else {
+            try? FileManager.default.removeItem(at: file)
+            return
+        }
+        try? data.write(to: file, options: .atomic)
+    }
+
+    /// NSE side: keyed by lowercase channel hex.
+    static func readChannelPushDirectory() -> [String: ChannelPushEntry] {
+        guard let dir = containerURL,
+              let data = try? Data(contentsOf: dir.appendingPathComponent("channel_push_directory.json")) else { return [:] }
+        return decodeChannelPushDirectory(data)
+    }
+
+    private static var nseChannelBlobDir: URL? {
+        guard let dir = containerURL else { return nil }
+        let blobs = dir.appendingPathComponent("nse_channel_blobs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        return blobs
+    }
+
+    /// NSE side: save one pull round's (channel hash, blob) pairs, each
+    /// stored as `channel(16) | blob` in the distro blob file format.
+    @discardableResult
+    static func saveNSEChannelBlobs(_ pairs: [(channel: Data, blob: Data)], in dir: URL? = nil) -> Bool {
+        guard let dir = dir ?? nseChannelBlobDir else { return pairs.isEmpty }
+        return saveNSEDistroBlobs(pairs.map { $0.channel + $0.blob }, in: dir)
+    }
+
+    /// App side: every pair the NSE saved, oldest first; read once.
+    static func readAndClearNSEChannelBlobs(in dir: URL? = nil) -> [(channel: Data, blob: Data)] {
+        guard let dir = dir ?? nseChannelBlobDir else { return [] }
+        return readAndClearNSEDistroBlobs(in: dir).compactMap { record in
+            guard record.count > 16 else { return nil }
+            return (Data(record.prefix(16)), Data(record.dropFirst(16)))
+        }
     }
 }

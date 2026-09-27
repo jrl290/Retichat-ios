@@ -84,6 +84,7 @@ struct ChannelInfoSheet: View {
                                 .tint(.retichatPrimary)
                                 .disabled(!pushEnabled)
                                 .onChange(of: notificationsEnabled) { _, enabled in
+                                    defer { channelClient.publishPushDirectory() }
                                     if enabled {
                                         UserPreferences.shared.enableChannelNotifications(channel.id)
                                     } else {
