@@ -28,6 +28,7 @@ struct NewConversationView: View {
 
     @State private var convType: NewConvType = .direct
     @State private var triggerStart = false
+    @State private var channelCanStart = false
 
     var body: some View {
         NavigationStack {
@@ -51,7 +52,8 @@ struct NewConversationView: View {
                     case .group:
                         GroupForm(selectedChatId: $selectedChatId, triggerStart: $triggerStart)
                     case .channel:
-                        NewChannelForm(selectedChannel: $selectedChannel, triggerStart: $triggerStart)
+                        NewChannelForm(selectedChannel: $selectedChannel, triggerStart: $triggerStart,
+                                       canStart: $channelCanStart)
                     }
                 }
             }
@@ -64,6 +66,7 @@ struct NewConversationView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Start") { triggerStart = true }
                         .fontWeight(.semibold)
+                        .disabled(convType == .channel && !channelCanStart)
                 }
             }
         }
@@ -328,20 +331,30 @@ private struct NewChannelForm: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var selectedChannel: Channel?
     @Binding var triggerStart: Bool
+    @Binding var canStart: Bool
 
     enum Privacy: String, CaseIterable { case `public` = "Public"; case `private` = "Private" }
 
     @State private var privacy: Privacy = .public
     @State private var subdomain = ""
-    @State private var privatePrefix: String = NewChannelForm.randomHex()
+    // The root of a private channel: editable, defaulting to 16 random hex
+    // characters, so a channel someone shared can be joined by typing its root.
+    @State private var privatePrefix: String = ChannelNameRules.randomRoot()
     @State private var isJoining = false
     @State private var errorMessage: String?
 
+    private var isPrivate: Bool { privacy == .private }
+
     private var fullChannelName: String {
-        let sub = subdomain.trimmingCharacters(in: .whitespaces)
-        guard !sub.isEmpty else { return "" }
-        let prefix = privacy == .public ? "public" : privatePrefix
-        return "\(prefix).\(sub)"
+        ChannelNameRules.fullName(isPrivate: isPrivate, root: privatePrefix, name: subdomain)
+    }
+
+    private var rootProblem: String? {
+        ChannelNameRules.rootProblem(isPrivate: isPrivate, root: privatePrefix)
+    }
+
+    private func refreshCanStart() {
+        canStart = ChannelNameRules.canStart(isPrivate: isPrivate, root: privatePrefix, name: subdomain)
     }
 
     var body: some View {
@@ -361,9 +374,41 @@ private struct NewChannelForm: View {
                     .pickerStyle(.segmented)
                     Text(privacy == .public
                          ? "Anyone who knows the name can join."
-                         : "Only people you share the name with can join.")
+                         : "Only people you share the full name with can join.")
                         .font(.caption)
                         .foregroundColor(.retichatOnSurfaceVariant)
+                }
+
+                // Private root (prefix) field
+                if isPrivate {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Prefix")
+                            .font(.headline)
+                            .foregroundColor(.retichatOnSurface)
+                        TextField("prefix", text: $privatePrefix)
+                            .foregroundColor(.retichatOnSurface)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .font(.system(.body, design: .monospaced))
+                            .onChange(of: privatePrefix) { _, val in
+                                let filtered = ChannelNameRules.filterRoot(val)
+                                if filtered != val { privatePrefix = filtered }
+                            }
+                            .padding(12)
+                            .glassBackground(cornerRadius: 12)
+                        HStack {
+                            Text("Keep the random prefix for a new channel, or type the prefix of one shared with you.")
+                                .font(.caption)
+                                .foregroundColor(.retichatOnSurfaceVariant)
+                            Spacer(minLength: 8)
+                            Button("Regenerate prefix") { privatePrefix = ChannelNameRules.randomRoot() }
+                                .font(.caption)
+                                .foregroundColor(.retichatPrimary)
+                        }
+                        if let problem = rootProblem {
+                            Text(problem).font(.caption).foregroundColor(.retichatError)
+                        }
+                    }
                 }
 
                 // Subdomain field
@@ -372,19 +417,26 @@ private struct NewChannelForm: View {
                         .font(.headline)
                         .foregroundColor(.retichatOnSurface)
                     HStack(spacing: 0) {
-                        let prefixLabel = privacy == .public ? "public." : "\(privatePrefix)."
+                        let prefixLabel = isPrivate ? "\(privatePrefix)." : "\(ChannelNameRules.publicRoot)."
                         Text(prefixLabel)
                             .font(.system(.body, design: .monospaced))
                             .foregroundColor(.retichatOnSurfaceVariant)
+                            .lineLimit(1)
+                            .truncationMode(.head)
                             .padding(.leading, 12)
                         TextField("general", text: $subdomain)
                             .foregroundColor(.retichatOnSurface)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
                             .font(.system(.body, design: .monospaced))
-                            .onChange(of: subdomain) { _, val in
-                                // Allow letters, digits, dots, hyphens
-                                subdomain = val.lowercased().filter { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
+                            .onChange(of: subdomain) { old, val in
+                                // Letters, digits, dots, hyphens. Private: a pasted
+                                // "root.name" fills both fields; Public: a pasted
+                                // "public.name" drops the duplicate "public.".
+                                let edit = ChannelNameRules.applyNameEdit(
+                                    old: old, new: val, isPrivate: isPrivate, root: privatePrefix)
+                                if edit.root != privatePrefix { privatePrefix = edit.root }
+                                if edit.name != val { subdomain = edit.name }
                             }
                             .padding(12)
                     }
@@ -403,21 +455,16 @@ private struct NewChannelForm: View {
                 }
 
                 // Private channel hint
-                if privacy == .private {
+                if isPrivate {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "info.circle")
                             .foregroundColor(.orange)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Private channel prefix: \(privatePrefix)")
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.retichatOnSurface)
-                            let exampleName = fullChannelName.isEmpty ? "\(privatePrefix).yourname" : fullChannelName
-                            Text("Share the full name \"\(exampleName)\" with others so they can join.")
+                            let root = privatePrefix.isEmpty ? "prefix" : privatePrefix
+                            let exampleName = fullChannelName.isEmpty ? "\(root).yourname" : fullChannelName
+                            Text("Share the full name \"\(exampleName)\" with others so they can join. Anyone who knows or guesses the prefix and name can join, so a short or guessable prefix is not private.")
                                 .font(.caption)
                                 .foregroundColor(.retichatOnSurfaceVariant)
-                            Button("Regenerate prefix") { privatePrefix = NewChannelForm.randomHex() }
-                                .font(.caption)
-                                .foregroundColor(.retichatPrimary)
                         }
                     }
                     .padding(12)
@@ -442,6 +489,11 @@ private struct NewChannelForm: View {
             triggerStart = false
             joinChannel()
         }
+        .onAppear { refreshCanStart() }
+        .onDisappear { canStart = false }
+        .onChange(of: privacy) { _, _ in refreshCanStart() }
+        .onChange(of: privatePrefix) { _, _ in refreshCanStart() }
+        .onChange(of: subdomain) { _, _ in refreshCanStart() }
     }
 
     private func joinChannel() {
@@ -466,11 +518,5 @@ private struct NewChannelForm: View {
                 }
             }
         }
-    }
-
-    private static func randomHex() -> String {
-        var bytes = [UInt8](repeating: 0, count: 4)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 }
