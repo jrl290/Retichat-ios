@@ -198,6 +198,44 @@ private func makeAvatarImage(name: String, size: CGFloat = 60) -> UIImage? {
 /// 4. Wait for the sync-complete callback, when a sync started (semaphore,
 ///    no polling).
 /// 5. Rewrite the notification with the newest message, plus how many more.
+#if DEBUG
+/// Debug builds only: the NSE's stdout and stderr (the Rust stack's log lines,
+/// print and NSLog) are appended to Library/Caches/nse-debug.log in the App
+/// Group. On a device, unified logging shows every NSE line as <private> and
+/// `log collect` over USB is unreliable, which left a generic notification on
+/// 2026-09-27 undiagnosable. Read it with:
+///   xcrun devicectl device copy from --device <id> --domain-type appGroupDataContainer
+///     --domain-identifier group.com.newendian.Retichat
+///     --source Library/Caches/nse-debug.log --destination <dir>
+/// Release builds never write it: it holds message metadata.
+enum NSEDebugLog {
+    static let start: Void = {
+        guard let dir = FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: PendingNotification.appGroup)?
+            .appendingPathComponent("Library/Caches", isDirectory: true) else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("nse-debug.log")
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int,
+           size > 2_000_000 {
+            try? FileManager.default.removeItem(at: url)
+        }
+        freopen(url.path, "a", stdout)
+        freopen(url.path, "a", stderr)
+        setvbuf(stdout, nil, _IOLBF, 0)
+        setvbuf(stderr, nil, _IONBF, 0)
+        print("===== NSE run \(Date()) pid \(getpid())")
+    }()
+}
+
+/// Debug builds only: every NSLog in this target also goes to stdout, and so
+/// to nse-debug.log in full (unified logging keeps only "<private>").
+func NSLog(_ format: String, _ args: CVarArg...) {
+    let text = String(format: format, arguments: args)
+    Foundation.NSLog("%@", text)
+    print(text)
+}
+#endif
+
 class NotificationService: UNNotificationServiceExtension {
 
     private var contentHandler: ((UNNotificationContent) -> Void)?
@@ -209,6 +247,9 @@ class NotificationService: UNNotificationServiceExtension {
         _ request: UNNotificationRequest,
         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
+        #if DEBUG
+        _ = NSEDebugLog.start
+        #endif
         self.contentHandler = contentHandler
         bestAttemptContent = request.content.mutableCopy() as? UNMutableNotificationContent
 
