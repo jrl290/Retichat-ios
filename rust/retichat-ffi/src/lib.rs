@@ -930,10 +930,11 @@ fn channel_out_buffer(bytes: Vec<u8>, out_len: *mut u32) -> *mut u8 {
 ///   * `sender_handle`       — identity handle of the local user (the *source*)
 ///   * `content_ptr/_len`    — message body bytes (UTF-8)
 ///   * `title_ptr/_len`      — optional title bytes (UTF-8); NULL/0 for none
-///   * `display_name_state`  — the Channel Display Name to carry in field 0xD1
-///                             (DISPLAY_NAMES.md §2.3, §4.2): 0 = none (no
-///                             0xD1; the bytes are exactly the pre-name
-///                             format), 1 = clear (empty 0xD1), 2 = the name
+///   * `display_name_state`  — the Channel Display Name to carry in key 0 of
+///                             field 0xD1 (DISPLAY_NAMES.md §2.3, §4.2): 0 =
+///                             none (no 0xD1; the bytes are exactly the
+///                             pre-name format), 1 = clear ({0xD1: {0: empty
+///                             bin}}), 2 = the name
 ///                             in `display_name_ptr/_len`
 ///   * `display_name_ptr/_len` — raw UTF-8 name for state 2 (cleaned here;
 ///                             a name that cleans to nothing is an error)
@@ -1469,11 +1470,16 @@ mod display_name_bridge_tests {
         lxmf_free_string(ptr);
         assert!(lxmf_display_name_clean(std::ptr::null(), 0, 0).is_null());
 
-        let fields = [0x81, 0xcc, 0xd1, 0xa3, b'B', b'o', b'b'];
+        // DISPLAY_NAMES.md §2.1: {0xD1: {0: name}}.
+        let fields = [0x81, 0xcc, 0xd1, 0x81, 0x00, 0xa3, b'B', b'o', b'b'];
         let mut len = 0u32;
         assert_eq!(take(lxmf_display_name_decode(fields.as_ptr(), fields.len() as u32, &mut len), len), vec![2, 0, 3, b'B', b'o', b'b']);
-        let clear = [0x81, 0xcc, 0xd1, 0xc4, 0x00];
+        let clear = [0x81, 0xcc, 0xd1, 0x81, 0x00, 0xc4, 0x00];
         assert_eq!(take(lxmf_display_name_decode(clear.as_ptr(), clear.len() as u32, &mut len), len), vec![1, 0, 0]);
+        let beside_group = [0x81, 0xcc, 0xd1, 0x82, 0x01, 0xa1, b'g', 0x00, 0xc4, 0x01, b'A'];
+        assert_eq!(take(lxmf_display_name_decode(beside_group.as_ptr(), beside_group.len() as u32, &mut len), len), vec![2, 0, 1, b'A']);
+        let not_a_map = [0x81, 0xcc, 0xd1, 0xa3, b'B', b'o', b'b'];
+        assert_eq!(take(lxmf_display_name_decode(not_a_map.as_ptr(), not_a_map.len() as u32, &mut len), len), vec![0, 0, 0], "a non-map 0xD1 is absent");
         let retired = [0x81, 0x10, 0xa3, b'B', b'o', b'b'];
         assert_eq!(take(lxmf_display_name_decode(retired.as_ptr(), retired.len() as u32, &mut len), len), vec![0, 0, 0]);
         assert_eq!(take(lxmf_display_name_decode(std::ptr::null(), 0, &mut len), len), vec![0, 0, 0]);
@@ -1496,5 +1502,22 @@ mod display_name_bridge_tests {
         let params: Vec<&str> = typedef.split(|c| c == ',' || c == '(').map(str::trim).collect();
         let valid = params.iter().position(|p| *p == "int32_t signature_valid").expect("signature_valid");
         assert_eq!(params[valid + 1], "int32_t unverified_reason", "unverified_reason follows signature_valid");
+    }
+
+    /// DISPLAY_NAMES.md §10: the Retichat field setters are declared with
+    /// the signatures the library exports (an int32_t key, so Swift passes
+    /// the key unchanged and the library refuses out-of-range keys instead
+    /// of a uint8_t truncating them).
+    #[test]
+    fn the_header_declares_the_retichat_field_setters() {
+        let header = include_str!("../../../Retichat/Bridge/CRetichatFFI.h");
+        assert!(header.contains("int32_t lxmf_message_set_retichat_string(uint64_t msg, int32_t key, const char *value);"));
+        assert!(header.contains("int32_t lxmf_message_set_retichat_bool(uint64_t msg, int32_t key, int32_t value);"));
+        let _: extern "C" fn(u64, i32, *const std::os::raw::c_char) -> i32 = lxmf_message_set_retichat_string;
+        let _: extern "C" fn(u64, i32, i32) -> i32 = lxmf_message_set_retichat_bool;
+        // Key 0 is the router's; refused before the handle is even looked up.
+        let value = std::ffi::CString::new("x").unwrap();
+        assert_eq!(lxmf_message_set_retichat_string(0, 0, value.as_ptr()), -1);
+        assert_eq!(lxmf_message_set_retichat_bool(0, 0, 1), -1);
     }
 }

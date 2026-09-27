@@ -106,7 +106,8 @@ void  lxmf_free_bytes(uint8_t *ptr, uint32_t len);
 #pragma mark - LXMF Client Lifecycle
 
 /// `display_name` is the initial Message Display Name (DISPLAY_NAMES.md §4.1):
-/// sent inside messages (field 0xD1) by the name-ledger rule, never announced.
+/// sent inside messages (key 0 of the Retichat field 0xD1) by the name-ledger
+/// rule, never announced.
 /// NULL/"" = none. The Announce Display Name starts empty; set both at runtime
 /// with lxmf_client_set_message_display_name / lxmf_client_set_announce_display_name.
 uint64_t lxmf_client_start(const char *config_dir,
@@ -418,8 +419,9 @@ int32_t lxmf_client_recall_display_name(uint64_t client,
 
 #pragma mark - Display names (DISPLAY_NAMES.md)
 
-/// Set the Message Display Name at runtime (§4.1): the router adds it (field
-/// 0xD1) to outbound messages by the name-ledger rule. NULL or "" clears it.
+/// Set the Message Display Name at runtime (§4.1): the router adds it (key 0
+/// of the Retichat field 0xD1) to outbound messages by the name-ledger rule,
+/// merged with any app entries in that map. NULL or "" clears it.
 /// Cleaned (§3). No restart. Returns 0 on success, -1 on error (e.g. not UTF-8).
 int32_t lxmf_client_set_message_display_name(uint64_t client, const char *name);
 
@@ -435,8 +437,9 @@ int32_t lxmf_client_set_announce_display_name(uint64_t client, const char *name)
 /// NULL when the input cleans to no name. Never fails.
 char *lxmf_display_name_clean(const uint8_t *raw, uint32_t raw_len, int32_t announce);
 
-/// Decode field 0xD1 from the msgpack `fields_raw` a delivery callback hands
-/// over. Returns a heap buffer (free with lxmf_free_bytes), at least 3 bytes:
+/// Decode the name, key 0 of the Retichat field 0xD1 ({0xD1: {0: name}}; a
+/// 0xD1 that is not a map is absent), from the msgpack `fields_raw` a
+/// delivery callback hands over. Returns a heap buffer (free with lxmf_free_bytes), at least 3 bytes:
 ///     [0]     name_state  0 = absent, 1 = clear, 2 = name
 ///     [1..3]  name_len    u16 BE (0 unless state 2)
 ///     [3..]   name        cleaned UTF-8
@@ -451,8 +454,23 @@ uint64_t lxmf_message_new(uint64_t client,
                            const char *content, const char *title,
                            uint8_t method);
 
+/// Set a top-level LXMF field (e.g. 0xA0-0xA8, the group fields senders use
+/// until the switch, DISPLAY_NAMES.md §10). 0xD1, the Retichat field, is
+/// refused (-1): set its entries with lxmf_message_set_retichat_*.
 int32_t lxmf_message_add_field(uint64_t msg, uint8_t key, const char *value);
 int32_t lxmf_message_add_field_bool(uint64_t msg, uint8_t key, int32_t value);
+/// Set an entry of the Retichat field 0xD1 (DISPLAY_NAMES.md §10): the fields
+/// get {0xD1: {key: value}}, merged with the entries already there (ascending
+/// key order). `key` must be 1..127: key 0 is the display name, which only
+/// the router writes. Keys 1-9 are the group entries (1 group id, 2 members,
+/// 3 name, 4 action, 5 sender, 6 relay seen, 7 relay for, 8 relay done,
+/// 9 member keys); all are strings except 8, a bool, and the wrong setter
+/// for a defined key is refused. `value` must be non-NULL UTF-8.
+/// Returns 0 on success, -1 on error (lxmf_last_error), changing nothing.
+int32_t lxmf_message_set_retichat_string(uint64_t msg, int32_t key, const char *value);
+/// As lxmf_message_set_retichat_string, for a bool entry; `value` non-zero
+/// is true.
+int32_t lxmf_message_set_retichat_bool(uint64_t msg, int32_t key, int32_t value);
 int32_t lxmf_message_add_attachment(uint64_t msg, const char *filename,
                                      const uint8_t *data, uint32_t data_len);
 /// Clone an existing message as a fresh PROPAGATED message, preserving fields
@@ -613,9 +631,10 @@ uint8_t *retichat_compute_channel_stamp(const uint8_t *payload, uint32_t payload
 /// `sender_handle`       — local user identity handle
 /// `content`             — message body (UTF-8)
 /// `title`               — optional title (UTF-8); pass NULL/0 for none
-/// `display_name_state`  — Channel Display Name in field 0xD1 (DISPLAY_NAMES.md
-///                         §2.3, §4.2): 0 = none (no 0xD1; bytes identical to
-///                         before names existed), 1 = clear (empty 0xD1),
+/// `display_name_state`  — Channel Display Name, key 0 of field 0xD1
+///                         (DISPLAY_NAMES.md §2.3, §4.2): 0 = none (no 0xD1;
+///                         bytes identical to before names existed), 1 = clear
+///                         ({0xD1: {0: empty bin}}),
 ///                         2 = the name in `display_name` (cleaned; a name that
 ///                         cleans to nothing is an error)
 ///
