@@ -29,7 +29,6 @@ use reticulum_rust::ffi as rns;
 use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::Packet;
 use reticulum_rust::transport::Transport;
-use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -672,13 +671,9 @@ pub extern "C" fn retichat_rfed_delivery_stop() -> i32 {
 /// Returns a heap-allocated ciphertext (free with `lxmf_free_bytes`) or NULL
 /// on error.  Wire format: `ephemeral_x25519_pub(32) | iv(16) | aes_cbc_ct | hmac(32)`.
 fn channel_private_key_bytes(name: &str) -> [u8; 64] {
-    let seed: [u8; 32] = Sha256::digest(name.as_bytes()).into();
-    // Same seed used for both X25519 (encryption) and Ed25519 (signing),
-    // mirroring ChannelKeypair::from_name in RFed-rust/rfed/src/channel.rs.
-    let mut prv = [0u8; 64];
-    prv[..32].copy_from_slice(&seed);
-    prv[32..].copy_from_slice(&seed);
-    prv
+    // SHA-256(name) as both the X25519 and the Ed25519 seed, mirroring
+    // ChannelKeypair::from_name in RFed-rust/rfed/src/channel.rs.
+    lxmf_rust::channel::channel_private_key_bytes(name)
 }
 
 #[no_mangle]
@@ -882,106 +877,78 @@ pub extern "C" fn retichat_compute_channel_stamp(
 // The legacy custom plaintext layout (sender_hash | ts_be | pubkey | sig |
 // content_utf8 inside `channel_encrypt`) is GONE.  Do not reintroduce it.
 
-use lxmf_rust::lx_message::LXMessage;
-
-const LXMF_APP_NAME: &str = "lxmf";
-const LXMF_DELIVERY_ASPECT: &str = "delivery";
-
 // ---------------------------------------------------------------------------
-// SOURCE-IDENTITY PRELUDE — DO NOT BREAK
+// SOURCE-IDENTITY PRELUDE AND KEY BINDING — DO NOT BREAK
 // ---------------------------------------------------------------------------
 //
-// LXMF PROPAGATED unpack requires the source identity to be present in
-// Reticulum's known-destinations cache so the Ed25519 signature can be
-// validated.  Normally that cache is populated by LXMF announces — but
-// announces are timing-dependent and lossy: the receiver might not
-// have heard the sender's announce yet, in which case every channel
-// message would be rejected as `SOURCE_UNKNOWN` until/unless the
-// sender re-announces while the receiver is online.  This is the same
-// failure mode that plagues regular LXMF ("have to be around at the
-// right time to receive anything").
-//
-// We solve it once and for all by embedding the sender's identity
-// public bytes INSIDE the EC-encrypted channel payload.  The receiver
-// detects the magic, registers `source_hash → identity_pub` via
-// `Identity::remember_destination`, then unpacks LXMF normally — the
-// signature now validates with zero dependence on announce timing.
-//
-// IMPORTANT: we deliberately do NOT pre-check that
-// `truncated_hash(identity_pub) == source_hash`.  That check would be
-// WRONG, because the LXMF `source_hash` is the lxmf.delivery
-// *destination* hash — derived as `truncated_hash(name_hash ||
-// identity_hash)` per Reticulum's Destination::hash — NOT the bare
-// identity hash.  Instead, the LXMF Ed25519 signature validation
-// itself provides the integrity guarantee: a sender claiming a
-// public key it does not possess will produce a signature that fails
-// to verify under the embedded pubkey, and the message is rejected
-// downstream as SIGNATURE_INVALID.  Cache poisoning by an
-// unauthorized party is also impossible because reaching this code
-// path requires successful EC-decrypt with the channel key — i.e.
-// the sender is already an authorized publisher.
-//
-// The prelude is MANDATORY — not a fallback, not optional.  All
-// Retichat clients on the same FFI version use it; receivers reject
-// blobs that lack the magic.
-//
-// Layout of the *plaintext* of the EC-encrypted payload:
+// The decrypted post is
 //
 //     [ b"RTID" (4) | sender_identity_pub (64) | source_hash (16) | sig (64) | msgpack_payload ]
 //
-// The 64 bytes of identity_pub are exactly what
-// `Identity::get_public_key()` returns (32 X25519 enc pub || 32 Ed25519
-// sign pub) and what `Identity::from_public_key` /
-// `Identity::remember_destination` consume.
+// The prelude carries the sender's public key so the LXMF signature can be
+// checked without waiting for the sender's announce. Unpack checks that
+// the key produces the claimed source hash as an `lxmf.delivery`
+// destination BEFORE remembering it, and rejects the post otherwise
+// (DISPLAY_NAMES.md §2.3): the channel key is derived from the channel's
+// name, so anyone who knows the name can post, and without the check could
+// post as a contact and overwrite that contact's stored key.
 //
-// The prelude is INSIDE the EC envelope so it leaks no more than the
-// message body itself does — only channel-key holders ever see it.
-const CHANNEL_IDENTITY_PRELUDE_MAGIC: &[u8; 4] = b"RTID";
-const CHANNEL_IDENTITY_PRELUDE_LEN: usize = 4 + 64; // magic + Identity::get_public_key()
+// Pack and unpack live once in `lxmf_rust::channel`, shared with the
+// Android JNI bridge; these functions are thin wrappers.
 
-fn channel_identity(name: &str) -> Result<Identity, String> {
-    let prv = channel_private_key_bytes(name);
-    Identity::from_bytes(&prv)
+fn channel_out_error(out_len: *mut u32, message: String) -> *mut u8 {
+    rns::set_error(message);
+    if !out_len.is_null() {
+        unsafe {
+            *out_len = 0;
+        }
+    }
+    std::ptr::null_mut()
 }
 
-fn channel_destination(name: &str) -> Result<Destination, String> {
-    let id = channel_identity(name)?;
-    Destination::new_outbound(
-        Some(id),
-        DestinationType::Single,
-        LXMF_APP_NAME.to_string(),
-        vec![LXMF_DELIVERY_ASPECT.to_string()],
-    )
+fn channel_out_buffer(bytes: Vec<u8>, out_len: *mut u32) -> *mut u8 {
+    if out_len.is_null() {
+        rns::set_error("out_len is NULL".into());
+        return std::ptr::null_mut();
+    }
+    let len = bytes.len() as u32;
+    let mut boxed = bytes.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    unsafe {
+        *out_len = len;
+    }
+    ptr
 }
 
-/// Build an LXMF message addressed to the channel destination and pack it
-/// into the on-wire payload.  The caller is responsible for appending the
-/// optional PoW stamp suffix and sending the result as the `rfed.channel`
-/// SEND payload.
+/// Build a channel post (an LXMF message addressed to the channel) and pack
+/// it into the on-wire payload. The caller appends the optional PoW stamp
+/// and sends `output[8..]` as the `rfed.channel` SEND payload.
 ///
 /// Inputs:
-///   * `name_ptr`           — channel name (UTF-8 C string), e.g. "public.general"
-///   * `sender_handle`      — identity handle of the local user (the *source*)
-///   * `content_ptr/_len`   — message body bytes (UTF-8)
-///   * `title_ptr/_len`     — optional title bytes (UTF-8); pass NULL/0 for none
+///   * `name_ptr`            — channel name (UTF-8 C string), e.g. "public.general"
+///   * `sender_handle`       — identity handle of the local user (the *source*)
+///   * `content_ptr/_len`    — message body bytes (UTF-8)
+///   * `title_ptr/_len`      — optional title bytes (UTF-8); NULL/0 for none
+///   * `display_name_state`  — the Channel Display Name to carry in field 0xD1
+///                             (DISPLAY_NAMES.md §2.3, §4.2): 0 = none (no
+///                             0xD1; the bytes are exactly the pre-name
+///                             format), 1 = clear (empty 0xD1), 2 = the name
+///                             in `display_name_ptr/_len`
+///   * `display_name_ptr/_len` — raw UTF-8 name for state 2 (cleaned here;
+///                             a name that cleans to nothing is an error)
 ///
-/// Returns a heap-allocated buffer (free with `lxmf_free_bytes`) in the
-/// following layout, or NULL on error (call `lxmf_last_error`):
+/// Returns a heap-allocated buffer (free with `lxmf_free_bytes`), or NULL on
+/// error (call `lxmf_last_error`):
 ///
 /// ```text
 /// offset  size  field
 /// ------  ----  -----
-/// 0       8     timestamp_ms_be    (u64 BE) — the LXMF timestamp the
-///                                   sender baked into the signed
-///                                   payload, returned out-of-band so
-///                                   the caller can match it against
-///                                   the echo for local-persist dedup.
+/// 0       8     timestamp_ms_be    (u64 BE) — the LXMF timestamp in the
+///                                   signed payload, for echo dedup.
 /// 8       16    channel_id_hash    (the routing label for RFed)
-/// 24      *     EC_encrypted(source_hash || signature || msgpack_payload)
+/// 24      *     EC_encrypted(prelude || source_hash || signature || msgpack_payload)
 /// ```
-///
-/// The wire payload is `output[8..]` — the 8-byte timestamp prefix is
-/// stripped before sending.
 #[no_mangle]
 pub extern "C" fn retichat_channel_lxm_pack(
     name_ptr: *const c_char,
@@ -990,231 +957,64 @@ pub extern "C" fn retichat_channel_lxm_pack(
     content_len: u32,
     title_ptr: *const u8,
     title_len: u32,
+    display_name_state: u8,
+    display_name_ptr: *const u8,
+    display_name_len: u32,
     out_len: *mut u32,
 ) -> *mut u8 {
     let name = unsafe { cstr_to_string(name_ptr) };
-    if name.is_empty() {
-        rns::set_error("channel name is empty".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
     let content = slice_from_raw(content_ptr, content_len);
     let title = slice_from_raw(title_ptr, title_len);
-
-    let sender_identity: Identity = match rns::get_handle::<Identity>(sender_handle) {
-        Some(id) => id,
-        None => {
-            rns::set_error("invalid sender identity handle".into());
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-
-    // Snapshot the sender's identity public bytes BEFORE we move the
-    // identity into Destination::new_outbound — the receiver needs these
-    // 64 bytes to register the source identity locally without waiting
-    // for an LXMF announce (see CHANNEL_IDENTITY_PRELUDE_MAGIC docs).
-    let sender_pub_bytes: Vec<u8> = match sender_identity.get_public_key() {
-        Ok(b) => b,
-        Err(e) => {
-            rns::set_error(format!("sender identity has no public key: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    if sender_pub_bytes.len() != 64 {
-        rns::set_error(format!(
-            "sender identity public key wrong length: expected 64, got {}",
-            sender_pub_bytes.len()
-        ));
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-
-    let mut channel_dest = match channel_destination(&name) {
-        Ok(d) => d,
-        Err(e) => {
-            rns::set_error(format!("channel destination: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    let sender_dest = match Destination::new_outbound(
-        Some(sender_identity),
-        DestinationType::Single,
-        LXMF_APP_NAME.to_string(),
-        vec![LXMF_DELIVERY_ASPECT.to_string()],
+    let post_name = match lxmf_rust::channel::post_name_from_state(
+        display_name_state,
+        &slice_from_raw(display_name_ptr, display_name_len),
     ) {
-        Ok(d) => d,
-        Err(e) => {
-            rns::set_error(format!("sender destination: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
+        Ok(post_name) => post_name,
+        Err(e) => return channel_out_error(out_len, e),
     };
-
-    let mut msg = match LXMessage::new(
-        Some(channel_dest.clone()),
-        Some(sender_dest),
-        Some(content),
-        Some(title),
-        None,                        // fields = empty map (default)
-        Some(LXMessage::PROPAGATED), // desired_method
-        None,
-        None,
-        None,  // stamp_cost (PoW is at the RFed wrapper, not LXMF)
-        false, // include_ticket
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            rns::set_error(format!("LXMessage::new: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
+    let Some(sender) = rns::get_handle::<Identity>(sender_handle) else {
+        return channel_out_error(out_len, "invalid sender identity handle".into());
     };
-
-    if let Err(e) = msg.pack(false) {
-        rns::set_error(format!("LXMessage::pack: {}", e));
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
+    match lxmf_rust::channel::pack(&name, &sender, &content, &title, &post_name) {
+        Ok(post) => channel_out_buffer(post.to_bridge_bytes(), out_len),
+        Err(e) => channel_out_error(out_len, e),
     }
-
-    // Build wire payload = [ channel_id_hash(16) | EC_encrypted(packed[16..]) ].
-    //
-    // packed[..16] is the LXMF `lxmf.delivery` destination_hash, used by
-    // pack() when computing the signature.  We replace it on the wire with
-    // the channel IDENTITY hash so RFed's `subscription_table` lookup
-    // (which is keyed by the identity hash subscribers registered with
-    // /rfed/subscribe) finds the right subscribers.  The receiver
-    // reconstructs the canonical LXMF block by deriving the same
-    // `lxmf.delivery` destination hash from the channel name before
-    // calling LXMessage::unpack_from_bytes — so the signature still
-    // validates against the original signed dest_hash.
-    let packed = match msg.packed.as_ref() {
-        Some(p) => p,
-        None => {
-            rns::set_error("LXMessage missing packed buffer after pack".into());
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    if packed.len() < LXMessage::DESTINATION_LENGTH {
-        rns::set_error("packed buffer too short".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-    // Prepend the SOURCE-IDENTITY PRELUDE to the LXMF tail before
-    // encryption.  Receivers detect the magic and register the source
-    // identity locally so signature validation succeeds without
-    // requiring a prior announce.  This is mandatory — every Retichat
-    // client on the network speaks this format.
-    let lxmf_tail = &packed[LXMessage::DESTINATION_LENGTH..];
-    let mut prelude_plus_tail = Vec::with_capacity(CHANNEL_IDENTITY_PRELUDE_LEN + lxmf_tail.len());
-    prelude_plus_tail.extend_from_slice(CHANNEL_IDENTITY_PRELUDE_MAGIC);
-    prelude_plus_tail.extend_from_slice(&sender_pub_bytes);
-    prelude_plus_tail.extend_from_slice(lxmf_tail);
-    let pn_enc = match channel_dest.encrypt(&prelude_plus_tail) {
-        Ok(d) => d,
-        Err(e) => {
-            rns::set_error(format!("channel encrypt: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-
-    // The channel identity hash is the routing label RFed expects.
-    let id_hash: Vec<u8> = match channel_identity(&name) {
-        Ok(id) => match id.hash.clone() {
-            Some(h) => h,
-            None => {
-                rns::set_error("channel identity has no hash".into());
-                unsafe {
-                    *out_len = 0;
-                }
-                return std::ptr::null_mut();
-            }
-        },
-        Err(e) => {
-            rns::set_error(format!("channel identity: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    if id_hash.len() != LXMessage::DESTINATION_LENGTH {
-        rns::set_error("channel identity hash wrong length".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-
-    let mut wire = Vec::with_capacity(8 + LXMessage::DESTINATION_LENGTH + pn_enc.len());
-    // Out-of-band: 8-byte LXMF timestamp prefix so the caller can use the
-    // same tsMs for local persistence and echo dedup.
-    let ts_ms: u64 = (msg.timestamp.unwrap_or(0.0) * 1000.0) as u64;
-    wire.extend_from_slice(&ts_ms.to_be_bytes());
-    wire.extend_from_slice(&id_hash);
-    wire.extend_from_slice(&pn_enc);
-
-    let len = wire.len() as u32;
-    let mut boxed = wire.into_boxed_slice();
-    let ptr = boxed.as_mut_ptr();
-    std::mem::forget(boxed);
-    unsafe {
-        *out_len = len;
-    }
-    ptr
 }
 
-/// Unpack an LXMF channel message received via RFed.
+/// Unpack a channel post received via RFed.
 ///
-/// Input is the wire payload as defined in `retichat_channel_lxm_pack`:
-///     [ channel_id_hash(16) | EC_encrypted(source_hash || signature || payload) ]
-/// (channel_id_hash = channel identity hash, the routing label RFed uses;
-///  the EC-encrypted tail carries the LXMF authentication payload.)
+/// Input is the wire payload as `retichat_channel_lxm_pack` produced it
+/// (without the 8-byte timestamp prefix):
+///     [ channel_id_hash(16) | EC_encrypted(prelude || source_hash || signature || payload) ]
 ///
-/// Returns a heap-allocated buffer (free with `lxmf_free_bytes`) containing
-/// a flat parsed-message struct in the following layout, or NULL on error:
+/// A post whose prelude key does not produce its claimed source hash is
+/// rejected (NULL, `lxmf_last_error` says "key binding") and no key is
+/// remembered (DISPLAY_NAMES.md §2.3).
+///
+/// Returns a heap-allocated buffer (free with `lxmf_free_bytes`), or NULL on
+/// error:
 ///
 /// ```text
-/// offset  size  field
-/// ------  ----  -----
-/// 0       16    source_hash
-/// 16      8     timestamp_ms_be      (u64, big-endian, milliseconds)
-/// 24      1     signature_validated  (1 = OK, 0 = NOT verified)
-/// 25      1     unverified_reason    (0 = ok, 1 = SOURCE_UNKNOWN,
-///                                      2 = SIGNATURE_INVALID)
-/// 26      2     title_len_be         (u16, big-endian)
-/// 28      4     content_len_be       (u32, big-endian)
-/// 32      title_len    title bytes (UTF-8)
-/// 32+t    content_len  content bytes (UTF-8)
+/// offset      size  field
+/// ------      ----  -----
+/// 0           16    source_hash
+/// 16          8     timestamp_ms_be      (u64, big-endian, milliseconds)
+/// 24          1     signature_validated  (1 = OK, 0 = NOT verified)
+/// 25          1     unverified_reason    (0 = ok, 1 = SOURCE_UNKNOWN,
+///                                         2 = SIGNATURE_INVALID)
+/// 26          2     title_len_be         (u16, big-endian)
+/// 28          4     content_len_be       (u32, big-endian)
+/// 32          t     title bytes (UTF-8)
+/// 32+t        c     content bytes (UTF-8)
+/// 32+t+c      1     name_state           (0 = absent, 1 = clear, 2 = name)
+/// 33+t+c      2     name_len_be          (u16, big-endian; 0 unless state 2)
+/// 35+t+c      n     name bytes           (cleaned UTF-8)
 /// ```
 ///
-/// Total = 32 + title_len + content_len bytes.
+/// The name trailer is new (2026-09-27) and sits at the end, so decoders
+/// that read the first 32+t+c bytes keep working. It reports the post's
+/// Channel Display Name only when the signature validated; otherwise the
+/// state is 0.
 #[no_mangle]
 pub extern "C" fn retichat_channel_lxm_unpack(
     name_ptr: *const c_char,
@@ -1223,179 +1023,11 @@ pub extern "C" fn retichat_channel_lxm_unpack(
     out_len: *mut u32,
 ) -> *mut u8 {
     let name = unsafe { cstr_to_string(name_ptr) };
-    if name.is_empty() {
-        rns::set_error("channel name is empty".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
     let data = slice_from_raw(lxmf_data, lxmf_data_len);
-    if data.len() < LXMessage::DESTINATION_LENGTH + 32 {
-        rns::set_error("lxmf_data too short".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
+    match lxmf_rust::channel::unpack(&name, &data).and_then(|post| post.to_bridge_bytes()) {
+        Ok(bytes) => channel_out_buffer(bytes, out_len),
+        Err(e) => channel_out_error(out_len, e),
     }
-
-    // EC-decrypt the tail using the channel's deterministic identity.
-    let mut id = match channel_identity(&name) {
-        Ok(id) => id,
-        Err(e) => {
-            rns::set_error(format!("channel identity: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    let encrypted = &data[LXMessage::DESTINATION_LENGTH..];
-    let decrypted = match id.decrypt(encrypted) {
-        Ok(p) => p,
-        Err(e) => {
-            rns::set_error(format!("channel decrypt: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-
-    // The decrypted plaintext MUST start with the SOURCE-IDENTITY PRELUDE
-    // (magic "RTID" + 64-byte sender public key).  No legacy fallback —
-    // every Retichat client embeds its identity inline so signature
-    // validation is independent of LXMF announce timing.  If the magic
-    // is absent, the sender is on an incompatible build (or the message
-    // is malformed); reject loudly.
-    if decrypted.len() < CHANNEL_IDENTITY_PRELUDE_LEN
-        || &decrypted[..4] != CHANNEL_IDENTITY_PRELUDE_MAGIC
-    {
-        rns::set_error(
-            "channel: missing SOURCE-IDENTITY PRELUDE — sender on incompatible build or payload malformed".into()
-        );
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-    let identity_pub = &decrypted[4..CHANNEL_IDENTITY_PRELUDE_LEN];
-    let lxmf_tail = &decrypted[CHANNEL_IDENTITY_PRELUDE_LEN..];
-    if lxmf_tail.len() < LXMessage::DESTINATION_LENGTH {
-        rns::set_error("channel: LXMF tail after prelude too short".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-    // Register identity_pub under the LXMF source_hash (= the
-    // lxmf.delivery destination hash for this sender, NOT the identity
-    // hash).  We do not pre-validate that identity_pub corresponds to
-    // source_hash — LXMF signature validation will catch a forged
-    // identity_pub by failing as SIGNATURE_INVALID, which is exactly
-    // the integrity guarantee we want.  And since this code path only
-    // runs after channel-key EC-decrypt succeeds, the sender already
-    // holds the channel key (i.e. is an authorized publisher), so
-    // cache-poisoning by a non-publisher is not a concern.
-    let claimed_source_hash = &lxmf_tail[..LXMessage::DESTINATION_LENGTH];
-    if let Err(e) = Identity::remember_destination(claimed_source_hash, identity_pub, None) {
-        rns::set_error(format!("channel: remember_destination failed: {}", e));
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-
-    // Reconstruct the LXMF canonical block [lxmf_dest | source | sig | payload]
-    // using the lxmf.delivery destination_hash for the channel identity —
-    // i.e. the same dest_hash the sender used inside LXMessage::pack when
-    // it computed the signature.  (The wire prefix `data[..16]` is the
-    // channel identity hash for RFed routing; it is NOT what the LXMF
-    // signature was computed over.)
-    let lxmf_dest = match channel_destination(&name) {
-        Ok(d) => d.hash.clone(),
-        Err(e) => {
-            rns::set_error(format!("channel destination: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    if lxmf_dest.len() != LXMessage::DESTINATION_LENGTH {
-        rns::set_error("lxmf dest hash wrong length".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-
-    let mut full = Vec::with_capacity(lxmf_dest.len() + lxmf_tail.len());
-    full.extend_from_slice(&lxmf_dest);
-    full.extend_from_slice(lxmf_tail);
-
-    let msg = match LXMessage::unpack_from_bytes(&full, Some(LXMessage::PROPAGATED)) {
-        Ok(m) => m,
-        Err(e) => {
-            rns::set_error(format!("LXMessage::unpack: {}", e));
-            unsafe {
-                *out_len = 0;
-            }
-            return std::ptr::null_mut();
-        }
-    };
-
-    let source_hash = msg.source_hash.clone();
-    if source_hash.len() != LXMessage::DESTINATION_LENGTH {
-        rns::set_error("source_hash wrong length".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-    let timestamp_ms: u64 = (msg.timestamp.unwrap_or(0.0) * 1000.0) as u64;
-    let sig_ok: u8 = if msg.signature_validated { 1 } else { 0 };
-    let reason: u8 = match msg.unverified_reason {
-        Some(LXMessage::SOURCE_UNKNOWN) => 1,
-        Some(LXMessage::SIGNATURE_INVALID) => 2,
-        Some(other) => other,
-        None => 0,
-    };
-    let title = msg.title.clone();
-    let content = msg.content.clone();
-    if title.len() > u16::MAX as usize {
-        rns::set_error("title too large".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-    if content.len() > u32::MAX as usize {
-        rns::set_error("content too large".into());
-        unsafe {
-            *out_len = 0;
-        }
-        return std::ptr::null_mut();
-    }
-
-    let mut out = Vec::with_capacity(32 + title.len() + content.len());
-    out.extend_from_slice(&source_hash); // [0..16]
-    out.extend_from_slice(&timestamp_ms.to_be_bytes()); // [16..24]
-    out.push(sig_ok); // [24]
-    out.push(reason); // [25]
-    out.extend_from_slice(&(title.len() as u16).to_be_bytes()); // [26..28]
-    out.extend_from_slice(&(content.len() as u32).to_be_bytes()); // [28..32]
-    out.extend_from_slice(&title); // [32..32+t]
-    out.extend_from_slice(&content); // [32+t..]
-
-    let len = out.len() as u32;
-    let mut boxed = out.into_boxed_slice();
-    let ptr = boxed.as_mut_ptr();
-    std::mem::forget(boxed);
-    unsafe {
-        *out_len = len;
-    }
-    ptr
 }
 
 // ── Distro ───────────────────────────────────────────────────────────────────
@@ -1477,23 +1109,29 @@ pub extern "C" fn retichat_distro_list_payload(distro_handle: u64, out_len: *mut
 ///
 /// RFed only ever learns the distro public key, so it cannot sign an announce
 /// for the distro address itself. Without this the address resolves nowhere.
+///
+/// `announce_name/_len` is the raw UTF-8 Announce Display Name
+/// (DISPLAY_NAMES.md §2.2), NULL/0 for none. The announce app_data is
+/// `[name | nil, nil, [0xD0]]`, the name cleaned with the announce rules.
+/// (Until 2026-09-27 this argument was caller app_data; every caller passed
+/// NULL, which still means "no name".)
 #[no_mangle]
 pub extern "C" fn retichat_distro_announce_payload(
     distro_handle: u64,
-    app_data: *const u8,
-    app_data_len: u32,
+    announce_name: *const u8,
+    announce_name_len: u32,
     out_len: *mut u32,
 ) -> *mut u8 {
     let Some(distro) = distro_identity(distro_handle, "distro") else {
         unsafe { *out_len = 0; }
         return std::ptr::null_mut();
     };
-    let app = if app_data.is_null() || app_data_len == 0 {
+    let name = if announce_name.is_null() || announce_name_len == 0 {
         None
     } else {
-        Some(slice_from_raw(app_data, app_data_len))
+        Some(slice_from_raw(announce_name, announce_name_len))
     };
-    match lxmf_rust::distro::announce_payload(&distro, app.as_deref()) {
+    match lxmf_rust::distro::announce_payload(&distro, name.as_deref()) {
         Ok(bytes) => emit_buffer(bytes, out_len),
         Err(e) => emit_error(out_len, e),
     }
@@ -1532,10 +1170,15 @@ pub extern "C" fn retichat_distro_delivery_hash(
 /// addressed to a different distro, which a node may legitimately hand over.
 ///
 /// Fields: source_hash (hex), timestamp, title, content,
-/// is_delivery_notification, ticket, distro_transfer_key, sent_to, sent_by.
+/// is_delivery_notification, ticket, distro_transfer_key, sent_to, sent_by,
+/// display_name_state, display_name, signature_validated, unverified_reason.
 /// sent_to/sent_by are the RFed SPEC §17.11 sent-message sync marker (null
 /// unless the message is a sync copy; a non-null sent_by with a null sent_to
 /// is a copy with a malformed 0xFC) — same keys as Android's nativeDistroUnwrap.
+/// display_name_state is 0 absent, 1 clear, 2 name (display_name is the
+/// cleaned name, null unless 2); signature_validated / unverified_reason
+/// (0 ok, 1 source unknown, 2 signature invalid) decide whether to accept it
+/// (DISPLAY_NAMES.md §5.2).
 #[no_mangle]
 pub extern "C" fn retichat_distro_unwrap(
     distro_handle: u64,
@@ -1551,45 +1194,9 @@ pub extern "C" fn retichat_distro_unwrap(
 
     match lxmf_rust::distro::unwrap_blob(&mut distro, &data) {
         Ok(None) => emit_buffer(Vec::new(), out_len),
-        Ok(Some(msg)) => {
-            let json = format!(
-                concat!(
-                    r#"{{"source_hash":"{}","timestamp":{},"title":{},"content":{},"#,
-                    r#""is_delivery_notification":{},"ticket":{},"distro_transfer_key":{},"#,
-                    r#""sent_to":{},"sent_by":{}}}"#
-                ),
-                msg.source_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                msg.timestamp,
-                json_string(&msg.title),
-                json_string(&msg.content),
-                msg.is_delivery_notification,
-                msg.ticket.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
-                msg.distro_transfer_key.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
-                msg.sent_to.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
-                msg.sent_by.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
-            );
-            emit_buffer(json.into_bytes(), out_len)
-        }
+        Ok(Some(msg)) => emit_buffer(msg.to_json().into_bytes(), out_len),
         Err(e) => emit_error(out_len, e),
     }
-}
-
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Generate a fresh distro private key (64 bytes: X25519_priv || Ed25519_priv).
@@ -1751,5 +1358,124 @@ mod distro_send_tests {
         assert_eq!(retichat_peer_is_distro(unknown.as_ptr(), 16), 0);
         assert_eq!(retichat_peer_is_distro(unknown.as_ptr(), 15), 0);
         assert_eq!(retichat_peer_is_distro(std::ptr::null(), 16), 0);
+    }
+}
+
+#[cfg(test)]
+mod display_name_bridge_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn take(ptr: *mut u8, len: u32) -> Vec<u8> {
+        assert!(!ptr.is_null(), "NULL result: {:?}", rns::take_error());
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize).to_vec() };
+        lxmf_free_bytes(ptr, len);
+        bytes
+    }
+
+    fn sender() -> (u64, Identity) {
+        let identity = Identity::new(true);
+        (rns::store_handle(identity.clone()), identity)
+    }
+
+    fn pack(channel: &CString, sender: u64, state: u8, name: &[u8]) -> Vec<u8> {
+        let mut len = 0u32;
+        let ptr = retichat_channel_lxm_pack(
+            channel.as_ptr(), sender,
+            b"body".as_ptr(), 4,
+            std::ptr::null(), 0,
+            state, name.as_ptr(), name.len() as u32,
+            &mut len,
+        );
+        take(ptr, len)
+    }
+
+    fn unpack_bytes(channel: &CString, wire: &[u8]) -> Option<Vec<u8>> {
+        let mut len = 0u32;
+        let ptr = retichat_channel_lxm_unpack(channel.as_ptr(), wire.as_ptr(), wire.len() as u32, &mut len);
+        if ptr.is_null() { None } else { Some(take(ptr, len)) }
+    }
+
+    #[test]
+    fn channel_pack_and_unpack_carry_the_name_state() {
+        let channel = CString::new("public.ffi-names").unwrap();
+        let (handle, identity) = sender();
+        for (state, name, trailer) in [
+            (0u8, &b"ignored"[..], vec![0u8, 0, 0]),
+            (1, b"", vec![1, 0, 0]),
+            (2, b" Bob ", vec![2, 0, 3, b'B', b'o', b'b']),
+        ] {
+            let out = pack(&channel, handle, state, name);
+            let got = unpack_bytes(&channel, &out[8..]).expect("unpack");
+            assert_eq!(&got[..16], &lxmf_rust::channel::lxmf_delivery_hash_for_public_key(&identity.get_public_key().unwrap()).unwrap()[..]);
+            assert_eq!(&got[16..24], &out[..8], "the echo timestamp matches");
+            assert_eq!(got[24], 1, "signature validated");
+            assert_eq!(&got[32..36], b"body");
+            assert_eq!(&got[36..], &trailer[..], "state {state}");
+        }
+        // A name that cleans to nothing, or an unknown state, is an error.
+        let mut len = 7u32;
+        let zwsp = "\u{200B}".as_bytes();
+        let ptr = retichat_channel_lxm_pack(channel.as_ptr(), handle, b"x".as_ptr(), 1, std::ptr::null(), 0, 2, zwsp.as_ptr(), zwsp.len() as u32, &mut len);
+        assert!(ptr.is_null() && len == 0);
+        let ptr = retichat_channel_lxm_pack(channel.as_ptr(), handle, b"x".as_ptr(), 1, std::ptr::null(), 0, 9, std::ptr::null(), 0, &mut len);
+        assert!(ptr.is_null());
+    }
+
+    /// DISPLAY_NAMES.md §2.3 through the C API: a post whose prelude key does
+    /// not produce its claimed source is rejected and nothing is remembered.
+    #[test]
+    fn channel_unpack_rejects_a_key_that_does_not_bind() {
+        let name = "public.ffi-binding";
+        let channel = CString::new(name).unwrap();
+        let (attacker, _) = sender();
+        let victim = Identity::new(true);
+        let victim_hash = lxmf_rust::channel::lxmf_delivery_hash_for_public_key(&victim.get_public_key().unwrap()).unwrap();
+        let out = pack(&channel, attacker, 0, b"");
+        let mut id = lxmf_rust::channel::channel_identity(name).unwrap();
+        let mut plaintext = id.decrypt(&out[8 + 16..]).unwrap();
+        plaintext[68..84].copy_from_slice(&victim_hash);
+        let mut forged = lxmf_rust::channel::channel_id_hash(name).unwrap();
+        forged.extend_from_slice(&lxmf_rust::channel::channel_destination(name).unwrap().encrypt(&plaintext).unwrap());
+
+        assert!(unpack_bytes(&channel, &forged).is_none());
+        assert!(rns::take_error().unwrap_or_default().contains("key binding"));
+        assert_eq!(Identity::recall_public_key(&victim_hash), None);
+    }
+
+    #[test]
+    fn distro_announce_payload_takes_the_announce_name() {
+        let identity = Identity::new(true);
+        let handle = rns::store_handle(identity);
+        let mut len = 0u32;
+        let name = b"Alice";
+        let named = take(retichat_distro_announce_payload(handle, name.as_ptr(), name.len() as u32, &mut len), len);
+        assert!(named.windows(7).any(|w| w == [0x93, 0xc4, 0x05, b'A', b'l', b'i', b'c']), "[bin \"Alice\", nil, [0xD0]]");
+        let bare = take(retichat_distro_announce_payload(handle, std::ptr::null(), 0, &mut len), len);
+        assert!(bare.windows(4).any(|w| w == [0x93, 0xc0, 0xc0, 0x91]), "[nil, nil, [0xD0]]");
+    }
+
+    #[test]
+    fn display_name_clean_and_decode_are_exported() {
+        let raw = " Alice\u{202e} ".as_bytes();
+        let ptr = lxmf_display_name_clean(raw.as_ptr(), raw.len() as u32, 0);
+        assert!(!ptr.is_null());
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap(), "Alice");
+        lxmf_free_string(ptr);
+        let anon = b"Anonymous Peer";
+        assert!(lxmf_display_name_clean(anon.as_ptr(), anon.len() as u32, 1).is_null());
+        let ptr = lxmf_display_name_clean(anon.as_ptr(), anon.len() as u32, 0);
+        assert!(!ptr.is_null(), "a message name may be anything");
+        lxmf_free_string(ptr);
+        assert!(lxmf_display_name_clean(std::ptr::null(), 0, 0).is_null());
+
+        let fields = [0x81, 0xcc, 0xd1, 0xa3, b'B', b'o', b'b'];
+        let mut len = 0u32;
+        assert_eq!(take(lxmf_display_name_decode(fields.as_ptr(), fields.len() as u32, &mut len), len), vec![2, 0, 3, b'B', b'o', b'b']);
+        let clear = [0x81, 0xcc, 0xd1, 0xc4, 0x00];
+        assert_eq!(take(lxmf_display_name_decode(clear.as_ptr(), clear.len() as u32, &mut len), len), vec![1, 0, 0]);
+        let retired = [0x81, 0x10, 0xa3, b'B', b'o', b'b'];
+        assert_eq!(take(lxmf_display_name_decode(retired.as_ptr(), retired.len() as u32, &mut len), len), vec![0, 0, 0]);
+        assert_eq!(take(lxmf_display_name_decode(std::ptr::null(), 0, &mut len), len), vec![0, 0, 0]);
     }
 }

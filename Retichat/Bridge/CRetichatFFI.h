@@ -105,6 +105,10 @@ void  lxmf_free_bytes(uint8_t *ptr, uint32_t len);
 
 #pragma mark - LXMF Client Lifecycle
 
+/// `display_name` is the initial Message Display Name (DISPLAY_NAMES.md §4.1):
+/// sent inside messages (field 0xD1) by the name-ledger rule, never announced.
+/// NULL/"" = none. The Announce Display Name starts empty; set both at runtime
+/// with lxmf_client_set_message_display_name / lxmf_client_set_announce_display_name.
 uint64_t lxmf_client_start(const char *config_dir,
                             const char *storage_path,
                             const char *identity_path,
@@ -129,6 +133,8 @@ typedef void (*lxmf_delivery_callback_t)(
     const uint8_t *fields_raw, uint32_t fields_len
 );
 
+/// `display_name` is the announce's name cleaned with the announce rules
+/// (DISPLAY_NAMES.md §5.1 announceName; "Anonymous Peer" is none), or NULL.
 typedef void (*lxmf_announce_callback_t)(
     void *context,
     const uint8_t *dest_hash, uint32_t dest_len,
@@ -391,12 +397,41 @@ int32_t lxmf_client_publish(uint64_t client, double refresh_secs);
 /// daemon. Returns 0 on success.
 int32_t lxmf_client_unpublish(uint64_t client);
 
-/// Look up the cached display name for a destination hash (from its last announce).
+/// Look up the Announce Display Name last heard from a destination hash
+/// (DISPLAY_NAMES.md §5.1 announceName: cleaned, "Anonymous Peer" is none).
 /// Writes a NUL-terminated UTF-8 string into out_buf.
-/// Returns the number of bytes written (including NUL), or 0 if unknown / buffer too small.
+/// Returns the number of bytes written (including NUL), or 0 if none / buffer too small.
 int32_t lxmf_client_recall_display_name(uint64_t client,
                                          const uint8_t *dest_hash, uint32_t dest_len,
                                          char *out_buf, uint32_t buf_len);
+
+#pragma mark - Display names (DISPLAY_NAMES.md)
+
+/// Set the Message Display Name at runtime (§4.1): the router adds it (field
+/// 0xD1) to outbound messages by the name-ledger rule. NULL or "" clears it.
+/// Cleaned (§3). No restart. Returns 0 on success, -1 on error (e.g. not UTF-8).
+int32_t lxmf_client_set_message_display_name(uint64_t client, const char *name);
+
+/// Set the Announce Display Name at runtime (§2.2): the PUBLIC name in this
+/// client's lxmf.delivery announce. NULL or "" (the default) announces nil.
+/// Cleaned with the announce rules ("Anonymous Peer" is none). The next
+/// announce carries it. Returns 0 on success, -1 on error.
+int32_t lxmf_client_set_announce_display_name(uint64_t client, const char *name);
+
+/// Clean a display name exactly as the router does (§3), for the settings
+/// screens. `announce` non-zero also maps "Anonymous Peer" to none.
+/// Returns a NUL-terminated UTF-8 string (free with lxmf_free_string), or
+/// NULL when the input cleans to no name. Never fails.
+char *lxmf_display_name_clean(const uint8_t *raw, uint32_t raw_len, int32_t announce);
+
+/// Decode field 0xD1 from the msgpack `fields_raw` a delivery callback hands
+/// over. Returns a heap buffer (free with lxmf_free_bytes), at least 3 bytes:
+///     [0]     name_state  0 = absent, 1 = clear, 2 = name
+///     [1..3]  name_len    u16 BE (0 unless state 2)
+///     [3..]   name        cleaned UTF-8
+/// Accepting it depends on the message's signature (§5.2).
+uint8_t *lxmf_display_name_decode(const uint8_t *fields_raw, uint32_t fields_len,
+                                  uint32_t *out_len);
 
 #pragma mark - LXMF Messages
 
@@ -563,21 +598,33 @@ uint8_t *retichat_compute_channel_stamp(const uint8_t *payload, uint32_t payload
 /// Build an LXMF message addressed to the channel destination and pack it
 /// into `lxmf_data` (the bytes RFed routes opaquely).
 ///
-/// `name`           — channel name (e.g. "public.general")
-/// `sender_handle`  — local user identity handle
-/// `content`        — message body (UTF-8)
-/// `title`          — optional title (UTF-8); pass NULL/0 for none
+/// `name`                — channel name (e.g. "public.general")
+/// `sender_handle`       — local user identity handle
+/// `content`             — message body (UTF-8)
+/// `title`               — optional title (UTF-8); pass NULL/0 for none
+/// `display_name_state`  — Channel Display Name in field 0xD1 (DISPLAY_NAMES.md
+///                         §2.3, §4.2): 0 = none (no 0xD1; bytes identical to
+///                         before names existed), 1 = clear (empty 0xD1),
+///                         2 = the name in `display_name` (cleaned; a name that
+///                         cleans to nothing is an error)
 ///
-/// Returns heap-allocated lxmf_data (free with lxmf_free_bytes) starting with
-/// the 16-byte channel_hash, or NULL on error.
+/// Returns a heap buffer (free with lxmf_free_bytes), or NULL on error:
+///     [0..8]   timestamp_ms_be (u64) — the signed LXMF timestamp, for echo dedup
+///     [8..]    lxmf_data: 16-byte channel_hash + EC_encrypted tail (send this)
 uint8_t *retichat_channel_lxm_pack(const char *name,
                                     uint64_t sender_handle,
                                     const uint8_t *content, uint32_t content_len,
                                     const uint8_t *title,   uint32_t title_len,
+                                    uint8_t display_name_state,
+                                    const uint8_t *display_name, uint32_t display_name_len,
                                     uint32_t *out_len);
 
 /// Unpack an LXMF channel message.
 /// Input is `lxmf_data` (16-byte channel_hash + EC_encrypted tail).
+///
+/// A post whose embedded public key does not produce its claimed source hash
+/// is rejected (NULL; lxmf_last_error mentions "key binding") and no key is
+/// remembered (DISPLAY_NAMES.md §2.3).
 ///
 /// Returns a heap-allocated buffer (free with lxmf_free_bytes) with layout:
 ///     [0..16]   source_hash
@@ -586,8 +633,13 @@ uint8_t *retichat_channel_lxm_pack(const char *name,
 ///     [25]      unverified_reason   (0=ok, 1=SOURCE_UNKNOWN, 2=SIGNATURE_INVALID)
 ///     [26..28]  title_len_be   (u16)
 ///     [28..32]  content_len_be (u32)
-///     [32..32+t]   title bytes
-///     [32+t..]     content bytes
+///     [32..32+t]       title bytes
+///     [32+t..32+t+c]   content bytes
+///     [32+t+c]         name_state (0=absent, 1=clear, 2=name) — the post's
+///                      Channel Display Name, reported only when the
+///                      signature validated
+///     [33+t+c..35+t+c] name_len_be (u16; 0 unless state 2)
+///     [35+t+c..]       name bytes (cleaned UTF-8)
 uint8_t *retichat_channel_lxm_unpack(const char *name,
                                       const uint8_t *lxmf_data, uint32_t lxmf_data_len,
                                       uint32_t *out_len);
@@ -710,10 +762,15 @@ uint8_t *retichat_distro_list_payload(uint64_t distro_handle, uint32_t *out_len)
 ///
 /// RFed only ever learns the distro PUBLIC key, so it cannot sign an announce
 /// for the distro address itself. Without this the address resolves nowhere and
-/// senders cannot reach it. Pass NULL/0 app_data for none.
+/// senders cannot reach it.
+///
+/// `announce_name` is the raw UTF-8 Announce Display Name (DISPLAY_NAMES.md
+/// §2.2), NULL/0 for none: the announce app_data is [name | nil, nil, [0xD0]],
+/// the name cleaned with the announce rules. (This argument used to be caller
+/// app_data; NULL/0 still means "no name".)
 uint8_t *retichat_distro_announce_payload(uint64_t distro_handle,
-                                          const uint8_t *app_data,
-                                          uint32_t app_data_len,
+                                          const uint8_t *announce_name,
+                                          uint32_t announce_name_len,
                                           uint32_t *out_len);
 
 /// The distro's lxmf.delivery hash — the address senders actually use.
@@ -726,7 +783,11 @@ int32_t retichat_distro_delivery_hash(uint64_t distro_handle,
 /// Decrypt a distro blob (from rfed.delivery or /rfed/pull) and return the
 /// message as JSON for JSONDecoder:
 ///   { source_hash, timestamp, title, content,
-///     is_delivery_notification, ticket, distro_transfer_key }
+///     is_delivery_notification, ticket, distro_transfer_key, sent_to, sent_by,
+///     display_name_state, display_name, signature_validated, unverified_reason }
+/// display_name_state: 0 absent, 1 clear, 2 name (display_name null unless 2).
+/// signature_validated + unverified_reason (0 ok, 1 source unknown, 2 invalid)
+/// decide whether to accept the name (DISPLAY_NAMES.md §5.2).
 ///
 /// A ZERO-LENGTH result is not an error: it means the blob is addressed to a
 /// different distro, which a node may legitimately hand over.
