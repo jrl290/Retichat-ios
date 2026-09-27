@@ -253,9 +253,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             logLevel: 4,
             stampCost: -1
         )
-        // Set right after the start, on the same queue, so it is in place
-        // before the first announce (the publish in finishStartService).
-        let announceName = prefs.announceDisplayName
 
         // Heavy FFI call (TCP connect, transport init, ratchet load) runs off
         // the main thread so the UI stays responsive during startup.
@@ -266,16 +263,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // which is what Settings → Apply hit once shutdown began tearing
         // links down (B31) and so took longer than the start's head start.
         let ffiQueueRef = ffiQueue
-        Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath, announceName] in
+        Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath] in
             let result: Result<LxmfClient, Error> = await withCheckedContinuation { cont in
                 ffiQueueRef.async {
-                    cont.resume(returning: Result {
-                        let client = try LxmfClient.start(config: config)
-                        if !client.setAnnounceDisplayName(announceName) {
-                            print("[Retichat] Announce Display Name not set: \(LxmfClient.lastError ?? "unknown error")")
-                        }
-                        return client
-                    })
+                    cont.resume(returning: Result { try LxmfClient.start(config: config) })
                 }
             }
 
@@ -312,7 +303,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///   5. Flip `serviceRunning = true` — this lets the App scene's
     ///      `.onReceive` handler wire up `RfedChannelClient` exactly once.
     ///   6. Start RNode interfaces (independent of the path/link stack).
-    ///   7. Hand delivery destination to publish daemon (auto-re-announce).
+    ///   7. Set the display names (DISPLAY_NAMES.md §6), then hand the
+    ///      delivery destination to the publish daemon (auto-re-announce):
+    ///      the Announce Display Name must be in place before the first
+    ///      announce. Both on ffiQueue, in that order.
     ///   8. Side-tasks: ratchet sync, periodic poll (seeds the router's
     ///      propagation node at once), rfed notify register.
     ///   9. Distro registration with RFed (after ConnectionStateManager is
@@ -371,6 +365,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 .filter { $0.enabled && $0.type == InterfaceKind.rnode.rawValue }
                 .map { ($0.id, $0.name, $0.configJSON) }
         RNodeInterfaceCoordinator.shared.start(with: rnodeRows)
+
+        // The names as saved now (DISPLAY_NAMES.md §6), on ffiQueue ahead of
+        // the publish below: the Announce Display Name is in place before
+        // the first announce, and a name changed in Settings while the
+        // stack was starting is not lost.
+        applyDisplayNames(announceChanged: false)
 
         // Hand the delivery destination off to Transport's auto-announce
         // daemon: it will announce immediately, on every interface up-edge,
@@ -3071,21 +3071,26 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         namesChanged()
     }
 
-    /// Fill announceName from the announce cache (the Rust side's record of
-    /// the last announce), for a contact whose announce this app did not
-    /// see arrive. Only a name found replaces: a cache miss is not an
-    /// announce without a name.
+    /// Fill an empty announceName from the announce cache (the Rust side's
+    /// record of the last announce): for a contact whose announce arrived
+    /// before the contact existed, so handleAnnounce never saw it. It only
+    /// fills: announces themselves replace (handleAnnounce), and a cache
+    /// miss is not an announce without a name. The lookup runs on ffiQueue.
     private func refreshAnnounceNameFromCache(destHash: String) {
-        guard let client = lxmfClient, let ctx = modelContext,
-              let hashData = Data(hexString: destHash),
-              let name = client.recallDisplayName(for: hashData) else { return }
-        let descriptor = FetchDescriptor<ContactEntity>(
-            predicate: #Predicate { $0.destHash == destHash }
-        )
-        guard let contact = try? ctx.fetch(descriptor).first, contact.announceName != name else { return }
-        contact.announceName = name
-        try? ctx.save()
-        namesChanged()
+        guard let client = lxmfClient, let hashData = Data(hexString: destHash) else { return }
+        ffiQueue.async { [weak self] in
+            guard let name = client.recallDisplayName(for: hashData) else { return }
+            Task { @MainActor [weak self] in
+                guard let self, let ctx = self.modelContext else { return }
+                let descriptor = FetchDescriptor<ContactEntity>(
+                    predicate: #Predicate { $0.destHash == destHash }
+                )
+                guard let contact = try? ctx.fetch(descriptor).first, contact.announceName == nil else { return }
+                contact.announceName = name
+                try? ctx.save()
+                self.namesChanged()
+            }
+        }
     }
 
     /// §5.4, once (guarded by a persisted flag): each contact's single old
@@ -3111,7 +3116,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 for (hash, value) in legacy {
                     let descriptor = FetchDescriptor<ContactEntity>(predicate: #Predicate { $0.destHash == hash })
                     guard let contact = try? ctx.fetch(descriptor).first else { continue }
-                    switch DisplayNames.migrateLegacyName(value, hash: hash, recalledAnnounceName: recalled[hash]) {
+                    // Cleaned as any saved name is (§3): an old announce name
+                    // was stored raw, and the recalled one comes back cleaned.
+                    let cleaned = LxmfClient.cleanDisplayName(value) ?? ""
+                    switch DisplayNames.migrateLegacyName(cleaned, hash: hash, recalledAnnounceName: recalled[hash]) {
                     case .drop:
                         break
                     case .announceName(let name):

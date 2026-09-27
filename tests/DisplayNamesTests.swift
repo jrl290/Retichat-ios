@@ -245,6 +245,23 @@ func testTheContactMigration() {
     check(m("Cafe", recalled: nil) == .localName("Cafe"), "no recalled name: localName")
 }
 
+func testTheContactMigrationWiring() {
+    let repo = source("Retichat/Services/ChatRepository.swift")
+    let migrate = body(repo, "private func migrateLegacyContactNamesIfNeeded(")
+    check(migrate.contains("guard !prefs.contactNamesMigrated") && migrate.contains("self.prefs.contactNamesMigrated = true"),
+          "the contact migration runs once, guarded by a persisted flag")
+    check(before(migrate, "ffiQueue.async", "client.recallDisplayName(for: data)"),
+          "its announce-name recalls run off the main thread")
+    check(migrate.contains("if contact.localName == nil { contact.localName = name")
+            && migrate.contains("if contact.announceName == nil { contact.announceName = name"),
+          "a slot filled since is never overwritten")
+    check(migrate.contains("LxmfClient.cleanDisplayName(value)"), "old names are cleaned as saved names are")
+    check(body(repo, "private func finishStartService(").contains("migrateLegacyContactNamesIfNeeded(client: client)"),
+          "it runs when the stack is up (the recall needs it)")
+    check(body(repo, "private func resolvedName(").contains("if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder("),
+          "until then an old non-placeholder name is still shown")
+}
+
 func testTheSettingsMigration() {
     let suite = "display-names-test-\(UUID().uuidString)"
     guard let d = UserDefaults(suiteName: suite) else { check(false, "a scratch defaults suite"); return }
@@ -408,9 +425,13 @@ func testTheSettings() {
             && vm.contains("messageDisplayName = LxmfClient.cleanDisplayName(messageDisplayName) ?? \"\""),
           "names are saved cleaned, as the router cleans them")
     let repo = source("Retichat/Services/ChatRepository.swift")
-    check(before(repo, "let client = try LxmfClient.start(config: config)\n                        if !client.setAnnounceDisplayName(announceName)",
-                 "_ = publishClient.publish(refreshSecs: 30 * 60)"),
-          "the announce name is set on the stack's queue before the first announce")
+    let finish = body(repo, "private func finishStartService(")
+    check(before(finish, "self.lxmfClient = client", "applyDisplayNames(announceChanged: false)")
+            && before(finish, "applyDisplayNames(announceChanged: false)", "_ = publishClient.publish(refreshSecs: 30 * 60)"),
+          "the names are set on the stack's queue before the first announce")
+    let apply = body(repo, "func applyDisplayNames(")
+    check(before(apply, "ffiQueue.async {", "client.setAnnounceDisplayName(announce)"),
+          "the setters run on ffiQueue, in order with the publish, never on the main thread")
     check(source("Retichat/Services/RfedDistroClient.swift").contains(
             "announceName: UserPreferences.shared.announceDisplayName"),
           "the distro's pre-signed announce carries it too (§2.2)")
@@ -428,6 +449,7 @@ enum DisplayNamesTests {
         testTheDigestMatchesTheRustVectors()
         testTheDistroUnwrapKeys()
         testTheContactMigration()
+        testTheContactMigrationWiring()
         testTheSettingsMigration()
         testTheReceivePaths()
         testTheSurfaces()
