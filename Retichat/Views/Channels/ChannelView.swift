@@ -18,6 +18,11 @@ struct ChannelInfoSheet: View {
     var onLeave: (() -> Void)? = nil
     @State private var pushEnabled = false
     @State private var notificationsEnabled = false
+    /// "Copied!" feedback on Copy name, as on the QR code sheet.
+    @State private var copiedName = false
+
+    /// Exactly what joins the channel: what Copy name and Share hand over.
+    private var shareName: String { ChannelShareInfo.shareText(channel.channelName) }
 
     var body: some View {
         NavigationStack {
@@ -26,11 +31,39 @@ struct ChannelInfoSheet: View {
 
                 ScrollView {
                     VStack(spacing: 16) {
-                        // Header
-                        VStack(spacing: 6) {
-                            Text("#\(channel.channelName)")
+                        // Header: the full channel name is how a channel is
+                        // shared (for a private channel it is the invite), so
+                        // it is shown whole, selectable and without the "#"
+                        // decoration; the hash, which cannot be used to join,
+                        // is secondary.
+                        VStack(spacing: 8) {
+                            Text(shareName)
                                 .font(.title3).fontWeight(.semibold)
                                 .foregroundColor(.retichatOnSurface)
+                                .textSelection(.enabled)
+                                .lineLimit(nil)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .multilineTextAlignment(.center)
+                            Text(ChannelShareInfo.hint(channel.channelName))
+                                .font(.caption)
+                                .foregroundColor(.retichatOnSurfaceVariant)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .multilineTextAlignment(.center)
+                            HStack(spacing: 12) {
+                                Button {
+                                    UIPasteboard.general.string = shareName
+                                    copiedName = true
+                                } label: {
+                                    Label(copiedName ? "Copied!" : "Copy name", systemImage: "doc.on.doc")
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.retichatPrimary)
+                                ShareLink(item: shareName) {
+                                    Label("Share", systemImage: "square.and.arrow.up")
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.retichatPrimary)
+                            }
                             Text(channel.id)
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundColor(.retichatOnSurfaceVariant)
@@ -122,6 +155,13 @@ struct ChannelInfoSheet: View {
             .onAppear {
                 pushEnabled = UserPreferences.shared.isChannelPushEnabled(channel.id)
                 notificationsEnabled = UserPreferences.shared.isChannelNotificationsEnabled(channel.id)
+            }
+            // Presentation timing only — how long "Copied!" stays up.
+            .task(id: copiedName) {
+                guard copiedName else { return }
+                try? await Task.sleep(for: .seconds(1.5))
+                guard !Task.isCancelled else { return }
+                copiedName = false
             }
         }
     }
