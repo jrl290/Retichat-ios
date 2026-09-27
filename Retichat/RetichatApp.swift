@@ -246,9 +246,10 @@ struct RetichatApp: App {
                     handleDeepLink(url)
                 }
                 .onAppear {
-                    // Channel labels fall back to the contact's name (DISPLAY_NAMES.md §5.3).
-                    channelClient.contactName = { [weak repo = repository] hash in
-                        repo?.resolvedContactName(for: hash)
+                    // Channel labels: a local name leads, else the contact's
+                    // name is the fallback (DISPLAY_NAMES.md §5.3).
+                    channelClient.contactEntry = { [weak repo = repository] hash in
+                        repo?.contactSharedName(for: hash)
                     }
                     channelClient.configure(
                         modelContext: modelContainer.mainContext,

@@ -451,17 +451,19 @@ struct ConversationView: View {
                         // the exact same visual layout. Channel timestamps
                         // are Unix-ms; ChatMessage expects seconds. Channels
                         // never carry attachments or upload progress. The
-                        // sender: channelName ?? contact ?? shortHash, with
-                        // the 8-hex hash beside a channel name (§5.3).
+                        // sender (§5.3): the local name with the channel name
+                        // in grey, else the channel name with the short hash,
+                        // else the contact's name or the short hash, alone.
                         let label = msg.isOutgoing ? nil : channelClient.senderLabel(
                             channelHashHex: channel.id, senderHashHex: msg.senderHash,
-                            contactName: repository.resolvedContactName(for: msg.senderHash))
+                            contact: repository.contactSharedName(for: msg.senderHash))
                         ChatBubble(
                             message: ChatMessage(
                                 id: msg.id,
                                 senderHash: msg.senderHash,
                                 senderName: label?.label ?? "You",
                                 senderSecondary: label?.secondary,
+                                senderSecondaryIsHash: label?.secondaryIsHash ?? false,
                                 content: msg.content,
                                 timestamp: msg.timestamp / 1000.0,
                                 isOutgoing: msg.isOutgoing,

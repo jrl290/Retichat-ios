@@ -374,7 +374,7 @@ class NotificationService: UNNotificationServiceExtension {
                 hash: shown.senderHash,
                 channelName: DisplayNames.channelName(afterPost: shown.displayName, postMs: shown.timestampMs,
                                                       stored: channelNames[shown.senderHash]),
-                contactName: chatNames[shown.senderHash]?.name)
+                contact: chatNames[shown.senderHash])
             candidates.append((shown.senderHash, shown.content, shown.timestamp, "channel", channelPull.channelHex,
                                DisplayNames.channelNotificationTitle(channelName: channelPull.channelName, label: label)))
         }

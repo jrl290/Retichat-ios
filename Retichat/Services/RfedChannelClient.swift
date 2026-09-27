@@ -91,10 +91,11 @@ final class RfedChannelClient: ObservableObject {
     /// names included, so its titles follow §5.2's ordering too.
     private var sharedSenderNames: [String: [String: DisplayNames.SharedChannelName]] = [:]
 
-    /// The contact resolver without the hash fallback (ChatRepository
-    /// .resolvedContactName), for channel labels in notifications. Set by
-    /// the app when both exist.
-    var contactName: (@MainActor (String) -> String?)?
+    /// The contact resolver without the hash fallback, with the slot the
+    /// name came from (ChatRepository.contactSharedName), for channel labels
+    /// in notifications: a local-slot name leads a channel name (§5.3). Set
+    /// by the app when both exist.
+    var contactEntry: (@MainActor (String) -> DisplayNames.SharedName?)?
 
     private var linkStatusTimer: AnyCancellable?
     private var trackedChannelStreamNodes: Set<String> = []
@@ -1025,7 +1026,7 @@ final class RfedChannelClient: ObservableObject {
             // Named as the bubble names the sender (audit L6), and as the NSE
             // names it (DisplayNames.channelNotificationTitle).
             let label = senderLabel(channelHashHex: channelHashHex, senderHashHex: senderHashHex,
-                                    contactName: contactName?(senderHashHex))
+                                    contact: contactEntry?(senderHashHex))
             NotificationManager.shared.postMessageNotification(
                 chatId: channelHashHex,
                 senderName: DisplayNames.channelNotificationTitle(channelName: channel.channelName, label: label),
@@ -1356,13 +1357,15 @@ final class RfedChannelClient: ObservableObject {
 
     // MARK: - Channel Display Names (DISPLAY_NAMES.md §4.2, §5)
 
-    /// A poster's label in a channel: channelName ?? the contact's own
-    /// resolution (`contactName`, no hash fallback) ?? shortHash, with the
-    /// 8-hex hash as secondary text when the label is the channel name.
-    func senderLabel(channelHashHex: String, senderHashHex: String, contactName: String?) -> DisplayNames.ChannelLabel {
+    /// A poster's label in a channel (§5.3, DisplayNames.channelLabel): the
+    /// user's localName with the channel name as secondary text; else the
+    /// channel name with the short hash; else the contact's own resolution
+    /// (`contact`, no hash fallback) ?? shortHash, alone.
+    func senderLabel(channelHashHex: String, senderHashHex: String,
+                     contact: DisplayNames.SharedName?) -> DisplayNames.ChannelLabel {
         DisplayNames.channelLabel(hash: senderHashHex,
                                   channelName: senderNames[channelHashHex]?[senderHashHex],
-                                  contactName: contactName)
+                                  contact: contact)
     }
 
     private func loadSenderNames() {

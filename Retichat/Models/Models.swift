@@ -223,9 +223,12 @@ struct ChatMessage: Identifiable {
     var senderHash: String
     /// The sender's resolved label (DisplayNames), never a stored snapshot.
     var senderName: String
-    /// Shown beside senderName: the 8-hex short hash when the label is a
-    /// channel name (DISPLAY_NAMES.md §5.3), else nil.
+    /// Shown beside senderName in grey (DISPLAY_NAMES.md §5.3): in a channel,
+    /// the poster's channel name beside the user's local name for them, or
+    /// the short hash beside a channel name; else nil.
     var senderSecondary: String? = nil
+    /// Whether senderSecondary is the short hash (set in monospace).
+    var senderSecondaryIsHash: Bool = false
     var content: String
     var timestamp: Double
     var isOutgoing: Bool

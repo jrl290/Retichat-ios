@@ -209,18 +209,47 @@ func testTheResolver() {
           "then the short hash")
     check(DisplayNames.contactName(local: nil, message: nil, announce: nil) == nil, "no slot, no name")
 
-    let fromChannel = DisplayNames.channelLabel(hash: alice, channelName: "Wizard", contactName: "Alice")
-    check(fromChannel == .init(label: "Wizard", secondary: "1a2b3c4d\u{2026}"),
-          "channelName first, with the standard short hash beside it (\"1a2b3c4d…\", as on Android and web)")
-    check(DisplayNames.channelLabel(hash: alice, channelName: nil, contactName: "Alice")
-            == .init(label: "Alice", secondary: nil), "then the contact's name, no hash")
-    check(DisplayNames.channelLabel(hash: alice, channelName: "", contactName: nil)
-            == .init(label: "1a2b3c4d\u{2026}", secondary: nil), "then the short hash")
+    // The channel resolver (§5.3, James 2026-09-27): a local name leads and
+    // the channel name goes to the grey spot; a channel name alone has the
+    // short hash beside it; no channel name, the contact resolver, alone.
+    typealias SN = DisplayNames.SharedName
+    let fromChannel = DisplayNames.channelLabel(hash: alice, channelName: "Wizard",
+                                                contact: SN(name: "Alice", slot: .message))
+    check(fromChannel == .init(label: "Wizard", secondary: .shortHash("1a2b3c4d\u{2026}")),
+          "a channelName, no localName: the channel name, with the standard short hash beside it")
+    check(fromChannel.secondary == "1a2b3c4d\u{2026}" && fromChannel.secondaryIsHash,
+          "that secondary text is the hash, set in monospace")
+    let localFirst = DisplayNames.channelLabel(hash: alice, channelName: "Wizard",
+                                               contact: SN(name: "Mum", slot: .local))
+    check(localFirst == .init(label: "Mum", secondary: .channelName("Wizard")),
+          "a channelName and a localName: the local name leads, the channel name is the secondary text")
+    check(localFirst.secondary == "Wizard" && !localFirst.secondaryIsHash,
+          "that secondary text is the channel name, not a hash")
+    for slot in [DisplayNames.NameSlot.message, .announce, .legacy] {
+        check(DisplayNames.channelLabel(hash: alice, channelName: "Wizard", contact: SN(name: "Alice", slot: slot))
+                == .init(label: "Wizard", secondary: .shortHash("1a2b3c4d\u{2026}")),
+              "only a local-slot name leads a channel name, not a \(slot.rawValue) one")
+    }
+    check(DisplayNames.channelLabel(hash: alice, channelName: "Wizard", contact: SN(name: "", slot: .local))
+            == .init(label: "Wizard", secondary: .shortHash("1a2b3c4d\u{2026}")),
+          "an empty local name is no local name")
+    check(DisplayNames.channelLabel(hash: alice, channelName: "Wizard", contact: nil)
+            == .init(label: "Wizard", secondary: .shortHash("1a2b3c4d\u{2026}")),
+          "a channel name from a stranger has the hash beside it")
+    check(DisplayNames.channelLabel(hash: alice, channelName: nil, contact: SN(name: "Alice", slot: .message))
+            == .init(label: "Alice", secondary: nil), "no channelName: the contact's name, no secondary")
+    check(DisplayNames.channelLabel(hash: alice, channelName: nil, contact: SN(name: "Mum", slot: .local))
+            == .init(label: "Mum", secondary: nil), "a local name alone has no secondary either")
+    check(DisplayNames.channelLabel(hash: alice, channelName: "", contact: nil)
+            == .init(label: "1a2b3c4d\u{2026}", secondary: nil), "then the short hash, alone")
     check(DisplayNames.channelNotificationTitle(channelName: "public.general", label: fromChannel)
             == "#public.general (Wizard \u{00B7} 1a2b3c4d\u{2026})", "a channel-name notification shows the hash too")
+    check(DisplayNames.channelNotificationTitle(channelName: "public.general", label: localFirst)
+            == "#public.general (Mum \u{00B7} Wizard)",
+          "a notification names the poster by the main label: the local name, then the channel name")
     check(DisplayNames.channelNotificationTitle(channelName: "public.general",
                                                 label: .init(label: "Alice", secondary: nil))
-            == "#public.general (Alice)", "a contact-named one does not")
+            == "#public.general (Alice)", "a contact-named one has no secondary")
 
     // The NSE's channel title (review ios-order-2): §5.2's ordering per
     // (channel, sender), against the app's shared channelNameAtMs.
@@ -586,10 +615,22 @@ func testTheSurfaces() {
             && !view.contains("guard !trimmed.isEmpty else { return }\n        if isGroup"),
           "the rename field holds only the local name, and saving it empty clears it (audit M5)")
     check(view.contains("channelClient.senderLabel(\n                            channelHashHex: channel.id, senderHashHex: msg.senderHash,")
-            && view.contains("senderSecondary: label?.secondary,"),
-          "channel bubbles use the channel resolver, with the hash beside a channel name (audit H10)")
-    check(source("Retichat/Views/Components/GlassComponents.swift").contains("if let secondary = message.senderSecondary {"),
-          "the bubble shows that hash")
+            && view.contains("senderSecondary: label?.secondary,")
+            && view.contains("senderSecondaryIsHash: label?.secondaryIsHash ?? false,"),
+          "channel bubbles use the channel resolver, with its secondary text and its kind (audit H10)")
+    check(view.contains("contact: repository.contactSharedName(for: msg.senderHash))"),
+          "with the contact's name and slot, so a local name leads a channel name (§5.3)")
+    let bubble = source("Retichat/Views/Components/GlassComponents.swift")
+    check(bubble.contains("if let secondary = message.senderSecondary {"),
+          "the bubble shows the secondary text, hash or channel name")
+    check(bubble.contains(".font(message.senderSecondaryIsHash\n                                      ? .system(.caption2, design: .monospaced) : .caption2)"),
+          "a hash in monospace, a channel name in the plain caption font")
+    let channelClient = source("Retichat/Services/RfedChannelClient.swift")
+    check(channelClient.contains("contact: contactEntry?(senderHashHex))")
+            && source("Retichat/RetichatApp.swift").contains("repo?.contactSharedName(for: hash)"),
+          "app channel notifications get the contact's slot too, so they use the same main label")
+    check(source("NotificationService/NotificationService.swift").contains("contact: chatNames[shown.senderHash])"),
+          "NSE channel titles pass the chat_names.json entry, whose slot says whether it is a local name")
     for picker in ["NewChat/NewChatView.swift", "NewChat/NewGroupView.swift", "NewChat/NewConversationView.swift"] {
         check(!source("Retichat/Views/" + picker).contains("prefix(16)"),
               "\(picker) shows the resolved name, not a 16-hex placeholder")

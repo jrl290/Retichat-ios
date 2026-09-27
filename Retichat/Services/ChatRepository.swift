@@ -3010,14 +3010,23 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return resolvedContactName(for: destHash) ?? DisplayNames.shortHash(destHash)
     }
 
-    /// The contact's name without the hash fallback (nil when it has none):
-    /// what a channel label falls back to after the channel name.
+    /// The contact's name without the hash fallback (nil when it has none).
     func resolvedContactName(for destHash: String) -> String? {
         guard let ctx = modelContext else { return nil }
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == destHash }
         )
         return (try? ctx.fetch(descriptor).first).flatMap { resolvedName($0) }
+    }
+
+    /// resolvedContactName with the slot it came from: a channel label
+    /// shows a local-slot name first (DisplayNames.channelLabel, §5.3).
+    func contactSharedName(for destHash: String) -> DisplayNames.SharedName? {
+        guard let ctx = modelContext else { return nil }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        return (try? ctx.fetch(descriptor).first).flatMap { sharedName($0) }
     }
 
     /// The three slots of a contact, for the rename UI (nil: no contact).

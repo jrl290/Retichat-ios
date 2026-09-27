@@ -65,18 +65,25 @@ struct ChatBubble: View {
             if message.isOutgoing { Spacer(minLength: 48) }
 
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 4) {
-                // Sender name in group chats and channels; beside a channel
-                // name, the sender's 8-hex hash (DISPLAY_NAMES.md §5.3)
+                // Sender name in group chats and channels, and in a channel
+                // the grey secondary text beside it (DISPLAY_NAMES.md §5.3):
+                // the channel name beside a local name, or the short hash
+                // (monospace) beside a channel name.
                 if isGroup && !message.isOutgoing {
                     HStack(spacing: 4) {
                         Text(message.senderName)
                             .font(.caption)
                             .fontWeight(.semibold)
                             .foregroundColor(.retichatPrimary)
+                            .lineLimit(1)
+                            .layoutPriority(1)
                         if let secondary = message.senderSecondary {
                             Text(secondary)
-                                .font(.system(.caption2, design: .monospaced))
+                                .font(message.senderSecondaryIsHash
+                                      ? .system(.caption2, design: .monospaced) : .caption2)
                                 .foregroundColor(.retichatOnSurfaceVariant)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
                         }
                     }
                 }

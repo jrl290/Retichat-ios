@@ -801,30 +801,71 @@ nonisolated enum DisplayNames {
         contactName(local: local, message: message, announce: announce) ?? shortHash(hash)
     }
 
-    /// A channel poster's label and, when it came from the channel name,
-    /// the short hash shown beside it (channel names are public and anyone
-    /// can pick any name).
+    /// A channel poster's main label and the optional secondary (grey) text
+    /// beside it (§5.3). Channel names are public and anyone can pick any
+    /// name, so a channel name never stands alone: beside the user's own
+    /// localName it is the secondary text, and as the main label it has the
+    /// short hash beside it.
     struct ChannelLabel: Equatable {
+        /// What the secondary text is: the bubble sets a hash in monospace.
+        enum Secondary: Equatable {
+            case channelName(String)
+            case shortHash(String)
+        }
+
         let label: String
-        let secondary: String?
+        let secondaryText: Secondary?
+
+        init(label: String, secondary: Secondary? = nil) {
+            self.label = label
+            self.secondaryText = secondary
+        }
+
+        /// The secondary text as shown, nil when there is none.
+        var secondary: String? {
+            switch secondaryText {
+            case .channelName(let name): return name
+            case .shortHash(let hash): return hash
+            case nil: return nil
+            }
+        }
+
+        /// Whether the secondary text is the short hash (set in monospace).
+        var secondaryIsHash: Bool {
+            if case .shortHash = secondaryText { return true }
+            return false
+        }
     }
 
-    /// The channel resolver (§5.3): channelName ?? (localName ?? messageName
-    /// ?? announceName) ?? shortHash. `contactName` is the contact's own
-    /// resolution without the hash fallback (contactName(local:message:announce:)).
-    /// The secondary text is the standard shortHash ("1a2b3c4d…"), as on
-    /// Android and the web.
-    static func channelLabel(hash: String, channelName: String?, contactName: String?) -> ChannelLabel {
+    /// The channel resolver (§5.3):
+    ///
+    ///   | The poster has                | Main label   | Secondary    |
+    ///   | a channelName and a localName | localName    | channelName  |
+    ///   | a channelName, no localName   | channelName  | shortHash    |
+    ///   | no channelName                | contact ?? shortHash | none |
+    ///
+    /// `contact` is the contact's own resolution without the hash fallback,
+    /// with the slot it came from (the app's sharedName, the NSE's
+    /// chat_names.json entry). Only a `.local` slot is a localName: the
+    /// user's own name for someone, the name they know them by. The short
+    /// hash is the standard one ("1a2b3c4d…"), as on Android and the web.
+    static func channelLabel(hash: String, channelName: String?, contact: SharedName?) -> ChannelLabel {
+        let contactName = contact.flatMap { $0.name.isEmpty ? nil : $0.name }
         if let channelName, !channelName.isEmpty {
-            return ChannelLabel(label: channelName, secondary: shortHash(hash))
+            if let contactName, contact?.slot == .local {
+                return ChannelLabel(label: contactName, secondary: .channelName(channelName))
+            }
+            return ChannelLabel(label: channelName, secondary: .shortHash(shortHash(hash)))
         }
-        if let contactName, !contactName.isEmpty {
-            return ChannelLabel(label: contactName, secondary: nil)
+        if let contactName {
+            return ChannelLabel(label: contactName)
         }
-        return ChannelLabel(label: shortHash(hash), secondary: nil)
+        return ChannelLabel(label: shortHash(hash))
     }
 
-    /// The title of a channel message notification, in the app and the NSE.
+    /// The title of a channel message notification, in the app and the NSE:
+    /// the poster named by the main label (§5.3), the secondary text after it
+    /// as in the bubble, so a channel name never stands alone here either.
     static func channelNotificationTitle(channelName: String, label: ChannelLabel) -> String {
         if let secondary = label.secondary {
             return "#\(channelName) (\(label.label) \u{00B7} \(secondary))"
