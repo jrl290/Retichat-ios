@@ -10,6 +10,7 @@
 // Run from the workspace root with:
 //
 //   swiftc -o /private/tmp/claude-501/nse-hand-off \
+//     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
 //     Retichat-ios/Retichat/Services/PendingNotification.swift \
 //     Retichat-ios/tests/NSEDeliveryHandOffTests.swift && \
 //     /private/tmp/claude-501/nse-hand-off

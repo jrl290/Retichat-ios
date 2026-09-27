@@ -110,13 +110,16 @@ func testTheRetiredFieldNoLongerStopsTheParse() {
 func testTheAcceptTable() {
     typealias C = DisplayNames.Change
     func accept(_ f: DisplayNames.NameField, _ reason: Int, _ current: String?) -> C {
-        DisplayNames.acceptMessageName(f, unverifiedReason: reason, current: current)
+        DisplayNames.acceptMessageName(f, unverifiedReason: reason, current: current,
+                                       currentAt: nil, messageTime: 1_800_000_000)
     }
     check(accept(.name("Alice"), 0, nil) == .set("Alice"), "validated name: set")
     check(accept(.name("Alice"), 0, "Old") == .set("Alice"), "validated name: replaces the one held")
-    check(accept(.name("Alice"), 0, "Alice") == .keep, "validated same name: nothing to write")
+    check(accept(.name("Alice"), 0, "Alice") == .set("Alice"),
+          "validated same name: accepted, so its timestamp is recorded (§5.2)")
     check(accept(.clear, 0, "Alice") == .set(nil), "validated clear: messageName = none")
-    check(accept(.clear, 0, nil) == .keep, "validated clear with nothing held: nothing to write")
+    check(accept(.clear, 0, nil) == .set(nil),
+          "validated clear with nothing held: accepted, so its timestamp is recorded")
     check(accept(.name("Alice"), 1, nil) == .set("Alice"), "source unknown: set only if none is held")
     check(accept(.name("Mallory"), 1, "Alice") == .keep, "source unknown: never replaces a name")
     check(accept(.clear, 1, "Alice") == .keep, "source unknown: a clear is ignored")
@@ -124,6 +127,50 @@ func testTheAcceptTable() {
     check(accept(.clear, 2, "Alice") == .keep, "invalid signature: a clear is ignored")
     check(accept(.absent, 0, "Alice") == .keep, "no 0xD1: nothing changes")
     check(accept(.name("X"), 7, nil) == .keep, "an unknown reason counts as invalid")
+}
+
+/// §5.2's ordering rule: a 0xD1 counts only from a message newer than
+/// messageNameAt, and accepting one records the message's timestamp.
+func testTheAcceptOrder() {
+    typealias C = DisplayNames.Change
+    let t = 1_800_000_000.0
+    func accept(_ f: DisplayNames.NameField, _ reason: Int, _ current: String?, at: Double?, _ time: Double) -> C {
+        DisplayNames.acceptMessageName(f, unverifiedReason: reason, current: current, currentAt: at, messageTime: time)
+    }
+    check(accept(.name("Old"), 0, "New", at: t, t - 60) == .keep,
+          "an older message's name never replaces a newer one (a propagated copy landing late)")
+    check(accept(.clear, 0, "New", at: t, t - 60) == .keep, "nor does an older clear")
+    check(accept(.name("Old"), 0, nil, at: t, t - 60) == .keep,
+          "nor an older name after a newer clear")
+    check(accept(.name("New"), 0, "New", at: t, t) == .keep, "the same timestamp is not newer")
+    check(accept(.name("Newer"), 0, "New", at: t, t + 1) == .set("Newer"), "a newer message's name replaces")
+    check(accept(.name("Alice"), 0, "Old", at: nil, 0) == .set("Alice"),
+          "a name held from before the rule (no timestamp) takes any message")
+    check(accept(.name("Alice"), 1, nil, at: t, t - 60) == .keep,
+          "an unknown source's first name is ordered too")
+    check(accept(.name("Alice"), 1, nil, at: t, t + 60) == .set("Alice"),
+          "and, taken, records its timestamp")
+
+    // The app's fold (ChatRepository.applyMessageName) over messages in
+    // arrival order: name and messageNameAt after each accepted change.
+    func fold(_ arrivals: [(DisplayNames.NameField, Int, Double)]) -> (String?, Double?) {
+        var name: String? = nil, at: Double? = nil
+        for (f, reason, time) in arrivals {
+            if case .set(let n) = accept(f, reason, name, at: at, time) { name = n; at = time }
+        }
+        return (name, at)
+    }
+    let late = fold([(.name("Ann B"), 0, t + 10), (.name("Ann"), 0, t)])
+    check(late.0 == "Ann B" && late.1 == t + 10,
+          "a direct message's new name survives the propagated copy of an older one arriving after it")
+    let repeated = fold([(.name("Ann"), 0, t), (.name("Ann"), 0, t + 20), (.name("Old"), 0, t + 10)])
+    check(repeated.0 == "Ann" && repeated.1 == t + 20,
+          "a repeat of the current name advances the timestamp, so an older rename between them loses")
+    let cleared = fold([(.clear, 0, t + 5), (.name("Ann"), 0, t)])
+    check(cleared.0 == nil && cleared.1 == t + 5, "a newer clear holds against an older name")
+    let unknownFirst = fold([(.name("Ann"), 1, t + 5), (.name("Old"), 0, t)])
+    check(unknownFirst.0 == "Ann" && unknownFirst.1 == t + 5,
+          "a first name from an unknown source records its timestamp too")
 }
 
 // MARK: - Resolving (§5.3)
@@ -141,14 +188,14 @@ func testTheResolver() {
     check(DisplayNames.contactName(local: nil, message: nil, announce: nil) == nil, "no slot, no name")
 
     let fromChannel = DisplayNames.channelLabel(hash: alice, channelName: "Wizard", contactName: "Alice")
-    check(fromChannel == .init(label: "Wizard", secondary: "1a2b3c4d"),
-          "channelName first, with the 8-hex hash beside it")
+    check(fromChannel == .init(label: "Wizard", secondary: "1a2b3c4d\u{2026}"),
+          "channelName first, with the standard short hash beside it (\"1a2b3c4d…\", as on Android and web)")
     check(DisplayNames.channelLabel(hash: alice, channelName: nil, contactName: "Alice")
             == .init(label: "Alice", secondary: nil), "then the contact's name, no hash")
     check(DisplayNames.channelLabel(hash: alice, channelName: "", contactName: nil)
             == .init(label: "1a2b3c4d\u{2026}", secondary: nil), "then the short hash")
     check(DisplayNames.channelNotificationTitle(channelName: "public.general", label: fromChannel)
-            == "#public.general (Wizard \u{00B7} 1a2b3c4d)", "a channel-name notification shows the hash too")
+            == "#public.general (Wizard \u{00B7} 1a2b3c4d\u{2026})", "a channel-name notification shows the hash too")
     check(DisplayNames.channelNotificationTitle(channelName: "public.general",
                                                 label: .init(label: "Alice", secondary: nil))
             == "#public.general (Alice)", "a contact-named one does not")
@@ -175,15 +222,65 @@ func testTheResolver() {
 }
 
 func testTheNotificationServiceTitle() {
-    func title(app: String?, _ field: DisplayNames.NameField, _ reason: Int, announce: String?) -> String {
+    typealias S = DisplayNames.SharedName
+    let t = 1_800_000_000.0
+    func title(app: S?, _ field: DisplayNames.NameField, _ reason: Int, time: Double = t, announce: String?) -> String {
         DisplayNames.notificationName(hash: alice, appName: app, messageName: field,
-                                      unverifiedReason: reason, announceName: announce)
+                                      unverifiedReason: reason, messageTime: time, announceName: announce)
     }
-    check(title(app: "Mum", .name("Alice"), 0, announce: "A.") == "Mum", "the app's resolved name first")
+    let local = S(name: "Mum", slot: .local)
+    check(title(app: local, .name("Alice"), 0, announce: "A.") == "Mum", "the user's localName always wins")
     check(title(app: nil, .name("Alice"), 0, announce: "A.") == "Alice", "then the message's validated name")
     check(title(app: nil, .name("Alice"), 1, announce: nil) == "Alice", "a first name from an unknown source")
     check(title(app: nil, .name("Mallory"), 2, announce: "A.") == "A.", "never an invalid message's name")
     check(title(app: nil, .absent, 0, announce: nil) == "1a2b3c4d\u{2026}", "then the short hash")
+
+    // Consistency item 11: a newer 0xD1 beats an app name that is not the
+    // user's own, as the app will once it imports the message.
+    let heldMessage = S(name: "Ann", slot: .message, messageNameAt: t - 60)
+    check(title(app: heldMessage, .name("Ann B"), 0, announce: nil) == "Ann B",
+          "a validated name beats the app's older message name")
+    check(title(app: S(name: "A.", slot: .announce), .name("Ann"), 0, announce: nil) == "Ann",
+          "and the app's announce name")
+    check(title(app: S(name: "A.", slot: .announce), .name("Ann"), 1, announce: nil) == "Ann",
+          "a source-unknown name beats an announce name (the app holds no messageName)")
+    check(title(app: heldMessage, .name("Mallory"), 1, announce: nil) == "Ann",
+          "but not the app's message name: an unknown source never replaces one")
+    check(title(app: heldMessage, .name("Old"), 0, time: t - 120, announce: nil) == "Ann",
+          "nor does a message older than the app's messageNameAt")
+    check(title(app: heldMessage, .name("Mallory"), 2, announce: nil) == "Ann", "nor an invalid one")
+    check(title(app: heldMessage, .clear, 0, announce: "A.") == "A.",
+          "a validated clear drops the app's message name, down to the announce name")
+    check(title(app: heldMessage, .absent, 0, announce: "A.") == "Ann", "no 0xD1: the app's name stands")
+    check(title(app: S(name: "A.", slot: .announce), .absent, 0, announce: "Stale") == "A.",
+          "the app's announce name before the recalled one")
+    check(title(app: S(name: "Mum", slot: .legacy), .name("Ann"), 0, announce: nil) == "Mum",
+          "a name of unknown origin (an old chat_names.json) keeps winning: it may have been typed")
+}
+
+/// chat_names.json records each name's slot; old files (hash → name) read.
+func testTheChatNamesFile() {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("chat-names-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    typealias S = DisplayNames.SharedName
+    let names = ["a": S(name: "Mum", slot: .local), "b": S(name: "Ann", slot: .message, messageNameAt: 1_800_000_000.5),
+                 "c": S(name: "A.", slot: .announce)]
+    check(PendingNotification.writeChatNames(names, in: dir) && PendingNotification.readChatNames(in: dir) == names,
+          "the NSE reads back each name with its slot and messageNameAt")
+    let old = try? JSONEncoder().encode(["a": "Mum", "b": "Ann"])
+    try? old?.write(to: dir.appendingPathComponent("chat_names.json"))
+    check(PendingNotification.readChatNames(in: dir) == ["a": S(name: "Mum", slot: .legacy), "b": S(name: "Ann", slot: .legacy)],
+          "a file from an older build (bare names) still reads, each name as legacy")
+    check(PendingNotification.writeChatNames(names, in: dir), "rewritten")
+    let written = String(decoding: (try? Data(contentsOf: dir.appendingPathComponent("chat_names.json"))) ?? Data(), as: UTF8.self)
+    check(written.contains("\"slot\":\"local\"") && written.contains("\"name\":\"Mum\""),
+          "entries are objects with name and slot", written)
+    check(DisplayNames.contactNameAndSlot(local: nil, message: "Ann", announce: "A.")! == ("Ann", .message),
+          "the slot is the resolver's")
+    check(DisplayNames.contactNameAndSlot(local: "", message: nil, announce: "A.")! == ("A.", .announce),
+          "an empty slot is skipped")
 }
 
 // MARK: - Channel posts (§4.2)
@@ -244,15 +341,27 @@ func testTheDistroUnwrapKeys() {
 
 func testTheContactMigration() {
     func m(_ v: String, recalled: String? = nil) -> DisplayNames.LegacyName {
-        DisplayNames.migrateLegacyName(v, hash: alice, recalledAnnounceName: recalled)
+        DisplayNames.migrateLegacyName(v, recalledAnnounceName: recalled)
     }
+    // §5.4's list, exactly: hash forms (8 to 32 hex, with or without "?"
+    // or "…"), "Retichat", "Retichat Web", "Anonymous Peer", any case.
     check(m("1a2b3c4d\u{2026}") == .drop, "the 8-hex placeholder is dropped")
     check(m("1a2b3c4d5e6f7081\u{2026}") == .drop, "the 16-hex picker placeholder is dropped")
-    check(m("1A2B3C4D...") == .drop, "any case, three dots")
-    check(m(alice) == .drop, "the whole hash is dropped")
+    check(m("1A2B3C4D") == .drop, "8 hex, any case, no ellipsis")
+    check(m(alice) == .drop && m(alice.uppercased() + "\u{2026}") == .drop, "the whole hash, 32 hex")
+    check(m("?" + alice) == .drop && m("?1a2b3c4d") == .drop, "the web's ?hash form")
+    check(m("deadbeef\u{2026}") == .drop, "any hash form, not only the contact's own")
     check(m("   ") == .drop, "an empty name is dropped")
-    check(m("Anonymous Peer") == .drop, "MeshChatX's and Columba's placeholder is dropped")
-    check(m("deadbeef\u{2026}") == .localName("deadbeef\u{2026}"), "another hash's prefix is a typed name")
+    for placeholder in ["Retichat", "RETICHAT", "Retichat Web", "retichat web", "Anonymous Peer", "anonymous PEER"] {
+        check(m(placeholder) == .drop, "the app placeholder \"\(placeholder)\" is dropped")
+    }
+    check(m("1a2b3c4") == .localName("1a2b3c4"), "7 hex is not a hash form")
+    check(m(alice + "0") == .localName(alice + "0"), "33 hex is not a hash form")
+    check(m("1A2B3C4D...") == .localName("1A2B3C4D..."), "three dots are not in the list")
+    check(m("??1a2b3c4d") == .localName("??1a2b3c4d") && m("1a2b3c4d\u{2026}\u{2026}") == .localName("1a2b3c4d\u{2026}\u{2026}"),
+          "one \"?\" and one \"…\" at most")
+    check(m("Retichat Fan") == .localName("Retichat Fan") && m("Anonymous") == .localName("Anonymous"),
+          "only the exact placeholder names")
     check(m("Alice", recalled: "Alice") == .announceName("Alice"), "equal to the recalled announce name")
     check(m("Mum", recalled: "Alice") == .localName("Mum"), "anything else was typed: localName")
     check(m("Cafe", recalled: nil) == .localName("Cafe"), "no recalled name: localName")
@@ -271,7 +380,7 @@ func testTheContactMigrationWiring() {
     check(migrate.contains("LxmfClient.cleanDisplayName(value)"), "old names are cleaned as saved names are")
     check(body(repo, "private func finishStartService(").contains("migrateLegacyContactNamesIfNeeded(client: client)"),
           "it runs when the stack is up (the recall needs it)")
-    check(body(repo, "private func resolvedName(").contains("if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder("),
+    check(body(repo, "private func sharedName(").contains("if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName)"),
           "until then an old non-placeholder name is still shown")
 }
 
@@ -298,25 +407,34 @@ func testTheReceivePaths() {
     let incoming = body(repo, "private func handleIncomingMessage(")
     check(before(incoming, "if let key = fields.distroTransferKey", "LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw)"),
           "transfers and sent copies are dropped before any name is read")
-    check(before(incoming, "if shouldProcessGroupMessage(", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex)\n                handleGroupMessage("),
-          "a group message's 0xD1 names its LXMF source, only when the group policy accepts it (audit H11)")
-    check(before(incoming, "guard allowlist.isAllowed else", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex)\n        storeIncomingDirect("),
-          "a DM's 0xD1 is applied after the allowlist and before the bubble and notification")
+    check(before(incoming, "if shouldProcessGroupMessage(", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                                 messageTime: timestamp)\n                handleGroupMessage("),
+          "a group message's 0xD1 names its LXMF source, only when the group policy accepts it (audit H11), ordered by its timestamp")
+    check(before(incoming, "guard allowlist.isAllowed else", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                         messageTime: timestamp)\n        storeIncomingDirect("),
+          "a DM's 0xD1 is applied after the allowlist and before the bubble and notification, ordered by its timestamp")
     let nse = body(repo, "func importNSEMessages()")
     check(nse.contains("let reason = msg.unverifiedReason ?? (msg.signatureValid ? 0 : 2)"),
           "the NSE import decides on the stored reason; older files count as invalid")
-    check(nse.components(separatedBy: "applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex)").count == 3,
-          "NSE-imported group messages and DMs both apply the name (audit M4)")
-    check(before(nse, "guard allowlist.isAllowed else", "applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex)\n            // As for"),
+    check(nse.components(separatedBy: "applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex,").count == 3
+            && nse.components(separatedBy: "messageTime: msg.timestamp)").count == 3,
+          "NSE-imported group messages and DMs both apply the name (audit M4), ordered by their timestamps")
+    check(before(nse, "guard allowlist.isAllowed else", "applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex,\n                             messageTime: msg.timestamp)\n            // As for"),
           "an NSE-imported DM applies it only past the allowlist")
     let distro = body(repo, "private func handleDistroMessage(")
-    check(distro.contains("applyMessageName(m.displayName, unverifiedReason: m.unverifiedReason, sourceHex: srcHex)")
+    check(distro.contains("applyMessageName(m.displayName, unverifiedReason: m.unverifiedReason, sourceHex: srcHex,\n                         messageTime: m.timestamp)")
             && distro.contains("signatureValid: m.unverifiedReason == 0"),
-          "distro messages carry their name and signature result (audit H7)")
+          "distro messages carry their name, signature result (audit H7) and timestamp")
+    check(repo.components(separatedBy: "applyMessageName(").count == 7,
+          "those five calls are every accept path (and the definition)")
     let apply = body(repo, "private func applyMessageName(")
     check(apply.contains("DisplayNames.acceptMessageName(field, unverifiedReason: unverifiedReason")
             && apply.contains("contact.messageName = name") && !apply.contains("localName"),
           "0xD1 writes messageName only, by the §5.2 table")
+    check(apply.contains("currentAt: existing?.messageNameAt,") && apply.contains("messageTime: messageTime)")
+            && apply.contains("contact.messageNameAt = messageTime"),
+          "the stored messageNameAt orders it, and an accepted 0xD1 records its message's timestamp (§5.2)")
+    check(source("Retichat/Models/Models.swift").contains("    var messageName: String?\n")
+            && source("Retichat/Models/Models.swift").contains("    var messageNameAt: Double?\n"),
+          "ContactEntity.messageNameAt is optional, so SwiftData migrates lightly")
     check(apply.contains("!isOwnAddress(sourceHex)"), "this device's own addresses are never named from a message")
     let announce = body(repo, "private func handleAnnounce(")
     check(announce.contains("contact.announceName = announceName") && !announce.contains("localName")
@@ -359,8 +477,12 @@ func testTheSurfaces() {
     check(refresh.contains("shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names)")
             && refresh.contains("previewByChat[m.chatId] = (m.id, m.content, m.senderHash)"),
           "so does the chat-list preview, by the message's id")
-    check(refresh.contains("let snapshot = names.compactMapValues { $0 }") && !refresh.contains("chatNameMap[chat.peerHash]"),
+    check(refresh.contains("let entries = contactNameEntries()") && refresh.contains("let snapshot = entries")
+            && !refresh.contains("chatNameMap[chat.peerHash]"),
           "chat_names.json holds every named contact's resolved name, keyed by contact, never a placeholder (audit M3)")
+    check(body(repo, "private func sharedName(").contains("DisplayNames.SharedName(name: resolved.name, slot: resolved.slot,")
+            && body(repo, "private func sharedName(").contains("messageNameAt: c.messageNameAt"),
+          "with the slot the name came from and messageNameAt, for the NSE")
     let contacts = body(repo, "func contacts() -> [Contact]")
     check(contacts.contains("!groupIds.contains($0.destHash)") && contacts.contains("!isOwnAddress($0.destHash)"),
           "the pickers never list a group id or this device (audit L4)")
@@ -405,6 +527,9 @@ func testTheSurfaces() {
     let service = source("NotificationService/NotificationService.swift")
     check(service.contains("DisplayNames.notificationName(") && !service.contains("senderName = msg.title"),
           "NSE titles use the resolver order and never the LXMF title (audit M3)")
+    check(service.contains("messageTime: timestamp,") && service.contains("reason,\n                                            m.timestamp)))")
+            && service.contains("$0.unverifiedReason, $0.timestamp))"),
+          "each NSE title is decided with its message's timestamp, from the sync and the distro pull")
     check(service.contains("PendingNotification.readChannelSenderNames()[channelPull.channelHex]"),
           "NSE channel titles know the stored channel names")
 }
@@ -421,8 +546,11 @@ func testTheChannelSend() {
             && before(send, "if !ok {", "recordPostName(postName"),
           "the name is recorded only after RFed took the post")
     let note = body(client, "private func noteSender(")
-    check(note.contains("if let at = row.channelNameAtMs, postMs < at {"),
-          "an older post pulled later does not undo a newer name")
+    check(note.contains("guard DisplayNames.isNewer(postMs, than: row.channelNameAtMs) else {")
+            && before(note, "guard DisplayNames.isNewer(", "row.channelNameAtMs = postMs"),
+          "an older post pulled later does not undo a newer name; the same ordering rule as messages (§5.2)")
+    check(DisplayNames.isNewer(2, than: 1) && !DisplayNames.isNewer(1, than: 1) && !DisplayNames.isNewer(0, than: 1)
+            && DisplayNames.isNewer(0, than: nil), "newer means strictly later; nothing held takes anything")
     check(body(client, "private func dispatchVerifiedLxmf(").contains("if !isOutgoing {\n            noteSender("),
           "only other senders' verified posts are noted")
     check(source("Retichat/Models/Models.swift").contains("var nameLastDigestHex: String?")
@@ -533,8 +661,10 @@ enum DisplayNamesTests {
         testTheNameStateBufferParses()
         testTheRetiredFieldNoLongerStopsTheParse()
         testTheAcceptTable()
+        testTheAcceptOrder()
         testTheResolver()
         testTheNotificationServiceTitle()
+        testTheChatNamesFile()
         testTheChannelRule()
         testTheDigestMatchesTheRustVectors()
         testTheDistroUnwrapKeys()

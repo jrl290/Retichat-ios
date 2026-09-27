@@ -13,6 +13,7 @@
 //     > /private/tmp/claude-501/NSEDistroPullDecoder.swift && \
 //   swiftc -o /private/tmp/claude-501/nse-distro-pull \
 //     /private/tmp/claude-501/NSEDistroPullDecoder.swift \
+//     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
 //     Retichat-ios/Retichat/Services/PendingNotification.swift \
 //     Retichat-ios/tests/NSEDistroPullTests.swift && \
 //     /private/tmp/claude-501/nse-distro-pull

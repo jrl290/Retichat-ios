@@ -24,6 +24,11 @@ final class ContactEntity {
     /// The name the contact sends in its messages, field 0xD1 (§5.1),
     /// accepted by the §5.2 rules.
     var messageName: String?
+    /// The LXMF timestamp (seconds) of the message that last set or cleared
+    /// messageName (§5.1, §5.2): only a newer message's 0xD1 counts. nil
+    /// until one has (rows from before this rule). Optional, so SwiftData
+    /// adds the column by lightweight migration.
+    var messageNameAt: Double?
     /// The name in the contact's last announce (§5.1), cleaned, "Anonymous
     /// Peer" as none. Replaced on every announce.
     var announceName: String?

@@ -299,14 +299,19 @@ class NotificationService: UNNotificationServiceExtension {
         // the channel pull, and how many others came with it. `thread` is the
         // conversation it opens (chatId): the sender, or the channel. Every
         // title is named by the app's resolver order (DISPLAY_NAMES.md §5.3):
-        // the app's resolved name (chat_names.json), else the message's own
-        // accepted 0xD1, else the cached announce name, else the short hash;
-        // a channel message as the app names it in its channel notifications
+        // the user's localName (chat_names.json), else the message's own
+        // 0xD1 when the §5.2 rules take it against the app's messageName and
+        // messageNameAt, else the app's message or announce name, else the
+        // recalled announce name, else the short hash
+        // (DisplayNames.notificationName); a channel message as the app
+        // names it in its channel notifications
         // (DisplayNames.channelNotificationTitle).
         let chatNames = PendingNotification.readChatNames()
-        func contactTitle(_ sender: String, _ name: DisplayNames.NameField, _ reason: Int) -> String {
+        func contactTitle(_ sender: String, _ name: DisplayNames.NameField, _ reason: Int,
+                          _ timestamp: Double) -> String {
             DisplayNames.notificationName(
                 hash: sender, appName: chatNames[sender], messageName: name, unverifiedReason: reason,
+                messageTime: timestamp,
                 announceName: NSEDistroPull.hexData(sender).flatMap { lxmfClient?.recallDisplayName(for: $0) })
         }
         var candidates: [(sender: String, content: String, timestamp: Double, hash: String,
@@ -315,11 +320,12 @@ class NotificationService: UNNotificationServiceExtension {
             let fields = Data(base64Encoded: m.fieldsRawBase64) ?? Data()
             let reason = m.unverifiedReason ?? (m.signatureValid ? 0 : 2)
             candidates.append((m.senderHash, m.content, m.timestamp, m.messageHash, m.senderHash,
-                               contactTitle(m.senderHash, LxmfClient.decodeDisplayName(fieldsRaw: fields), reason)))
+                               contactTitle(m.senderHash, LxmfClient.decodeDisplayName(fieldsRaw: fields), reason,
+                                            m.timestamp)))
         }
         candidates += distro.shown.map {
             ($0.senderHash, $0.content, $0.timestamp, "distro", $0.senderHash,
-             contactTitle($0.senderHash, $0.displayName, $0.unverifiedReason))
+             contactTitle($0.senderHash, $0.displayName, $0.unverifiedReason, $0.timestamp))
         }
         let channelNames = PendingNotification.readChannelSenderNames()[channelPull.channelHex] ?? [:]
         for shown in channelPull.shown {
@@ -327,7 +333,7 @@ class NotificationService: UNNotificationServiceExtension {
                 hash: shown.senderHash,
                 channelName: DisplayNames.channelName(afterPost: shown.displayName,
                                                       stored: channelNames[shown.senderHash]),
-                contactName: chatNames[shown.senderHash])
+                contactName: chatNames[shown.senderHash]?.name)
             candidates.append((shown.senderHash, shown.content, shown.timestamp, "channel", channelPull.channelHex,
                                DisplayNames.channelNotificationTitle(channelName: channelPull.channelName, label: label)))
         }

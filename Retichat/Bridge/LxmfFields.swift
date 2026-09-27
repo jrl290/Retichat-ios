@@ -511,22 +511,37 @@ nonisolated enum DisplayNames {
 
     /// What a message's 0xD1 does to the messageName held for its LXMF source.
     enum Change: Equatable {
+        /// Ignored: nothing is written, the timestamp included.
         case keep
-        /// nil clears the name.
+        /// Accepted: the name becomes this (nil clears it) and messageNameAt
+        /// becomes the message's timestamp, also when the name is the one
+        /// already held (§5.2: a repeat advances the timestamp).
         case set(String?)
+    }
+
+    /// §5.2's ordering rule: a 0xD1 counts only from a message whose LXMF
+    /// timestamp is newer than the one that last set or cleared the slot
+    /// (`heldAt`; nil when nothing has, e.g. a name from before this rule).
+    static func isNewer(_ messageTime: Double, than heldAt: Double?) -> Bool {
+        guard let heldAt else { return true }
+        return messageTime > heldAt
     }
 
     /// §5.2. `unverifiedReason`: 0 signature validated, 1 source unknown (no
     /// key yet), anything else invalid. A validated name replaces, a
     /// validated clear clears; from an unknown source a name is only taken
     /// when none is held, and a clear is ignored; an invalid signature
-    /// changes nothing.
-    static func acceptMessageName(_ field: NameField, unverifiedReason: Int, current: String?) -> Change {
+    /// changes nothing. Only a message newer than `currentAt` (messageNameAt)
+    /// counts: a propagated copy landing after a later direct message must
+    /// not bring back the old name, which the sender's ledger never resends.
+    static func acceptMessageName(_ field: NameField, unverifiedReason: Int, current: String?,
+                                  currentAt: Double?, messageTime: Double) -> Change {
+        guard isNewer(messageTime, than: currentAt) else { return .keep }
         switch (field, unverifiedReason) {
         case (.name(let s), 0):
-            return s == current ? .keep : .set(s)
+            return .set(s)
         case (.clear, 0):
-            return current == nil ? .keep : .set(nil)
+            return .set(nil)
         case (.name(let s), 1):
             return current == nil ? .set(s) : .keep
         default:
@@ -542,8 +557,22 @@ nonisolated enum DisplayNames {
     /// localName ?? messageName ?? announceName, empty slots skipped; nil
     /// when the contact has no name at all.
     static func contactName(local: String?, message: String?, announce: String?) -> String? {
-        for name in [local, message, announce] {
-            if let name, !name.isEmpty { return name }
+        contactNameAndSlot(local: local, message: message, announce: announce)?.name
+    }
+
+    /// Which slot (§5.1) a contact's resolved name came from. `legacy` is a
+    /// name of unknown origin: the single name of builds before the three
+    /// slots, shown until the §5.4 migration has run, or a chat_names.json
+    /// entry written by such a build.
+    enum NameSlot: String, Codable, Equatable {
+        case local, message, announce, legacy
+    }
+
+    /// contactName, and the slot it came from.
+    static func contactNameAndSlot(local: String?, message: String?,
+                                   announce: String?) -> (name: String, slot: NameSlot)? {
+        for (name, slot) in [(local, NameSlot.local), (message, .message), (announce, .announce)] {
+            if let name, !name.isEmpty { return (name, slot) }
         }
         return nil
     }
@@ -554,8 +583,8 @@ nonisolated enum DisplayNames {
     }
 
     /// A channel poster's label and, when it came from the channel name,
-    /// the 8-hex short hash shown beside it (channel names are public and
-    /// anyone can pick any name).
+    /// the short hash shown beside it (channel names are public and anyone
+    /// can pick any name).
     struct ChannelLabel: Equatable {
         let label: String
         let secondary: String?
@@ -564,9 +593,11 @@ nonisolated enum DisplayNames {
     /// The channel resolver (§5.3): channelName ?? (localName ?? messageName
     /// ?? announceName) ?? shortHash. `contactName` is the contact's own
     /// resolution without the hash fallback (contactName(local:message:announce:)).
+    /// The secondary text is the standard shortHash ("1a2b3c4d…"), as on
+    /// Android and the web.
     static func channelLabel(hash: String, channelName: String?, contactName: String?) -> ChannelLabel {
         if let channelName, !channelName.isEmpty {
-            return ChannelLabel(label: channelName, secondary: String(hash.lowercased().prefix(8)))
+            return ChannelLabel(label: channelName, secondary: shortHash(hash))
         }
         if let contactName, !contactName.isEmpty {
             return ChannelLabel(label: contactName, secondary: nil)
@@ -616,45 +647,110 @@ nonisolated enum DisplayNames {
         case localName(String)
     }
 
-    /// §5.4: a hash placeholder is dropped; a value equal to the contact's
+    /// §5.4: a placeholder is dropped; a value equal to the contact's
     /// recalled announce name becomes announceName; anything else is a
     /// name the user typed (iOS had no rename flag) and becomes localName.
-    static func migrateLegacyName(_ value: String, hash: String, recalledAnnounceName: String?) -> LegacyName {
+    /// iOS has no legacyName slot: its mapping is the spec's iOS rule.
+    static func migrateLegacyName(_ value: String, recalledAnnounceName: String?) -> LegacyName {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isPlaceholder(trimmed, hash: hash) { return .drop }
+        if isPlaceholder(trimmed) { return .drop }
         if let recalled = recalledAnnounceName, !recalled.isEmpty, recalled == trimmed {
             return .announceName(recalled)
         }
         return .localName(trimmed)
     }
 
-    /// Empty, a prefix of the contact's own hash (with or without an
-    /// ellipsis: "1a2b3c4d…", the 16-hex picker form, the whole hash), or
-    /// MeshChatX's and Columba's "Anonymous Peer" (§3).
-    static func isPlaceholder(_ value: String, hash: String) -> Bool {
-        var v = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// The placeholder names of §5.4, all case-insensitive: "Retichat",
+    /// "Retichat Web" (what unnamed Android and web senders used to send),
+    /// "Anonymous Peer" (MeshChatX's, Columba's and lxmd's announce).
+    static let placeholderNames: Set<String> = ["retichat", "retichat web", "anonymous peer"]
+
+    /// §5.4's placeholder test, exactly the spec's list: a hash form (8 to 32
+    /// hex digits, with or without a leading "?" or a trailing "…"; any
+    /// hash, not only the contact's own) or one of `placeholderNames`, case-
+    /// insensitive, surrounding white space ignored. Empty is no name at
+    /// all, so it is dropped too.
+    static func isPlaceholder(_ value: String) -> Bool {
+        var v = Substring(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         if v.isEmpty { return true }
-        if v.caseInsensitiveCompare("Anonymous Peer") == .orderedSame { return true }
-        if v.hasSuffix("\u{2026}") { v.removeLast() } else if v.hasSuffix("...") { v.removeLast(3) }
-        v = v.lowercased()
-        guard v.count >= 6, v.allSatisfy(\.isHexDigit) else { return false }
-        return hash.lowercased().hasPrefix(v)
+        if placeholderNames.contains(String(v)) { return true }
+        if v.hasPrefix("?") { v = v.dropFirst() }
+        if v.hasSuffix("\u{2026}") { v = v.dropLast() }
+        return (8...32).contains(v.count) && v.allSatisfy { $0.isASCII && $0.isHexDigit }
     }
 
     // MARK: Notification Service Extension
 
-    /// The NSE's title for a message from `hash`. It has no store, only
-    /// what the app shares: `appName` is the app's resolved name for the
-    /// contact (chat_names.json; absent when the contact has none). Without
-    /// it, the message's own 0xD1 when the §5.2 rules would take it, then
-    /// the cached announce name, then shortHash — the resolver's order.
-    static func notificationName(hash: String, appName: String?, messageName: NameField,
-                                 unverifiedReason: Int, announceName: String?) -> String {
-        if let appName, !appName.isEmpty { return appName }
-        if case .set(let name?) = acceptMessageName(messageName, unverifiedReason: unverifiedReason, current: nil) {
-            return name
+    /// One contact's entry in chat_names.json, the app's names shared with
+    /// the NSE: the resolved name, the slot it came from, and the contact's
+    /// messageNameAt (§5.2), so the NSE can apply the accept rules to a
+    /// message the app has not imported yet.
+    ///
+    /// Written as {"name": …, "slot": "local"|"message"|"announce"|"legacy",
+    /// "messageNameAt": …}. Files from builds before the slot kind hold a
+    /// bare string per contact; it still reads, as a `legacy` name.
+    struct SharedName: Equatable, Codable {
+        let name: String
+        let slot: NameSlot
+        var messageNameAt: Double? = nil
+
+        init(name: String, slot: NameSlot, messageNameAt: Double? = nil) {
+            self.name = name
+            self.slot = slot
+            self.messageNameAt = messageNameAt
         }
-        if let announceName, !announceName.isEmpty { return announceName }
+
+        private enum CodingKeys: String, CodingKey { case name, slot, messageNameAt }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer(), let old = try? single.decode(String.self) {
+                self.init(name: old, slot: .legacy)
+                return
+            }
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(name: try c.decode(String.self, forKey: .name),
+                      slot: (try? c.decode(NameSlot.self, forKey: .slot)) ?? .legacy,
+                      messageNameAt: try c.decodeIfPresent(Double.self, forKey: .messageNameAt))
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(name, forKey: .name)
+            try c.encode(slot, forKey: .slot)
+            try c.encodeIfPresent(messageNameAt, forKey: .messageNameAt)
+        }
+    }
+
+    /// The NSE's title for a message from `hash`, sent at `messageTime`
+    /// (its LXMF timestamp). It has no store, only what the app shares:
+    /// `appName` is the app's entry for the contact (chat_names.json; nil
+    /// when the contact has no name). The resolver's order, with the
+    /// message's own 0xD1 applied as the app will apply it on import:
+    /// - the user's localName (or a legacy name of unknown origin) wins;
+    /// - otherwise the §5.2 rules run against the app's messageName (known
+    ///   only when that is the name shown) and messageNameAt: a validated
+    ///   name, or a first name from an unknown source, beats the app's
+    ///   message or announce name; a validated clear drops the app's
+    ///   message name;
+    /// - then the announce name (the app's, else the recalled one);
+    /// - then shortHash.
+    static func notificationName(hash: String, appName: SharedName?, messageName: NameField,
+                                 unverifiedReason: Int, messageTime: Double, announceName: String?) -> String {
+        if let appName, appName.slot == .local || appName.slot == .legacy, !appName.name.isEmpty {
+            return appName.name
+        }
+        let heldMessage = appName?.slot == .message ? appName?.name : nil
+        var message = heldMessage
+        if case .set(let accepted) = acceptMessageName(messageName, unverifiedReason: unverifiedReason,
+                                                       current: heldMessage, currentAt: appName?.messageNameAt,
+                                                       messageTime: messageTime) {
+            message = accepted
+        }
+        if let message, !message.isEmpty { return message }
+        let appAnnounce = appName?.slot == .announce ? appName?.name : nil
+        for name in [appAnnounce, announceName] {
+            if let name, !name.isEmpty { return name }
+        }
         return shortHash(hash)
     }
 

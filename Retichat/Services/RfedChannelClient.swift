@@ -1403,7 +1403,11 @@ final class RfedChannelClient: ObservableObject {
         case .clear: newName = nil
         case .name(let n): newName = n
         }
-        if let at = row.channelNameAtMs, postMs < at {
+        // §5.2's ordering, per (channel, sender): only a post newer than
+        // the one that last set or cleared the name counts; an older post
+        // pulled later ("Load earlier messages") does not undo it. A newer
+        // post repeating the name still records its time.
+        guard DisplayNames.isNewer(postMs, than: row.channelNameAtMs) else {
             try? ctx.save()
             return
         }

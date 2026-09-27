@@ -871,7 +871,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 if shouldProcessGroupMessage(groupId: groupId,
                                              sourceHash: srcHex,
                                              action: fields.groupAction) {
-                    applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex)
+                    applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex,
+                                     messageTime: msg.timestamp)
                     handleGroupMessage(
                         hash: Data(hexString: msg.messageHash) ?? Data(),
                         srcHash: Data(hexString: srcHex) ?? Data(),
@@ -894,7 +895,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let chatId = srcHex
             ensureChat(id: chatId, peerHash: srcHex)
             ensureContact(destHash: srcHex)
-            applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex)
+            applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex,
+                             messageTime: msg.timestamp)
             // As for a message the app received itself: watch the sender's
             // announces (their announce name) and fill it from the cache.
             if let srcData = Data(hexString: srcHex) {
@@ -1896,7 +1898,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             if shouldProcessGroupMessage(groupId: groupId,
                                          sourceHash: srcHex,
                                          action: fields.groupAction) {
-                applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex)
+                applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,
+                                 messageTime: timestamp)
                 handleGroupMessage(
                     hash: hash, srcHash: srcHash, content: content,
                     timestamp: timestamp, fields: fields, groupId: groupId
@@ -1914,7 +1917,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         print("[Retichat] handleIncomingMessage: ACCEPTED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
 
-        applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex)
+        applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,
+                         messageTime: timestamp)
         storeIncomingDirect(
             messageId: msgHashHex, srcHash: srcHash, title: title, content: content,
             timestamp: timestamp, signatureValid: signatureValid,
@@ -2012,7 +2016,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         print("[Retichat] handleDistroMessage: src=\(srcHex.prefix(8)) len=\(content.count)")
         ensureContact(destHash: srcHex)
-        applyMessageName(m.displayName, unverifiedReason: m.unverifiedReason, sourceHex: srcHex)
+        applyMessageName(m.displayName, unverifiedReason: m.unverifiedReason, sourceHex: srcHex,
+                         messageTime: m.timestamp)
         storeIncomingDirect(
             messageId: msgId, srcHash: m.sourceHash, title: m.title, content: content,
             timestamp: m.timestamp, signatureValid: m.unverifiedReason == 0,
@@ -2804,7 +2809,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
 
         // Every contact's name slots in one fetch (DISPLAY_NAMES.md §5.3)
-        let names = contactNameIndex()
+        let entries = contactNameEntries()
+        let names = entries.mapValues { Optional($0.name) }
 
         chats = chatEntities.map { entity in
             let displayName: String
@@ -2831,12 +2837,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             )
         }
 
-        // Every contact's resolved name (never a hash placeholder; a
-        // contact without a name is left out) for the NSE's notification
-        // titles, keyed by the hash messages come from, so a group invite
-        // no longer overwrites its inviter's name (audit M3). File I/O, off
-        // the main actor.
-        let snapshot = names.compactMapValues { $0 }
+        // Every contact's resolved name (never a placeholder; a contact
+        // without a name is left out) for the NSE's notification titles,
+        // keyed by the hash messages come from, so a group invite no longer
+        // overwrites its inviter's name (audit M3). Each entry records its
+        // slot and messageNameAt, so the NSE lets a newer 0xD1 in the
+        // message beat any name but the user's own. File I/O, off the main
+        // actor.
+        let snapshot = entries
         Task.detached(priority: .utility) {
             PendingNotification.writeChatNames(snapshot)
         }
@@ -3014,24 +3022,37 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// localName ?? messageName ?? announceName. Until the §5.4 migration
     /// has run (it needs the stack, for the recalled announce names), a
-    /// legacy name that is not a hash placeholder is shown as it was.
+    /// legacy name that is not a placeholder is shown as it was.
     private func resolvedName(_ c: ContactEntity) -> String? {
-        if let name = DisplayNames.contactName(local: c.localName, message: c.messageName,
-                                               announce: c.announceName) {
-            return name
+        sharedName(c)?.name
+    }
+
+    /// resolvedName, with the slot it came from and the contact's
+    /// messageNameAt: the contact's chat_names.json entry for the NSE.
+    private func sharedName(_ c: ContactEntity) -> DisplayNames.SharedName? {
+        if let resolved = DisplayNames.contactNameAndSlot(local: c.localName, message: c.messageName,
+                                                           announce: c.announceName) {
+            return DisplayNames.SharedName(name: resolved.name, slot: resolved.slot,
+                                           messageNameAt: c.messageNameAt)
         }
-        if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName, hash: c.destHash) {
-            return c.displayName
+        if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName) {
+            return DisplayNames.SharedName(name: c.displayName, slot: .legacy, messageNameAt: c.messageNameAt)
         }
         return nil
     }
 
     /// Every contact's resolved name (nil: none) in one fetch.
     private func contactNameIndex() -> [String: String?] {
+        contactNameEntries().mapValues { Optional($0.name) }
+    }
+
+    /// Every named contact's shared name in one fetch; a contact without a
+    /// name is left out.
+    private func contactNameEntries() -> [String: DisplayNames.SharedName] {
         guard let ctx = modelContext,
               let contacts = try? ctx.fetch(FetchDescriptor<ContactEntity>()) else { return [:] }
-        var index: [String: String?] = [:]
-        for c in contacts { index[c.destHash] = resolvedName(c) }
+        var index: [String: DisplayNames.SharedName] = [:]
+        for c in contacts { index[c.destHash] = sharedName(c) }
         return index
     }
 
@@ -3074,28 +3095,43 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         refreshChats()
     }
 
-    /// §5.2: a message's 0xD1 applied to the messageName of its LXMF source.
+    /// §5.2: a message's 0xD1 applied to the messageName of its LXMF source,
+    /// with the ordering rule: only a message whose LXMF timestamp
+    /// (`messageTime`) is newer than messageNameAt counts, and accepting one
+    /// records its timestamp, a repeat of the current name included.
     /// Callers pass only messages this device accepted (allowlist, group
     /// policy, distro, NSE import); this device's own addresses are skipped.
-    private func applyMessageName(_ field: DisplayNames.NameField, unverifiedReason: Int, sourceHex: String) {
+    private func applyMessageName(_ field: DisplayNames.NameField, unverifiedReason: Int, sourceHex: String,
+                                  messageTime: Double) {
         guard field != .absent, !isOwnAddress(sourceHex), let ctx = modelContext else { return }
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == sourceHex }
         )
         let existing = try? ctx.fetch(descriptor).first
         let change = DisplayNames.acceptMessageName(field, unverifiedReason: unverifiedReason,
-                                                    current: existing?.messageName)
+                                                    current: existing?.messageName,
+                                                    currentAt: existing?.messageNameAt,
+                                                    messageTime: messageTime)
         guard case .set(let name) = change else { return }
         let contact: ContactEntity
         if let existing {
             contact = existing
         } else {
             // A plain row, not allowlisted, as for any sender we accepted.
+            // Also for a clear: its timestamp keeps an older name out.
             contact = ContactEntity(destHash: sourceHex)
             ctx.insert(contact)
         }
+        let renamed = contact.messageName != name
         contact.messageName = name
+        contact.messageNameAt = messageTime
         try? ctx.save()
+        guard renamed else {
+            // Only the timestamp moved: no surface changes, but the NSE's
+            // copy of messageNameAt (chat_names.json) follows.
+            scheduleRefreshChats()
+            return
+        }
         print("[Retichat] message name for \(sourceHex.prefix(8)) \(name == nil ? "cleared" : "set") (reason \(unverifiedReason))")
         namesChanged()
     }
@@ -3131,10 +3167,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// §5.4, once (guarded by a persisted flag): each contact's single old
-    /// name goes to the slot it came from. A hash placeholder is dropped, a
-    /// value equal to the contact's recalled announce name becomes
-    /// announceName, anything else was typed by the user and becomes
-    /// localName. A slot filled since (a message or announce that already
+    /// name goes to the slot it came from. A placeholder (the spec's list,
+    /// DisplayNames.isPlaceholder) is dropped, a value equal to the
+    /// contact's recalled announce name becomes announceName, anything else
+    /// was typed by the user and becomes localName. A slot filled since (a message or announce that already
     /// arrived) is not overwritten. The recalls run on ffiQueue.
     private func migrateLegacyContactNamesIfNeeded(client: LxmfClient) {
         guard !prefs.contactNamesMigrated, let ctx = modelContext,
@@ -3156,7 +3192,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     // Cleaned as any saved name is (§3): an old announce name
                     // was stored raw, and the recalled one comes back cleaned.
                     let cleaned = LxmfClient.cleanDisplayName(value) ?? ""
-                    switch DisplayNames.migrateLegacyName(cleaned, hash: hash, recalledAnnounceName: recalled[hash]) {
+                    switch DisplayNames.migrateLegacyName(cleaned, recalledAnnounceName: recalled[hash]) {
                     case .drop:
                         break
                     case .announceName(let name):

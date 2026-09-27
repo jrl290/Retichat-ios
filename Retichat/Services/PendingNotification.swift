@@ -420,23 +420,29 @@ nonisolated enum PendingNotification {
 
     // MARK: - Chat name map (for NSE notification titles)
 
-    /// Write a map of contact hash → resolved name (DISPLAY_NAMES.md §5.3:
-    /// localName ?? messageName ?? announceName; a contact with no name is
-    /// left out, never written as a hash placeholder) for the NSE's titles.
-    static func writeChatNames(_ names: [String: String]) {
-        guard let dir = containerURL else { return }
-        let file = dir.appendingPathComponent("chat_names.json")
-        if let data = try? JSONEncoder().encode(names) {
-            try? data.write(to: file, options: .atomic)
+    /// Write a map of contact hash → the contact's shared name
+    /// (DISPLAY_NAMES.md §5.3: localName ?? messageName ?? announceName,
+    /// with the slot it came from and messageNameAt; a contact with no name
+    /// is left out, never written as a hash placeholder) for the NSE's
+    /// titles. Format: DisplayNames.SharedName.
+    @discardableResult
+    static func writeChatNames(_ names: [String: DisplayNames.SharedName], in dir: URL? = nil) -> Bool {
+        guard let dir = dir ?? containerURL,
+              let data = try? JSONEncoder().encode(names) else { return false }
+        do {
+            try data.write(to: dir.appendingPathComponent("chat_names.json"), options: .atomic)
+            return true
+        } catch {
+            return false
         }
     }
 
-    /// Read the peerHash → displayName map written by the main app.
-    static func readChatNames() -> [String: String] {
-        guard let dir = containerURL else { return [:] }
-        let file = dir.appendingPathComponent("chat_names.json")
-        guard let data = try? Data(contentsOf: file),
-              let names = try? JSONDecoder().decode([String: String].self, from: data) else {
+    /// Read the map written by the main app. A file from a build before the
+    /// slot kind (hash → bare name) still reads, each name as `legacy`.
+    static func readChatNames(in dir: URL? = nil) -> [String: DisplayNames.SharedName] {
+        guard let dir = dir ?? containerURL,
+              let data = try? Data(contentsOf: dir.appendingPathComponent("chat_names.json")),
+              let names = try? JSONDecoder().decode([String: DisplayNames.SharedName].self, from: data) else {
             return [:]
         }
         return names
