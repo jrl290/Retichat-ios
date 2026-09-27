@@ -783,13 +783,51 @@ nonisolated enum DisplayNames {
         return .set(recalled)
     }
 
-    /// A sender's channelName once a post is seen: the post's own name or
-    /// clear wins, a post without 0xD1 leaves the stored one.
-    static func channelName(afterPost post: NameField, stored: String?) -> String? {
+    /// One sender's channelName in one channel as the app shares it with
+    /// the NSE (channel_sender_names.json): the name (nil once cleared)
+    /// and `atMs`, the post time that last set or cleared it (the app's
+    /// ChannelSenderEntity.channelNameAtMs), so the NSE applies §5.2's
+    /// ordering as the app does. Written as {"name": …, "atMs": …}; files
+    /// from builds before the time hold a bare name, which still reads,
+    /// with no time.
+    struct SharedChannelName: Equatable, Codable {
+        let name: String?
+        var atMs: Double? = nil
+
+        init(name: String?, atMs: Double? = nil) {
+            self.name = name
+            self.atMs = atMs
+        }
+
+        private enum CodingKeys: String, CodingKey { case name, atMs }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer(), let old = try? single.decode(String.self) {
+                self.init(name: old)
+                return
+            }
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(name: try c.decodeIfPresent(String.self, forKey: .name),
+                      atMs: try c.decodeIfPresent(Double.self, forKey: .atMs))
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encodeIfPresent(name, forKey: .name)
+            try c.encodeIfPresent(atMs, forKey: .atMs)
+        }
+    }
+
+    /// A sender's channelName once a post from `postMs` is seen (the NSE's
+    /// title; the app's own rule is RfedChannelClient.noteSender): a post
+    /// newer than the one that set or cleared the stored name (§5.2, per
+    /// channel and sender) replaces it with its own name or clear; an older
+    /// post, or one without 0xD1, leaves the stored name.
+    static func channelName(afterPost post: NameField, postMs: Double, stored: SharedChannelName?) -> String? {
+        guard post != .absent, isNewer(postMs, than: stored?.atMs) else { return stored?.name }
         switch post {
         case .name(let name): return name
-        case .clear: return nil
-        case .absent: return stored
+        case .clear, .absent: return nil
         }
     }
 

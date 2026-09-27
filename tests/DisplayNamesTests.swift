@@ -222,9 +222,27 @@ func testTheResolver() {
                                                 label: .init(label: "Alice", secondary: nil))
             == "#public.general (Alice)", "a contact-named one does not")
 
-    check(DisplayNames.channelName(afterPost: .name("New"), stored: "Old") == "New", "a post's name replaces")
-    check(DisplayNames.channelName(afterPost: .clear, stored: "Old") == nil, "a post's clear clears")
-    check(DisplayNames.channelName(afterPost: .absent, stored: "Old") == "Old", "a post without 0xD1 keeps it")
+    // The NSE's channel title (review ios-order-2): §5.2's ordering per
+    // (channel, sender), against the app's shared channelNameAtMs.
+    typealias SC = DisplayNames.SharedChannelName
+    let ms = 1_800_000_000_000.0
+    let old = SC(name: "Old", atMs: ms)
+    check(DisplayNames.channelName(afterPost: .name("New"), postMs: ms + 1, stored: old) == "New",
+          "a newer post's name replaces")
+    check(DisplayNames.channelName(afterPost: .clear, postMs: ms + 1, stored: old) == nil, "a newer post's clear clears")
+    check(DisplayNames.channelName(afterPost: .absent, postMs: ms + 1, stored: old) == "Old",
+          "a post without 0xD1 keeps it")
+    check(DisplayNames.channelName(afterPost: .name("Older"), postMs: ms - 1, stored: old) == "Old",
+          "an older post (uploaded late) does not rename its sender in the title, as the app keeps the newer name")
+    check(DisplayNames.channelName(afterPost: .clear, postMs: ms - 1, stored: old) == "Old", "nor clear it")
+    check(DisplayNames.channelName(afterPost: .name("Same"), postMs: ms, stored: old) == "Old",
+          "the same post time is not newer")
+    check(DisplayNames.channelName(afterPost: .name("Older"), postMs: ms - 1, stored: SC(name: nil, atMs: ms)) == nil,
+          "a newer clear holds against an older post's name")
+    check(DisplayNames.channelName(afterPost: .name("New"), postMs: 0, stored: SC(name: "Old")) == "New",
+          "a name with no time (an older app's file) takes any post")
+    check(DisplayNames.channelName(afterPost: .name("New"), postMs: ms, stored: nil) == "New",
+          "nothing stored takes the post's name")
 
     let token = DisplayNames.subjectToken
     for id in ["inv_0123456789abcdef", "acc_01234567_89abcdef", "left_" + alice] {
@@ -303,6 +321,34 @@ func testTheChatNamesFile() {
           "the slot is the resolver's")
     check(DisplayNames.contactNameAndSlot(local: "", message: nil, announce: "A.")! == ("A.", .announce),
           "an empty slot is skipped")
+}
+
+/// channel_sender_names.json carries each sender's post time, cleared
+/// names included (review ios-order-2); old files (bare names) read.
+func testTheChannelSenderNamesFile() {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("channel-names-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    typealias SC = DisplayNames.SharedChannelName
+    let names = ["chan": ["a": SC(name: "Wizard", atMs: 1_800_000_000_123), "b": SC(name: nil, atMs: 1_800_000_000_456)]]
+    check(PendingNotification.writeChannelSenderNames(names, in: dir)
+            && PendingNotification.readChannelSenderNames(in: dir) == names,
+          "the NSE reads back each sender's name and post time, a clear included")
+    let old = try? JSONEncoder().encode(["chan": ["a": "Wizard"]])
+    try? old?.write(to: dir.appendingPathComponent("channel_sender_names.json"))
+    check(PendingNotification.readChannelSenderNames(in: dir) == ["chan": ["a": SC(name: "Wizard")]],
+          "a file from an older build (bare names) still reads, with no time")
+
+    let client = source("Retichat/Services/RfedChannelClient.swift")
+    let note = body(client, "private func noteSender(")
+    check(note.contains("sharedSenderNames[channel, default: [:]][sender] =\n            DisplayNames.SharedChannelName(name: newName, atMs: postMs)\n        shareSenderNames()")
+            && before(note, "guard DisplayNames.isNewer(", "sharedSenderNames[channel"),
+          "every accepted post updates the NSE's copy with its time, also when only the time moved")
+    check(body(client, "private func shareSenderNames(").contains("let snapshot = sharedSenderNames"),
+          "the NSE gets the names with their times")
+    check(body(client, "private func loadSenderNames(").contains("if row.channelName != nil || row.channelNameAtMs != nil {"),
+          "a cleared name is shared too, so its time holds off older posts")
 }
 
 // MARK: - Channel posts (§4.2)
@@ -555,6 +601,9 @@ func testTheSurfaces() {
           "each NSE title is decided with its message's timestamp, from the sync and the distro pull")
     check(service.contains("PendingNotification.readChannelSenderNames()[channelPull.channelHex]"),
           "NSE channel titles know the stored channel names")
+    check(service.contains("DisplayNames.channelName(afterPost: shown.displayName, postMs: shown.timestampMs,")
+            && source("NotificationService/NSEChannelPull.swift").contains("timestampMs: Double(message.timestampMs),"),
+          "and order the post against them by its time in ms, as the app's channelNameAtMs")
 }
 
 func testTheChannelSend() {
@@ -688,6 +737,7 @@ enum DisplayNamesTests {
         testTheResolver()
         testTheNotificationServiceTitle()
         testTheChatNamesFile()
+        testTheChannelSenderNamesFile()
         testTheChannelRule()
         testTheDigestMatchesTheRustVectors()
         testTheDistroUnwrapKeys()

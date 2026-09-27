@@ -451,20 +451,31 @@ nonisolated enum PendingNotification {
     // MARK: - Channel Display Names (for NSE notification titles)
 
     /// channel hash → sender hash → the Channel Display Name that sender's
-    /// posts there carry (DISPLAY_NAMES.md §5.1), so the NSE labels a
-    /// channel post as the app does even when the post carries no name.
-    static func writeChannelSenderNames(_ names: [String: [String: String]]) {
-        guard let dir = containerURL else { return }
-        let file = dir.appendingPathComponent("channel_sender_names.json")
-        if let data = try? JSONEncoder().encode(names) {
-            try? data.write(to: file, options: .atomic)
+    /// posts there carry (DISPLAY_NAMES.md §5.1) and the post time that set
+    /// or cleared it, so the NSE labels a channel post as the app does even
+    /// when the post carries no name, and an older post pulled late does
+    /// not rename its sender in the title (§5.2). A cleared name stays in
+    /// the file, with its time. Format: DisplayNames.SharedChannelName.
+    @discardableResult
+    static func writeChannelSenderNames(_ names: [String: [String: DisplayNames.SharedChannelName]],
+                                        in dir: URL? = nil) -> Bool {
+        guard let dir = dir ?? containerURL,
+              let data = try? JSONEncoder().encode(names) else { return false }
+        do {
+            try data.write(to: dir.appendingPathComponent("channel_sender_names.json"), options: .atomic)
+            return true
+        } catch {
+            return false
         }
     }
 
-    static func readChannelSenderNames() -> [String: [String: String]] {
-        guard let dir = containerURL,
+    /// Read the map written by the main app. A file from a build before the
+    /// post times (bare names) still reads, each name with no time.
+    static func readChannelSenderNames(in dir: URL? = nil) -> [String: [String: DisplayNames.SharedChannelName]] {
+        guard let dir = dir ?? containerURL,
               let data = try? Data(contentsOf: dir.appendingPathComponent("channel_sender_names.json")),
-              let names = try? JSONDecoder().decode([String: [String: String]].self, from: data) else {
+              let names = try? JSONDecoder().decode([String: [String: DisplayNames.SharedChannelName]].self,
+                                                    from: data) else {
             return [:]
         }
         return names

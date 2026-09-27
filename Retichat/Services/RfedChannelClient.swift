@@ -86,6 +86,10 @@ final class RfedChannelClient: ObservableObject {
     /// hash → the name that sender's posts in that channel carry. Persisted
     /// in ChannelSenderEntity; it never becomes the contact's messageName.
     @Published private(set) var senderNames: [String: [String: String]] = [:]
+    /// What the NSE gets (channel_sender_names.json): every sender's
+    /// channelName with the post time that set or cleared it, cleared
+    /// names included, so its titles follow §5.2's ordering too.
+    private var sharedSenderNames: [String: [String: DisplayNames.SharedChannelName]] = [:]
 
     /// The contact resolver without the hash fallback (ChatRepository
     /// .resolvedContactName), for channel labels in notifications. Set by
@@ -444,7 +448,8 @@ final class RfedChannelClient: ObservableObject {
             for e in senderEntities { ctx.delete(e) }
             try? ctx.save()
         }
-        if senderNames.removeValue(forKey: channelHashHex) != nil {
+        let hadNames = senderNames.removeValue(forKey: channelHashHex) != nil
+        if sharedSenderNames.removeValue(forKey: channelHashHex) != nil || hadNames {
             shareSenderNames()
         }
 
@@ -1364,16 +1369,22 @@ final class RfedChannelClient: ObservableObject {
         guard let ctx = modelContext,
               let rows = try? ctx.fetch(FetchDescriptor<ChannelSenderEntity>()) else { return }
         var names: [String: [String: String]] = [:]
+        var shared: [String: [String: DisplayNames.SharedChannelName]] = [:]
         for row in rows {
             if let name = row.channelName { names[row.channelHash, default: [:]][row.senderHash] = name }
+            if row.channelName != nil || row.channelNameAtMs != nil {
+                shared[row.channelHash, default: [:]][row.senderHash] =
+                    DisplayNames.SharedChannelName(name: row.channelName, atMs: row.channelNameAtMs)
+            }
         }
         senderNames = names
+        sharedSenderNames = shared
         shareSenderNames()
     }
 
     /// The NSE names channel notifications the same way.
     private func shareSenderNames() {
-        let snapshot = senderNames
+        let snapshot = sharedSenderNames
         Task.detached(priority: .utility) {
             PendingNotification.writeChannelSenderNames(snapshot)
         }
@@ -1416,8 +1427,11 @@ final class RfedChannelClient: ObservableObject {
         try? ctx.save()
         if senderNames[channel]?[sender] != newName {
             senderNames[channel, default: [:]][sender] = newName
-            shareSenderNames()
         }
+        // The NSE's copy follows every accepted post, the time included.
+        sharedSenderNames[channel, default: [:]][sender] =
+            DisplayNames.SharedChannelName(name: newName, atMs: postMs)
+        shareSenderNames()
     }
 
     /// §4.2: whether this post carries the Channel Display Name, from the

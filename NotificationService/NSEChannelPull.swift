@@ -24,6 +24,8 @@ enum NSEChannelPull {
         let senderHash: String
         let content: String
         let timestamp: Double
+        /// The post time in milliseconds, as the app records channelNameAtMs.
+        let timestampMs: Double
         /// The post's own Channel Display Name (DISPLAY_NAMES.md §2.3).
         let displayName: DisplayNames.NameField
     }
@@ -129,6 +131,7 @@ enum NSEChannelPull {
         return Shown(senderHash: message.sourceHash.map { String(format: "%02x", $0) }.joined(),
                      content: message.content,
                      timestamp: Double(message.timestampMs) / 1000,
+                     timestampMs: Double(message.timestampMs),
                      displayName: message.displayName)
     }
 }

@@ -331,7 +331,7 @@ class NotificationService: UNNotificationServiceExtension {
         for shown in channelPull.shown {
             let label = DisplayNames.channelLabel(
                 hash: shown.senderHash,
-                channelName: DisplayNames.channelName(afterPost: shown.displayName,
+                channelName: DisplayNames.channelName(afterPost: shown.displayName, postMs: shown.timestampMs,
                                                       stored: channelNames[shown.senderHash]),
                 contactName: chatNames[shown.senderHash]?.name)
             candidates.append((shown.senderHash, shown.content, shown.timestamp, "channel", channelPull.channelHex,
