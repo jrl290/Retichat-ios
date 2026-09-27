@@ -82,6 +82,16 @@ final class RfedChannelClient: ObservableObject {
     /// UI uses this to disable the page-load button to prevent double taps.
     @Published var pullInFlight: [String: Bool] = [:]
 
+    /// Channel Display Names (DISPLAY_NAMES.md §5.1): channel hash → sender
+    /// hash → the name that sender's posts in that channel carry. Persisted
+    /// in ChannelSenderEntity; it never becomes the contact's messageName.
+    @Published private(set) var senderNames: [String: [String: String]] = [:]
+
+    /// The contact resolver without the hash fallback (ChatRepository
+    /// .resolvedContactName), for channel labels in notifications. Set by
+    /// the app when both exist.
+    var contactName: (@MainActor (String) -> String?)?
+
     private var linkStatusTimer: AnyCancellable?
     private var trackedChannelStreamNodes: Set<String> = []
     /// Runtime-only set of channel hashes whose conversation view has been
@@ -143,6 +153,7 @@ final class RfedChannelClient: ObservableObject {
         if !didLoadPersistedState {
             loadPersistedChannels()
             loadPersistedMessages()
+            loadSenderNames()
             didLoadPersistedState = true
         }
 
@@ -427,7 +438,14 @@ final class RfedChannelClient: ObservableObject {
                 predicate: #Predicate { $0.channelHash == hash }
             ))) ?? []
             for e in msgEntities { ctx.delete(e) }
+            let senderEntities = (try? ctx.fetch(FetchDescriptor<ChannelSenderEntity>(
+                predicate: #Predicate { $0.channelHash == hash }
+            ))) ?? []
+            for e in senderEntities { ctx.delete(e) }
             try? ctx.save()
+        }
+        if senderNames.removeValue(forKey: channelHashHex) != nil {
+            shareSenderNames()
         }
 
         channels.removeAll { $0.id == channelHashHex }
@@ -587,7 +605,7 @@ final class RfedChannelClient: ObservableObject {
             let optimisticTs = Date().timeIntervalSince1970 * 1000.0
             let optimisticEntity = ChannelMessageEntity(
                 id: optimisticId, channelHash: channel.id,
-                senderHash: ownHashHex, senderDisplayName: "",
+                senderHash: ownHashHex,
                 content: content, timestamp: optimisticTs, isOutgoing: true,
                 deliveryState: DeliveryState.pending
             )
@@ -595,7 +613,7 @@ final class RfedChannelClient: ObservableObject {
             try? modelContext?.save()
             appendMessage(
                 ChannelMessage(id: optimisticId, channelHash: channel.id,
-                               senderHash: ownHashHex, senderDisplayName: "",
+                               senderHash: ownHashHex,
                                content: content, timestamp: optimisticTs, isOutgoing: true,
                                deliveryState: DeliveryState.pending),
                 toChannelHash: channel.id
@@ -679,10 +697,14 @@ final class RfedChannelClient: ObservableObject {
         // canonical id so the echo back from RFed dedupes cleanly against
         // the optimistic entity (after we rename it).
         let contentData = Data(content.utf8)
+        // The Channel Display Name, by the §4.2 rule (DISPLAY_NAMES.md):
+        // never the Message Display Name.
+        let postName = channelPostName(for: channel)
         guard let packed = bridge.channelLxmPack(name: channel.channelName,
                                                   senderIdentityHandle: identityHandle,
                                                   content: contentData,
-                                                  title: Data()) else {
+                                                  title: Data(),
+                                                  displayName: postName) else {
             print("[RfedChannel] LXMF pack failed: \(bridge.lastError() ?? "unknown")")
             return false
         }
@@ -725,6 +747,8 @@ final class RfedChannelClient: ObservableObject {
             print("[RfedChannel] Send failed: AppLinks DATA delivery failed")
             return false
         }
+        // Handed to RFed: record what this post carried (§4.2).
+        recordPostName(postName, channelHashHex: channel.id)
 
         // SEND succeeded — upgrade the optimistic entity in place to the
         // canonical id (sender_hex+lxmf_ts) and mark it `sent` (= published
@@ -769,7 +793,6 @@ final class RfedChannelClient: ObservableObject {
                     list.append(ChannelMessage(
                         id: canonicalId, channelHash: upgraded.channelHash,
                         senderHash: ownHashHex.isEmpty ? upgraded.senderHash : ownHashHex,
-                        senderDisplayName: upgraded.senderDisplayName,
                         content: upgraded.content, timestamp: Double(tsMs),
                         isOutgoing: true,
                         deliveryState: DeliveryState.sent
@@ -968,9 +991,16 @@ final class RfedChannelClient: ObservableObject {
         print("[RfedChannel] dispatchVerifiedLxmf DELIVERING sender=\(senderHashHex.prefix(8)) content='\(content.prefix(40))'")
 
         let isOutgoing = senderHashHex == ownHashHex
+        // The sender in this channel: seen (§4.2) and named (§5.2; the
+        // unpack reports a name only for a validated signature, and only
+        // validated posts reach here).
+        if !isOutgoing {
+            noteSender(channelHashHex: channelHashHex, senderHashHex: senderHashHex,
+                       postMs: Double(tsMs), name: result.displayName)
+        }
         let deliveryState = Self.verifiedChannelMessageDeliveryState(isOutgoing: isOutgoing)
         let entity = ChannelMessageEntity(id: msgId, channelHash: channelHashHex,
-                                          senderHash: senderHashHex, senderDisplayName: "",
+                                          senderHash: senderHashHex,
                                           content: content,
                           timestamp: Double(tsMs), isOutgoing: isOutgoing,
                           deliveryState: deliveryState)
@@ -978,7 +1008,7 @@ final class RfedChannelClient: ObservableObject {
         try? modelContext?.save()
 
         let msg = ChannelMessage(id: msgId, channelHash: channelHashHex,
-                                  senderHash: senderHashHex, senderDisplayName: "", content: content,
+                                  senderHash: senderHashHex, content: content,
                       timestamp: Double(tsMs), isOutgoing: isOutgoing,
                       deliveryState: deliveryState)
         appendMessage(msg, toChannelHash: channelHashHex)
@@ -987,10 +1017,13 @@ final class RfedChannelClient: ObservableObject {
 
         if notify, !isOutgoing, let channel = channels.first(where: { $0.id == channelHashHex }),
            UserPreferences.shared.isChannelNotificationsEnabled(channelHashHex) {
-            let senderLabel = senderHashHex.prefix(8) + "…"
+            // Named as the bubble names the sender (audit L6), and as the NSE
+            // names it (DisplayNames.channelNotificationTitle).
+            let label = senderLabel(channelHashHex: channelHashHex, senderHashHex: senderHashHex,
+                                    contactName: contactName?(senderHashHex))
             NotificationManager.shared.postMessageNotification(
                 chatId: channelHashHex,
-                senderName: "#\(channel.channelName) (\(senderLabel))",
+                senderName: DisplayNames.channelNotificationTitle(channelName: channel.channelName, label: label),
                 content: content
             )
         }
@@ -1295,7 +1328,7 @@ final class RfedChannelClient: ObservableObject {
         var grouped: [String: [ChannelMessage]] = [:]
         for e in entities {
             let msg = ChannelMessage(id: e.id, channelHash: e.channelHash,
-                                     senderHash: e.senderHash, senderDisplayName: e.senderDisplayName,
+                                     senderHash: e.senderHash,
                                      content: e.content,
                                      timestamp: e.timestamp, isOutgoing: e.isOutgoing,
                                      deliveryState: e.deliveryState)
@@ -1314,6 +1347,109 @@ final class RfedChannelClient: ObservableObject {
 
     private static func verifiedChannelMessageDeliveryState(isOutgoing: Bool) -> Int {
         isOutgoing ? DeliveryState.sent : DeliveryState.delivered
+    }
+
+    // MARK: - Channel Display Names (DISPLAY_NAMES.md §4.2, §5)
+
+    /// A poster's label in a channel: channelName ?? the contact's own
+    /// resolution (`contactName`, no hash fallback) ?? shortHash, with the
+    /// 8-hex hash as secondary text when the label is the channel name.
+    func senderLabel(channelHashHex: String, senderHashHex: String, contactName: String?) -> DisplayNames.ChannelLabel {
+        DisplayNames.channelLabel(hash: senderHashHex,
+                                  channelName: senderNames[channelHashHex]?[senderHashHex],
+                                  contactName: contactName)
+    }
+
+    private func loadSenderNames() {
+        guard let ctx = modelContext,
+              let rows = try? ctx.fetch(FetchDescriptor<ChannelSenderEntity>()) else { return }
+        var names: [String: [String: String]] = [:]
+        for row in rows {
+            if let name = row.channelName { names[row.channelHash, default: [:]][row.senderHash] = name }
+        }
+        senderNames = names
+        shareSenderNames()
+    }
+
+    /// The NSE names channel notifications the same way.
+    private func shareSenderNames() {
+        let snapshot = senderNames
+        Task.detached(priority: .utility) {
+            PendingNotification.writeChannelSenderNames(snapshot)
+        }
+    }
+
+    /// A post from `senderHashHex` passed the key binding and signature
+    /// checks: remember when this device first saw them here (§4.2 rule
+    /// 2), and take the post's 0xD1 as their channelName (§5.2). A post
+    /// older than the one that last set the name (pulled later with "Load
+    /// earlier messages") leaves it alone.
+    private func noteSender(channelHashHex: String, senderHashHex: String, postMs: Double,
+                            name: DisplayNames.NameField) {
+        guard let ctx = modelContext else { return }
+        let channel = channelHashHex, sender = senderHashHex
+        let row: ChannelSenderEntity
+        if let existing = try? ctx.fetch(FetchDescriptor<ChannelSenderEntity>(
+            predicate: #Predicate { $0.channelHash == channel && $0.senderHash == sender })).first {
+            row = existing
+        } else {
+            row = ChannelSenderEntity(channelHash: channel, senderHash: sender,
+                                      firstSeenAt: Date().timeIntervalSince1970)
+            ctx.insert(row)
+        }
+        let newName: String?
+        switch name {
+        case .absent: try? ctx.save(); return
+        case .clear: newName = nil
+        case .name(let n): newName = n
+        }
+        if let at = row.channelNameAtMs, postMs < at {
+            try? ctx.save()
+            return
+        }
+        row.channelName = newName
+        row.channelNameAtMs = postMs
+        try? ctx.save()
+        if senderNames[channel]?[sender] != newName {
+            senderNames[channel, default: [:]][sender] = newName
+            shareSenderNames()
+        }
+    }
+
+    /// §4.2: whether this post carries the Channel Display Name, from the
+    /// channel's persisted state.
+    private func channelPostName(for channel: Channel) -> DisplayNames.NameField {
+        let current = LxmfClient.cleanDisplayName(prefs.channelDisplayName)
+        let hash = channel.id
+        let entity = try? modelContext?.fetch(FetchDescriptor<ChannelEntity>(
+            predicate: #Predicate { $0.channelHash == hash })).first
+        let lastIncludedAt = entity?.nameLastIncludedAt
+        let lastDigest = entity?.nameLastDigestHex.flatMap { Data(hexString: $0) }
+        let own = ownHashHex
+        let senders = (try? modelContext?.fetch(FetchDescriptor<ChannelSenderEntity>(
+            predicate: #Predicate { $0.channelHash == hash }))) ?? []
+        let newSender = senders.contains { $0.senderHash != own && $0.firstSeenAt > (lastIncludedAt ?? -Double.infinity) }
+        return DisplayNames.channelPostName(current: current, lastDigest: lastDigest,
+                                            lastIncludedAt: lastIncludedAt,
+                                            newSenderSinceIncluded: newSender,
+                                            now: Date().timeIntervalSince1970)
+    }
+
+    /// After a post is handed to RFed: what it carried and when (§4.2).
+    private func recordPostName(_ name: DisplayNames.NameField, channelHashHex: String) {
+        let digest: Data
+        switch name {
+        case .absent: return
+        case .clear: digest = DisplayNames.digest(nil)
+        case .name(let n): digest = DisplayNames.digest(n)
+        }
+        let hash = channelHashHex
+        guard let ctx = modelContext,
+              let entity = try? ctx.fetch(FetchDescriptor<ChannelEntity>(
+                predicate: #Predicate { $0.channelHash == hash })).first else { return }
+        entity.nameLastDigestHex = digest.hexString
+        entity.nameLastIncludedAt = Date().timeIntervalSince1970
+        try? ctx.save()
     }
 
     // MARK: - Static helpers
@@ -1363,25 +1499,6 @@ final class RfedChannelClient: ObservableObject {
         return segments
     }
 
-    /// Encode inner blob v2: 0x02 | senderHash(16) | timestampMS_BE(8) | nameLen_BE(2) | utf8name | utf8content
-    nonisolated static func encodeBlob(senderHash: Data, senderDisplayName: String, content: String) -> Data {
-        var blob = Data([0x02])
-        let hash16 = senderHash.count >= 16 ? senderHash.prefix(16) : (senderHash + Data(repeating: 0, count: 16 - senderHash.count))
-        blob.append(contentsOf: hash16)
-        let tsMs = UInt64(Date().timeIntervalSince1970 * 1000)
-        var tsBytes = tsMs.bigEndian
-        blob.append(contentsOf: withUnsafeBytes(of: &tsBytes) { Data($0) })
-        let nameBytes = Data(senderDisplayName.utf8)
-        let nameLen = UInt16(min(nameBytes.count, 255))
-        var nameLenBytes = nameLen.bigEndian
-        blob.append(contentsOf: withUnsafeBytes(of: &nameLenBytes) { Data($0) })
-        blob.append(nameBytes.prefix(Int(nameLen)))
-        blob.append(Data(content.utf8))
-        return blob
-    }
-
-    /// Decode inner blob. Returns (senderHashHex, timestampMS, senderDisplayName, content) or nil.
-    /// Handles both v1 (0x01, no display name) and v2 (0x02, display name embedded).
     /// Encode a value as msgpack bin8: 0xc4 | len | bytes
     nonisolated static func msgpackBin(_ data: Data) -> Data {
         var out = Data([0xc4, UInt8(data.count)])

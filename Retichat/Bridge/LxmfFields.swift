@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 // MARK: - LXMF field keys
 //
@@ -15,7 +16,10 @@ import Foundation
 
 enum LxmfFieldKey {
     static let fileAttachments: UInt8 = 0x05
-    static let senderName:      UInt8 = 0x10  // sender display name (UTF-8) — per-message
+    // 0x10 (FIELD_SENDER_NAME) is retired (DISPLAY_NAMES.md §2.1): never sent,
+    // never read, skipped like any unknown field. MeshChatX and Columba put
+    // dicts there. The sender's name is field 0xD1, which the Rust side
+    // decodes (LxmfClient.decodeDisplayName, DisplayNames below).
     // Group chat fields
     static let groupId:        UInt8 = 0xA0  // string: 32-char hex group identifier
     static let groupMembers:   UInt8 = 0xA1  // string: comma-sep hex hashes of ALL members (invite only)
@@ -88,7 +92,6 @@ enum MemberStatus {
 
 struct LxmfFields {
     var attachments: [(filename: String, data: Data)] = []
-    var senderName: String?  // from FIELD_SENDER_NAME (0x10)
     // Group fields
     var groupId: String?
     var groupMembers: [String]?      // full member list (invite messages only)
@@ -161,9 +164,6 @@ final class LxmfFieldsDecoder {
                     }
                     fields.attachments = attachments
                 }
-
-            case LxmfFieldKey.senderName:
-                fields.senderName = readString(bytes, &offset)
 
             case LxmfFieldKey.groupId:
                 fields.groupId = readString(bytes, &offset)
@@ -461,5 +461,293 @@ final class LxmfFieldsDecoder {
         default:
             offset += 1 // skip unknown
         }
+    }
+}
+
+// MARK: - Display names (LXMF-rust/DISPLAY_NAMES.md)
+//
+// The rules the app applies to names; cleaning a name and decoding field
+// 0xD1 happen once, in Rust (lxmf_display_name_clean, lxmf_display_name_decode
+// and the channel unpack trailer, wrapped by LxmfClient). Foundation and
+// CryptoKit only, and compiled into both the app and the Notification Service
+// Extension: tests/DisplayNamesTests.swift runs it on its own.
+
+nonisolated enum DisplayNames {
+
+    /// A decoded 0xD1 (§3): no field, "I have no name now", or a cleaned name.
+    enum NameField: Equatable {
+        case absent
+        case clear
+        case name(String)
+
+        /// The FFI's name_state: 0 absent, 1 clear, 2 name.
+        var stateByte: UInt8 {
+            switch self {
+            case .absent: return 0
+            case .clear:  return 1
+            case .name:   return 2
+            }
+        }
+    }
+
+    /// `name_state u8 | name_len u16 BE | name` — the buffer of
+    /// lxmf_display_name_decode and the trailer of retichat_channel_lxm_unpack.
+    /// nil when malformed (a short buffer, an unknown state, a name that is
+    /// empty or not UTF-8).
+    static func parseNameState(_ data: Data) -> NameField? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 3 else { return nil }
+        let len = (Int(bytes[1]) << 8) | Int(bytes[2])
+        switch bytes[0] {
+        case 0: return .absent
+        case 1: return .clear
+        case 2:
+            guard len > 0, bytes.count >= 3 + len,
+                  let name = String(bytes: bytes[3..<(3 + len)], encoding: .utf8) else { return nil }
+            return .name(name)
+        default: return nil
+        }
+    }
+
+    /// What a message's 0xD1 does to the messageName held for its LXMF source.
+    enum Change: Equatable {
+        case keep
+        /// nil clears the name.
+        case set(String?)
+    }
+
+    /// §5.2. `unverifiedReason`: 0 signature validated, 1 source unknown (no
+    /// key yet), anything else invalid. A validated name replaces, a
+    /// validated clear clears; from an unknown source a name is only taken
+    /// when none is held, and a clear is ignored; an invalid signature
+    /// changes nothing.
+    static func acceptMessageName(_ field: NameField, unverifiedReason: Int, current: String?) -> Change {
+        switch (field, unverifiedReason) {
+        case (.name(let s), 0):
+            return s == current ? .keep : .set(s)
+        case (.clear, 0):
+            return current == nil ? .keep : .set(nil)
+        case (.name(let s), 1):
+            return current == nil ? .set(s) : .keep
+        default:
+            return .keep
+        }
+    }
+
+    /// The first 8 hex characters and an ellipsis, on every client (§5.3).
+    static func shortHash(_ hex: String) -> String {
+        String(hex.lowercased().prefix(8)) + "\u{2026}"
+    }
+
+    /// localName ?? messageName ?? announceName, empty slots skipped; nil
+    /// when the contact has no name at all.
+    static func contactName(local: String?, message: String?, announce: String?) -> String? {
+        for name in [local, message, announce] {
+            if let name, !name.isEmpty { return name }
+        }
+        return nil
+    }
+
+    /// The contact resolver (§5.3): localName ?? messageName ?? announceName ?? shortHash.
+    static func contactLabel(hash: String, local: String?, message: String?, announce: String?) -> String {
+        contactName(local: local, message: message, announce: announce) ?? shortHash(hash)
+    }
+
+    /// A channel poster's label and, when it came from the channel name,
+    /// the 8-hex short hash shown beside it (channel names are public and
+    /// anyone can pick any name).
+    struct ChannelLabel: Equatable {
+        let label: String
+        let secondary: String?
+    }
+
+    /// The channel resolver (§5.3): channelName ?? (localName ?? messageName
+    /// ?? announceName) ?? shortHash. `contactName` is the contact's own
+    /// resolution without the hash fallback (contactName(local:message:announce:)).
+    static func channelLabel(hash: String, channelName: String?, contactName: String?) -> ChannelLabel {
+        if let channelName, !channelName.isEmpty {
+            return ChannelLabel(label: channelName, secondary: String(hash.lowercased().prefix(8)))
+        }
+        if let contactName, !contactName.isEmpty {
+            return ChannelLabel(label: contactName, secondary: nil)
+        }
+        return ChannelLabel(label: shortHash(hash), secondary: nil)
+    }
+
+    /// The title of a channel message notification, in the app and the NSE.
+    static func channelNotificationTitle(channelName: String, label: ChannelLabel) -> String {
+        if let secondary = label.secondary {
+            return "#\(channelName) (\(label.label) \u{00B7} \(secondary))"
+        }
+        return "#\(channelName) (\(label.label))"
+    }
+
+    /// First 16 bytes of SHA-256 of the cleaned name's UTF-8; no name hashes
+    /// the empty string (§4.1, used by the channel rule §4.2).
+    static func digest(_ name: String?) -> Data {
+        Data(SHA256.hash(data: Data((name ?? "").utf8)).prefix(16))
+    }
+
+    /// CHANNEL_NAME_REFRESH_SECS (§4.2).
+    static let channelNameRefreshSecs: Double = 24 * 60 * 60
+
+    /// §4.2: whether a channel post carries the Channel Display Name.
+    /// `current` is the cleaned Channel Display Name (nil when unset);
+    /// `lastDigest`/`lastIncludedAt` the persisted state of the channel;
+    /// `newSenderSinceIncluded` whether a sender not seen before has posted
+    /// in the channel since the name was last included. Times in seconds.
+    static func channelPostName(current: String?, lastDigest: Data?, lastIncludedAt: Double?,
+                                newSenderSinceIncluded: Bool, now: Double) -> NameField {
+        guard let current, !current.isEmpty else {
+            // Unset: clear once, only if a real name went out last.
+            if let lastDigest, lastDigest != digest(nil) { return .clear }
+            return .absent
+        }
+        if lastDigest != digest(current) { return .name(current) }
+        if newSenderSinceIncluded { return .name(current) }
+        guard let lastIncludedAt else { return .name(current) }
+        return now - lastIncludedAt > channelNameRefreshSecs ? .name(current) : .absent
+    }
+
+    /// Where a name from before the three slots goes (§5.4, iOS).
+    enum LegacyName: Equatable {
+        case drop
+        case announceName(String)
+        case localName(String)
+    }
+
+    /// §5.4: a hash placeholder is dropped; a value equal to the contact's
+    /// recalled announce name becomes announceName; anything else is a
+    /// name the user typed (iOS had no rename flag) and becomes localName.
+    static func migrateLegacyName(_ value: String, hash: String, recalledAnnounceName: String?) -> LegacyName {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isPlaceholder(trimmed, hash: hash) { return .drop }
+        if let recalled = recalledAnnounceName, !recalled.isEmpty, recalled == trimmed {
+            return .announceName(recalled)
+        }
+        return .localName(trimmed)
+    }
+
+    /// Empty, a prefix of the contact's own hash (with or without an
+    /// ellipsis: "1a2b3c4d…", the 16-hex picker form, the whole hash), or
+    /// MeshChatX's and Columba's "Anonymous Peer" (§3).
+    static func isPlaceholder(_ value: String, hash: String) -> Bool {
+        var v = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if v.isEmpty { return true }
+        if v.caseInsensitiveCompare("Anonymous Peer") == .orderedSame { return true }
+        if v.hasSuffix("\u{2026}") { v.removeLast() } else if v.hasSuffix("...") { v.removeLast(3) }
+        v = v.lowercased()
+        guard v.count >= 6, v.allSatisfy(\.isHexDigit) else { return false }
+        return hash.lowercased().hasPrefix(v)
+    }
+
+    // MARK: Notification Service Extension
+
+    /// The NSE's title for a message from `hash`. It has no store, only
+    /// what the app shares: `appName` is the app's resolved name for the
+    /// contact (chat_names.json; absent when the contact has none). Without
+    /// it, the message's own 0xD1 when the §5.2 rules would take it, then
+    /// the cached announce name, then shortHash — the resolver's order.
+    static func notificationName(hash: String, appName: String?, messageName: NameField,
+                                 unverifiedReason: Int, announceName: String?) -> String {
+        if let appName, !appName.isEmpty { return appName }
+        if case .set(let name?) = acceptMessageName(messageName, unverifiedReason: unverifiedReason, current: nil) {
+            return name
+        }
+        if let announceName, !announceName.isEmpty { return announceName }
+        return shortHash(hash)
+    }
+
+    /// A sender's channelName once a post is seen: the post's own name or
+    /// clear wins, a post without 0xD1 leaves the stored one.
+    static func channelName(afterPost post: NameField, stored: String?) -> String? {
+        switch post {
+        case .name(let name): return name
+        case .clear: return nil
+        case .absent: return stored
+        }
+    }
+
+    // MARK: Distro unwrap
+
+    /// retichat_distro_unwrap's display_name_state / display_name (0 absent,
+    /// 1 clear, 2 name; the name null unless 2). Missing keys (an older FFI
+    /// build) and anything malformed read as absent.
+    static func distroNameField(state: Int?, name: String?) -> NameField {
+        switch state {
+        case 1: return .clear
+        case 2:
+            if let name, !name.isEmpty { return .name(name) }
+            return .absent
+        default: return .absent
+        }
+    }
+
+    /// The unwrap's signature result as a §5.2 reason: 0 when validated,
+    /// else its unverified_reason; a message not validated without one is
+    /// invalid (2), which never lets a name through.
+    static func distroReason(validated: Bool?, unverifiedReason: Int?) -> Int {
+        if validated == true { return 0 }
+        if let reason = unverifiedReason, reason == 1 || reason == 2 { return reason }
+        return 2
+    }
+
+    // MARK: System messages
+
+    /// Stands for the message's senderHash in a stored system message
+    /// ("… joined the group"): the name is resolved when the message is
+    /// shown, never frozen into the stored text (§5.3).
+    static let subjectToken = "\u{FFFC}"
+
+    /// A system message's text with its subject in place of the token.
+    static func systemText(_ template: String, subject: String) -> String {
+        template.contains(subjectToken)
+            ? template.replacingOccurrences(of: subjectToken, with: subject)
+            : template
+    }
+}
+
+// MARK: - Channel unpack output
+
+/// The output of retichat_channel_lxm_unpack (CRetichatFFI.h), read by the
+/// app (RetichatBridge.channelLxmUnpack) and the NSE (NSEChannelUnpackDecoder):
+/// source(16) | timestamp_ms u64 BE | sig_ok u8 | reason u8 | title_len u16 BE |
+/// content_len u32 BE | title | content | name_state u8 | name_len u16 BE | name.
+/// The trailer is the post's Channel Display Name (DISPLAY_NAMES.md §2.3),
+/// reported by the Rust side only when the signature validated.
+nonisolated enum ChannelUnpackLayout {
+    struct Message: Equatable {
+        let sourceHash: Data
+        let timestampMs: UInt64
+        let signatureValidated: Bool
+        /// 0 = ok, 1 = SOURCE_UNKNOWN, 2 = SIGNATURE_INVALID.
+        let unverifiedReason: UInt8
+        let title: Data
+        let content: Data
+        let displayName: DisplayNames.NameField
+    }
+
+    static func decode(_ raw: Data) -> Message? {
+        let bytes = [UInt8](raw)
+        guard bytes.count >= 32 else { return nil }
+        func uint(_ from: Int, _ count: Int) -> Int {
+            bytes[from..<(from + count)].reduce(0) { ($0 << 8) | Int($1) }
+        }
+        let titleLen = uint(26, 2)
+        let contentLen = uint(28, 4)
+        let end = 32 + titleLen + contentLen
+        guard bytes.count >= end else { return nil }
+        let timestamp = bytes[16..<24].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let validated = bytes[24] == 1
+        // A name is taken only from a validated post, whatever the trailer says.
+        let name = validated ? (DisplayNames.parseNameState(Data(bytes[end...])) ?? .absent) : .absent
+        return Message(
+            sourceHash: Data(bytes[0..<16]),
+            timestampMs: timestamp,
+            signatureValidated: validated,
+            unverifiedReason: bytes[25],
+            title: Data(bytes[32..<(32 + titleLen)]),
+            content: Data(bytes[(32 + titleLen)..<end]),
+            displayName: name)
     }
 }

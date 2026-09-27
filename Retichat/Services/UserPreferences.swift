@@ -25,11 +25,27 @@ final class UserPreferences {
         // now; drop the copies so none can come back.
         defaults.removeObject(forKey: Keys.rfedNotifyHash)
         defaults.removeObject(forKey: Keys.lxmfPropagationHash)
+        Self.migrateDisplayName(defaults)
+    }
+
+    /// DISPLAY_NAMES.md §5.4: the old single display name was sent inside
+    /// messages, so it becomes the Message Display Name. The Announce
+    /// Display Name starts empty; the channel name keeps its key.
+    static func migrateDisplayName(_ defaults: UserDefaults) {
+        guard let old = defaults.string(forKey: Keys.legacyDisplayName) else { return }
+        if defaults.string(forKey: Keys.messageDisplayName) == nil {
+            defaults.set(old, forKey: Keys.messageDisplayName)
+        }
+        defaults.removeObject(forKey: Keys.legacyDisplayName)
     }
 
     private enum Keys {
-        static let displayName = "display_name"
+        /// Until 2026-09-27; moved to messageDisplayName at init.
+        static let legacyDisplayName = "display_name"
+        static let messageDisplayName = "message_display_name"
+        static let announceDisplayName = "announce_display_name"
         static let channelDisplayName = "channel_display_name"
+        static let contactNamesMigrated = "contact_names_migrated_v1"
         static let defaultTcpEnabled = "default_tcp_enabled"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
@@ -48,17 +64,36 @@ final class UserPreferences {
         static let distroContacts = "distro_contacts"
     }
 
-    var displayName: String {
-        get { defaults.string(forKey: Keys.displayName) ?? "" }
-        set { defaults.set(newValue, forKey: Keys.displayName) }
+    // MARK: - Display names (LXMF-rust/DISPLAY_NAMES.md)
+    //
+    // Three independent names, all empty by default; none falls back to
+    // another (§1). Settings saves them cleaned (lxmf_display_name_clean), so
+    // the screen shows exactly what goes out.
+
+    /// Sent inside messages (field 0xD1), only to the people messaged (§4.1).
+    var messageDisplayName: String {
+        get { defaults.string(forKey: Keys.messageDisplayName) ?? "" }
+        set { defaults.set(newValue, forKey: Keys.messageDisplayName) }
     }
 
-    /// Display name embedded in outgoing channel messages.
-    /// If empty, falls back to `displayName`. Stored once by the sender;
-    /// receivers see whatever name was in the message when it arrived.
+    /// PUBLIC: sent in this device's and the distro's announces to the whole
+    /// network (§2.2). Empty = anonymous (the announce carries nil).
+    var announceDisplayName: String {
+        get { defaults.string(forKey: Keys.announceDisplayName) ?? "" }
+        set { defaults.set(newValue, forKey: Keys.announceDisplayName) }
+    }
+
+    /// Carried in channel posts by the §4.2 rule. Empty = posts carry no
+    /// name; it never falls back to the Message Display Name.
     var channelDisplayName: String {
         get { defaults.string(forKey: Keys.channelDisplayName) ?? "" }
         set { defaults.set(newValue, forKey: Keys.channelDisplayName) }
+    }
+
+    /// The one-time contact name migration (§5.4) has run.
+    var contactNamesMigrated: Bool {
+        get { defaults.bool(forKey: Keys.contactNamesMigrated) }
+        set { defaults.set(newValue, forKey: Keys.contactNamesMigrated) }
     }
 
     /// When true (default) and no user-configured interfaces are present,

@@ -32,7 +32,8 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 GroupMemberEntity.self,
                 InterfaceConfigEntity.self,
                 ChannelEntity.self,
-                ChannelMessageEntity.self
+                ChannelMessageEntity.self,
+                ChannelSenderEntity.self
             )
         } catch {
             fatalError("Failed to create ModelContainer: \(error)")
@@ -245,6 +246,10 @@ struct RetichatApp: App {
                     handleDeepLink(url)
                 }
                 .onAppear {
+                    // Channel labels fall back to the contact's name (DISPLAY_NAMES.md §5.3).
+                    channelClient.contactName = { [weak repo = repository] hash in
+                        repo?.resolvedContactName(for: hash)
+                    }
                     channelClient.configure(
                         modelContext: modelContainer.mainContext,
                         identityHandle: 0,

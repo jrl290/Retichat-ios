@@ -24,6 +24,8 @@ enum NSEChannelPull {
         let senderHash: String
         let content: String
         let timestamp: Double
+        /// The post's own Channel Display Name (DISPLAY_NAMES.md §2.3).
+        let displayName: DisplayNames.NameField
     }
 
     struct Result {
@@ -126,16 +128,18 @@ enum NSEChannelPull {
         guard let message = NSEChannelUnpackDecoder.decode(raw), message.signatureValidated else { return nil }
         return Shown(senderHash: message.sourceHash.map { String(format: "%02x", $0) }.joined(),
                      content: message.content,
-                     timestamp: Double(message.timestampMs) / 1000)
+                     timestamp: Double(message.timestampMs) / 1000,
+                     displayName: message.displayName)
     }
 }
 
 // BEGIN NSEChannelUnpackDecoder
-// Foundation only: tests/NSEChannelPullTests.swift compiles this block on its own.
+// Foundation only: tests/NSEChannelPullTests.swift compiles this block on its
+// own, with Retichat/Bridge/LxmfFields.swift (ChannelUnpackLayout, DisplayNames).
 
-/// The output of retichat_channel_lxm_unpack, as RetichatBridge.channelLxmUnpack
-/// reads it: source(16) | timestamp_ms u64 BE | sig_ok u8 | reason u8 |
-/// title_len u16 BE | content_len u32 BE | title | content.
+/// The output of retichat_channel_lxm_unpack, as the NSE shows it. The layout
+/// is read by ChannelUnpackLayout, the parser RetichatBridge.channelLxmUnpack
+/// uses too, trailer (the post's Channel Display Name) included.
 enum NSEChannelUnpackDecoder {
     struct Message: Equatable {
         let sourceHash: Data
@@ -143,24 +147,19 @@ enum NSEChannelUnpackDecoder {
         let signatureValidated: Bool
         let title: String
         let content: String
+        /// The post's own 0xD1 (.absent unless the signature validated).
+        let displayName: DisplayNames.NameField
     }
 
     static func decode(_ raw: Data) -> Message? {
-        let bytes = [UInt8](raw)
-        guard bytes.count >= 32 else { return nil }
-        func uint(_ from: Int, _ count: Int) -> Int {
-            bytes[from..<(from + count)].reduce(0) { ($0 << 8) | Int($1) }
-        }
-        let titleLen = uint(26, 2)
-        let contentLen = uint(28, 4)
-        guard bytes.count >= 32 + titleLen + contentLen else { return nil }
-        let timestamp = bytes[16..<24].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        guard let m = ChannelUnpackLayout.decode(raw) else { return nil }
         return Message(
-            sourceHash: Data(bytes[0..<16]),
-            timestampMs: timestamp,
-            signatureValidated: bytes[24] == 1,
-            title: String(decoding: bytes[32..<(32 + titleLen)], as: UTF8.self),
-            content: String(decoding: bytes[(32 + titleLen)..<(32 + titleLen + contentLen)], as: UTF8.self))
+            sourceHash: m.sourceHash,
+            timestampMs: m.timestampMs,
+            signatureValidated: m.signatureValidated,
+            title: String(decoding: m.title, as: UTF8.self),
+            content: String(decoding: m.content, as: UTF8.self),
+            displayName: m.displayName)
     }
 }
 // END NSEChannelUnpackDecoder

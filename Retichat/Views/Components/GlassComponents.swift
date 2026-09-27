@@ -65,12 +65,20 @@ struct ChatBubble: View {
             if message.isOutgoing { Spacer(minLength: 48) }
 
             VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 4) {
-                // Sender name in group chats
+                // Sender name in group chats and channels; beside a channel
+                // name, the sender's 8-hex hash (DISPLAY_NAMES.md §5.3)
                 if isGroup && !message.isOutgoing {
-                    Text(message.senderName)
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.retichatPrimary)
+                    HStack(spacing: 4) {
+                        Text(message.senderName)
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.retichatPrimary)
+                        if let secondary = message.senderSecondary {
+                            Text(secondary)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.retichatOnSurfaceVariant)
+                        }
+                    }
                 }
 
                 // Attachments

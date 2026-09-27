@@ -15,9 +15,14 @@
 //     > /private/tmp/claude-501/NSEChannelUnpackDecoder.swift && \
 //   swiftc -o /private/tmp/claude-501/nse-channel-pull \
 //     /private/tmp/claude-501/NSEChannelUnpackDecoder.swift \
+//     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
 //     Retichat-ios/Retichat/Services/PendingNotification.swift \
 //     Retichat-ios/tests/NSEChannelPullTests.swift && \
 //     /private/tmp/claude-501/nse-channel-pull
+//
+// Since 2026-09-27 (DISPLAY_NAMES.md) the unpack output ends in the post's
+// Channel Display Name, parsed by ChannelUnpackLayout in LxmfFields.swift,
+// which the app's RetichatBridge.channelLxmUnpack uses too.
 //
 // The directory, the blob store and the unpack decoder run for real (the store
 // against a scratch directory, never the App Group). The NSE and app wiring
@@ -75,7 +80,10 @@ func testSavedChannelBlobsComeBackOnceWithTheirChannel() {
     check(PendingNotification.readAndClearNSEChannelBlobs(in: dir).isEmpty, "and only once")
 }
 
-func unpackOutput(sigOk: Bool, title: String, content: String, truncateBy: Int = 0) -> Data {
+/// `trailer`: the name_state | name_len u16 BE | name bytes the Rust side
+/// appends; nil leaves them off.
+func unpackOutput(sigOk: Bool, title: String, content: String, truncateBy: Int = 0,
+                  trailer: Data? = Data([0, 0, 0])) -> Data {
     var d = Data(repeating: 0x5C, count: 16)
     var ts = UInt64(1_790_000_000_123).bigEndian
     d.append(Data(bytes: &ts, count: 8))
@@ -87,7 +95,13 @@ func unpackOutput(sigOk: Bool, title: String, content: String, truncateBy: Int =
     d.append(Data(bytes: &cl, count: 4))
     d.append(t)
     d.append(c)
+    if let trailer { d.append(trailer) }
     return d.dropLast(truncateBy)
+}
+
+func nameTrailer(_ name: String) -> Data {
+    let n = Data(name.utf8)
+    return Data([2, UInt8(n.count >> 8), UInt8(n.count & 0xFF)]) + n
 }
 
 func testTheUnpackLayoutDecodes() {
@@ -98,8 +112,24 @@ func testTheUnpackLayoutDecodes() {
     check(m?.title == "t" && m?.content == "hello channel", "title and content")
     check(NSEChannelUnpackDecoder.decode(unpackOutput(sigOk: false, title: "", content: "x"))?.signatureValidated == false,
           "an unverified message says so")
-    check(NSEChannelUnpackDecoder.decode(unpackOutput(sigOk: true, title: "t", content: "hello", truncateBy: 2)) == nil,
+    check(NSEChannelUnpackDecoder.decode(unpackOutput(sigOk: true, title: "t", content: "hello", truncateBy: 5)) == nil,
           "a truncated output is rejected")
+
+    // The trailer: the post's Channel Display Name (DISPLAY_NAMES.md §2.3).
+    check(m?.displayName == .absent, "a post without 0xD1 names nobody")
+    let named = NSEChannelUnpackDecoder.decode(unpackOutput(sigOk: true, title: "", content: "hi",
+                                                            trailer: nameTrailer("Zoë \u{1F600}")))
+    check(named?.displayName == .name("Zoë \u{1F600}"), "a validated post's name is read as UTF-8")
+    check(named?.content == "hi", "and the content still ends where content_len says")
+    check(NSEChannelUnpackDecoder.decode(unpackOutput(sigOk: true, title: "", content: "hi",
+                                                      trailer: Data([1, 0, 0])))?.displayName == .clear,
+          "an empty 0xD1 is a clear")
+    check(NSEChannelUnpackDecoder.decode(unpackOutput(sigOk: false, title: "", content: "hi",
+                                                      trailer: nameTrailer("Mallory")))?.displayName == .absent,
+          "an unvalidated post names nobody, whatever its trailer says")
+    check(NSEChannelUnpackDecoder.decode(unpackOutput(sigOk: true, title: "", content: "hi",
+                                                      trailer: nil))?.displayName == .absent,
+          "no trailer reads as no name")
 }
 
 func testTheWiring() {
@@ -118,7 +148,9 @@ func testTheWiring() {
           "the NSE reads the channel from the push (apns-bridge rfed.channel)")
     check(before(nse, "channelPull = NSEChannelPull.run(", "distro = NSEDistroPull.run("),
           "a channel push pulls the channel; any other push pulls the distro")
-    check(nse.contains("\"#\\(channelPull.channelName) (\\($0.senderHash.prefix(8))\\u{2026})\""),
+    check(nse.contains("DisplayNames.channelNotificationTitle(channelName: channelPull.channelName, label: label)")
+            && source("Retichat/Services/RfedChannelClient.swift").contains(
+                "senderName: DisplayNames.channelNotificationTitle(channelName: channel.channelName, label: label)"),
           "a channel message is named as the app names its channel notifications")
     check(nse.contains("best.userInfo[\"chatId\"] = msg.thread"), "tapping opens the channel")
     check(before(nse, "} else if channelPull.failed {", "} else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {"),

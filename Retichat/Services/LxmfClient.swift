@@ -32,8 +32,12 @@ struct LxmfClientConfig: Sendable {
     /// Create a new identity if the file doesn't exist.
     let createIdentity: Bool
 
-    /// Display name announced on the network (empty = anonymous).
-    let displayName: String
+    /// The initial Message Display Name (DISPLAY_NAMES.md §4.1): sent inside
+    /// messages (field 0xD1) by the router's name ledger, never announced.
+    /// Empty = none. Changed at runtime with setMessageDisplayName; the
+    /// Announce Display Name starts empty and is set with
+    /// setAnnounceDisplayName before the first announce.
+    let messageDisplayName: String
 
     /// Log level (0–7, or -1 for default).
     let logLevel: Int32
@@ -160,7 +164,7 @@ final class LxmfClient: @unchecked Sendable {
         let h = config.configDir.withCString { dir in
             config.storagePath.withCString { store in
                 config.identityPath.withCString { id in
-                    config.displayName.withCString { name in
+                    config.messageDisplayName.withCString { name in
                         lxmf_client_start(
                             dir, store, id,
                             config.createIdentity ? 1 : 0,
@@ -819,9 +823,58 @@ final class LxmfClient: @unchecked Sendable {
         destHash.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Look up the cached display name for a destination hash (from its last announce).
-    /// Returns nil if no name is known.
-    func recallDisplayName(for destHash: Data) -> String? {
+    // MARK: - Display names (DISPLAY_NAMES.md)
+
+    /// The Message Display Name (§4.1): the router adds it (field 0xD1) to
+    /// outbound messages by the name-ledger rule. Empty clears it. Takes
+    /// effect at once; no restart. Blocking FFI: call off the main thread.
+    @discardableResult
+    nonisolated func setMessageDisplayName(_ name: String) -> Bool {
+        name.withCString { lxmf_client_set_message_display_name(handle, $0) } == 0
+    }
+
+    /// The Announce Display Name (§2.2): the PUBLIC name in this client's
+    /// lxmf.delivery announce. Empty announces nil. The next announce carries
+    /// it. Blocking FFI: call off the main thread.
+    @discardableResult
+    nonisolated func setAnnounceDisplayName(_ name: String) -> Bool {
+        name.withCString { lxmf_client_set_announce_display_name(handle, $0) } == 0
+    }
+
+    /// Clean a name exactly as the router does (§3), for what Settings saves
+    /// and what the user types as a contact's local name. `announce` also
+    /// maps "Anonymous Peer" to none. nil = no name. Pure; any thread.
+    nonisolated static func cleanDisplayName(_ raw: String, announce: Bool = false) -> String? {
+        let bytes = Data(raw.utf8)
+        let ptr = bytes.withUnsafeBytes { buf in
+            lxmf_display_name_clean(buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                    UInt32(bytes.count), announce ? 1 : 0)
+        }
+        guard let ptr else { return nil }
+        let name = String(cString: ptr)
+        lxmf_free_string(ptr)
+        return name.isEmpty ? nil : name
+    }
+
+    /// Field 0xD1 of a delivered message's raw fields (§3): absent, clear or
+    /// a cleaned name. Whether to accept it depends on the signature
+    /// (DisplayNames.acceptMessageName). Pure; any thread.
+    nonisolated static func decodeDisplayName(fieldsRaw: Data) -> DisplayNames.NameField {
+        guard !fieldsRaw.isEmpty else { return .absent }
+        var outLen: UInt32 = 0
+        let ptr = fieldsRaw.withUnsafeBytes { buf in
+            lxmf_display_name_decode(buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                     UInt32(fieldsRaw.count), &outLen)
+        }
+        guard let ptr else { return .absent }
+        let raw = Data(bytes: ptr, count: Int(outLen))
+        lxmf_free_bytes(ptr, outLen)
+        return DisplayNames.parseNameState(raw) ?? .absent
+    }
+
+    /// The Announce Display Name last heard from a destination hash (§5.1
+    /// announceName: cleaned, "Anonymous Peer" is none), or nil.
+    nonisolated func recallDisplayName(for destHash: Data) -> String? {
         // LXMF_DISPLAY_NAME_BUF_LEN holds the longest name (256 bytes + NUL).
         var buf = [CChar](repeating: 0, count: Int(LXMF_DISPLAY_NAME_BUF_LEN))
         let written = destHash.withUnsafeBytes { hashBuf -> Int32 in
@@ -840,7 +893,7 @@ final class LxmfClient: @unchecked Sendable {
     }
 
     /// Public access to the last error string (nil if empty).
-    static var lastError: String? {
+    nonisolated static var lastError: String? {
         let msg = fetchLastError()
         return msg == "unknown" || msg.isEmpty ? nil : msg
     }

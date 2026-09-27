@@ -28,7 +28,9 @@ struct PendingInterface: Identifiable, Equatable {
 
 @MainActor
 class SettingsViewModel: ObservableObject {
-    @Published var displayName: String
+    // The three names of DISPLAY_NAMES.md §6, independent, all empty by default.
+    @Published var announceDisplayName: String
+    @Published var messageDisplayName: String
     @Published var channelDisplayName: String
     @Published var rfedNodeIdentityHash: String
     @Published var rfedLxmfPropOverride: String
@@ -37,7 +39,8 @@ class SettingsViewModel: ObservableObject {
     @Published var pendingInterfaces: [PendingInterface]
 
     // Baseline captured at init; updated after Apply so hasChanges resets.
-    private var originalDisplayName: String
+    private var originalAnnounceDisplayName: String
+    private var originalMessageDisplayName: String
     private var originalChannelDisplayName: String
     private var originalRfedNodeIdentityHash: String
     private var originalRfedLxmfPropOverride: String
@@ -48,11 +51,25 @@ class SettingsViewModel: ObservableObject {
 
     /// True when any setting differs from the values present when the screen opened (or last Apply).
     var hasChanges: Bool {
-        displayName != originalDisplayName ||
-        channelDisplayName != originalChannelDisplayName ||
+        namesChanged ||
+        filterStrangers != persistedFilterStrangers ||
+        needsRestart
+    }
+
+    /// A display name differs from what was saved. Names apply through the
+    /// router's setters with no stack restart (DISPLAY_NAMES.md §6).
+    var namesChanged: Bool {
+        announceDisplayName != originalAnnounceDisplayName ||
+        messageDisplayName != originalMessageDisplayName ||
+        channelDisplayName != originalChannelDisplayName
+    }
+
+    /// Only these settings are read at stack start (the generated config,
+    /// the RFed node's destinations, the propagation node), so only they
+    /// restart the stack on Apply.
+    var needsRestart: Bool {
         rfedNodeIdentityHash != originalRfedNodeIdentityHash ||
         rfedLxmfPropOverride != originalRfedLxmfPropOverride ||
-        filterStrangers != persistedFilterStrangers ||
         defaultTcpEnabled != originalDefaultTcpEnabled ||
         pendingInterfaces != originalInterfaces
     }
@@ -70,7 +87,8 @@ class SettingsViewModel: ObservableObject {
 
     init() {
         let prefs = UserPreferences.shared
-        self.displayName = prefs.displayName
+        self.announceDisplayName = prefs.announceDisplayName
+        self.messageDisplayName = prefs.messageDisplayName
         self.channelDisplayName = prefs.channelDisplayName
         // The node in use, the default included, is shown in the field: no
         // hidden fallback behind a blank one.
@@ -78,7 +96,8 @@ class SettingsViewModel: ObservableObject {
         self.rfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.filterStrangers = prefs.filterStrangers
         self.defaultTcpEnabled = prefs.defaultTcpEnabled
-        self.originalDisplayName = prefs.displayName
+        self.originalAnnounceDisplayName = prefs.announceDisplayName
+        self.originalMessageDisplayName = prefs.messageDisplayName
         self.originalChannelDisplayName = prefs.channelDisplayName
         self.originalRfedNodeIdentityHash = prefs.effectiveRfedNodeIdentityHash
         self.originalRfedLxmfPropOverride = prefs.rfedLxmfPropOverride
@@ -101,9 +120,16 @@ class SettingsViewModel: ObservableObject {
     }
 
     /// Persist all settings to UserPreferences. Call before restarting the service.
+    /// The names are saved cleaned exactly as the router cleans them (§3,
+    /// lxmf_display_name_clean; the announce name with the announce rules),
+    /// and the fields show the cleaned value: what goes out.
     func apply() {
         let prefs = UserPreferences.shared
-        prefs.displayName = displayName
+        announceDisplayName = LxmfClient.cleanDisplayName(announceDisplayName, announce: true) ?? ""
+        messageDisplayName = LxmfClient.cleanDisplayName(messageDisplayName) ?? ""
+        channelDisplayName = LxmfClient.cleanDisplayName(channelDisplayName) ?? ""
+        prefs.announceDisplayName = announceDisplayName
+        prefs.messageDisplayName = messageDisplayName
         prefs.channelDisplayName = channelDisplayName
         prefs.defaultTcpEnabled = defaultTcpEnabled
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
@@ -155,7 +181,9 @@ class SettingsViewModel: ObservableObject {
 
     /// Restore all settings to the values they had when the screen opened.
     func revert() {
-        displayName = originalDisplayName
+        announceDisplayName = originalAnnounceDisplayName
+        messageDisplayName = originalMessageDisplayName
+        channelDisplayName = originalChannelDisplayName
         rfedNodeIdentityHash = originalRfedNodeIdentityHash
         rfedLxmfPropOverride = originalRfedLxmfPropOverride
         filterStrangers = originalFilterStrangers
@@ -169,7 +197,9 @@ class SettingsViewModel: ObservableObject {
     /// Reset the dirty baseline to current values (call after Apply).
     func markClean() {
         objectWillChange.send()
-        originalDisplayName = displayName
+        originalAnnounceDisplayName = announceDisplayName
+        originalMessageDisplayName = messageDisplayName
+        originalChannelDisplayName = channelDisplayName
         originalRfedNodeIdentityHash = rfedNodeIdentityHash
         originalRfedLxmfPropOverride = rfedLxmfPropOverride
         originalFilterStrangers = filterStrangers

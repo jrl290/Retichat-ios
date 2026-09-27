@@ -33,6 +33,11 @@ nonisolated struct DistroMessage: Sendable {
     let title: String
     let content: String
     let timestamp: Double
+    /// The sender's 0xD1 (DISPLAY_NAMES.md §2.1) as the unwrap reports it,
+    /// before the §5.2 rules, which ChatRepository applies.
+    var displayName: DisplayNames.NameField = .absent
+    /// 0 signature validated, 1 source unknown, 2 invalid.
+    var unverifiedReason: Int = 2
     /// Pulled by the NSE, which already showed it: stored without a second
     /// notification (review of 793a542).
     var shownByNSE = false
@@ -332,18 +337,31 @@ final class RfedDistroClient: ObservableObject {
             destination: registerDestHex, sources: pullRouteSources))
 
         // Pre-signed announce (Android publishAnnounce, kt:104-117).
-        guard let announce = Self.announcePayload(distro: k.handle) else {
+        guard await publishAnnounce(k, dest) else { return }
+
+        // Drain anything RFed deferred. Pulling right after the announce reply
+        // replaces Android's 7 s PULL_AFTER_REGISTER_MS timer — the reply IS the
+        // readiness event (DESIGN_PRINCIPLES.md §5, §7).
+        await pull()
+    }
+
+    /// Hand RFed the pre-signed distro announce, carrying the Announce
+    /// Display Name (DISPLAY_NAMES.md §2.2). false when no payload could be
+    /// built or the result was superseded; a refusal is recorded in status.
+    private func publishAnnounce(_ k: RegKey, _ dest: Data) async -> Bool {
+        guard let announce = Self.announcePayload(distro: k.handle,
+                                                  announceName: UserPreferences.shared.announceDisplayName) else {
             status.announced = false
             status.lastError = "announce payload: \(RetichatBridge.shared.rnsLastError() ?? "unknown error")"
             print("[Distro] \(status.lastError ?? "")")
-            return
+            return false
         }
         let aresp = await ConnectionStateManager.shared.appLinkSend(
             destHash: dest, app: "rfed", aspects: ["distro", "register"],
             path: "/rfed/distro/announce", payload: announce)
         guard isCurrent(k) else {
             print("[Distro] announce result dropped: superseded")
-            return
+            return false
         }
         if DistroCodec.isAffirmative(aresp) {
             status.announced = true
@@ -355,11 +373,20 @@ final class RfedDistroClient: ObservableObject {
             status.lastError = "RFed refused the pre-signed announce"
             print("[Distro] RFed refused the pre-signed announce")
         }
+        return true
+    }
 
-        // Drain anything RFed deferred. Pulling right after the announce reply
-        // replaces Android's 7 s PULL_AFTER_REGISTER_MS timer — the reply IS the
-        // readiness event (DESIGN_PRINCIPLES.md §5, §7).
-        await pull()
+    /// The Announce Display Name changed (Settings): the distro's announce
+    /// is pre-signed here and handed to RFed, so hand RFed a new one now,
+    /// as every delivery destination must carry the change (§2.2). Only
+    /// once registered for this stack run: a registration still to come
+    /// sends the new name itself.
+    func republishAnnounce() {
+        guard let k = currentKey(), registeredKey == k,
+              let dest = Data(hexString: registerDestHex), dest.count == 16 else { return }
+        Task { [weak self] in
+            _ = await self?.publishAnnounce(k, dest)
+        }
     }
 
     /// One-shot: re-run registerIfNeeded on the next ACTIVE (3) edge of
@@ -568,7 +595,10 @@ final class RfedDistroClient: ObservableObject {
         } else {
             inbound = .message(DistroMessage(sourceHash: src, title: parsed.title ?? "",
                                              content: parsed.content ?? "",
-                                             timestamp: parsed.timestamp, shownByNSE: shownByNSE))
+                                             timestamp: parsed.timestamp,
+                                             displayName: parsed.nameField,
+                                             unverifiedReason: parsed.reason,
+                                             shownByNSE: shownByNSE))
         }
 
         Task { @MainActor in
@@ -643,6 +673,19 @@ final class RfedDistroClient: ObservableObject {
         /// SPEC §17.11: non-nil exactly when the marker is present ("" when
         /// 0xFD is missing). Optional so an older FFI build still decodes.
         let sent_by: String?
+        /// DISPLAY_NAMES.md §5.2: the sender's 0xD1 (0 absent, 1 clear,
+        /// 2 name) and the signature result that decides whether to take it.
+        let display_name_state: Int?
+        let display_name: String?
+        let signature_validated: Bool?
+        let unverified_reason: Int?
+
+        var nameField: DisplayNames.NameField {
+            DisplayNames.distroNameField(state: display_name_state, name: display_name)
+        }
+        var reason: Int {
+            DisplayNames.distroReason(validated: signature_validated, unverifiedReason: unverified_reason)
+        }
     }
 
     // MARK: - Identity transfer (receive)
@@ -848,11 +891,17 @@ final class RfedDistroClient: ObservableObject {
         return data.isEmpty ? nil : data
     }
 
-    /// nil app_data: the Rust side (lxmf_rust::distro::announce_payload)
-    /// always writes [nil, nil, [0xD0]] — SF_RFED_DISTRO, SPEC §17.10.
-    nonisolated private static func announcePayload(distro: UInt64) -> Data? {
+    /// The Rust side (lxmf_rust::distro::announce_payload) writes the
+    /// app_data [announce_name | nil, nil, [0xD0]] — SF_RFED_DISTRO, SPEC
+    /// §17.10 — with the Announce Display Name (DISPLAY_NAMES.md §2.2),
+    /// cleaned with the announce rules; empty announces nil.
+    nonisolated private static func announcePayload(distro: UInt64, announceName: String) -> Data? {
         var outLen: UInt32 = 0
-        guard let ptr = retichat_distro_announce_payload(distro, nil, 0, &outLen) else { return nil }
+        let name = Data(announceName.utf8)
+        guard let ptr = name.withUnsafeBytes({ buf in
+            retichat_distro_announce_payload(distro, buf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                                             UInt32(name.count), &outLen)
+        }) else { return nil }
         let data = Data(bytes: ptr, count: Int(outLen))
         rns_free_bytes(ptr, outLen)
         return data.isEmpty ? nil : data

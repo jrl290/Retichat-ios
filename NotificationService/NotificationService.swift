@@ -90,6 +90,7 @@ private func nseDeliveryTrampoline(
     content: UnsafePointer<CChar>?,
     timestamp: Double,
     signatureValid: Int32,
+    unverifiedReason: Int32,
     fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32
 ) {
     let msgHash  = hash.map     { Data(bytes: $0, count: Int(hashLen)) }  ?? Data()
@@ -113,7 +114,8 @@ private func nseDeliveryTrampoline(
         content:         contentStr,
         timestamp:       timestamp,
         signatureValid:  signatureValid != 0,
-        fieldsRawBase64: fields.base64EncodedString()
+        fieldsRawBase64: fields.base64EncodedString(),
+        unverifiedReason: Int(unverifiedReason)
     ))
 }
 
@@ -295,20 +297,39 @@ class NotificationService: UNNotificationServiceExtension {
 
         // The newest message of the run, from the sync, the distro pull or
         // the channel pull, and how many others came with it. `thread` is the
-        // conversation it opens (chatId): the sender, or the channel; a
-        // channel message is named as the app names it in its own channel
-        // notifications (RfedChannelClient: "#<channel> (<sender8>…)").
-        var candidates: [(sender: String, title: String, content: String, timestamp: Double, hash: String,
-                          thread: String, display: String?)] = []
+        // conversation it opens (chatId): the sender, or the channel. Every
+        // title is named by the app's resolver order (DISPLAY_NAMES.md §5.3):
+        // the app's resolved name (chat_names.json), else the message's own
+        // accepted 0xD1, else the cached announce name, else the short hash;
+        // a channel message as the app names it in its channel notifications
+        // (DisplayNames.channelNotificationTitle).
+        let chatNames = PendingNotification.readChatNames()
+        func contactTitle(_ sender: String, _ name: DisplayNames.NameField, _ reason: Int) -> String {
+            DisplayNames.notificationName(
+                hash: sender, appName: chatNames[sender], messageName: name, unverifiedReason: reason,
+                announceName: NSEDistroPull.hexData(sender).flatMap { lxmfClient?.recallDisplayName(for: $0) })
+        }
+        var candidates: [(sender: String, content: String, timestamp: Double, hash: String,
+                          thread: String, display: String)] = []
         if let m = summary.newest {
-            candidates.append((m.senderHash, m.title, m.content, m.timestamp, m.messageHash, m.senderHash, nil))
+            let fields = Data(base64Encoded: m.fieldsRawBase64) ?? Data()
+            let reason = m.unverifiedReason ?? (m.signatureValid ? 0 : 2)
+            candidates.append((m.senderHash, m.content, m.timestamp, m.messageHash, m.senderHash,
+                               contactTitle(m.senderHash, LxmfClient.decodeDisplayName(fieldsRaw: fields), reason)))
         }
         candidates += distro.shown.map {
-            ($0.senderHash, $0.title, $0.content, $0.timestamp, "distro", $0.senderHash, nil)
+            ($0.senderHash, $0.content, $0.timestamp, "distro", $0.senderHash,
+             contactTitle($0.senderHash, $0.displayName, $0.unverifiedReason))
         }
-        candidates += channelPull.shown.map {
-            ($0.senderHash, "", $0.content, $0.timestamp, "channel", channelPull.channelHex,
-             "#\(channelPull.channelName) (\($0.senderHash.prefix(8))\u{2026})")
+        let channelNames = PendingNotification.readChannelSenderNames()[channelPull.channelHex] ?? [:]
+        for shown in channelPull.shown {
+            let label = DisplayNames.channelLabel(
+                hash: shown.senderHash,
+                channelName: DisplayNames.channelName(afterPost: shown.displayName,
+                                                      stored: channelNames[shown.senderHash]),
+                contactName: chatNames[shown.senderHash])
+            candidates.append((shown.senderHash, shown.content, shown.timestamp, "channel", channelPull.channelHex,
+                               DisplayNames.channelNotificationTitle(channelName: channelPull.channelName, label: label)))
         }
         if let msg = candidates.max(by: { $0.timestamp < $1.timestamp }) {
             let others = stored + distro.shown.count + channelPull.shown.count - 1
@@ -317,18 +338,9 @@ class NotificationService: UNNotificationServiceExtension {
             NSLog("[NSE] delivered after %ds: %d stored, %d from the distro, %d from the channel, %d not stored, showing the newest",
                   elapsed, stored, distro.shown.count, channelPull.shown.count, summary.failed)
 
-            let chatNames = PendingNotification.readChatNames()
-            let chatName = chatNames[msg.sender]
-            let senderName: String
-            if let display = msg.display {
-                senderName = display
-            } else if let name = chatName, !name.isEmpty {
-                senderName = name
-            } else if !msg.title.isEmpty {
-                senderName = msg.title
-            } else {
-                senderName = String(msg.sender.prefix(8)) + "\u{2026}"
-            }
+            // Never the LXMF title: a subject line the sender chooses, not a
+            // name (audit M3).
+            let senderName = msg.display
             // --- Explicit APNs push receipt log ---
             NSLog("[NSE] APNs push received and processed: sender=%@ hash=%@", senderName, msg.hash)
 
@@ -438,7 +450,7 @@ class NotificationService: UNNotificationServiceExtension {
             storagePath: storage,
             identityPath: idFile,
             createIdentity: false,
-            displayName: "",
+            messageDisplayName: "",
             logLevel: 4,
             stampCost: -1
         )

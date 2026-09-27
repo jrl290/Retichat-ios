@@ -19,8 +19,12 @@ final class ConversationViewModel: ObservableObject {
     private let pageSize = 50
     private var currentOffset = 0
     private var isLoadingMore = false
+    /// repository.namesVersion when the bubbles were last built: names are
+    /// resolved into them, so a name change rebuilds them.
+    private var namesVersion = -1
 
     func loadChat(chatId: String, repository: ChatRepository) {
+        namesVersion = repository.namesVersion
         if let chat = repository.chats.first(where: { $0.id == chatId }) {
             chatTitle = chat.displayName
             peerHash = chat.peerHash
@@ -41,9 +45,14 @@ final class ConversationViewModel: ObservableObject {
         // delivery states may have changed.  This avoids the heavy attachment
         // fetch + SwiftUI diff every tick when nothing is happening.
         let page = repository.messagesSummary(forChatId: chatId, limit: pageSize + currentOffset)
-        let changed = page.count != messages.count
+        let namesChanged = repository.namesVersion != namesVersion
+        let changed = namesChanged || page.count != messages.count
             || zip(page, messages).contains(where: { $0.0 != $1.id || $0.1 != $1.deliveryState })
         guard changed else { return }
+        if namesChanged {
+            namesVersion = repository.namesVersion
+            if !isGroup { chatTitle = repository.contactDisplayName(for: chatId) }
+        }
 
         let full = repository.messages(forChatId: chatId, limit: pageSize + currentOffset, offset: 0)
         messages = full

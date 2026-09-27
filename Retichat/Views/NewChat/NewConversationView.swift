@@ -203,9 +203,9 @@ private struct DirectContactRow: View {
     var body: some View {
         Button(action: onTap) {
             HStack {
-                AvatarView(name: contact.displayName.isEmpty ? contact.id : contact.displayName, size: 40)
+                AvatarView(name: contact.displayName, size: 40)
                 VStack(alignment: .leading) {
-                    Text(contact.displayName.isEmpty ? String(contact.id.prefix(16)) + "…" : contact.displayName)
+                    Text(contact.displayName)
                         .foregroundColor(.retichatOnSurface)
                     Text(contact.id).font(.caption2).foregroundColor(.retichatOnSurfaceVariant).lineLimit(1)
                 }
@@ -277,9 +277,9 @@ private struct GroupForm: View {
                                     Image(systemName: selectedMembers.contains(contact.id) ? "checkmark.circle.fill" : "circle")
                                         .foregroundColor(selectedMembers.contains(contact.id) ? .retichatPrimary : .retichatOnSurfaceVariant)
                                         .font(.title3)
-                                    AvatarView(name: contact.displayName.isEmpty ? contact.id : contact.displayName, size: 40)
+                                    AvatarView(name: contact.displayName, size: 40)
                                     VStack(alignment: .leading) {
-                                        Text(contact.displayName.isEmpty ? String(contact.id.prefix(16)) + "…" : contact.displayName)
+                                        Text(contact.displayName)
                                             .foregroundColor(.retichatOnSurface)
                                         Text(contact.id).font(.caption2).foregroundColor(.retichatOnSurfaceVariant).lineLimit(1)
                                     }

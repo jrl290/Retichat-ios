@@ -2,7 +2,7 @@
 //  SettingsView.swift
 //  Retichat
 //
-//  Full settings screen: service control, identity (→ IdentityView), display name,
+//  Full settings screen: service control, identity (→ IdentityView), display names,
 //  connection preferences, network interface management.
 //  Mirrors Android SettingsScreen.kt.
 //
@@ -57,7 +57,7 @@ struct SettingsView: View {
                 ScrollView {
                     VStack(spacing: 20) {
                         identityNavRow
-                        profileSection
+                        displayNamesSection
                         privacySection
                         rfedSection
                         notificationSection
@@ -149,10 +149,22 @@ struct SettingsView: View {
         let rfedNodeChanged = (newRfedIdentityHash.isEmpty
             ? UserPreferences.defaultRfedNodeIdentityHash : newRfedIdentityHash) != oldRfedIdentityHash
 
+        // Decided before the baseline moves: names never restart the stack.
+        let namesChanged = vm.namesChanged
+        let announceChanged = UserPreferences.shared.announceDisplayName
+            != (LxmfClient.cleanDisplayName(vm.announceDisplayName, announce: true) ?? "")
+        let needsRestart = vm.needsRestart
+
         // Persist all settings to UserDefaults.
         vm.apply()
         vm.applyInterfaces(to: repository)
         vm.markClean()
+
+        // The names take effect at once through the router's setters
+        // (DISPLAY_NAMES.md §6); the next announce carries the new one.
+        if namesChanged {
+            repository.applyDisplayNames(announceChanged: announceChanged)
+        }
 
         // If the rfed node changed and the service is running, best-effort
         // deregister from the old node before restarting (which will re-register
@@ -165,7 +177,7 @@ struct SettingsView: View {
             )
         }
 
-        guard repository.serviceRunning else { return }
+        guard needsRestart, repository.serviceRunning else { return }
         repository.stopService()
         Task { repository.startService() }
     }
@@ -207,39 +219,45 @@ struct SettingsView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Profile
+    // MARK: - Display names (DISPLAY_NAMES.md §6)
 
-    private var profileSection: some View {
+    /// Three independent names under the identity, all empty by default.
+    /// Saved cleaned on Apply, applied without a restart.
+    private var displayNamesSection: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Profile")
+                Text("Display Names")
                     .font(.headline)
                     .foregroundColor(.retichatOnSurface)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Display Name")
-                        .font(.caption)
-                        .foregroundColor(.retichatOnSurfaceVariant)
-                    TextField("Your name in DMs", text: $vm.displayName)
-                        .foregroundColor(.retichatOnSurface)
-                        .padding(10)
-                        .glassBackground(cornerRadius: 8)
-                }
+                nameField(title: "Announce Display Name", placeholder: "Anonymous",
+                          text: $vm.announceDisplayName,
+                          hint: "Public. Sent in your announces to the whole network, including other Reticulum apps. Leave empty to stay anonymous.")
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Channel Display Name")
-                        .font(.caption)
-                        .foregroundColor(.retichatOnSurfaceVariant)
-                    TextField(vm.displayName.isEmpty ? "Same as Display Name" : vm.displayName,
-                              text: $vm.channelDisplayName)
-                        .foregroundColor(.retichatOnSurface)
-                        .padding(10)
-                        .glassBackground(cornerRadius: 8)
-                    Text("Shown to others in channels. If blank, uses your Display Name.")
-                        .font(.caption2)
-                        .foregroundColor(.retichatOnSurfaceVariant)
-                }
+                nameField(title: "Message Display Name", placeholder: "No name",
+                          text: $vm.messageDisplayName,
+                          hint: "Sent inside your messages, only to the people you message.")
+
+                nameField(title: "Channel Display Name", placeholder: "No name",
+                          text: $vm.channelDisplayName,
+                          hint: "Shown on your channel posts. Anyone who can read a channel can see it. Leave empty to post without a name.")
             }
+        }
+    }
+
+    private func nameField(title: String, placeholder: String, text: Binding<String>, hint: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.retichatOnSurfaceVariant)
+            TextField(placeholder, text: text)
+                .foregroundColor(.retichatOnSurface)
+                .padding(10)
+                .glassBackground(cornerRadius: 8)
+            Text(hint)
+                .font(.caption2)
+                .foregroundColor(.retichatOnSurfaceVariant)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

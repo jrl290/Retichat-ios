@@ -171,13 +171,11 @@ private struct ContactRow: View {
         Button(action: onTap) {
             HStack {
                 AvatarView(
-                    name: contact.displayName.isEmpty ? contact.id : contact.displayName,
+                    name: contact.displayName,
                     size: 40
                 )
                 VStack(alignment: .leading) {
-                    Text(contact.displayName.isEmpty
-                         ? String(contact.id.prefix(16)) + "…"
-                         : contact.displayName)
+                    Text(contact.displayName)
                         .foregroundColor(.retichatOnSurface)
                     Text(contact.id)
                         .font(.caption2)

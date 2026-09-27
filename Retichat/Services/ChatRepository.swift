@@ -34,6 +34,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// .failure branch); reset by startService(). Lets the chat-list status
     /// line show "Error" as Android does (ChatListScreen.kt:116-135).
     @Published private(set) var serviceStartFailed = false
+    /// Bumped whenever a contact's name slots change (DISPLAY_NAMES.md §5):
+    /// open conversations reload their bubbles and header on it, so a name
+    /// that arrives while a chat is on screen shows at once.
+    @Published private(set) var namesVersion = 0
 
     // MARK: - Handles
 
@@ -122,8 +126,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// death leaves the held bubbles pending.
     private var heldSends = HeldSends<HeldSend>()
 
-    /// Chat-list preview per chat id: the content of the chat's newest
-    /// message as refreshChats() last saw it, "" when the chat has none.
+    /// Chat-list preview per chat id: the content and sender of the chat's
+    /// newest message as refreshChats() last saw it, content "" when the
+    /// chat has none. The sender is kept so a system message's subject is
+    /// named when the list is built (DisplayNames.subjectToken), not when
+    /// the memo was filled.
     ///
     /// refreshChats() takes previews from a window of the newest messages
     /// across ALL chats; a chat outside it needs a `chatId == X` fetch, and
@@ -139,7 +146,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// which can be older than the whole window yet newer than the chat's
     /// last message. So every MessageEntity insert goes through
     /// insertMessage(_:into:) and every delete path drops the chat's entry.
-    private var chatPreviewMemo: [String: String] = [:]
+    private var chatPreviewMemo: [String: (content: String, senderHash: String)] = [:]
 
     /// Destination tracked for the live rfed.propagation.stream APP_LINK.
     private var propagationStreamDest: Data?
@@ -242,10 +249,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             storagePath: storagePath,
             identityPath: idPath,
             createIdentity: true,
-            displayName: prefs.displayName,
+            messageDisplayName: prefs.messageDisplayName,
             logLevel: 4,
             stampCost: -1
         )
+        // Set right after the start, on the same queue, so it is in place
+        // before the first announce (the publish in finishStartService).
+        let announceName = prefs.announceDisplayName
 
         // Heavy FFI call (TCP connect, transport init, ratchet load) runs off
         // the main thread so the UI stays responsive during startup.
@@ -256,10 +266,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // which is what Settings → Apply hit once shutdown began tearing
         // links down (B31) and so took longer than the start's head start.
         let ffiQueueRef = ffiQueue
-        Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath] in
+        Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath, announceName] in
             let result: Result<LxmfClient, Error> = await withCheckedContinuation { cont in
                 ffiQueueRef.async {
-                    cont.resume(returning: Result { try LxmfClient.start(config: config) })
+                    cont.resume(returning: Result {
+                        let client = try LxmfClient.start(config: config)
+                        if !client.setAnnounceDisplayName(announceName) {
+                            print("[Retichat] Announce Display Name not set: \(LxmfClient.lastError ?? "unknown error")")
+                        }
+                        return client
+                    })
                 }
             }
 
@@ -396,6 +412,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
         }
 
+        // Contacts' names from before the three slots (DISPLAY_NAMES.md
+        // §5.4): needs the stack for the recalled announce names.
+        migrateLegacyContactNamesIfNeeded(client: client)
+
         // Import any messages the NSE delivered while we were dead
         importNSEMessages()
 
@@ -446,6 +466,31 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         ffiQueue.async {
             _ = client?.unpublish()
             client?.shutdown()
+        }
+    }
+
+    // MARK: - Own display names (DISPLAY_NAMES.md §4, §6)
+
+    /// Settings saved the names: hand them to the router at once, with no
+    /// stack restart (the router's setters). The Channel Display Name is
+    /// read when a channel post is packed, so it needs nothing here. With
+    /// the stack down, the next start reads them from the preferences.
+    func applyDisplayNames(announceChanged: Bool) {
+        guard let client = lxmfClient else { return }
+        let message = prefs.messageDisplayName
+        let announce = prefs.announceDisplayName
+        ffiQueue.async {
+            if !client.setMessageDisplayName(message) {
+                print("[Retichat] Message Display Name not set: \(LxmfClient.lastError ?? "unknown error")")
+            }
+            if !client.setAnnounceDisplayName(announce) {
+                print("[Retichat] Announce Display Name not set: \(LxmfClient.lastError ?? "unknown error")")
+            }
+        }
+        // The distro's announce is pre-signed and handed to RFed (§2.2:
+        // every delivery destination carries the change).
+        if announceChanged {
+            RfedDistroClient.shared.republishAnnounce()
         }
     }
 
@@ -792,10 +837,18 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 continue
             }
 
+            // DISPLAY_NAMES.md §5.2 on the NSE path, as on the router's: the
+            // NSE keeps the delivery's reason. A file from an older NSE build
+            // has none; an unvalidated message without one counts as invalid,
+            // as the router reports it, which never lets a name through.
+            let reason = msg.unverifiedReason ?? (msg.signatureValid ? 0 : 2)
+            let nameField = LxmfClient.decodeDisplayName(fieldsRaw: fieldsData)
+
             if let groupId = fields.groupId {
                 if shouldProcessGroupMessage(groupId: groupId,
                                              sourceHash: srcHex,
                                              action: fields.groupAction) {
+                    applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex)
                     handleGroupMessage(
                         hash: Data(hexString: msg.messageHash) ?? Data(),
                         srcHash: Data(hexString: srcHex) ?? Data(),
@@ -818,6 +871,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let chatId = srcHex
             ensureChat(id: chatId, peerHash: srcHex)
             ensureContact(destHash: srcHex)
+            applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex)
+            // As for a message the app received itself: watch the sender's
+            // announces (their announce name) and fill it from the cache.
+            if let srcData = Data(hexString: srcHex) {
+                RetichatBridge.shared.watchAnnounce(destHash: srcData)
+                lxmfClient?.watch(destHash: srcData)
+                refreshAnnounceNameFromCache(destHash: srcHex)
+            }
 
             let entity = MessageEntity(
                 id: hashHex,
@@ -1406,14 +1467,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                          inviteStatus: MemberStatus.accepted))
         }
 
-        // Add all group members to allowlist (key spec requirement)
-        for hash in allHashes {
+        // Add all group members to allowlist (key spec requirement); not
+        // this device, and not the group id (phantom contacts, audit L4).
+        for hash in allHashes where hash != ownHashHex {
             ensureAllowlistedContact(destHash: hash)
-            if hash != ownHashHex, let hashData = Data(hexString: hash) {
+            if let hashData = Data(hexString: hash) {
                 RetichatBridge.shared.watchAnnounce(destHash: hashData)
             }
         }
-        ensureAllowlistedContact(destHash: groupId)
 
         try? ctx.save()
 
@@ -1748,17 +1809,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
                                title: String, content: String, timestamp: Double,
-                               signatureValid: Bool, fieldsRaw: Data) {
+                               signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data) {
         handleIncomingMessage(
             hash: hash, srcHash: srcHash, destHash: destHash,
             title: title, content: content, timestamp: timestamp,
-            signatureValid: signatureValid, fieldsRaw: fieldsRaw
+            signatureValid: signatureValid, unverifiedReason: unverifiedReason, fieldsRaw: fieldsRaw
         )
     }
 
     private func handleIncomingMessage(hash: Data, srcHash: Data, destHash: Data,
                                         title: String, content: String, timestamp: Double,
-                                        signatureValid: Bool, fieldsRaw: Data) {
+                                        signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data) {
         let content = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let srcHexForLog = srcHash.hexString
         let msgHashHexForLog = hash.hexString
@@ -1801,11 +1862,18 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
+        // The sender's name, field 0xD1 (DISPLAY_NAMES.md §5.2). It names
+        // the LXMF source (for a relayed group message, the relayer) and is
+        // taken only from a message this device accepts: a group message
+        // the group policy lets through, or a DM past the allowlist.
+        let nameField = LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw)
+
         // Handle group message
         if let groupId = fields.groupId {
             if shouldProcessGroupMessage(groupId: groupId,
                                          sourceHash: srcHex,
                                          action: fields.groupAction) {
+                applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex)
                 handleGroupMessage(
                     hash: hash, srcHash: srcHash, content: content,
                     timestamp: timestamp, fields: fields, groupId: groupId
@@ -1823,10 +1891,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         print("[Retichat] handleIncomingMessage: ACCEPTED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
 
+        applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex)
         storeIncomingDirect(
             messageId: msgHashHex, srcHash: srcHash, title: title, content: content,
             timestamp: timestamp, signatureValid: signatureValid,
-            senderName: fields.senderName, attachments: fields.attachments)
+            attachments: fields.attachments)
     }
 
     /// Store an accepted direct message and notify — the tail shared by the
@@ -1834,7 +1903,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// deduplicated and applied (or deliberately skipped) the allowlist.
     private func storeIncomingDirect(messageId msgHashHex: String, srcHash: Data,
                                      title: String, content: String, timestamp: Double,
-                                     signatureValid: Bool, senderName: String?,
+                                     signatureValid: Bool,
                                      attachments: [(filename: String, data: Data)],
                                      notify: Bool = true) {
         guard let ctx = modelContext else { return }
@@ -1845,18 +1914,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         ensureChat(id: chatId, peerHash: srcHex)
         ensureContact(destHash: srcHex)
 
-        // Watch for announces from this sender so their display name is received
+        // Watch for announces from this sender so their announce name
+        // (DISPLAY_NAMES.md §5.1 announceName) is received, and take the
+        // one already cached. The message name was applied by the caller.
         RetichatBridge.shared.watchAnnounce(destHash: srcHash)
         lxmfClient?.watch(destHash: srcHash)
-
-        // Attempt to fill in the contact's display name from the per-message
-        // FIELD_SENDER_NAME first (privacy-preserving — only message recipients
-        // see it). Fall back to the announce cache if not present.
-        if let name = senderName, !name.isEmpty {
-            updateContactNameIfEmpty(destHash: srcHex, name: name)
-        } else if let name = lxmfClient?.recallDisplayName(for: srcHash), !name.isEmpty {
-            updateContactNameIfEmpty(destHash: srcHex, name: name)
-        }
+        refreshAnnounceNameFromCache(destHash: srcHex)
 
         // Insert message
         let msgEntity = MessageEntity(
@@ -1903,9 +1966,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// ChatRepository.onDistroMessageReceived, kt:894-910).
     ///
     /// No allowlist check: mail to the distro is mail to this person, and the
-    /// contact is always created, as on Android. `unwrap_blob` neither verifies
-    /// the signature nor carries attachments, so the bubble is marked
-    /// unverified and an attachment-only message gets a placeholder.
+    /// contact is always created, as on Android. The unwrap reports the
+    /// signature and the sender's 0xD1 (DISPLAY_NAMES.md §5.2) but carries no
+    /// attachments, so an attachment-only message gets a placeholder.
     private func handleDistroMessage(_ m: DistroMessage) {
         guard let ctx = modelContext else {
             print("[Retichat] handleDistroMessage: DROPPED - modelContext is nil")
@@ -1925,10 +1988,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
         print("[Retichat] handleDistroMessage: src=\(srcHex.prefix(8)) len=\(content.count)")
+        ensureContact(destHash: srcHex)
+        applyMessageName(m.displayName, unverifiedReason: m.unverifiedReason, sourceHex: srcHex)
         storeIncomingDirect(
             messageId: msgId, srcHash: m.sourceHash, title: m.title, content: content,
-            timestamp: m.timestamp, signatureValid: false,
-            senderName: nil, attachments: [], notify: !m.shownByNSE)
+            timestamp: m.timestamp, signatureValid: m.unverifiedReason == 0,
+            attachments: [], notify: !m.shownByNSE)
     }
 
     /// A message another of our devices sent as the distro, reported by its
@@ -2073,13 +2138,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Add the inviting sender to our allowlist so we can reply
         ensureAllowlistedContact(destHash: srcHex)
 
-        // Insert a system message representing the invite notification
+        // Insert a system message representing the invite notification. The
+        // inviter's name is resolved when shown (DisplayNames.subjectToken).
         let inviteMsgId = "inv_\(groupId.prefix(16))"
         let dupDesc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == inviteMsgId })
         if (try? ctx.fetch(dupDesc).first) == nil {
             let msg = MessageEntity(
                 id: inviteMsgId, chatId: groupId, senderHash: srcHex,
-                content: "Group invite from \(contactDisplayName(for: srcHex)): \"\(groupName)\"",
+                content: "Group invite from \(DisplayNames.subjectToken): \"\(groupName)\"",
                 timestamp: timestamp, isOutgoing: false, deliveryState: DeliveryState.delivered
             )
             insertMessage(msg, into: ctx)
@@ -2116,12 +2182,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
 
         // Insert a system message so the group timeline shows who joined
+        // (the name resolved when shown, DisplayNames.subjectToken)
         let sysId = "acc_\(memberHex.prefix(8))_\(groupId.prefix(8))"
         let dupDesc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == sysId })
         if (try? ctx.fetch(dupDesc).first) == nil {
             let msg = MessageEntity(
                 id: sysId, chatId: groupId, senderHash: memberHex,
-                content: "\(contactDisplayName(for: memberHex)) joined the group",
+                content: "\(DisplayNames.subjectToken) joined the group",
                 timestamp: Date().timeIntervalSince1970,
                 isOutgoing: false, deliveryState: DeliveryState.delivered
             )
@@ -2150,7 +2217,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         if (try? ctx.fetch(dupDesc).first) == nil {
             let msg = MessageEntity(
                 id: msgId, chatId: groupId, senderHash: memberHex,
-                content: "\(contactDisplayName(for: memberHex)) left the group",
+                content: "\(DisplayNames.subjectToken) left the group",
                 timestamp: timestamp, isOutgoing: false, deliveryState: DeliveryState.delivered
             )
             insertMessage(msg, into: ctx)
@@ -2281,24 +2348,29 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == hex }
         )
+        // The announce name (DISPLAY_NAMES.md §5.1 announceName), cleaned
+        // by the Rust side: replaced on every announce, none when the
+        // announce carries none. The other two slots are never touched.
+        let announceName = (displayName?.isEmpty ?? true) ? nil : displayName
         if let contact = try? ctx.fetch(descriptor).first {
-            // Only update displayName if the contact has no name yet (preserves user renames)
-            if let name = displayName, !name.isEmpty, contact.displayName.isEmpty {
-                contact.displayName = name
+            if contact.announceName != announceName {
+                contact.announceName = announceName
+                namesChanged()
             }
             contact.lastSeen = Date().timeIntervalSince1970
             try? ctx.save()
             scheduleRefreshChats()  // debounced: coalesces announce bursts
-        } else if let name = displayName, !name.isEmpty, !prefs.filterStrangers {
+        } else if let name = announceName, !prefs.filterStrangers {
             // Only auto-create a contact stub from announces when the stranger
             // filter is off — otherwise we'd be storing data for unknown senders.
             let contact = ContactEntity(
                 destHash: hex,
-                displayName: name,
+                announceName: name,
                 lastSeen: Date().timeIntervalSince1970
             )
             ctx.insert(contact)
             try? ctx.save()
+            namesChanged()
         }
     }
 
@@ -2337,6 +2409,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             RetichatBridge.shared.watchAnnounce(destHash: hashData)
             lxmfClient?.watch(destHash: hashData)
             _ = bridge.transportRequestPath(destHash: hashData)
+            // A name already cached from an earlier announce (audit M10).
+            refreshAnnounceNameFromCache(destHash: normalizedHash)
         }
 
         refreshChats()
@@ -2369,13 +2443,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let member = GroupMemberEntity(groupId: groupId, memberHash: memberHash,
                                            inviteStatus: status)
             ctx.insert(member)
+            // Not this device: it is no contact of its own (audit L4).
+            guard memberHash != ownHashHex else { continue }
             ensureAllowlistedContact(destHash: memberHash)
-            if memberHash != ownHashHex, let hashData = Data(hexString: memberHash) {
+            if let hashData = Data(hexString: memberHash) {
                 RetichatBridge.shared.watchAnnounce(destHash: hashData)
             }
         }
-        // Allowlist the group ID so inbound group messages pass the filter
-        ensureAllowlistedContact(destHash: groupId)
+        // No contact row for the group id: group messages pass on the group
+        // policy (groupMessagePolicy), never on the allowlist, and the row
+        // showed up as a phantom contact in the pickers (audit L4).
 
         try? ctx.save()
 
@@ -2505,16 +2582,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         )
         guard let entities = try? ctx.fetch(descriptor) else { return [] }
 
-        let nameCache = batchContactDisplayNames(
-            hashes: Set(entities.compactMap { $0.isGroup ? nil : $0.peerHash })
-        )
+        let names = contactNameIndex()
 
         return entities.compactMap { entity -> Chat? in
             let displayName: String
             if entity.isGroup {
                 displayName = entity.groupName ?? "Group"
             } else {
-                displayName = nameCache[entity.peerHash] ?? shortHash(entity.peerHash)
+                displayName = label(for: entity.peerHash, in: names)
             }
             guard displayName.localizedCaseInsensitiveContains(lower) ||
                   entity.peerHash.localizedCaseInsensitiveContains(lower) else { return nil }
@@ -2524,7 +2599,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 id: entity.id,
                 peerHash: entity.peerHash,
                 displayName: displayName,
-                lastMessage: lastMsg?.content ?? "",
+                lastMessage: lastMsg.map { shownText($0.content, senderHash: $0.senderHash, names: names) } ?? "",
                 lastMessageTime: entity.lastMessageTime,
                 unreadCount: 0,
                 isArchived: entity.isArchived,
@@ -2565,9 +2640,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             attachmentsByMsg[att.messageId, default: []].append(a)
         }
 
-        // Batch-fetch contact display names
-        let senderHashes = Set(entities.map { $0.senderHash })
-        let nameCache = batchContactDisplayNames(hashes: senderHashes)
+        // Every sender's name, resolved now (DISPLAY_NAMES.md §5.3)
+        let names = contactNameIndex()
 
         // Reverse back to chronological order for display
         return entities.reversed().map { entity in
@@ -2585,11 +2659,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     progress = p
                 }
             }
+            let senderName = label(for: entity.senderHash, in: names)
             return ChatMessage(
                 id: entity.id,
                 senderHash: entity.senderHash,
-                senderName: nameCache[entity.senderHash] ?? shortHash(entity.senderHash),
-                content: entity.content,
+                senderName: senderName,
+                content: DisplayNames.systemText(entity.content, subject: senderName),
                 timestamp: entity.timestamp,
                 isOutgoing: entity.isOutgoing,
                 deliveryState: entity.deliveryState,
@@ -2614,16 +2689,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return entities.reversed().map { ($0.id, $0.deliveryState) }
     }
 
+    /// The contacts the user added (allowlisted), named by the resolver and
+    /// sorted by that name. Never this device's own address or the distro's,
+    /// nor a group id: older builds made allowlisted rows for both, which
+    /// the pickers showed as contacts (audit L4).
     func contacts() -> [Contact] {
-        guard let ctx = modelContext else { return [] }
-        let descriptor = FetchDescriptor<ContactEntity>(
-            sortBy: [SortDescriptor(\.displayName)]
-        )
-        guard let entities = try? ctx.fetch(descriptor) else { return [] }
-        // Only surface contacts the user explicitly added (allowlisted)
+        guard let ctx = modelContext,
+              let entities = try? ctx.fetch(FetchDescriptor<ContactEntity>()) else { return [] }
+        let groupIds = Set(((try? ctx.fetch(FetchDescriptor<ChatEntity>(
+            predicate: #Predicate { $0.isGroup == true }))) ?? []).map(\.id))
         return entities
-            .filter { $0.isAllowlisted == true }
-            .map { Contact(id: $0.destHash, displayName: $0.displayName, lastSeen: $0.lastSeen) }
+            .filter { $0.isAllowlisted == true && !groupIds.contains($0.destHash) && !isOwnAddress($0.destHash) }
+            .map { Contact(id: $0.destHash,
+                           displayName: resolvedName($0) ?? DisplayNames.shortHash($0.destHash),
+                           lastSeen: $0.lastSeen) }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
     /// Remove a contact from the allowlist.  The ContactEntity is deleted
@@ -2652,7 +2732,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Batch-fetch the latest message per chat in ONE query instead of N
         let chatIds = chatEntities.map { $0.id }
-        var previewByChat: [String: String] = [:]
+        var previewByChat: [String: (content: String, senderHash: String)] = [:]
         if !chatIds.isEmpty {
             // Fetch the most recent messages; we only need the newest per chat
             var msgDesc = FetchDescriptor<MessageEntity>(
@@ -2666,8 +2746,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     if previewByChat[m.chatId] == nil {
                         // Sorted newest first, so a chat's first hit here is
                         // its newest message: remember it for when it drops out.
-                        previewByChat[m.chatId] = m.content
-                        chatPreviewMemo[m.chatId] = m.content
+                        previewByChat[m.chatId] = (m.content, m.senderHash)
+                        chatPreviewMemo[m.chatId] = (m.content, m.senderHash)
                     }
                 }
             }
@@ -2681,7 +2761,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     previewByChat[id] = memo
                 } else {
                     do {
-                        let preview = try lastMessage(forChatId: id)?.content ?? ""
+                        let last = try lastMessage(forChatId: id)
+                        let preview = (last?.content ?? "", last?.senderHash ?? "")
                         chatPreviewMemo[id] = preview
                         previewByChat[id] = preview
                     } catch {
@@ -2693,23 +2774,25 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
         }
 
-        // Batch-fetch contact display names for non-group chats
-        let peerHashes = Set(chatEntities.compactMap { $0.isGroup ? nil : $0.peerHash })
-        let nameCache = batchContactDisplayNames(hashes: peerHashes)
+        // Every contact's name slots in one fetch (DISPLAY_NAMES.md §5.3)
+        let names = contactNameIndex()
 
         chats = chatEntities.map { entity in
             let displayName: String
             if entity.isGroup {
                 displayName = entity.groupName ?? "Group"
             } else {
-                displayName = nameCache[entity.peerHash] ?? shortHash(entity.peerHash)
+                displayName = label(for: entity.peerHash, in: names)
             }
+            let preview = previewByChat[entity.id].map {
+                shownText($0.content, senderHash: $0.senderHash, names: names)
+            } ?? ""
 
             return Chat(
                 id: entity.id,
                 peerHash: entity.peerHash,
                 displayName: displayName,
-                lastMessage: previewByChat[entity.id] ?? "",
+                lastMessage: preview,
                 lastMessageTime: entity.lastMessageTime,
                 unreadCount: 0,
                 isArchived: entity.isArchived,
@@ -2719,13 +2802,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             )
         }
 
-        // Sync chat names to App Group so the NSE can use them in notification titles.
-        // Do this off the main actor — it's file I/O and not time-critical for UI.
-        var chatNameMap: [String: String] = [:]
-        for chat in chats where !chat.displayName.isEmpty {
-            chatNameMap[chat.peerHash] = chat.displayName
-        }
-        let snapshot = chatNameMap
+        // Every contact's resolved name (never a hash placeholder; a
+        // contact without a name is left out) for the NSE's notification
+        // titles, keyed by the hash messages come from, so a group invite
+        // no longer overwrites its inviter's name (audit M3). File I/O, off
+        // the main actor.
+        let snapshot = names.compactMapValues { $0 }
         Task.detached(priority: .utility) {
             PendingNotification.writeChatNames(snapshot)
         }
@@ -2868,46 +2950,181 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         action == GroupAction.invite ? inviterAllowed : groupExists
     }
 
+    // MARK: - Names (LXMF-rust/DISPLAY_NAMES.md §5)
+    //
+    // One resolver for every surface: localName ?? messageName ??
+    // announceName ?? shortHash (DisplayNames.contactLabel). Nothing stores
+    // a resolved name; system messages keep the subject's hash and are
+    // named when shown.
+
+    /// The resolved label for a hash: "You" for this device's own address.
     func contactDisplayName(for destHash: String) -> String {
         if destHash == ownHashHex { return "You" }
-        guard let ctx = modelContext else { return shortHash(destHash) }
+        return resolvedContactName(for: destHash) ?? DisplayNames.shortHash(destHash)
+    }
+
+    /// The contact's name without the hash fallback (nil when it has none):
+    /// what a channel label falls back to after the channel name.
+    func resolvedContactName(for destHash: String) -> String? {
+        guard let ctx = modelContext else { return nil }
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == destHash }
         )
-        if let contact = try? ctx.fetch(descriptor).first, !contact.displayName.isEmpty {
-            return contact.displayName
-        }
-        return shortHash(destHash)
+        return (try? ctx.fetch(descriptor).first).flatMap { resolvedName($0) }
     }
 
-    /// Batch-fetch display names for a set of hashes in one SwiftData query.
-    private func batchContactDisplayNames(hashes: Set<String>) -> [String: String] {
-        var result: [String: String] = [:]
-        for h in hashes where h == ownHashHex { result[h] = "You" }
-        guard let ctx = modelContext else {
-            for h in hashes where result[h] == nil { result[h] = shortHash(h) }
-            return result
-        }
-        // Fetch all contacts (typically <100) and filter in-memory
-        let descriptor = FetchDescriptor<ContactEntity>()
-        if let contacts = try? ctx.fetch(descriptor) {
-            for c in contacts where hashes.contains(c.destHash) && !c.displayName.isEmpty {
-                result[c.destHash] = c.displayName
-            }
-        }
-        for h in hashes where result[h] == nil { result[h] = shortHash(h) }
-        return result
+    /// The three slots of a contact, for the rename UI (nil: no contact).
+    func contactNameSlots(for destHash: String) -> (local: String?, message: String?, announce: String?)? {
+        guard let ctx = modelContext else { return nil }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        guard let c = try? ctx.fetch(descriptor).first else { return nil }
+        return (c.localName, c.messageName, c.announceName)
     }
 
-    func renameContact(destHash: String, newName: String) {
+    /// localName ?? messageName ?? announceName. Until the §5.4 migration
+    /// has run (it needs the stack, for the recalled announce names), a
+    /// legacy name that is not a hash placeholder is shown as it was.
+    private func resolvedName(_ c: ContactEntity) -> String? {
+        if let name = DisplayNames.contactName(local: c.localName, message: c.messageName,
+                                               announce: c.announceName) {
+            return name
+        }
+        if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName, hash: c.destHash) {
+            return c.displayName
+        }
+        return nil
+    }
+
+    /// Every contact's resolved name (nil: none) in one fetch.
+    private func contactNameIndex() -> [String: String?] {
+        guard let ctx = modelContext,
+              let contacts = try? ctx.fetch(FetchDescriptor<ContactEntity>()) else { return [:] }
+        var index: [String: String?] = [:]
+        for c in contacts { index[c.destHash] = resolvedName(c) }
+        return index
+    }
+
+    /// contactDisplayName against a prefetched index.
+    private func label(for hash: String, in names: [String: String?]) -> String {
+        if hash == ownHashHex { return "You" }
+        return (names[hash] ?? nil) ?? DisplayNames.shortHash(hash)
+    }
+
+    /// A stored message's text as shown: a system message's subject named now.
+    private func shownText(_ content: String, senderHash: String, names: [String: String?]) -> String {
+        DisplayNames.systemText(content, subject: label(for: senderHash, in: names))
+    }
+
+    /// A contact's name slots changed: the chat list, open conversations
+    /// (namesVersion) and the NSE's name file follow.
+    private func namesChanged() {
+        namesVersion &+= 1
+        scheduleRefreshChats()
+    }
+
+    /// The user's own name for a contact (§5.1 localName), cleaned like any
+    /// name (§3). Saving an empty name clears it, and the contact shows its
+    /// provided name again.
+    func setLocalName(destHash: String, name: String) {
         guard let ctx = modelContext else { return }
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == destHash }
         )
-        if let contact = try? ctx.fetch(descriptor).first {
-            contact.displayName = newName
-            try? ctx.save()
-            refreshChats()
+        let contact: ContactEntity
+        if let existing = try? ctx.fetch(descriptor).first {
+            contact = existing
+        } else {
+            contact = ContactEntity(destHash: destHash)
+            ctx.insert(contact)
+        }
+        contact.localName = LxmfClient.cleanDisplayName(name)
+        try? ctx.save()
+        namesChanged()
+        refreshChats()
+    }
+
+    /// §5.2: a message's 0xD1 applied to the messageName of its LXMF source.
+    /// Callers pass only messages this device accepted (allowlist, group
+    /// policy, distro, NSE import); this device's own addresses are skipped.
+    private func applyMessageName(_ field: DisplayNames.NameField, unverifiedReason: Int, sourceHex: String) {
+        guard field != .absent, !isOwnAddress(sourceHex), let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == sourceHex }
+        )
+        let existing = try? ctx.fetch(descriptor).first
+        let change = DisplayNames.acceptMessageName(field, unverifiedReason: unverifiedReason,
+                                                    current: existing?.messageName)
+        guard case .set(let name) = change else { return }
+        let contact: ContactEntity
+        if let existing {
+            contact = existing
+        } else {
+            // A plain row, not allowlisted, as for any sender we accepted.
+            contact = ContactEntity(destHash: sourceHex)
+            ctx.insert(contact)
+        }
+        contact.messageName = name
+        try? ctx.save()
+        print("[Retichat] message name for \(sourceHex.prefix(8)) \(name == nil ? "cleared" : "set") (reason \(unverifiedReason))")
+        namesChanged()
+    }
+
+    /// Fill announceName from the announce cache (the Rust side's record of
+    /// the last announce), for a contact whose announce this app did not
+    /// see arrive. Only a name found replaces: a cache miss is not an
+    /// announce without a name.
+    private func refreshAnnounceNameFromCache(destHash: String) {
+        guard let client = lxmfClient, let ctx = modelContext,
+              let hashData = Data(hexString: destHash),
+              let name = client.recallDisplayName(for: hashData) else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        guard let contact = try? ctx.fetch(descriptor).first, contact.announceName != name else { return }
+        contact.announceName = name
+        try? ctx.save()
+        namesChanged()
+    }
+
+    /// §5.4, once (guarded by a persisted flag): each contact's single old
+    /// name goes to the slot it came from. A hash placeholder is dropped, a
+    /// value equal to the contact's recalled announce name becomes
+    /// announceName, anything else was typed by the user and becomes
+    /// localName. A slot filled since (a message or announce that already
+    /// arrived) is not overwritten. The recalls run on ffiQueue.
+    private func migrateLegacyContactNamesIfNeeded(client: LxmfClient) {
+        guard !prefs.contactNamesMigrated, let ctx = modelContext,
+              let contacts = try? ctx.fetch(FetchDescriptor<ContactEntity>()) else { return }
+        let legacy = contacts.filter { !$0.displayName.isEmpty }.map { ($0.destHash, $0.displayName) }
+        ffiQueue.async { [weak self] in
+            var recalled: [String: String] = [:]
+            for (hash, _) in legacy {
+                if let data = Data(hexString: hash), let name = client.recallDisplayName(for: data) {
+                    recalled[hash] = name
+                }
+            }
+            Task { @MainActor [weak self, recalled] in
+                guard let self, !self.prefs.contactNamesMigrated, let ctx = self.modelContext else { return }
+                var moved = 0
+                for (hash, value) in legacy {
+                    let descriptor = FetchDescriptor<ContactEntity>(predicate: #Predicate { $0.destHash == hash })
+                    guard let contact = try? ctx.fetch(descriptor).first else { continue }
+                    switch DisplayNames.migrateLegacyName(value, hash: hash, recalledAnnounceName: recalled[hash]) {
+                    case .drop:
+                        break
+                    case .announceName(let name):
+                        if contact.announceName == nil { contact.announceName = name; moved += 1 }
+                    case .localName(let name):
+                        if contact.localName == nil { contact.localName = name; moved += 1 }
+                    }
+                }
+                try? ctx.save()
+                self.prefs.contactNamesMigrated = true
+                print("[Retichat] contact names migrated: \(moved) of \(legacy.count) kept")
+                self.namesChanged()
+            }
         }
     }
 
@@ -2921,23 +3138,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             try? ctx.save()
             refreshChats()
         }
-    }
-
-    /// Set the contact's display name only when it is currently empty.
-    /// Preserves any name the user has entered manually.
-    private func updateContactNameIfEmpty(destHash: String, name: String) {
-        guard let ctx = modelContext else { return }
-        let descriptor = FetchDescriptor<ContactEntity>(
-            predicate: #Predicate { $0.destHash == destHash }
-        )
-        if let contact = try? ctx.fetch(descriptor).first, contact.displayName.isEmpty {
-            contact.displayName = name
-            try? ctx.save()
-        }
-    }
-
-    private func shortHash(_ hex: String) -> String {
-        String(hex.prefix(8)) + "…"
     }
 
     private func updateChatTimestamp(chatId: String, timestamp: Double) {

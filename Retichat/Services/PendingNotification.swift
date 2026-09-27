@@ -29,6 +29,10 @@ nonisolated enum PendingNotification {
         let timestamp: Double
         let signatureValid: Bool
         let fieldsRawBase64: String   // base64-encoded raw LXMF fields
+        /// Why the signature did not validate: 0 validated, 1 source unknown,
+        /// 2 invalid. The app accepts the sender's name (field 0xD1) by it
+        /// (DISPLAY_NAMES.md §5.2). nil in files written by older builds.
+        var unverifiedReason: Int? = nil
         /// Set when this message was a distro identity transfer (SPEC §17.9).
         /// Its fields are then NOT persisted — see stashDistroTransferKey.
         /// Optional so files written by older builds still decode.
@@ -40,7 +44,7 @@ nonisolated enum PendingNotification {
             NSEMessage(messageHash: messageHash, senderHash: senderHash, destHash: destHash,
                        title: title, content: content, timestamp: timestamp,
                        signatureValid: signatureValid, fieldsRawBase64: "",
-                       distroTransfer: stash)
+                       unverifiedReason: unverifiedReason, distroTransfer: stash)
         }
     }
 
@@ -416,7 +420,9 @@ nonisolated enum PendingNotification {
 
     // MARK: - Chat name map (for NSE notification titles)
 
-    /// Write a map of peerHash → displayName so the NSE can resolve names.
+    /// Write a map of contact hash → resolved name (DISPLAY_NAMES.md §5.3:
+    /// localName ?? messageName ?? announceName; a contact with no name is
+    /// left out, never written as a hash placeholder) for the NSE's titles.
     static func writeChatNames(_ names: [String: String]) {
         guard let dir = containerURL else { return }
         let file = dir.appendingPathComponent("chat_names.json")
@@ -431,6 +437,28 @@ nonisolated enum PendingNotification {
         let file = dir.appendingPathComponent("chat_names.json")
         guard let data = try? Data(contentsOf: file),
               let names = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return names
+    }
+
+    // MARK: - Channel Display Names (for NSE notification titles)
+
+    /// channel hash → sender hash → the Channel Display Name that sender's
+    /// posts there carry (DISPLAY_NAMES.md §5.1), so the NSE labels a
+    /// channel post as the app does even when the post carries no name.
+    static func writeChannelSenderNames(_ names: [String: [String: String]]) {
+        guard let dir = containerURL else { return }
+        let file = dir.appendingPathComponent("channel_sender_names.json")
+        if let data = try? JSONEncoder().encode(names) {
+            try? data.write(to: file, options: .atomic)
+        }
+    }
+
+    static func readChannelSenderNames() -> [String: [String: String]] {
+        guard let dir = containerURL,
+              let data = try? Data(contentsOf: dir.appendingPathComponent("channel_sender_names.json")),
+              let names = try? JSONDecoder().decode([String: [String: String]].self, from: data) else {
             return [:]
         }
         return names

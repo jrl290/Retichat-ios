@@ -13,7 +13,20 @@ import SwiftData
 @Model
 final class ContactEntity {
     @Attribute(.unique) var destHash: String
+    /// The single name slot of builds before DISPLAY_NAMES.md (2026-09-27).
+    /// Read once, by the §5.4 migration (ChatRepository
+    /// .migrateLegacyContactNamesIfNeeded), and never written or shown
+    /// after: the three slots below replace it.
     var displayName: String
+    /// The user's own name for the contact (§5.1). nil = none; the rename
+    /// UI clears it by saving an empty name.
+    var localName: String?
+    /// The name the contact sends in its messages, field 0xD1 (§5.1),
+    /// accepted by the §5.2 rules.
+    var messageName: String?
+    /// The name in the contact's last announce (§5.1), cleaned, "Anonymous
+    /// Peer" as none. Replaced on every announce.
+    var announceName: String?
     var lastSeen: Double
     /// True when the contact was explicitly added by the user (via hash entry,
     /// QR scan, or group creation).  Nil/false for contacts auto-created from
@@ -22,10 +35,11 @@ final class ContactEntity {
     /// existing stores without a default value.
     var isAllowlisted: Bool?
 
-    init(destHash: String, displayName: String = "", lastSeen: Double = 0,
+    init(destHash: String, announceName: String? = nil, lastSeen: Double = 0,
          isAllowlisted: Bool? = nil) {
         self.destHash = destHash
-        self.displayName = displayName
+        self.displayName = ""
+        self.announceName = announceName
         self.lastSeen = lastSeen
         self.isAllowlisted = isAllowlisted
     }
@@ -202,7 +216,11 @@ struct Chat: Identifiable {
 struct ChatMessage: Identifiable {
     let id: String
     var senderHash: String
+    /// The sender's resolved label (DisplayNames), never a stored snapshot.
     var senderName: String
+    /// Shown beside senderName: the 8-hex short hash when the label is a
+    /// channel name (DISPLAY_NAMES.md §5.3), else nil.
+    var senderSecondary: String? = nil
     var content: String
     var timestamp: Double
     var isOutgoing: Bool
@@ -248,6 +266,11 @@ final class ChannelEntity {
     var lastMessageTime: Double
     var isSubscribed: Bool
     var stampCost: Int?                           // PoW bits required by rfed; nil = disabled
+    /// DISPLAY_NAMES.md §4.2, persisted: digest (hex, 16 bytes) of the
+    /// Channel Display Name last included in a post here (the empty-name
+    /// digest after a clear), and when (seconds). nil = never.
+    var nameLastDigestHex: String?
+    var nameLastIncludedAt: Double?
 
     init(channelHash: String, channelName: String, rfedNodeHash: String,
          lastMessageTime: Double = 0, isSubscribed: Bool = true, stampCost: Int? = nil) {
@@ -265,7 +288,10 @@ final class ChannelMessageEntity {
     @Attribute(.unique) var id: String           // sender_hex+timestamp hex
     var channelHash: String
     var senderHash: String                        // 32-char hex (16 bytes)
-    var senderDisplayName: String = ""            // display name embedded by sender in blob
+    /// Unused: the pre-LXMF channel blob carried a name here. Names now
+    /// live per (channel, sender) in ChannelSenderEntity (DISPLAY_NAMES.md
+    /// §5.1) and are resolved when shown. Kept so existing stores load.
+    var senderDisplayName: String = ""
     var content: String
     var timestamp: Double                         // Unix ms
     var isOutgoing: Bool
@@ -275,17 +301,39 @@ final class ChannelMessageEntity {
     /// render with the previous “no indicator needed” behaviour.
     var deliveryState: Int = DeliveryState.sent
 
-    init(id: String, channelHash: String, senderHash: String, senderDisplayName: String = "",
+    init(id: String, channelHash: String, senderHash: String,
          content: String, timestamp: Double, isOutgoing: Bool = false,
          deliveryState: Int = DeliveryState.sent) {
         self.id = id
         self.channelHash = channelHash
         self.senderHash = senderHash
-        self.senderDisplayName = senderDisplayName
         self.content = content
         self.timestamp = timestamp
         self.isOutgoing = isOutgoing
         self.deliveryState = deliveryState
+    }
+}
+
+/// One sender seen in one channel (DISPLAY_NAMES.md §4.2, §5.1): when this
+/// device first saw them post there, and the Channel Display Name their
+/// posts there carry. The name never becomes the contact's messageName.
+@Model
+final class ChannelSenderEntity {
+    var channelHash: String                       // 32-char hex
+    var senderHash: String                        // 32-char hex
+    /// Local time (seconds) this sender was first seen posting here: rule 2
+    /// of §4.2 includes the name when this is after the last inclusion.
+    var firstSeenAt: Double
+    /// From 0xD1 in this sender's posts here; nil = none (or cleared).
+    var channelName: String?
+    /// The post time (ms) of the post that last set or cleared channelName:
+    /// an older post pulled later ("Load earlier messages") does not undo it.
+    var channelNameAtMs: Double?
+
+    init(channelHash: String, senderHash: String, firstSeenAt: Double) {
+        self.channelHash = channelHash
+        self.senderHash = senderHash
+        self.firstSeenAt = firstSeenAt
     }
 }
 
@@ -304,7 +352,6 @@ struct ChannelMessage: Identifiable {
     let id: String
     var channelHash: String
     var senderHash: String
-    var senderDisplayName: String  // embedded in blob at send time; stored once on receive
     var content: String
     var timestamp: Double
     var isOutgoing: Bool

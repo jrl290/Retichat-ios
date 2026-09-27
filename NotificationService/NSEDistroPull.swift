@@ -22,6 +22,10 @@ enum NSEDistroPull {
         let title: String
         let content: String
         let timestamp: Double
+        /// The sender's 0xD1 and the signature result that decides whether
+        /// the title may use it (DISPLAY_NAMES.md §5.2).
+        let displayName: DisplayNames.NameField
+        let unverifiedReason: Int
     }
 
     struct Result {
@@ -220,6 +224,10 @@ enum NSEDistroPull {
         let is_delivery_notification: Bool
         let distro_transfer_key: String?
         let sent_by: String?
+        let display_name_state: Int?
+        let display_name: String?
+        let signature_validated: Bool?
+        let unverified_reason: Int?
     }
 
     private static func unwrapToShow(_ blob: Data, distroHandle: UInt64) -> Shown? {
@@ -238,7 +246,10 @@ enum NSEDistroPull {
             return nil
         }
         return Shown(senderHash: m.source_hash.lowercased(), title: m.title ?? "",
-                     content: m.content ?? "", timestamp: m.timestamp)
+                     content: m.content ?? "", timestamp: m.timestamp,
+                     displayName: DisplayNames.distroNameField(state: m.display_name_state, name: m.display_name),
+                     unverifiedReason: DisplayNames.distroReason(validated: m.signature_validated,
+                                                                 unverifiedReason: m.unverified_reason))
     }
 
     static func hexData(_ hex: String) -> Data? {

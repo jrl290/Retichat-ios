@@ -82,9 +82,12 @@ struct ConversationView: View {
         return repository.chats.first(where: { $0.id == chatId })?.isPendingInvite ?? false
     }
 
+    /// Live: the chat list's resolved name, which follows every name change
+    /// (DISPLAY_NAMES.md §5.3), not a copy taken when the screen appeared.
     private var navigationTitle: String {
         switch mode {
-        case .dm:              return viewModel.chatTitle
+        case .dm:              return repository.chats.first(where: { $0.id == chatId })?.displayName
+                                   ?? viewModel.chatTitle
         case .channel(let ch): return "#\(ch.channelName)"
         }
     }
@@ -330,6 +333,13 @@ struct ConversationView: View {
                 refreshPeerLinkStatus()
             }
         }
+        // A name learned while the chat is open shows at once in the
+        // bubbles, sender labels and system messages.
+        .onReceive(repository.$namesVersion) { _ in
+            if case .dm(let id) = mode {
+                viewModel.refreshMessages(chatId: id, repository: repository)
+            }
+        }
     }
 
     // MARK: - DM message list
@@ -437,16 +447,18 @@ struct ConversationView: View {
                         // Reuse the direct/group ChatBubble so channels share
                         // the exact same visual layout. Channel timestamps
                         // are Unix-ms; ChatMessage expects seconds. Channels
-                        // never carry attachments or upload progress.
+                        // never carry attachments or upload progress. The
+                        // sender: channelName ?? contact ?? shortHash, with
+                        // the 8-hex hash beside a channel name (§5.3).
+                        let label = msg.isOutgoing ? nil : channelClient.senderLabel(
+                            channelHashHex: channel.id, senderHashHex: msg.senderHash,
+                            contactName: repository.resolvedContactName(for: msg.senderHash))
                         ChatBubble(
                             message: ChatMessage(
                                 id: msg.id,
                                 senderHash: msg.senderHash,
-                                senderName: msg.isOutgoing
-                                    ? "You"
-                                    : (!msg.senderDisplayName.isEmpty
-                                        ? msg.senderDisplayName
-                                        : repository.contactDisplayName(for: msg.senderHash)),
+                                senderName: label?.label ?? "You",
+                                senderSecondary: label?.secondary,
                                 content: msg.content,
                                 timestamp: msg.timestamp / 1000.0,
                                 isOutgoing: msg.isOutgoing,
@@ -710,7 +722,21 @@ struct ChatInfoSheet: View {
     @State private var showLeaveConfirm = false
 
     private var chat: Chat? { repository.chats.first(where: { $0.id == chatId }) }
-    private var title: String { chat?.displayName ?? chatId }
+    private var title: String { chat?.displayName ?? repository.contactDisplayName(for: chatId) }
+    private var peerHash: String { chat?.peerHash ?? chatId }
+    /// The contact's three name slots (DISPLAY_NAMES.md §5.1); nil for a group.
+    private var slots: (local: String?, message: String?, announce: String?)? {
+        isGroup ? nil : repository.contactNameSlots(for: peerHash)
+    }
+    /// What the contact shows when the user's own name is cleared.
+    private var providedName: String {
+        DisplayNames.contactName(local: nil, message: slots?.message, announce: slots?.announce)
+            ?? DisplayNames.shortHash(peerHash)
+    }
+    private var renameUnchanged: Bool {
+        let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isGroup ? (trimmed.isEmpty || trimmed == title) : trimmed == (slots?.local ?? "")
+    }
 
     var body: some View {
         NavigationStack {
@@ -742,15 +768,30 @@ struct ChatInfoSheet: View {
                                     .font(.headline)
                                     .foregroundColor(.retichatOnSurface)
                                 HStack {
-                                    TextField("Name", text: $renameText)
+                                    TextField(isGroup ? "Name" : providedName, text: $renameText)
                                         .foregroundColor(.retichatOnSurface)
                                         .padding(10)
                                         .glassBackground(cornerRadius: 8)
                                     Button("Save") {
                                         applyRename()
                                     }
-                                    .disabled(renameText.isEmpty || renameText == title)
+                                    .disabled(renameUnchanged)
                                     .tint(.retichatPrimary)
+                                }
+                                if !isGroup {
+                                    Text("Your own name for this contact. Leave it empty to show the name they send.")
+                                        .font(.caption2)
+                                        .foregroundColor(.retichatOnSurfaceVariant)
+                                    if let sent = slots?.message {
+                                        Text("Name in their messages: \(sent)")
+                                            .font(.caption2)
+                                            .foregroundColor(.retichatOnSurfaceVariant)
+                                    }
+                                    if let announced = slots?.announce {
+                                        Text("Name in their announces: \(announced)")
+                                            .font(.caption2)
+                                            .foregroundColor(.retichatOnSurfaceVariant)
+                                    }
                                 }
                             }
                         }
@@ -873,7 +914,9 @@ struct ChatInfoSheet: View {
                 Text("You will stop receiving messages from this group.")
             }
             .onAppear {
-                renameText = title
+                // A contact's field holds only the user's own name, so saving
+                // it empty clears it (§5.1).
+                renameText = isGroup ? title : (slots?.local ?? "")
                 notificationsEnabled = !UserPreferences.shared.isChatMuted(chatId)
             }
         }
@@ -881,11 +924,13 @@ struct ChatInfoSheet: View {
 
     private func applyRename() {
         let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
         if isGroup {
+            guard !trimmed.isEmpty else { return }
             repository.renameGroup(chatId: chatId, newName: trimmed)
         } else {
-            repository.renameContact(destHash: chat?.peerHash ?? chatId, newName: trimmed)
+            // Empty clears the local name (§5.1); saved cleaned (§3).
+            repository.setLocalName(destHash: peerHash, name: trimmed)
+            renameText = repository.contactNameSlots(for: peerHash)?.local ?? ""
         }
     }
 

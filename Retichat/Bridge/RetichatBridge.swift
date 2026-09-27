@@ -11,12 +11,18 @@ import Foundation
 
 // MARK: - Callback protocols
 
+/// `unverifiedReason`: 0 validated, 1 source unknown (no key for the source
+/// yet), 2 signature invalid. DISPLAY_NAMES.md §5.2 accepts a 0xD1 name
+/// differently for 1 and 2, so names are decided on it, not on signatureValid.
 protocol MessageCallback: AnyObject {
     @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
                               title: String, content: String, timestamp: Double,
-                              signatureValid: Bool, fieldsRaw: Data)
+                              signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data)
 }
 
+/// `displayName` is the announce's name cleaned by the Rust side with the
+/// announce rules (DISPLAY_NAMES.md §5.1 announceName), or nil when the
+/// announce carries none.
 protocol AnnounceCallback: AnyObject {
     @MainActor func onAnnounce(destHash: Data, displayName: String?)
 }
@@ -439,6 +445,10 @@ final class RetichatBridge: @unchecked Sendable {
         let title: Data
         /// Content bytes (UTF-8 message body).
         let content: Data
+        /// The post's Channel Display Name (field 0xD1, DISPLAY_NAMES.md
+        /// §2.3). The Rust side reports it only when the signature
+        /// validated; otherwise it is .absent.
+        let displayName: DisplayNames.NameField
     }
 
     /// Result of packing a channel LXMF message.
@@ -455,23 +465,34 @@ final class RetichatBridge: @unchecked Sendable {
 
     /// Build an LXMF channel message and return the on-wire payload plus
     /// the LXMF timestamp the sender baked into the signed body.
+    /// `displayName` is the Channel Display Name decision for this post
+    /// (DISPLAY_NAMES.md §4.2, DisplayNames.channelPostName): .absent writes
+    /// no 0xD1, .clear an empty one, .name the (cleaned) name.
     nonisolated func channelLxmPack(name: String,
                                     senderIdentityHandle: UInt64,
                                     content: Data,
-                                    title: Data) -> ChannelLxmPackResult? {
+                                    title: Data,
+                                    displayName: DisplayNames.NameField) -> ChannelLxmPackResult? {
         var outLen: UInt32 = 0
+        let nameBytes: Data
+        if case .name(let n) = displayName { nameBytes = Data(n.utf8) } else { nameBytes = Data() }
         guard let ptr = name.withCString({ cName in
             content.withUnsafeBytes { cBuf in
                 title.withUnsafeBytes { tBuf in
-                    retichat_channel_lxm_pack(
-                        cName,
-                        senderIdentityHandle,
-                        cBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        UInt32(content.count),
-                        tBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        UInt32(title.count),
-                        &outLen
-                    )
+                    nameBytes.withUnsafeBytes { nBuf in
+                        retichat_channel_lxm_pack(
+                            cName,
+                            senderIdentityHandle,
+                            cBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt32(content.count),
+                            tBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt32(title.count),
+                            displayName.stateByte,
+                            nBuf.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt32(nameBytes.count),
+                            &outLen
+                        )
+                    }
                 }
             }
         }) else { return nil }
@@ -487,7 +508,8 @@ final class RetichatBridge: @unchecked Sendable {
     /// Unpack an LXMF channel message received from RFed. `lxmfData` MUST
     /// start with the 16-byte channel_hash. Returns parsed fields including
     /// signature-validation status. Returns nil on hard failure (corrupt or
-    /// undecryptable bytes).
+    /// undecryptable bytes, or a key that does not bind to the claimed
+    /// sender: DISPLAY_NAMES.md §2.3).
     nonisolated func channelLxmUnpack(name: String, lxmfData: Data) -> ChannelLxmUnpackResult? {
         var outLen: UInt32 = 0
         guard let ptr = name.withCString({ cName in
@@ -503,24 +525,16 @@ final class RetichatBridge: @unchecked Sendable {
         let raw = Data(bytes: ptr, count: Int(outLen))
         lxmf_free_bytes(ptr, outLen)
 
-        // Layout: 16 src_hash | 8 ts_ms_be | 1 sig_ok | 1 reason | 2 title_len_be | 4 content_len_be | title | content
-        guard raw.count >= 32 else { return nil }
-        let sourceHash = raw.subdata(in: 0..<16)
-        let timestampMs = raw.subdata(in: 16..<24).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
-        let sigOk = raw[24] == 1
-        let reason = raw[25]
-        let titleLen = Int(raw.subdata(in: 26..<28).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian })
-        let contentLen = Int(raw.subdata(in: 28..<32).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
-        guard raw.count >= 32 + titleLen + contentLen else { return nil }
-        let title = raw.subdata(in: 32..<(32 + titleLen))
-        let content = raw.subdata(in: (32 + titleLen)..<(32 + titleLen + contentLen))
+        // The NSE reads the same layout (NSEChannelUnpackDecoder); one parser.
+        guard let m = ChannelUnpackLayout.decode(raw) else { return nil }
         return ChannelLxmUnpackResult(
-            sourceHash: sourceHash,
-            timestampMs: timestampMs,
-            signatureValidated: sigOk,
-            unverifiedReason: reason,
-            title: title,
-            content: content
+            sourceHash: m.sourceHash,
+            timestampMs: m.timestampMs,
+            signatureValidated: m.signatureValidated,
+            unverifiedReason: m.unverifiedReason,
+            title: m.title,
+            content: m.content,
+            displayName: m.displayName
         )
     }
 
@@ -616,7 +630,7 @@ final class RetichatBridge: @unchecked Sendable {
 
     func handleDelivery(hash: Data, srcHash: Data, destHash: Data,
                         title: String, content: String, timestamp: Double,
-                        signatureValid: Bool, fieldsRaw: Data) {
+                        signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data) {
         // Capture the callback before hopping to MainActor so a transient
         // lifecycle change cannot nil out the weak reference after Rust has
         // already accepted the delivery.
@@ -629,7 +643,8 @@ final class RetichatBridge: @unchecked Sendable {
             callback.onMessage(
                 hash: hash, srcHash: srcHash, destHash: destHash,
                 title: title, content: content, timestamp: timestamp,
-                signatureValid: signatureValid, fieldsRaw: fieldsRaw
+                signatureValid: signatureValid, unverifiedReason: unverifiedReason,
+                fieldsRaw: fieldsRaw
             )
         }
     }
@@ -665,6 +680,7 @@ private func deliveryTrampoline(
     content: UnsafePointer<CChar>?,
     timestamp: Double,
     signatureValid: Int32,
+    unverifiedReason: Int32,
     fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32
 ) {
     guard let context = context else { return }
@@ -680,7 +696,8 @@ private func deliveryTrampoline(
     bridge.handleDelivery(
         hash: hashData, srcHash: srcData, destHash: destData,
         title: titleStr, content: contentStr, timestamp: timestamp,
-        signatureValid: signatureValid != 0, fieldsRaw: fieldsData
+        signatureValid: signatureValid != 0, unverifiedReason: Int(unverifiedReason),
+        fieldsRaw: fieldsData
     )
 }
 
