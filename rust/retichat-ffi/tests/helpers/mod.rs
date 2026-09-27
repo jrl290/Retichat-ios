@@ -512,6 +512,8 @@ pub struct DeliveredMsg {
     pub dest_hash: Vec<u8>,
     pub content: String,
     pub sig_valid: bool,
+    /// 0 validated, 1 source unknown, 2 signature invalid.
+    pub unverified_reason: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +552,7 @@ pub extern "C" fn delivery_trampoline(
     content: *const c_char,
     _timestamp: f64,
     sig_valid: i32,
+    unverified_reason: i32,
     _fields: *const u8,
     _fields_len: u32,
 ) {
@@ -566,6 +569,7 @@ pub extern "C" fn delivery_trampoline(
             }
         },
         sig_valid: sig_valid != 0,
+        unverified_reason,
     };
     let (lock, cvar) = &**capture;
     lock.lock().unwrap().push(msg);

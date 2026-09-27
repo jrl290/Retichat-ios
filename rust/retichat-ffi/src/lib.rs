@@ -1478,4 +1478,23 @@ mod display_name_bridge_tests {
         assert_eq!(take(lxmf_display_name_decode(retired.as_ptr(), retired.len() as u32, &mut len), len), vec![0, 0, 0]);
         assert_eq!(take(lxmf_display_name_decode(std::ptr::null(), 0, &mut len), len), vec![0, 0, 0]);
     }
+
+    /// The Swift header must say what the Rust library does: the buffer that
+    /// holds every name, and the delivery callback's reason argument
+    /// (DISPLAY_NAMES.md §5.2 needs "unknown" apart from "invalid").
+    #[test]
+    fn the_header_matches_the_display_name_exports() {
+        let header = include_str!("../../../Retichat/Bridge/CRetichatFFI.h");
+        let define = header
+            .lines()
+            .find_map(|l| l.strip_prefix("#define LXMF_DISPLAY_NAME_BUF_LEN "))
+            .expect("LXMF_DISPLAY_NAME_BUF_LEN in the header");
+        assert_eq!(define.trim().parse::<u32>().unwrap(), LXMF_DISPLAY_NAME_BUF_LEN);
+
+        let start = header.find("typedef void (*lxmf_delivery_callback_t)(").expect("delivery typedef");
+        let typedef = &header[start..start + header[start..].find(");").unwrap()];
+        let params: Vec<&str> = typedef.split(|c| c == ',' || c == '(').map(str::trim).collect();
+        let valid = params.iter().position(|p| *p == "int32_t signature_valid").expect("signature_valid");
+        assert_eq!(params[valid + 1], "int32_t unverified_reason", "unverified_reason follows signature_valid");
+    }
 }

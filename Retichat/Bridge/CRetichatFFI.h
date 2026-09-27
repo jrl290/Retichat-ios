@@ -121,6 +121,10 @@ int32_t lxmf_client_shutdown(uint64_t client);
 
 #pragma mark - LXMF Client Callbacks
 
+/// `signature_valid`: 1 validated, 0 not. `unverified_reason`: 0 validated,
+/// 1 source unknown (no key for the source yet), 2 signature invalid.
+/// DISPLAY_NAMES.md §5.2 accepts a 0xD1 name differently for 1 and 2, so
+/// decide on `unverified_reason`, never on `signature_valid` alone.
 typedef void (*lxmf_delivery_callback_t)(
     void *context,
     const uint8_t *hash, uint32_t hash_len,
@@ -130,6 +134,7 @@ typedef void (*lxmf_delivery_callback_t)(
     const char *content,
     double timestamp,
     int32_t signature_valid,
+    int32_t unverified_reason,
     const uint8_t *fields_raw, uint32_t fields_len
 );
 
@@ -397,10 +402,16 @@ int32_t lxmf_client_publish(uint64_t client, double refresh_secs);
 /// daemon. Returns 0 on success.
 int32_t lxmf_client_unpublish(uint64_t client);
 
+/// Buffer size, NUL included, that holds any cleaned display name: 64
+/// scalars of up to 4 UTF-8 bytes each, plus the NUL.
+#define LXMF_DISPLAY_NAME_BUF_LEN 257
+
 /// Look up the Announce Display Name last heard from a destination hash
 /// (DISPLAY_NAMES.md §5.1 announceName: cleaned, "Anonymous Peer" is none).
 /// Writes a NUL-terminated UTF-8 string into out_buf.
 /// Returns the number of bytes written (including NUL), or 0 if none / buffer too small.
+/// Pass a buffer of LXMF_DISPLAY_NAME_BUF_LEN bytes: a smaller one reports
+/// the longest names as none.
 int32_t lxmf_client_recall_display_name(uint64_t client,
                                          const uint8_t *dest_hash, uint32_t dest_len,
                                          char *out_buf, uint32_t buf_len);

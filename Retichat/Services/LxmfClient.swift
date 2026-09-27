@@ -822,10 +822,11 @@ final class LxmfClient: @unchecked Sendable {
     /// Look up the cached display name for a destination hash (from its last announce).
     /// Returns nil if no name is known.
     func recallDisplayName(for destHash: Data) -> String? {
-        var buf = [CChar](repeating: 0, count: 256)
+        // LXMF_DISPLAY_NAME_BUF_LEN holds the longest name (256 bytes + NUL).
+        var buf = [CChar](repeating: 0, count: Int(LXMF_DISPLAY_NAME_BUF_LEN))
         let written = destHash.withUnsafeBytes { hashBuf -> Int32 in
             let p = hashBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
-            return lxmf_client_recall_display_name(handle, p, UInt32(destHash.count), &buf, 256)
+            return lxmf_client_recall_display_name(handle, p, UInt32(destHash.count), &buf, UInt32(LXMF_DISPLAY_NAME_BUF_LEN))
         }
         guard written > 1 else { return nil }  // >1 because 1 would be just a NUL
         return String(cString: buf)
