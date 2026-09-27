@@ -517,13 +517,25 @@ nonisolated enum DisplayNames {
         /// becomes the message's timestamp, also when the name is the one
         /// already held (§5.2: a repeat advances the timestamp).
         case set(String?)
+        /// Taken from a source whose key is not known yet (§5.2's weak
+        /// fill): the name is written but messageNameAt is not. The
+        /// timestamp is the sender's claim and nothing vouches for the
+        /// sender, so recording it would let a forged message dated far
+        /// ahead block every later validated name and clear from the real
+        /// source until that date (review ios-order-1). The source's first
+        /// validated 0xD1 newer than the last recorded one replaces it.
+        case fill(String)
     }
 
     /// §5.2's ordering rule: a 0xD1 counts only from a message whose LXMF
     /// timestamp is newer than the one that last set or cleared the slot
     /// (`heldAt`; nil when nothing has, e.g. a name from before this rule).
+    /// A timestamp that is not a finite number cannot be ordered and never
+    /// counts (as on Android and the web); held, it would refuse every
+    /// later message for good.
     static func isNewer(_ messageTime: Double, than heldAt: Double?) -> Bool {
-        guard let heldAt else { return true }
+        guard messageTime.isFinite else { return false }
+        guard let heldAt, heldAt.isFinite else { return true }
         return messageTime > heldAt
     }
 
@@ -534,6 +546,8 @@ nonisolated enum DisplayNames {
     /// changes nothing. Only a message newer than `currentAt` (messageNameAt)
     /// counts: a propagated copy landing after a later direct message must
     /// not bring back the old name, which the sender's ledger never resends.
+    /// A name from an unknown source is a `.fill`: it does not record its
+    /// timestamp, so it cannot hold off the validated names that follow.
     static func acceptMessageName(_ field: NameField, unverifiedReason: Int, current: String?,
                                   currentAt: Double?, messageTime: Double) -> Change {
         guard isNewer(messageTime, than: currentAt) else { return .keep }
@@ -543,7 +557,7 @@ nonisolated enum DisplayNames {
         case (.clear, 0):
             return .set(nil)
         case (.name(let s), 1):
-            return current == nil ? .set(s) : .keep
+            return current == nil ? .fill(s) : .keep
         default:
             return .keep
         }
@@ -741,10 +755,12 @@ nonisolated enum DisplayNames {
         }
         let heldMessage = appName?.slot == .message ? appName?.name : nil
         var message = heldMessage
-        if case .set(let accepted) = acceptMessageName(messageName, unverifiedReason: unverifiedReason,
-                                                       current: heldMessage, currentAt: appName?.messageNameAt,
-                                                       messageTime: messageTime) {
-            message = accepted
+        switch acceptMessageName(messageName, unverifiedReason: unverifiedReason,
+                                 current: heldMessage, currentAt: appName?.messageNameAt,
+                                 messageTime: messageTime) {
+        case .set(let accepted): message = accepted
+        case .fill(let accepted): message = accepted
+        case .keep: break
         }
         if let message, !message.isEmpty { return message }
         let appAnnounce = appName?.slot == .announce ? appName?.name : nil

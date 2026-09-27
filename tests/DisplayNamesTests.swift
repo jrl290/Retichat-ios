@@ -120,7 +120,8 @@ func testTheAcceptTable() {
     check(accept(.clear, 0, "Alice") == .set(nil), "validated clear: messageName = none")
     check(accept(.clear, 0, nil) == .set(nil),
           "validated clear with nothing held: accepted, so its timestamp is recorded")
-    check(accept(.name("Alice"), 1, nil) == .set("Alice"), "source unknown: set only if none is held")
+    check(accept(.name("Alice"), 1, nil) == .fill("Alice"),
+          "source unknown: set only if none is held, as a fill that records no timestamp")
     check(accept(.name("Mallory"), 1, "Alice") == .keep, "source unknown: never replaces a name")
     check(accept(.clear, 1, "Alice") == .keep, "source unknown: a clear is ignored")
     check(accept(.name("Mallory"), 2, nil) == .keep, "invalid signature: a name is ignored")
@@ -148,15 +149,26 @@ func testTheAcceptOrder() {
           "a name held from before the rule (no timestamp) takes any message")
     check(accept(.name("Alice"), 1, nil, at: t, t - 60) == .keep,
           "an unknown source's first name is ordered too")
-    check(accept(.name("Alice"), 1, nil, at: t, t + 60) == .set("Alice"),
-          "and, taken, records its timestamp")
+    check(accept(.name("Alice"), 1, nil, at: t, t + 60) == .fill("Alice"),
+          "and, taken, is a fill: its timestamp is the unverified sender's claim")
+    for bad in [Double.nan, .infinity, -.infinity] {
+        check(accept(.name("Alice"), 0, nil, at: nil, bad) == .keep,
+              "a timestamp that is not finite (\(bad)) cannot be ordered and never counts")
+    }
+    check(!DisplayNames.isNewer(.nan, than: nil) && DisplayNames.isNewer(t, than: .nan),
+          "nor is it newer than anything, and a non-finite held time orders nothing")
 
     // The app's fold (ChatRepository.applyMessageName) over messages in
-    // arrival order: name and messageNameAt after each accepted change.
+    // arrival order: name and messageNameAt after each accepted change. A
+    // fill writes the name and leaves messageNameAt.
     func fold(_ arrivals: [(DisplayNames.NameField, Int, Double)]) -> (String?, Double?) {
         var name: String? = nil, at: Double? = nil
         for (f, reason, time) in arrivals {
-            if case .set(let n) = accept(f, reason, name, at: at, time) { name = n; at = time }
+            switch accept(f, reason, name, at: at, time) {
+            case .set(let n): name = n; at = time
+            case .fill(let n): name = n
+            case .keep: break
+            }
         }
         return (name, at)
     }
@@ -168,9 +180,19 @@ func testTheAcceptOrder() {
           "a repeat of the current name advances the timestamp, so an older rename between them loses")
     let cleared = fold([(.clear, 0, t + 5), (.name("Ann"), 0, t)])
     check(cleared.0 == nil && cleared.1 == t + 5, "a newer clear holds against an older name")
+    // Review ios-order-1: a forged message from a source we hold no key
+    // for, dated far ahead, must not pin its name against the real source.
+    let forged = fold([(.name("Mallory"), 1, 4e9), (.name("Alice"), 0, t)])
+    check(forged.0 == "Alice" && forged.1 == t,
+          "a source-unknown name dated far ahead does not hold off the source's validated name")
+    let forgedThenClear = fold([(.name("Mallory"), 1, 4e9), (.clear, 0, t)])
+    check(forgedThenClear.0 == nil && forgedThenClear.1 == t, "nor its validated clear")
     let unknownFirst = fold([(.name("Ann"), 1, t + 5), (.name("Old"), 0, t)])
-    check(unknownFirst.0 == "Ann" && unknownFirst.1 == t + 5,
-          "a first name from an unknown source records its timestamp too")
+    check(unknownFirst.0 == "Old" && unknownFirst.1 == t,
+          "a validated name replaces a source-unknown fill whatever their dates (§5.2's table)")
+    let fillAfterClear = fold([(.clear, 0, t), (.name("Ann"), 1, t - 5), (.name("Ann"), 1, t + 5)])
+    check(fillAfterClear.0 == "Ann" && fillAfterClear.1 == t,
+          "a fill is still ordered against the last validated change, and does not move its time")
 }
 
 // MARK: - Resolving (§5.3)
@@ -430,7 +452,8 @@ func testTheReceivePaths() {
             && apply.contains("contact.messageName = name") && !apply.contains("localName"),
           "0xD1 writes messageName only, by the §5.2 table")
     check(apply.contains("currentAt: existing?.messageNameAt,") && apply.contains("messageTime: messageTime)")
-            && apply.contains("contact.messageNameAt = messageTime"),
+            && apply.contains("if case .set = change { contact.messageNameAt = messageTime }")
+            && apply.contains("case .fill(let n): name = n"),
           "the stored messageNameAt orders it, and an accepted 0xD1 records its message's timestamp (§5.2)")
     check(source("Retichat/Models/Models.swift").contains("    var messageName: String?\n")
             && source("Retichat/Models/Models.swift").contains("    var messageNameAt: Double?\n"),

@@ -3112,7 +3112,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                                     current: existing?.messageName,
                                                     currentAt: existing?.messageNameAt,
                                                     messageTime: messageTime)
-        guard case .set(let name) = change else { return }
+        let name: String?
+        switch change {
+        case .keep: return
+        case .set(let n): name = n
+        case .fill(let n): name = n
+        }
         let contact: ContactEntity
         if let existing {
             contact = existing
@@ -3124,7 +3129,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         let renamed = contact.messageName != name
         contact.messageName = name
-        contact.messageNameAt = messageTime
+        // A fill (unknown source) leaves messageNameAt alone, so the
+        // source's validated names that follow still replace it.
+        if case .set = change { contact.messageNameAt = messageTime }
         try? ctx.save()
         guard renamed else {
             // Only the timestamp moved: no surface changes, but the NSE's
