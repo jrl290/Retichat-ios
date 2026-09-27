@@ -256,13 +256,8 @@ final class LxmfFieldsDecoder {
                     var attachments: [(String, Data)] = []
                     for _ in 0..<arrLen {
                         guard offset < bytes.count else { break }
-                        // Each attachment is [filename, data]
-                        if let innerLen = readArrayLength(bytes, &offset), innerLen >= 2 {
-                            let filename = readString(bytes, &offset) ?? ""
-                            let fileData = readBin(bytes, &offset) ?? Data()
-                            attachments.append((filename, fileData))
-                            // Skip extra elements
-                            for _ in 2..<innerLen { skipValue(bytes, &offset) }
+                        if let attachment = readAttachment(bytes, &offset) {
+                            attachments.append(attachment)
                         }
                     }
                     fields.attachments = attachments
@@ -289,6 +284,28 @@ final class LxmfFieldsDecoder {
         fields.groupEntries = resolveGroupEntries(retichat: retichatGroup, legacy: legacyGroup)
         applyGroupEntries(&fields)
         return fields
+    }
+
+    /// One element of the attachments field, [filename, data, ...]: the
+    /// filename a str (else ""), the data a bin or str (else empty). The
+    /// element is ALWAYS consumed whole, whatever its shape (not an array,
+    /// fewer than 2 entries, entries of other types), and yields nil when it
+    /// is not an array of at least 2. Reading it piecemeal left a malformed
+    /// element half-read, and the walk then took the rest of the fields out
+    /// of the wrong place: the group entries after it were lost, which the
+    /// Rust reader (a whole-value parse) does not do.
+    private static func readAttachment(_ bytes: [UInt8], _ offset: inout Int) -> (String, Data)? {
+        var end = offset
+        skipValue(bytes, &end)
+        defer { offset = end }
+        var pos = offset
+        guard let innerLen = readArrayLength(bytes, &pos), innerLen >= 2 else { return nil }
+        var at = pos
+        let filename = readString(bytes, &at) ?? ""
+        skipValue(bytes, &pos)
+        at = pos
+        let fileData = readBin(bytes, &at) ?? Data()
+        return (filename, fileData)
     }
 
     // MARK: - Group entries (§10)

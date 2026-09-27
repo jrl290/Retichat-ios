@@ -221,6 +221,45 @@ func testTheWalkStaysInStep() {
     }
 }
 
+/// A malformed attachments field (0x05) is consumed whole: the group entries
+/// after it decode, in both forms, as lxmf_rust's read_group_entry reads
+/// them. Well-formed attachments still read.
+func testAMalformedAttachmentKeepsTheWalkInStep() {
+    let oldG = [0xCC, 0xA0] + str("g")                 // 0xA0: "g"
+    let mapG = [0xCC, 0xD1, 0x81, 0x01] + str("g")     // 0xD1: {1: "g"}
+    let malformed: [(String, [UInt8])] = [
+        ("[[\"a\"]] (inner array of 1)", [0x91, 0x91] + str("a")),
+        ("[nil] (element not an array)", [0x91, 0xC0]),
+        ("[[1, bin]] (filename not a str)", [0x91, 0x92, 0x01, 0xC4, 0x01, 0x78]),
+        ("[[\"f\", nil]] (data neither bin nor str)", [0x91, 0x92] + str("f") + [0xC0]),
+        ("[[{1: 2}, [3]]] (containers in both slots)", [0x91, 0x92, 0x81, 0x01, 0x02, 0x91, 0x03]),
+        ("[[\"f\"], [\"x\", bin]] (a short element before a good one)",
+         [0x92, 0x91] + str("f") + [0x92] + str("x") + [0xC4, 0x01, 0x79]),
+    ]
+    for (name, attachment) in malformed {
+        for (form, group) in [("old 0xA0", oldG), ("0xD1 map", mapG)] {
+            let fields = LxmfFieldsDecoder.decode(Data([0x82, 0x05] + attachment + group))
+            check(fields.groupId == "g", "attachments \(name) then \(form): the group id decodes",
+                  "got \(String(describing: fields.groupId))")
+        }
+    }
+    // The good element after the short one still reads.
+    let mixed = LxmfFieldsDecoder.decode(Data([0x82, 0x05] + malformed[5].1 + oldG))
+    check(mixed.attachments.count == 1 && mixed.attachments.first?.filename == "x"
+          && mixed.attachments.first?.data == Data([0x79]), "a good attachment after a short one reads")
+
+    // Well-formed: [filename, bin], [filename, str] and extra entries.
+    let good = [0x93,
+                0x92] + str("a.txt") + [0xC4, 0x02, 0x68, 0x69] + [
+                0x92] + str("b") + str("yo") + [
+                0x93] + str("c") + [0xC4, 0x01, 0x7A] + [0x81, 0x01, 0x02]
+    let fields = LxmfFieldsDecoder.decode(Data([0x82, 0x05] + good + oldG))
+    check(fields.groupId == "g", "well-formed attachments then 0xA0: the group id decodes")
+    check(fields.attachments.map { $0.filename } == ["a.txt", "b", "c"]
+          && fields.attachments.map { $0.data } == [Data("hi".utf8), Data("yo".utf8), Data([0x7A])],
+          "well-formed attachments read: bin data, str data, extra entries skipped")
+}
+
 // MARK: - Sender (§10)
 
 func testTheSendFormsMatchTheEncodeVectors() {
@@ -426,6 +465,7 @@ enum RetichatFieldTests {
         testTheDecoderRunsTheSharedVectors()
         testTheTypedFieldsComeFromTheResolvedEntries()
         testTheWalkStaysInStep()
+        testAMalformedAttachmentKeepsTheWalkInStep()
         testTheSendFormsMatchTheEncodeVectors()
         testTheConstantSelectsTheForm()
         testEveryGroupWriteGoesThroughTheHelper()
