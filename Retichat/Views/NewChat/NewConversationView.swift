@@ -392,7 +392,7 @@ private struct NewChannelForm: View {
                             .font(.system(.body, design: .monospaced))
                             .onChange(of: privatePrefix) { _, val in
                                 let filtered = ChannelNameRules.filterRoot(val)
-                                if filtered != val { privatePrefix = filtered }
+                                if !ChannelNameRules.sameBytes(filtered, val) { privatePrefix = filtered }
                             }
                             .padding(12)
                             .glassBackground(cornerRadius: 12)
@@ -430,13 +430,13 @@ private struct NewChannelForm: View {
                             .textInputAutocapitalization(.never)
                             .font(.system(.body, design: .monospaced))
                             .onChange(of: subdomain) { old, val in
-                                // Letters, digits, dots, hyphens. Private: a pasted
-                                // "root.name" fills both fields; Public: a pasted
-                                // "public.name" drops the duplicate "public.".
+                                // Letters, digits, dots, hyphens (NFC). Private: a
+                                // pasted "root.name" fills both fields; Public: a
+                                // leading "public." is dropped.
                                 let edit = ChannelNameRules.applyNameEdit(
                                     old: old, new: val, isPrivate: isPrivate, root: privatePrefix)
-                                if edit.root != privatePrefix { privatePrefix = edit.root }
-                                if edit.name != val { subdomain = edit.name }
+                                if !ChannelNameRules.sameBytes(edit.root, privatePrefix) { privatePrefix = edit.root }
+                                if !ChannelNameRules.sameBytes(edit.name, val) { subdomain = edit.name }
                             }
                             .padding(12)
                     }

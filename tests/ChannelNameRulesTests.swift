@@ -49,6 +49,33 @@ func testTheCharacterRules() {
           "a root is filtered like the name part, without dots",
           ChannelNameRules.filterRoot("Team.Ops-1 !"))
     check(ChannelNameRules.filterRoot("4CDC4115") == "4cdc4115", "a root is lowercased")
+
+    // The web client (Retichat-js filterChannelChars) lowercases, NFC-normalises
+    // and keeps \p{L}\p{N}.- per scalar. The channel hash is over the UTF-8
+    // bytes, so iOS must give the same bytes for the same visible name.
+    func hex(_ s: String) -> String { s.utf8.map { String(format: "%02x", $0) }.joined() }
+    let vectors: [(String, String)] = [          // expected bytes from node
+        ("cafe\u{301}", "636166c3a9"),            // NFD e + U+0301 -> U+00E9
+        ("q\u{301}x", "7178"),                    // a mark NFC cannot compose is dropped
+        ("x\u{b2}", "78c2b2"),                    // superscript two is \p{N}
+        ("\u{1c5}a", "c78661"),                   // titlecase letter lowercased
+        ("Caf\u{c9}.N\u{e4}me", "636166c3a92e6ec3a46d65"),
+        ("a b!c", "616263"),
+    ]
+    for (input, want) in vectors {
+        check(hex(ChannelNameRules.filterName(input)) == want,
+              "the name filter gives the web client's bytes for \(input.unicodeScalars.map { String($0.value, radix: 16) })",
+              hex(ChannelNameRules.filterName(input)))
+    }
+    check(hex(ChannelNameRules.filterRoot("Cafe\u{301}.x")) == "636166c3a978",
+          "the root filter is NFC too", hex(ChannelNameRules.filterRoot("Cafe\u{301}.x")))
+    // SwiftUI may keep an NFD value in the field (String == is canonical
+    // equivalence), so the joined name normalises whatever the fields hold.
+    check(hex(ChannelNameRules.fullName(isPrivate: true, root: "cafe\u{301}", name: "cafe\u{301}"))
+            == "636166c3a92e636166c3a9",
+          "the full name is NFC even when the fields are not")
+    check(!ChannelNameRules.sameBytes("cafe\u{301}", "caf\u{e9}") && ChannelNameRules.sameBytes("ab", "ab"),
+          "sameBytes tells NFD from NFC")
 }
 
 func testAPrivatePasteFillsBothFields() {
@@ -80,6 +107,40 @@ func testAPrivatePasteFillsBothFields() {
     check(dotMore.root == "abc" && dotMore.name == "team.ops.x",
           "Private: another dot typed into a dotted name leaves the root alone", "\(dotMore)")
 
+    // A select-all paste shares its first character, or a tail that holds the
+    // dot, with the old name: the inferred edit is smaller than the paste, and
+    // it must still split (the field reports no selection).
+    let sharedHead = edit("team.ops", "tango.foo", private: true, root: "abc")
+    check(sharedHead.root == "tango" && sharedHead.name == "foo",
+          "Private: a root.name pasted over a name starting with the same letter fills both fields",
+          "\(sharedHead)")
+    let sharedTail = edit("news.eu", "c0ffee12.eu", private: true, root: "abc")
+    check(sharedTail.root == "c0ffee12" && sharedTail.name == "eu",
+          "Private: a root.name pasted over a name ending like it fills both fields", "\(sharedTail)")
+    let sharedBoth = edit("4cdc4115.news.eu", "c0ffee12.news.eu", private: true, root: "abc")
+    check(sharedBoth.root == "c0ffee12" && sharedBoth.name == "news.eu",
+          "Private: a root.name.x pasted over one with the same tail fills both fields", "\(sharedBoth)")
+
+    // Edits that are not pastes over the first segment leave the root alone.
+    let later = edit("team.ops", "team.eu.west", private: true, root: "abc")
+    check(later.root == "abc" && later.name == "team.eu.west",
+          "Private: a paste after the first segment leaves the root alone", "\(later)")
+    let keystroke = edit("team.ops", "teams.ops", private: true, root: "abc")
+    check(keystroke.root == "abc" && keystroke.name == "teams.ops",
+          "Private: typing into the first segment leaves the root alone", "\(keystroke)")
+    let backspace = edit("team.ops", "tea.ops", private: true, root: "abc")
+    check(backspace.root == "abc" && backspace.name == "tea.ops",
+          "Private: deleting from the first segment leaves the root alone", "\(backspace)")
+    let atStart = edit("team.ops", "newteam.ops", private: true, root: "abc")
+    check(atStart.root == "abc" && atStart.name == "newteam.ops",
+          "Private: dotless text pasted at the start leaves the root alone", "\(atStart)")
+    let dottedAtStart = edit("team.ops", "x.yteam.ops", private: true, root: "abc")
+    check(dottedAtStart.root == "x" && dottedAtStart.name == "yteam.ops",
+          "Private: a root. pasted at the start moves into the root", "\(dottedAtStart)")
+    let writeBack = edit("c0ffee12.news.eu", "news.eu", private: true, root: "c0ffee12")
+    check(writeBack.root == "c0ffee12" && writeBack.name == "news.eu",
+          "Private: the write-back after a shared-tail paste is not split again", "\(writeBack)")
+
     let typed = edit("team", "team.", private: true)
     check(typed.root == "team" && typed.name == "",
           "Private: typing root then a dot moves it into the root", "\(typed)")
@@ -99,9 +160,18 @@ func testAPublicPasteDropsTheDuplicatePrefix() {
     check(edit("public.general", "general", private: false).name == "general",
           "Public: the write-back is stable")
     let twice = edit("", "public.public.x", private: false)
-    check(twice.name == "public.x", "Public: only one \"public.\" is dropped", "\(twice)")
-    check(edit("public.public.x", "public.x", private: false).name == "public.x",
-          "Public: the write-back of public.x is not stripped again")
+    check(twice.name == "x", "Public: every leading \"public.\" is dropped", "\(twice)")
+    check(edit("public.x", "x", private: false).name == "x", "Public: the write-back is stable")
+
+    // A select-all paste of public.name over a name that already starts with
+    // "public." (left there by a Private paste of "abc.public.x", then
+    // switching to Public) still drops the duplicate.
+    let overDup = edit("public.x", "public.general", private: false)
+    check(overDup.name == "general",
+          "Public: a pasted public.name over a public.-prefixed name drops \"public.\"",
+          "\(overDup)")
+    let typedDup = edit("public.", "public.g", private: false)
+    check(typedDup.name == "g", "Public: typing after a leading public. drops it", "\(typedDup)")
     let other = edit("", "news.tech", private: false)
     check(other.name == "news.tech" && other.root == "0123456789abcdef",
           "Public: any other x.y stays in the name part", "\(other)")
@@ -190,6 +260,9 @@ func testTheFormWiring() {
           "the form reports ChannelNameRules.canStart to the Start button")
     check(view.contains("Only people you share the full name with can join."),
           "the private hint says the full name must be shared")
+    check(view.contains("if !ChannelNameRules.sameBytes(edit.name, val) { subdomain = edit.name }")
+            && view.contains("if !ChannelNameRules.sameBytes(filtered, val) { privatePrefix = filtered }"),
+          "the form writes a filtered value back when its bytes differ, not only when != says so")
     check(!view.contains("Private channel prefix:"),
           "the read-only prefix line is gone")
 }
