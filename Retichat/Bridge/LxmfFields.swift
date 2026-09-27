@@ -665,9 +665,9 @@ nonisolated enum DisplayNames {
     /// recalled announce name becomes announceName; anything else is a
     /// name the user typed (iOS had no rename flag) and becomes localName.
     /// iOS has no legacyName slot: its mapping is the spec's iOS rule.
-    static func migrateLegacyName(_ value: String, recalledAnnounceName: String?) -> LegacyName {
+    static func migrateLegacyName(_ value: String, hash: String, recalledAnnounceName: String?) -> LegacyName {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isPlaceholder(trimmed) { return .drop }
+        if isPlaceholder(trimmed, ownHash: hash) { return .drop }
         if let recalled = recalledAnnounceName, !recalled.isEmpty, recalled == trimmed {
             return .announceName(recalled)
         }
@@ -679,18 +679,21 @@ nonisolated enum DisplayNames {
     /// "Anonymous Peer" (MeshChatX's, Columba's and lxmd's announce).
     static let placeholderNames: Set<String> = ["retichat", "retichat web", "anonymous peer"]
 
-    /// §5.4's placeholder test, exactly the spec's list: a hash form (8 to 32
-    /// hex digits, with or without a leading "?" or a trailing "…"; any
-    /// hash, not only the contact's own) or one of `placeholderNames`, case-
-    /// insensitive, surrounding white space ignored. Empty is no name at
-    /// all, so it is dropped too.
-    static func isPlaceholder(_ value: String) -> Bool {
+    /// §5.4's placeholder test: a hash form of the contact's OWN hash (8 to
+    /// 32 hex digits that prefix `ownHash`, with or without a leading "?" or a
+    /// trailing "…") or one of `placeholderNames`, case-insensitive,
+    /// surrounding white space ignored. Empty is no name at all, so it is
+    /// dropped too. iOS cannot tell a typed name from a received one, so other
+    /// hex ("deadbeef", "20260927") may have been typed and is kept, as the
+    /// Android and web migrations keep hex a user typed.
+    static func isPlaceholder(_ value: String, ownHash: String) -> Bool {
         var v = Substring(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         if v.isEmpty { return true }
         if placeholderNames.contains(String(v)) { return true }
         if v.hasPrefix("?") { v = v.dropFirst() }
         if v.hasSuffix("\u{2026}") { v = v.dropLast() }
-        return (8...32).contains(v.count) && v.allSatisfy { $0.isASCII && $0.isHexDigit }
+        guard (8...32).contains(v.count), v.allSatisfy({ $0.isASCII && $0.isHexDigit }) else { return false }
+        return ownHash.lowercased().hasPrefix(String(v))
     }
 
     // MARK: Notification Service Extension

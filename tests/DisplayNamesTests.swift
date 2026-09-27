@@ -409,16 +409,18 @@ func testTheDistroUnwrapKeys() {
 
 func testTheContactMigration() {
     func m(_ v: String, recalled: String? = nil) -> DisplayNames.LegacyName {
-        DisplayNames.migrateLegacyName(v, recalledAnnounceName: recalled)
+        DisplayNames.migrateLegacyName(v, hash: alice, recalledAnnounceName: recalled)
     }
-    // §5.4's list, exactly: hash forms (8 to 32 hex, with or without "?"
-    // or "…"), "Retichat", "Retichat Web", "Anonymous Peer", any case.
+    // §5.4's list: hash forms of the contact's own hash (8 to 32 hex, with or
+    // without "?" or "…"), "Retichat", "Retichat Web", "Anonymous Peer", any case.
     check(m("1a2b3c4d\u{2026}") == .drop, "the 8-hex placeholder is dropped")
     check(m("1a2b3c4d5e6f7081\u{2026}") == .drop, "the 16-hex picker placeholder is dropped")
     check(m("1A2B3C4D") == .drop, "8 hex, any case, no ellipsis")
     check(m(alice) == .drop && m(alice.uppercased() + "\u{2026}") == .drop, "the whole hash, 32 hex")
     check(m("?" + alice) == .drop && m("?1a2b3c4d") == .drop, "the web's ?hash form")
-    check(m("deadbeef\u{2026}") == .drop, "any hash form, not only the contact's own")
+    check(m("deadbeef") == .localName("deadbeef") && m("20260927") == .localName("20260927")
+            && m("?deadbeef") == .localName("?deadbeef"),
+          "hex that is not the contact's own hash may have been typed: kept")
     check(m("   ") == .drop, "an empty name is dropped")
     for placeholder in ["Retichat", "RETICHAT", "Retichat Web", "retichat web", "Anonymous Peer", "anonymous PEER"] {
         check(m(placeholder) == .drop, "the app placeholder \"\(placeholder)\" is dropped")
@@ -448,7 +450,7 @@ func testTheContactMigrationWiring() {
     check(migrate.contains("LxmfClient.cleanDisplayName(value)"), "old names are cleaned as saved names are")
     check(body(repo, "private func finishStartService(").contains("migrateLegacyContactNamesIfNeeded(client: client)"),
           "it runs when the stack is up (the recall needs it)")
-    check(body(repo, "private func sharedName(").contains("if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName)"),
+    check(body(repo, "private func sharedName(").contains("if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName, ownHash: c.destHash)"),
           "until then an old non-placeholder name is still shown")
 }
 

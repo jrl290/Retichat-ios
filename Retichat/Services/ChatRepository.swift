@@ -3035,7 +3035,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return DisplayNames.SharedName(name: resolved.name, slot: resolved.slot,
                                            messageNameAt: c.messageNameAt)
         }
-        if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName) {
+        if !prefs.contactNamesMigrated, !DisplayNames.isPlaceholder(c.displayName, ownHash: c.destHash) {
             return DisplayNames.SharedName(name: c.displayName, slot: .legacy, messageNameAt: c.messageNameAt)
         }
         return nil
@@ -3199,7 +3199,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     // Cleaned as any saved name is (§3): an old announce name
                     // was stored raw, and the recalled one comes back cleaned.
                     let cleaned = LxmfClient.cleanDisplayName(value) ?? ""
-                    switch DisplayNames.migrateLegacyName(cleaned, recalledAnnounceName: recalled[hash]) {
+                    switch DisplayNames.migrateLegacyName(cleaned, hash: hash, recalledAnnounceName: recalled[hash]) {
                     case .drop:
                         break
                     case .announceName(let name):
