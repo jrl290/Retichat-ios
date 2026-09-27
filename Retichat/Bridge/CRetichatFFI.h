@@ -118,6 +118,33 @@ uint64_t lxmf_client_start(const char *config_dir,
                             int32_t log_level,
                             int32_t stamp_cost);
 
+/// lxmf_client_start with the delivery ratchets' mirror and freeze in place
+/// before the ratchets load and before the delivery destination is registered
+/// with Transport (which can announce it, and so rotate, from then on).
+/// Reticulum-rust PARITY-AUDIT-1.5.2.md A29: a named departure, off by default.
+/// `ratchets_mirror_dir`: NULL/"" = none; else an existing directory that
+///   receives the identical ratchet file (`<dest hexhash>.ratchets`) after every
+///   write of it. The app passes the directory the NSE loads its ratchets from.
+/// `ratchets_frozen`: non-zero = read-only ratchets: never rotated, the file
+///   never written or created; announces carry the newest ratchet held and
+///   decryption reloads the file after a miss. The NSE passes 1.
+uint64_t lxmf_client_start_with_ratchets(const char *config_dir,
+                                         const char *storage_path,
+                                         const char *identity_path,
+                                         int32_t create_identity,
+                                         const char *display_name,
+                                         int32_t log_level,
+                                         int32_t stamp_cost,
+                                         const char *ratchets_mirror_dir,
+                                         int32_t ratchets_frozen);
+
+/// A29 at runtime, on every copy of the delivery destination (router,
+/// Transport, client handle). Prefer lxmf_client_start_with_ratchets: set
+/// here, a rotation already under way is not covered. NULL/"" stops the
+/// mirror; `frozen` 0 unfreezes. Return 0 on success, -1 on error.
+int32_t lxmf_client_set_ratchets_mirror_dir(uint64_t client, const char *dir);
+int32_t lxmf_client_set_ratchets_frozen(uint64_t client, int32_t frozen);
+
 int32_t lxmf_client_shutdown(uint64_t client);
 
 #pragma mark - LXMF Client Callbacks

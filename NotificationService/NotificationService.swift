@@ -499,7 +499,16 @@ class NotificationService: UNNotificationServiceExtension {
             createIdentity: false,
             messageDisplayName: "",
             logLevel: 4,
-            stampCost: -1
+            stampCost: -1,
+            // The ratchets here are the app's: its stack mirrors every
+            // rotation into this stack's ratchet file. Frozen from the start,
+            // before they load and before the delivery destination is
+            // registered with Transport (which answers path requests for it
+            // by announcing): this stack never rotates a ratchet only it would
+            // hold, and never writes the App Group ratchet file. A message to
+            // a ratchet the app rotated while this runs is decrypted after a
+            // reload of the file (Reticulum-rust PARITY-AUDIT-1.5.2.md A29).
+            ratchetsFrozen: true
         )
 
         do {

@@ -257,8 +257,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             createIdentity: true,
             messageDisplayName: prefs.messageDisplayName,
             logLevel: 4,
-            stampCost: -1
+            stampCost: -1,
+            // The NSE decrypts with the app's ratchets, from this directory.
+            // The stack mirrors every write of the ratchet file there from
+            // before the delivery destination can announce, so the rotation
+            // of this run's first announce reaches the NSE as it happens
+            // (Reticulum-rust PARITY-AUDIT-1.5.2.md A29).
+            ratchetsMirrorDir: PendingNotification.nseRatchetsDir()
         )
+        if config.ratchetsMirrorDir == nil {
+            print("[Retichat] NSE ratchet directory unavailable: ratchets are not mirrored for the NSE")
+        }
 
         // Heavy FFI call (TCP connect, transport init, ratchet load) runs off
         // the main thread so the UI stays responsive during startup.
@@ -273,6 +282,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         Task.detached(priority: .userInitiated) { [weak self, config, idPath, configDir, storagePath, announceName] in
             let result: Result<LxmfClient, Error> = await withCheckedContinuation { cont in
                 ffiQueueRef.async {
+                    // The one copy of the ratchet files into the NSE's
+                    // directory, before the stack starts: no stack runs, so
+                    // nothing writes them meanwhile, and the NSE has every
+                    // ratchet from before this run. From the start on the
+                    // stack's mirror keeps the NSE's file current; a copy
+                    // after the start could race it and put an older file
+                    // over a newer mirror.
+                    PendingNotification.syncRatchetsToAppGroup(from: storagePath)
                     let result = Result { try LxmfClient.start(config: config) }
                     // The Announce Display Name in the same ffiQueue turn as
                     // the start: Transport answers path requests for the
@@ -287,8 +304,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 }
             }
 
-            // Persist the live router state before mirroring files into the App
-            // Group, otherwise the NSE can read an older ratchet snapshot.
+            // Persist the live path table before copying storage into the App
+            // Group. (Ratchets are not copied here: see the copy before the
+            // start, and the stack's mirror.)
             if case .success(let client) = result {
                 client.persist()
             }
@@ -297,9 +315,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             PendingNotification.copyIdentityToAppGroup(from: idPath)
             PendingNotification.copyConfigToAppGroup(from: configDir + "/config")
             PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
-            PendingNotification.syncRatchetsToAppGroup(from: storagePath)
 
-            await self?.finishStartService(result: result, configDir: configDir, storagePath: storagePath)
+            await self?.finishStartService(result: result, configDir: configDir)
         }
     }
 
@@ -324,7 +341,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///      delivery destination to the publish daemon (auto-re-announce):
     ///      the Announce Display Name must be in place before the first
     ///      announce. Both on ffiQueue, in that order.
-    ///   8. Side-tasks: ratchet sync, periodic poll (seeds the router's
+    ///   8. Side-tasks: periodic poll (seeds the router's
     ///      propagation node at once), rfed notify register.
     ///   9. Distro registration with RFed (after ConnectionStateManager is
     ///      registered; Android StackRuntime 310-313).
@@ -337,7 +354,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// Each step that touches the FFI is hopped to `ffiQueue` (serial) or to
     /// a detached Task; all on-main-actor work above runs synchronously in
     /// the order written, so component callbacks observe a consistent state.
-    private func finishStartService(result: Result<LxmfClient, Error>, configDir: String, storagePath: String) async {
+    private func finishStartService(result: Result<LxmfClient, Error>, configDir: String) async {
         let client: LxmfClient
         switch result {
         case .success(let c):
@@ -398,12 +415,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         ffiQueue.async {
             guard let publishClient else { return }
             _ = publishClient.publish(refreshSecs: 30 * 60)
-        }
-
-        // Sync ratchets to App Group after announce (so the NSE can decrypt).
-        // Heavy file-copy I/O runs off the main thread.
-        Task.detached(priority: .utility) {
-            PendingNotification.syncRatchetsToAppGroup(from: storagePath)
         }
 
         // Start propagation polling
@@ -694,7 +705,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 }
             }
             PendingNotification.syncStorageToAppGroup(from: configDir + "/storage")
-            PendingNotification.syncRatchetsToAppGroup(from: configDir + "/lxmf_storage")
         }
     }
 

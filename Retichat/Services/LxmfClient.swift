@@ -17,6 +17,12 @@
 
 import Foundation
 
+/// `withCString` for an optional string: `body` gets NULL for nil.
+nonisolated private func withOptionalCString<R>(_ string: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+    guard let string else { return body(nil) }
+    return string.withCString { body($0) }
+}
+
 // MARK: - Configuration
 
 struct LxmfClientConfig: Sendable {
@@ -44,6 +50,18 @@ struct LxmfClientConfig: Sendable {
 
     /// Stamp cost for the delivery endpoint (-1 = none).
     let stampCost: Int32
+
+    /// App only: the directory the NSE loads its ratchets from. Every write
+    /// of the delivery ratchet file is mirrored there, identical, from
+    /// before the destination can announce (lxmf_client_start_with_ratchets;
+    /// Reticulum-rust PARITY-AUDIT-1.5.2.md A29). The directory must exist.
+    /// nil = no mirror.
+    var ratchetsMirrorDir: String? = nil
+
+    /// NSE only: read-only ratchets from before they load. The NSE never
+    /// rotates a ratchet and never writes the App Group ratchet file; it
+    /// reloads the app's mirror when a message needs a newer ratchet.
+    var ratchetsFrozen: Bool = false
 }
 
 // MARK: - LxmfClient
@@ -165,13 +183,17 @@ final class LxmfClient: @unchecked Sendable {
             config.storagePath.withCString { store in
                 config.identityPath.withCString { id in
                     config.messageDisplayName.withCString { name in
-                        lxmf_client_start(
-                            dir, store, id,
-                            config.createIdentity ? 1 : 0,
-                            name,
-                            config.logLevel,
-                            config.stampCost
-                        )
+                        withOptionalCString(config.ratchetsMirrorDir) { mirror in
+                            lxmf_client_start_with_ratchets(
+                                dir, store, id,
+                                config.createIdentity ? 1 : 0,
+                                name,
+                                config.logLevel,
+                                config.stampCost,
+                                mirror,
+                                config.ratchetsFrozen ? 1 : 0
+                            )
+                        }
                     }
                 }
             }

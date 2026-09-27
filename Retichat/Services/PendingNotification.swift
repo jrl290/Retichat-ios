@@ -390,21 +390,53 @@ nonisolated enum PendingNotification {
         }
     }
 
-    /// Sync the LXMF ratchet keys into the App Group so the NSE can decrypt
-    /// ratchet-encrypted messages from the propagation node.
+    /// The directory the NSE loads its delivery ratchets from (its LXMRouter
+    /// appends "/lxmf" to its storage path "nse_reticulum/lxmf_storage", and
+    /// keeps ratchets in "ratchets/<dest hexhash>.ratchets" under that).
+    /// Created if missing: the app's stack mirrors every write of its ratchet
+    /// file here (LxmfClientConfig.ratchetsMirrorDir), and a mirror write
+    /// into a missing directory fails.
+    static func nseRatchetsDir() -> String? {
+        guard let nseDir = nseReticulumDir() else { return nil }
+        let dir = URL(fileURLWithPath: nseDir)
+            .appendingPathComponent("lxmf_storage")
+            .appendingPathComponent("lxmf")
+            .appendingPathComponent("ratchets")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            NSLog("[Retichat] NSE ratchet directory not created: %@", error.localizedDescription)
+            return nil
+        }
+        return dir.path
+    }
+
+    /// Copy the app's LXMF ratchet files into the NSE's ratchet directory,
+    /// once per start, BEFORE the app's stack starts (ChatRepository runs it
+    /// on ffiQueue ahead of LxmfClient.start). From the start on, the stack
+    /// itself keeps the NSE's file current: it mirrors every write of the
+    /// ratchet file there (LxmfClientConfig.ratchetsMirrorDir), including the
+    /// rotation of the run's first announce. This copy only brings over what
+    /// a run before the mirror existed, or a failed mirror write, left behind.
+    ///
+    /// It cannot overwrite a newer mirror: while no stack runs nothing writes
+    /// the app's ratchet file, the NSE never writes its own (it starts with
+    /// frozen ratchets), and the last mirror write is identical to the last
+    /// primary write. A copy racing the running stack could put an older
+    /// file over a newer mirror, so there is no other copy.
+    ///
+    /// Each file is written atomically (tmp + rename), so an NSE that loads
+    /// its ratchets meanwhile reads the old file or the new one, never none.
     ///
     /// Note: LXMRouter internally appends "/lxmf" to the storage path, so the
     /// real ratchet dir is `{lxmfStoragePath}/lxmf/ratchets/`.
-    static func syncRatchetsToAppGroup(from lxmfStoragePath: String) {
-        guard let nseDir = nseReticulumDir() else { return }
+    static func syncRatchetsToAppGroup(from lxmfStoragePath: String, to nseRatchetsDir: String? = nil) {
+        guard let dstPath = nseRatchetsDir ?? Self.nseRatchetsDir() else { return }
         let fm = FileManager.default
         let srcDir = URL(fileURLWithPath: lxmfStoragePath)
             .appendingPathComponent("lxmf")
             .appendingPathComponent("ratchets")
-        let dstDir = URL(fileURLWithPath: nseDir)
-            .appendingPathComponent("lxmf_storage")
-            .appendingPathComponent("lxmf")
-            .appendingPathComponent("ratchets")
+        let dstDir = URL(fileURLWithPath: dstPath)
 
         guard fm.fileExists(atPath: srcDir.path) else { return }
         try? fm.createDirectory(at: dstDir, withIntermediateDirectories: true)
@@ -413,8 +445,18 @@ nonisolated enum PendingNotification {
         for file in files where file.hasSuffix(".ratchets") {
             let src = srcDir.appendingPathComponent(file)
             let dst = dstDir.appendingPathComponent(file)
-            try? fm.removeItem(at: dst)
-            try? fm.copyItem(at: src, to: dst)
+            let tmp = dstDir.appendingPathComponent(file + ".copy.tmp")
+            try? fm.removeItem(at: tmp)
+            do {
+                try fm.copyItem(at: src, to: tmp)
+                guard rename(tmp.path, dst.path) == 0 else {
+                    NSLog("[Retichat] ratchet copy to the App Group not renamed: errno %d", errno)
+                    try? fm.removeItem(at: tmp)
+                    continue
+                }
+            } catch {
+                NSLog("[Retichat] ratchet copy to the App Group failed: %@", error.localizedDescription)
+            }
         }
     }
 
