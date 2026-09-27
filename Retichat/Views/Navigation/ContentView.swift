@@ -71,8 +71,17 @@ struct ContentView: View {
                 showNewConversation = false
                 showSettings = false
                 showQRCode = false
-                selectedChannel = nil
-                selectedChatId = chatId
+                // A channel notification (the NSE's, and the app's own local
+                // ones) carries the channel hash as its chatId: open the
+                // channel. Until 2026-09-26 every id opened a DM, so a tap on
+                // a channel notification showed an empty DM to the channel hash.
+                if let channel = channelClient.channels.first(where: { $0.id.lowercased() == chatId.lowercased() }) {
+                    selectedChatId = nil
+                    selectedChannel = channel
+                } else {
+                    selectedChannel = nil
+                    selectedChatId = chatId
+                }
             }
         }
         // Deselect if the active chat was deleted or archived out of the list

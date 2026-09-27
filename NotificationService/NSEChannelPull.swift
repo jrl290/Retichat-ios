@@ -37,6 +37,9 @@ enum NSEChannelPull {
         var unknownChannel = false
         /// The channel's "Notifications" toggle.
         var notify = true
+        /// A known channel whose Notifications are off: nothing about it is
+        /// shown, not even the generic alert when a pull fails.
+        var silenced: Bool { !unknownChannel && !notify }
         var channelName = ""
         var channelHex = ""
     }
@@ -45,7 +48,9 @@ enum NSEChannelPull {
     private static let roundsMax = 8
 
     /// Pull, save and unpack. Blocking: call from the NSE's own thread.
-    static func run(channelHex: String, identityHandle: UInt64, deadline: Date) -> Result {
+    /// `ownHash` is this device's lxmf.delivery hash: RFed fans a publish
+    /// back to its sender, and the app never notifies its own echo.
+    static func run(channelHex: String, identityHandle: UInt64, ownHash: Data, deadline: Date) -> Result {
         var result = Result()
         let key = channelHex.lowercased()
         guard let entry = PendingNotification.readChannelPushDirectory()[key],
@@ -94,8 +99,10 @@ enum NSEChannelPull {
             }
             result.pulled += blobs.count
             if entry.notify {
+                let ownHex = ownHash.map { String(format: "%02x", $0) }.joined()
                 for blob in blobs {
-                    if let shown = unpackToShow(name: entry.name, lxmfData: channel + blob) {
+                    if let shown = unpackToShow(name: entry.name, lxmfData: channel + blob),
+                       shown.senderHash != ownHex {
                         result.shown.append(shown)
                     }
                 }

@@ -1835,7 +1835,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private func storeIncomingDirect(messageId msgHashHex: String, srcHash: Data,
                                      title: String, content: String, timestamp: Double,
                                      signatureValid: Bool, senderName: String?,
-                                     attachments: [(filename: String, data: Data)]) {
+                                     attachments: [(filename: String, data: Data)],
+                                     notify: Bool = true) {
         guard let ctx = modelContext else { return }
         let srcHex = srcHash.hexString
 
@@ -1886,11 +1887,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         updateChatTimestamp(chatId: chatId, timestamp: timestamp)
         try? ctx.save()
 
-        // Get sender name for notification
-        let notifyName = contactDisplayName(for: srcHex)
-        notifManager.postMessageNotification(
-            chatId: chatId, senderName: notifyName, content: content
-        )
+        // Get sender name for notification (none for a message the NSE
+        // already showed).
+        if notify {
+            let notifyName = contactDisplayName(for: srcHex)
+            notifManager.postMessageNotification(
+                chatId: chatId, senderName: notifyName, content: content
+            )
+        }
 
         refreshChats()
     }
@@ -1924,7 +1928,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         storeIncomingDirect(
             messageId: msgId, srcHash: m.sourceHash, title: m.title, content: content,
             timestamp: m.timestamp, signatureValid: false,
-            senderName: nil, attachments: [])
+            senderName: nil, attachments: [], notify: !m.shownByNSE)
     }
 
     /// A message another of our devices sent as the distro, reported by its

@@ -247,10 +247,19 @@ class NotificationService: UNNotificationServiceExtension {
         if let client = lxmfClient {
             if let channelHex, !channelHex.isEmpty {
                 channelPull = NSEChannelPull.run(channelHex: channelHex, identityHandle: client.identityHandle,
-                                                 deadline: start.addingTimeInterval(20))
+                                                 ownHash: client.destHash, deadline: start.addingTimeInterval(20))
                 NSLog("[NSE] channel pull %@: unknown=%d pulled=%d shown=%d notify=%d failed=%d",
                       String(channelHex.prefix(8)), channelPull.unknownChannel ? 1 : 0, channelPull.pulled,
                       channelPull.shown.count, channelPull.notify ? 1 : 0, channelPull.failed ? 1 : 0)
+                // APNs keeps one pending push per app for an offline device,
+                // so this push may stand in for an earlier distro wake: pull
+                // the distro too while enough of the budget is left.
+                if start.addingTimeInterval(20).timeIntervalSinceNow > 8 {
+                    distro = NSEDistroPull.run(identityHandle: client.identityHandle,
+                                               deadline: start.addingTimeInterval(20))
+                    NSLog("[NSE] distro pull after the channel: noDistro=%d pulled=%d shown=%d failed=%d",
+                          distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0)
+                }
             } else {
                 distro = NSEDistroPull.run(identityHandle: client.identityHandle, deadline: start.addingTimeInterval(20))
                 NSLog("[NSE] distro pull: noDistro=%d pulled=%d shown=%d failed=%d",
@@ -353,6 +362,15 @@ class NotificationService: UNNotificationServiceExtension {
             // This device has a distro and its pull did not complete: the
             // push may be for a message still waiting in RFed. Not "0 new".
             NSLog("[NSE] distro pull incomplete — showing generic alert after %ds", elapsed)
+
+        } else if channelPull.silenced {
+            // A push for a channel whose Notifications are off: nothing about
+            // it is shown, even when its pull or the sync failed.
+            NSLog("[NSE] channel %@ is silenced — suppressing after %ds",
+                  String(channelPull.channelHex.prefix(8)), elapsed)
+            best.title = ""
+            best.body  = ""
+            best.sound = nil
 
         } else if channelPull.failed {
             // The channel's pull did not complete: its message may still be

@@ -33,6 +33,9 @@ nonisolated struct DistroMessage: Sendable {
     let title: String
     let content: String
     let timestamp: Double
+    /// Pulled by the NSE, which already showed it: stored without a second
+    /// notification (review of 793a542).
+    var shownByNSE = false
 }
 
 /// A message a SIBLING device sent as the distro, reported to this device by
@@ -496,8 +499,8 @@ final class RfedDistroClient: ObservableObject {
     /// after the main-actor hand-off succeeds (fixes Android quirk 5, which
     /// marked a message seen before storing it). A copy that races through
     /// both the stream and a pull is caught by ChatRepository's msgId check.
-    nonisolated static func ingestBlob(_ blob: Data) {
-        blobQueue.async { unwrapAndDeliver(blob) }
+    nonisolated static func ingestBlob(_ blob: Data, shownByNSE: Bool = false) {
+        blobQueue.async { unwrapAndDeliver(blob, shownByNSE: shownByNSE) }
     }
 
     /// Distro blobs the NSE pulled for a push while the app was not running
@@ -510,10 +513,10 @@ final class RfedDistroClient: ObservableObject {
         let blobs = PendingNotification.readAndClearNSEDistroBlobs()
         guard !blobs.isEmpty else { return }
         print("[Distro] importing \(blobs.count) blob(s) the NSE pulled")
-        for blob in blobs { ingestBlob(blob) }
+        for blob in blobs { ingestBlob(blob, shownByNSE: true) }
     }
 
-    nonisolated private static func unwrapAndDeliver(_ blob: Data) {
+    nonisolated private static func unwrapAndDeliver(_ blob: Data, shownByNSE: Bool) {
         let h = DistroManager.shared.handle
         guard h != 0 else {
             print("[Distro] blob dropped: no distro loaded")
@@ -565,7 +568,7 @@ final class RfedDistroClient: ObservableObject {
         } else {
             inbound = .message(DistroMessage(sourceHash: src, title: parsed.title ?? "",
                                              content: parsed.content ?? "",
-                                             timestamp: parsed.timestamp))
+                                             timestamp: parsed.timestamp, shownByNSE: shownByNSE))
         }
 
         Task { @MainActor in

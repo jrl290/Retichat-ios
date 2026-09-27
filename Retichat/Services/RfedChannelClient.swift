@@ -157,6 +157,7 @@ final class RfedChannelClient: ObservableObject {
         }
 
         drainPendingRfedOperationsIfReady()
+        importNSEBlobs()
     }
 
     func stop() {
@@ -461,16 +462,20 @@ final class RfedChannelClient: ObservableObject {
     }
 
     /// Channel blobs the NSE pulled for a push while the app was not running,
-    /// dispatched as a pull of our own (dedupe, signature check, storage).
-    /// Left in the App Group until the channels are loaded: dispatchBlob
-    /// drops a blob for a channel it does not know.
+    /// dispatched as a pull of our own (dedupe, signature check, storage),
+    /// without a second notification. Left in the App Group until the stored
+    /// channels AND messages are loaded (dispatchBlob drops a blob for a
+    /// channel it does not know, and its dedupe checks the loaded messages)
+    /// and this device's hash is known (our own echo is told apart by it):
+    /// start() calls this again once configure() has the identity.
     func importNSEBlobs() {
-        guard !channels.isEmpty else { return }
+        guard didLoadPersistedState, !ownHashHex.isEmpty, !channels.isEmpty else { return }
         let pairs = PendingNotification.readAndClearNSEChannelBlobs()
         guard !pairs.isEmpty else { return }
         print("[RfedChannel] importing \(pairs.count) blob(s) the NSE pulled")
         for pair in pairs {
-            dispatchBlob(channelHashHex: pair.channel.hexString, blob: pair.blob)
+            // The NSE already showed them: stored, not notified again.
+            dispatchBlob(channelHashHex: pair.channel.hexString, blob: pair.blob, notify: false)
         }
     }
 
@@ -885,7 +890,7 @@ final class RfedChannelClient: ObservableObject {
 
     // MARK: - Private
 
-    private func dispatchBlob(channelHashHex: String, blob: Data) {
+    private func dispatchBlob(channelHashHex: String, blob: Data, notify: Bool = true) {
         // Skip if this channel is not known
         guard let channel = channels.first(where: { $0.id == channelHashHex }) else {
             let known = channels.map { $0.id.prefix(8) }.joined(separator: ", ")
@@ -940,11 +945,13 @@ final class RfedChannelClient: ObservableObject {
         }
 
         print("[RfedChannel] dispatchBlob unpack OK source=\(result.sourceHash.hexString.prefix(8)) ts_ms=\(result.timestampMs) content_bytes=\(result.content.count) sig_ok=true")
-        dispatchVerifiedLxmf(channelHashHex: channelHashHex, result: result)
+        dispatchVerifiedLxmf(channelHashHex: channelHashHex, result: result, notify: notify)
     }
 
     /// Dispatch a successfully signature-verified LXMF channel message.
-    private func dispatchVerifiedLxmf(channelHashHex: String, result: RetichatBridge.ChannelLxmUnpackResult) {
+    /// `notify` is false for blobs the NSE pulled: it already showed them.
+    private func dispatchVerifiedLxmf(channelHashHex: String, result: RetichatBridge.ChannelLxmUnpackResult,
+                                      notify: Bool = true) {
         let senderHashHex = result.sourceHash.hexString
         let tsMs = result.timestampMs
         guard let content = String(data: result.content, encoding: .utf8) else {
@@ -978,7 +985,7 @@ final class RfedChannelClient: ObservableObject {
         // updateChannelLastMessage takes seconds; tsMs is wire-format ms.
         updateChannelLastMessage(channelHashHex: channelHashHex, time: Double(tsMs) / 1000.0)
 
-        if !isOutgoing, let channel = channels.first(where: { $0.id == channelHashHex }),
+        if notify, !isOutgoing, let channel = channels.first(where: { $0.id == channelHashHex }),
            UserPreferences.shared.isChannelNotificationsEnabled(channelHashHex) {
             let senderLabel = senderHashHex.prefix(8) + "…"
             NotificationManager.shared.postMessageNotification(
@@ -1122,7 +1129,6 @@ final class RfedChannelClient: ObservableObject {
         }
         try? ctx.save()
         publishPushDirectory()
-        importNSEBlobs()
     }
 
     /// Re-subscribe to every persisted-subscribed channel once the rfed.channel

@@ -111,6 +111,7 @@ func testTheWiring() {
           "every pulled blob is saved before any is unpacked (the pull drained RFed)")
     check(pull.contains("if entry.notify {"), "nothing is unpacked to show when the channel's Notifications are off")
     check(pull.contains("message.signatureValidated else { return nil }"), "only a signature-verified message is shown")
+    check(pull.contains("shown.senderHash != ownHex"), "our own echoed message is not shown (the app never notifies it)")
 
     let nse = source("NotificationService/NotificationService.swift")
     check(nse.contains("(request.content.userInfo[\"rfed\"] as? [String: Any])?[\"channel\"] as? String"),
@@ -122,6 +123,11 @@ func testTheWiring() {
     check(nse.contains("best.userInfo[\"chatId\"] = msg.thread"), "tapping opens the channel")
     check(before(nse, "} else if channelPull.failed {", "} else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {"),
           "an incomplete channel pull keeps the alert; it is decided before any suppression")
+    check(before(nse, "} else if channelPull.silenced {", "} else if channelPull.failed {")
+            && before(nse, "} else if channelPull.silenced {", "NSLog(\"[NSE] sync failed after %ds — showing generic alert\", elapsed)"),
+          "a silenced channel shows nothing, not even the generic alert when its pull or the sync fails")
+    check(nse.contains("if start.addingTimeInterval(20).timeIntervalSinceNow > 8 {\n                    distro = NSEDistroPull.run("),
+          "a channel push also pulls the distro while time is left (APNs keeps one pending push)")
 
     let client = source("Retichat/Services/RfedChannelClient.swift")
     let disable = client.range(of: "func disableChannelPush(channelHashHex: String) {")
@@ -130,8 +136,19 @@ func testTheWiring() {
           "disable passes the register hash, so switching push back on sends again")
     check(client.components(separatedBy: "publishPushDirectory()").count >= 5,
           "the directory is rewritten on enable, disable, leave and load")
-    check(client.contains("guard !channels.isEmpty else { return }\n        let pairs = PendingNotification.readAndClearNSEChannelBlobs()"),
-          "saved blobs are read only once the channels are loaded (dispatch drops unknown channels)")
+    check(client.contains("guard didLoadPersistedState, !ownHashHex.isEmpty, !channels.isEmpty else { return }\n        let pairs = PendingNotification.readAndClearNSEChannelBlobs()"),
+          "saved blobs are read only once channels, messages and our own hash are loaded (review of 793a542)")
+    check(client.contains("dispatchBlob(channelHashHex: pair.channel.hexString, blob: pair.blob, notify: false)")
+            && client.contains("if notify, !isOutgoing, let channel = channels.first"),
+          "blobs the NSE showed are stored without a second notification")
+    let distroClient = source("Retichat/Services/RfedDistroClient.swift")
+    let repo = source("Retichat/Services/ChatRepository.swift")
+    check(distroClient.contains("ingestBlob(blob, shownByNSE: true)") && repo.contains("notify: !m.shownByNSE")
+            && repo.contains("if notify {\n            let notifyName = contactDisplayName(for: srcHex)"),
+          "distro blobs the NSE showed are stored without a second notification")
+    check(source("Retichat/Views/Navigation/ContentView.swift").contains(
+            "if let channel = channelClient.channels.first(where: { $0.id.lowercased() == chatId.lowercased() }) {"),
+          "tapping a channel notification opens the channel, not a DM to its hash")
     check(source("Retichat/RetichatApp.swift").components(separatedBy: "channelClient.importNSEBlobs()").count == 4,
           "the app ingests them wherever it imports the NSE's messages")
     check(source("Retichat/Views/Channels/ChannelView.swift").contains("defer { channelClient.publishPushDirectory() }"),
