@@ -808,7 +808,7 @@ final class RfedChannelClient: ObservableObject {
                 messages[channel.id] = list
             }
         }
-        updateChannelLastMessage(channelHashHex: channel.id, time: Double(tsMs))
+        updateChannelLastMessage(channelHashHex: channel.id, postMs: tsMs)
         return true
     }
 
@@ -1018,8 +1018,7 @@ final class RfedChannelClient: ObservableObject {
                       timestamp: Double(tsMs), isOutgoing: isOutgoing,
                       deliveryState: deliveryState)
         appendMessage(msg, toChannelHash: channelHashHex)
-        // updateChannelLastMessage takes seconds; tsMs is wire-format ms.
-        updateChannelLastMessage(channelHashHex: channelHashHex, time: Double(tsMs) / 1000.0)
+        updateChannelLastMessage(channelHashHex: channelHashHex, postMs: tsMs)
 
         if notify, !isOutgoing, let channel = channels.first(where: { $0.id == channelHashHex }),
            UserPreferences.shared.isChannelNotificationsEnabled(channelHashHex) {
@@ -1042,7 +1041,11 @@ final class RfedChannelClient: ObservableObject {
         messages[hash] = list
     }
 
-    private func updateChannelLastMessage(channelHashHex: String, time: Double) {
+    /// Takes the post's wire timestamp (ms) and stores seconds, so no caller
+    /// can hand it the wrong unit: the send path once passed the ms straight
+    /// through and the chat list showed a post made today as "Jun 30".
+    private func updateChannelLastMessage(channelHashHex: String, postMs: UInt64) {
+        let time = ChannelTime.lastMessageSeconds(postMs: postMs)
         if let idx = channels.firstIndex(where: { $0.id == channelHashHex }) {
             if time > channels[idx].lastMessageTime {
                 channels[idx].lastMessageTime = time
@@ -1153,11 +1156,11 @@ final class RfedChannelClient: ObservableObject {
             }
         }
         channels = entities.map {
-            // Migrate legacy ms-encoded timestamps written before the unit
-            // switch to seconds.  Anything > 1e11 cannot be a seconds-epoch
-            // value within any plausible date (year 5138+) so it must be ms.
+            // Rows written in ms (before the unit switch, and by the send
+            // path until 2026-09-27) are corrected once, here; a seconds
+            // value passes unchanged.
             let raw = $0.lastMessageTime
-            let seconds = raw > 1e11 ? raw / 1000.0 : raw
+            let seconds = ChannelTime.normalizedStoredSeconds(raw)
             if seconds != raw { $0.lastMessageTime = seconds }
             return Channel(id: $0.channelHash, channelName: $0.channelName,
                     rfedNodeHash: $0.rfedNodeHash, lastMessageTime: seconds,
