@@ -634,7 +634,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             addedInterfaces = true
         }
 
-        if !addedInterfaces {
+        // Fallback backbones only when the user left "Default TCP" on, as the
+        // setting documents and Android's StackRuntime does. With it off and
+        // no interfaces, the stack starts with none: before this, a first
+        // launch with the setting off still dialled three public backbones.
+        if !addedInterfaces && prefs.defaultTcpEnabled {
             let endpoints = fallbackEndpoints.isEmpty
                 ? Array(DefaultEndpointManager.shuffled().prefix(DefaultEndpointManager.fallbackEndpointCount))
                 : fallbackEndpoints
