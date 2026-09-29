@@ -47,6 +47,7 @@ final class UserPreferences {
         static let channelDisplayName = "channel_display_name"
         static let contactNamesMigrated = "contact_names_migrated_v1"
         static let defaultTcpEnabled = "default_tcp_enabled"
+        static let rtnodeBluetoothEnabled = "rtnode_bluetooth_enabled"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
         /// No longer written; removed at init (see init).
@@ -102,6 +103,13 @@ final class UserPreferences {
     var defaultTcpEnabled: Bool {
         get { defaults.object(forKey: Keys.defaultTcpEnabled) != nil ? defaults.bool(forKey: Keys.defaultTcpEnabled) : true }
         set { defaults.set(newValue, forKey: Keys.defaultTcpEnabled) }
+    }
+
+    /// When true (default), Retichat links over Bluetooth to any RTNode in
+    /// range, with no other configuration (RTNodeBluetoothCoordinator).
+    var rtnodeBluetoothEnabled: Bool {
+        get { defaults.object(forKey: Keys.rtnodeBluetoothEnabled) != nil ? defaults.bool(forKey: Keys.rtnodeBluetoothEnabled) : true }
+        set { defaults.set(newValue, forKey: Keys.rtnodeBluetoothEnabled) }
     }
 
     var dropAnnounces: Bool {

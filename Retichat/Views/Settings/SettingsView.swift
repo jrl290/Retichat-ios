@@ -21,6 +21,7 @@ struct SettingsView: View {
     /// and survives parent view re-inits — the singleton itself is never
     /// re-created.
     @StateObject private var rnodeCoord = RNodeInterfaceCoordinator.shared
+    @StateObject private var rtnodeBle = RTNodeBluetoothCoordinator.shared
     @Environment(\.dismiss) private var dismiss
 
     /// Drives the Identity row's subtitle (distro held or not).
@@ -435,10 +436,12 @@ struct SettingsView: View {
 
                 if vm.pendingInterfaces.isEmpty {
                     defaultTcpCard
+                    rtnodeBluetoothCard
                 } else {
                     // Show the default-endpoints row alongside user interfaces
                     // so it's always visible with the same visual weight.
                     defaultTcpCard
+                    rtnodeBluetoothCard
 
                     // NOTE: We deliberately use ForEach on the *value* collection (not
                     // ForEach($vm.pendingInterfaces)) and synthesize the Toggle binding
@@ -550,6 +553,64 @@ struct SettingsView: View {
                 .labelsHidden()
         }
         .padding(.vertical, 4)
+    }
+
+    /// Toggle card for the Bluetooth link to any RTNode in range. Like the
+    /// default endpoints there is nothing to set up, only on or off
+    /// (RTNodeBluetoothCoordinator); the line under it is the live status.
+    private var rtnodeBluetoothCard: some View {
+        HStack {
+            Circle()
+                .fill(rtnodeDotColor)
+                .frame(width: 8, height: 8)
+
+            Image(systemName: "dot.radiowaves.left.and.right")
+                .font(.body)
+                .foregroundColor(.retichatOnSurfaceVariant)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Nearby RTNode")
+                    .font(.subheadline)
+                    .foregroundColor(.retichatOnSurface)
+                Text("Bluetooth")
+                    .font(.caption)
+                    .foregroundColor(.retichatPrimary)
+                Text(rtnodeStatusText)
+                    .font(.caption)
+                    .foregroundColor(.retichatOnSurfaceVariant)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: $vm.rtnodeBluetoothEnabled)
+                .tint(.retichatPrimary)
+                .labelsHidden()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var rtnodeStatusText: String {
+        guard vm.rtnodeBluetoothEnabled else { return "Off" }
+        switch rtnodeBle.status {
+        case .off: return "Not running"
+        case .searching: return "Looking for an RTNode in range"
+        case .connecting: return "Connecting…"
+        case .connected(let id): return "Connected to RTNode \(id)"
+        case .unavailable(let why): return why
+        }
+    }
+
+    /// Grey off, yellow looking or connecting, green linked, red when
+    /// Bluetooth itself is unavailable.
+    private var rtnodeDotColor: Color {
+        guard vm.rtnodeBluetoothEnabled else { return .retichatOnSurfaceVariant }
+        switch rtnodeBle.status {
+        case .off: return .retichatOnSurfaceVariant
+        case .searching, .connecting: return .orange
+        case .connected: return .retichatSuccess
+        case .unavailable: return .retichatError
+        }
     }
 
     /// Dot color for the default-endpoint card.  Green when the service is

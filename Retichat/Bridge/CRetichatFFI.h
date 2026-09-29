@@ -789,6 +789,56 @@ int32_t  rns_rnode_iface_id_beacon_now(uint64_t handle);
 /// calling rns_rnode_iface_feed before invoking this. Returns 0 on success, -1 on error.
 int32_t  rns_rnode_iface_deregister(uint64_t handle);
 
+#pragma mark - RTNode over Bluetooth (Prns native protocol, central only)
+//
+// Reticulum-rust interfaces/prns_ble (cffi.rs). The app is the radio: it
+// scans when asked, reports each advertisement of the Prns service, connects
+// when handed a link, discovers the service and subscribes to both
+// characteristics, performs the writes it is asked for, and reports every
+// event. Rust decides what to dial and does the protocol. Every function
+// returns 0 on success or -1 with the reason in rns_last_error(), except
+// rns_prns_ble_sighted.
+
+/// Start (on != 0) or stop scanning for the Prns service.
+typedef void (*RnsPrnsBleScanFn)(void *user_data, int32_t on);
+/// Write len bytes to characteristic 0 (control) or 1 (data), with response,
+/// then report the result with rns_prns_ble_link_write_done.
+typedef void (*RnsPrnsBleWriteFn)(void *user_data, uint64_t link, uint8_t characteristic,
+                                  const uint8_t *data, uint32_t len);
+/// Cancel the connection or connection attempt. No link_closed needed after.
+typedef void (*RnsPrnsBleDisconnectFn)(void *user_data, uint64_t link);
+/// Link state: 0 handshaking, 1 settled, 2 closed, 3 dialling. peer_identity
+/// (16 bytes) and interface_name may be NULL; valid only during the call.
+typedef void (*RnsPrnsBleStateFn)(void *user_data, uint64_t link, int32_t state,
+                                  const uint8_t *peer_identity, const char *interface_name);
+
+/// Start once the stack runs and the delivery destination is published; then
+/// start scanning. endpoint: stack 1 (CoreBluetooth), host 1 iOS / 2 iPadOS /
+/// 0 macOS. storage_dir keeps the Bluetooth identity; identity_out gets it
+/// (16 bytes, or NULL). user_data must stay valid until rns_prns_ble_stop returns.
+int32_t  rns_prns_ble_start(const char *storage_dir, uint8_t endpoint_stack, uint8_t endpoint_host,
+                            RnsPrnsBleScanFn scan_fn, RnsPrnsBleWriteFn write_fn,
+                            RnsPrnsBleDisconnectFn disconnect_fn, RnsPrnsBleStateFn state_fn,
+                            void *user_data, uint8_t *identity_out);
+/// Close every link and remove the RTNodes' interfaces. Blocks briefly: call
+/// off the main thread, before the stack shuts down, never from a callback.
+int32_t  rns_prns_ble_stop(void);
+/// An advertisement of the Prns service. address: the peripheral identifier's
+/// UUID string; manufacturer_data: kCBAdvDataManufacturerData whole. Returns
+/// the link to dial it on, or 0 (not an RTNode, linked, busy, or paused).
+uint64_t rns_prns_ble_sighted(const char *address, const uint8_t *manufacturer_data, uint32_t len);
+/// Connected, service discovered, both characteristics subscribed.
+/// max_write_len: maximumWriteValueLength(for: .withoutResponse).
+int32_t  rns_prns_ble_link_ready(uint64_t link, uint32_t max_write_len);
+/// A notification from characteristic 0 (control) or 1 (data).
+int32_t  rns_prns_ble_link_received(uint64_t link, uint8_t characteristic,
+                                    const uint8_t *data, uint32_t len);
+/// The write asked for completed (ok != 0) or failed.
+int32_t  rns_prns_ble_link_write_done(uint64_t link, int32_t ok);
+/// The connection or attempt is gone (disconnect, connect failure, or a
+/// failure setting the link up).
+int32_t  rns_prns_ble_link_closed(uint64_t link);
+
 #pragma mark - Distro
 //
 // RFed's distro feature: one LXMF address shared by all of a person's devices.

@@ -36,6 +36,7 @@ class SettingsViewModel: ObservableObject {
     @Published var rfedLxmfPropOverride: String
     @Published var filterStrangers: Bool
     @Published var defaultTcpEnabled: Bool
+    @Published var rtnodeBluetoothEnabled: Bool
     @Published var pendingInterfaces: [PendingInterface]
 
     // Baseline captured at init; updated after Apply so hasChanges resets.
@@ -47,6 +48,7 @@ class SettingsViewModel: ObservableObject {
     private var originalFilterStrangers: Bool
     private var persistedFilterStrangers: Bool
     private var originalDefaultTcpEnabled: Bool
+    private var originalRtnodeBluetoothEnabled: Bool
     private var originalInterfaces: [PendingInterface]
 
     /// True when any setting differs from the values present when the screen opened (or last Apply).
@@ -71,6 +73,7 @@ class SettingsViewModel: ObservableObject {
         rfedNodeIdentityHash != originalRfedNodeIdentityHash ||
         rfedLxmfPropOverride != originalRfedLxmfPropOverride ||
         defaultTcpEnabled != originalDefaultTcpEnabled ||
+        rtnodeBluetoothEnabled != originalRtnodeBluetoothEnabled ||
         pendingInterfaces != originalInterfaces
     }
 
@@ -96,6 +99,7 @@ class SettingsViewModel: ObservableObject {
         self.rfedLxmfPropOverride = prefs.rfedLxmfPropOverride
         self.filterStrangers = prefs.filterStrangers
         self.defaultTcpEnabled = prefs.defaultTcpEnabled
+        self.rtnodeBluetoothEnabled = prefs.rtnodeBluetoothEnabled
         self.originalAnnounceDisplayName = prefs.announceDisplayName
         self.originalMessageDisplayName = prefs.messageDisplayName
         self.originalChannelDisplayName = prefs.channelDisplayName
@@ -104,6 +108,7 @@ class SettingsViewModel: ObservableObject {
         self.originalFilterStrangers = prefs.filterStrangers
         self.persistedFilterStrangers = prefs.filterStrangers
         self.originalDefaultTcpEnabled = prefs.defaultTcpEnabled
+        self.originalRtnodeBluetoothEnabled = prefs.rtnodeBluetoothEnabled
         self.pendingInterfaces = []
         self.originalInterfaces = []
     }
@@ -132,6 +137,7 @@ class SettingsViewModel: ObservableObject {
         prefs.messageDisplayName = messageDisplayName
         prefs.channelDisplayName = channelDisplayName
         prefs.defaultTcpEnabled = defaultTcpEnabled
+        prefs.rtnodeBluetoothEnabled = rtnodeBluetoothEnabled
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
         // rfed.notify and lxmf.propagation are derived from the node when they
         // are used (UserPreferences); only the explicit override is saved.
@@ -191,6 +197,8 @@ class SettingsViewModel: ObservableObject {
         persistedFilterStrangers = originalFilterStrangers
         defaultTcpEnabled = originalDefaultTcpEnabled
         UserPreferences.shared.defaultTcpEnabled = originalDefaultTcpEnabled
+        rtnodeBluetoothEnabled = originalRtnodeBluetoothEnabled
+        UserPreferences.shared.rtnodeBluetoothEnabled = originalRtnodeBluetoothEnabled
         pendingInterfaces = originalInterfaces
     }
 
@@ -205,6 +213,7 @@ class SettingsViewModel: ObservableObject {
         originalFilterStrangers = filterStrangers
         persistedFilterStrangers = filterStrangers
         originalDefaultTcpEnabled = defaultTcpEnabled
+        originalRtnodeBluetoothEnabled = rtnodeBluetoothEnabled
         originalInterfaces = pendingInterfaces
     }
 

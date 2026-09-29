@@ -9,6 +9,7 @@
 import Foundation
 import SwiftData
 import Combine
+import UIKit
 
 /// This device's own identity, for the Identity screen.
 struct DeviceIdentityInfo: Equatable {
@@ -417,6 +418,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             _ = publishClient.publish(refreshSecs: 30 * 60)
         }
 
+        // Bluetooth to any RTNode in range, queued behind the publish above:
+        // an RTNode's interface comes up the moment its link settles, and
+        // that up-edge is when Transport announces the published destination
+        // on it (DESIGN_PRINCIPLES §5).
+        if UserPreferences.shared.rtnodeBluetoothEnabled {
+            let bluetoothHost = Self.bluetoothEndpointHost
+            ffiQueue.async {
+                RTNodeBluetoothCoordinator.shared.start(storageDir: configDir, endpointHost: bluetoothHost)
+            }
+        }
+
         // Start propagation polling
         startPropagationPolling()
 
@@ -492,9 +504,22 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         NetworkMonitor.shared.onConnect = nil
 
         ffiQueue.async {
+            // Bluetooth first: its RTNode interfaces leave Transport before
+            // the stack shuts down (a no-op if it never started).
+            RTNodeBluetoothCoordinator.shared.stop()
             _ = client?.unpublish()
             client?.shutdown()
         }
+    }
+
+    /// The Prns endpoint host byte this device sends in its Bluetooth Hello:
+    /// iOS 1, iPadOS 2; macOS 0 when running under Mac Catalyst.
+    private static var bluetoothEndpointHost: UInt8 {
+        #if targetEnvironment(macCatalyst)
+        return 0
+        #else
+        return UIDevice.current.userInterfaceIdiom == .pad ? 2 : 1
+        #endif
     }
 
     // MARK: - Own display names (DISPLAY_NAMES.md §4, §6)

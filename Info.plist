@@ -11,6 +11,7 @@
 		<string>remote-notification</string>
 		<string>fetch</string>
 		<string>processing</string>
+		<string>bluetooth-central</string>
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
@@ -20,7 +21,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Retichat uses the camera to scan QR codes for adding contacts.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Retichat uses Bluetooth to connect to RNode LoRa radios for off-grid messaging.</string>
+	<string>Retichat uses Bluetooth to connect to RTNode and RNode LoRa radios nearby for off-grid messaging.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Retichat needs local network access to connect to nearby Reticulum nodes.</string>
 	<key>NSBonjourServices</key>
