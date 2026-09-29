@@ -10,8 +10,14 @@
 //
 //   swiftc -o /private/tmp/claude-501/rfed-derived \
 //     Retichat-ios/Retichat/Services/UserPreferences.swift \
+//     Retichat-ios/Retichat/Services/PropagationNodeManager.swift \
 //     Retichat-ios/tests/RfedDerivedHashesTests.swift && \
 //     /private/tmp/claude-501/rfed-derived
+//
+// PropagationNodeManager.swift is an input for its `Data(hexString:)` and
+// `Data.hexString` helpers, which UserPreferences' hash derivation uses
+// (Foundation only, like UserPreferences.swift). The command listed only
+// UserPreferences.swift when this test was added, so it never compiled.
 //
 // It uses the test binary's own UserDefaults domain and clears the keys it
 // sets.
