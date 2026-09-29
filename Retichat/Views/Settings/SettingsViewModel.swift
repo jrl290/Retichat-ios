@@ -202,6 +202,14 @@ class SettingsViewModel: ObservableObject {
         pendingInterfaces = originalInterfaces
     }
 
+    /// Bluetooth is not allowed for Retichat, and RTNodeBluetoothCoordinator
+    /// has saved the Nearby RTNode switch off. Shown off, and off is the
+    /// baseline too: not an unapplied change, and Revert cannot save it on.
+    func rtnodeBluetoothDenied() {
+        rtnodeBluetoothEnabled = false
+        originalRtnodeBluetoothEnabled = false
+    }
+
     /// Reset the dirty baseline to current values (call after Apply).
     func markClean() {
         objectWillChange.send()

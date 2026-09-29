@@ -424,6 +424,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // on it (DESIGN_PRINCIPLES §5). Only when the user turned the Nearby
         // RTNode switch on (off by default): start() creates the
         // CBCentralManager, and that is what asks for Bluetooth permission.
+        // iOS asks only once: when Bluetooth is not allowed the coordinator
+        // saves the switch off, so later starts do not get here.
         if UserPreferences.shared.rtnodeBluetoothEnabled {
             let bluetoothHost = Self.bluetoothEndpointHost
             ffiQueue.async {

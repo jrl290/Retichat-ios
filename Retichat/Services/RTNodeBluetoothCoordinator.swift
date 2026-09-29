@@ -24,6 +24,14 @@
 //  which is what asks for Bluetooth permission, is created in start() and
 //  nowhere else, so a user who never turns the switch on is never asked.
 //
+//  iOS asks once. After Don't Allow, or with Bluetooth denied or restricted
+//  for Retichat in iOS Settings, the coordinator stops the engine and saves
+//  the switch off, so no stack start starts it again, and Settings shows the
+//  switch off with the way to iOS Settings. Allowed there, the switch turned
+//  on and Apply start it as normal. Denied or not is read from the
+//  CBManager.authorization class property, which never prompts and needs no
+//  CBCentralManager.
+//
 
 import Foundation
 import CoreBluetooth
@@ -40,8 +48,12 @@ enum RTNodeBluetoothStatus: Equatable {
     case connecting
     /// Linked; the RTNode's Bluetooth identity, first 8 hex digits.
     case connected(String)
-    /// Bluetooth is off, not permitted or unsupported, or the engine failed.
+    /// Bluetooth is off or unsupported, or the engine failed.
     case unavailable(String)
+    /// Bluetooth is not allowed for Retichat: Don't Allow at the prompt, or
+    /// denied or restricted in iOS Settings. iOS never asks twice, so the
+    /// switch is saved off and only iOS Settings can undo it.
+    case denied
 }
 
 /// The Prns service and its characteristics (Reticulum-rust
@@ -82,8 +94,20 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
     private var scanWanted = false
     private var nodes: [UInt64: Node] = [:]
 
-    // Confined to the caller of start/stop (ChatRepository's ffiQueue).
+    // Under engineLock: start() and stop() come from ChatRepository's
+    // ffiQueue, and a denial stops the engine from `queue`. The lock is
+    // never held across a `queue.sync`.
+    private let engineLock = NSLock()
     private var engineRunning = false
+
+    /// Bluetooth is denied or restricted for Retichat. The class property:
+    /// reading it creates no CBCentralManager and never prompts.
+    static var bluetoothDenied: Bool {
+        switch CBManager.authorization {
+        case .denied, .restricted: return true
+        default: return false
+        }
+    }
 
     // MARK: - Lifecycle (ChatRepository's ffiQueue)
 
@@ -91,7 +115,16 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
     /// `endpointHost` is the Prns endpoint host byte: iOS 1, iPadOS 2,
     /// macOS 0.
     func start(storageDir: String, endpointHost: UInt8) {
+        engineLock.lock()
+        defer { engineLock.unlock() }
         guard !engineRunning else { return }
+        // Saved on, then denied in iOS Settings: iOS will not ask again, so
+        // nothing starts and the switch is saved off.
+        guard !Self.bluetoothDenied else {
+            say("not started: Bluetooth is not allowed for Retichat")
+            switchOff()
+            return
+        }
         var identity = [UInt8](repeating: 0, count: 16)
         let context = Unmanaged.passUnretained(self).toOpaque()
         let rc = storageDir.withCString { dir in
@@ -128,18 +161,39 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
             running = false
             if central?.state == .poweredOn { central?.stopScan() }
         }
-        if engineRunning {
-            rns_prns_ble_stop()
-            engineRunning = false
-        }
+        stopEngine()
         queue.sync { [self] in
             for node in nodes.values {
                 central?.cancelPeripheralConnection(node.peripheral)
             }
             nodes.removeAll()
         }
-        publish(.off)
+        // Still not allowed: the card keeps pointing to iOS Settings.
+        publish(Self.bluetoothDenied ? .denied : .off)
         say("stopped")
+    }
+
+    /// Settings, on appearing and on coming back to the foreground: the
+    /// permission may have changed in iOS Settings. Denied or restricted is
+    /// handled as a Don't Allow; allowed again clears the note, and the
+    /// switch then starts as normal.
+    @MainActor func recheckAuthorization() {
+        if Self.bluetoothDenied {
+            if status != .denied { queue.async { [self] in denied() } }
+        } else if status == .denied {
+            status = .off
+        }
+    }
+
+    /// From stop() on ChatRepository's ffiQueue or from denied() on `queue`.
+    /// Blocking `queue` here cannot deadlock: the engine's callbacks only
+    /// queue.async onto it.
+    private func stopEngine() {
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        guard engineRunning else { return }
+        rns_prns_ble_stop()
+        engineRunning = false
     }
 
     // MARK: - Engine callbacks (any thread; hop to `queue`)
@@ -228,14 +282,39 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
             dropAll()
             publish(.unavailable("Bluetooth is off"))
         case .unauthorized:
-            dropAll()
-            publish(.unavailable("Bluetooth is not allowed for Retichat"))
+            // Don't Allow at the prompt, or denied or restricted in iOS
+            // Settings since.
+            denied()
         case .unsupported:
             dropAll()
             publish(.unavailable("This device has no Bluetooth LE"))
         default:
             // Resetting or unknown: the next state change says what next.
             dropAll()
+        }
+    }
+
+    /// Bluetooth is not allowed for Retichat, and iOS never asks twice:
+    /// left started, the engine would scan nothing, on every stack start.
+    /// So it stops, and the switch is saved off. The central is kept: if
+    /// Bluetooth is allowed in iOS Settings while the app runs, its next
+    /// state is powered on, which clears the card. On `queue`.
+    private func denied() {
+        say("Bluetooth is not allowed for Retichat: stopped, switch saved off")
+        running = false
+        dropAll()
+        stopEngine()
+        switchOff()
+    }
+
+    /// Saves the Nearby RTNode switch off, then shows .denied, in one turn
+    /// of the main actor: Settings, seeing .denied, finds the switch saved off.
+    private func switchOff() {
+        DispatchQueue.main.async { [self] in
+            MainActor.assumeIsolated {
+                UserPreferences.shared.rtnodeBluetoothEnabled = false
+                if self.status != .denied { self.status = .denied }
+            }
         }
     }
 

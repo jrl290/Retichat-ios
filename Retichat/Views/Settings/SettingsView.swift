@@ -23,6 +23,8 @@ struct SettingsView: View {
     @StateObject private var rnodeCoord = RNodeInterfaceCoordinator.shared
     @StateObject private var rtnodeBle = RTNodeBluetoothCoordinator.shared
     @Environment(\.dismiss) private var dismiss
+    /// Back from iOS Settings: Bluetooth may have been allowed or denied there.
+    @Environment(\.scenePhase) private var scenePhase
 
     /// Drives the Identity row's subtitle (distro held or not).
     @StateObject private var distroClient = RfedDistroClient.shared
@@ -120,6 +122,7 @@ struct SettingsView: View {
                     vm.loadInterfaces(from: repository)
                 }
                 refreshNotificationStatus()
+                rtnodeBle.recheckAuthorization()
                 channelClient.startRfedLinkMonitor()
                 refreshInterfaceStatus()
                 interfaceStatusTimer?.invalidate()
@@ -134,6 +137,13 @@ struct SettingsView: View {
             }
             .onChange(of: vm.filterStrangers) { _, _ in
                 vm.persistFilterStrangersLive()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { rtnodeBle.recheckAuthorization() }
+            }
+            .onChange(of: rtnodeBle.status) { _, status in
+                // Not allowed: the coordinator saved the switch off; show it off.
+                if status == .denied { vm.rtnodeBluetoothDenied() }
             }
         }
     }
@@ -560,7 +570,10 @@ struct SettingsView: View {
     /// (RTNodeBluetoothCoordinator); the line under it is the live status.
     /// Off by default: turning it on and pressing Apply restarts a running
     /// stack (needsRestart), whose start starts the coordinator, and only
-    /// then does iOS ask for Bluetooth permission.
+    /// then does iOS ask for Bluetooth permission. iOS asks once: after
+    /// Don't Allow the switch is saved off and held off, and the card links
+    /// to iOS Settings, like the Notifications card; allowed there, the
+    /// switch works again.
     private var rtnodeBluetoothCard: some View {
         HStack {
             Circle()
@@ -582,6 +595,20 @@ struct SettingsView: View {
                 Text(rtnodeStatusText)
                     .font(.caption)
                     .foregroundColor(.retichatOnSurfaceVariant)
+                if rtnodeBle.status == .denied {
+                    Button {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Open Settings")
+                            Image(systemName: "arrow.up.right.square")
+                        }
+                        .font(.caption)
+                    }
+                    .tint(.retichatPrimary)
+                }
             }
 
             Spacer()
@@ -589,18 +616,22 @@ struct SettingsView: View {
             Toggle("", isOn: $vm.rtnodeBluetoothEnabled)
                 .tint(.retichatPrimary)
                 .labelsHidden()
+                // Turned on, it would only be saved off again: iOS will not ask.
+                .disabled(rtnodeBle.status == .denied)
         }
         .padding(.vertical, 4)
     }
 
     private var rtnodeStatusText: String {
-        guard vm.rtnodeBluetoothEnabled else { return "Off" }
-        switch rtnodeBle.status {
-        case .off: return "Not running"
-        case .searching: return "Looking for an RTNode in range"
-        case .connecting: return "Connecting…"
-        case .connected(let id): return "Connected to RTNode \(id)"
-        case .unavailable(let why): return why
+        switch (rtnodeBle.status, vm.rtnodeBluetoothEnabled) {
+        // Whatever the switch: it is off, and this is how to turn it on.
+        case (.denied, _): return "Allow Bluetooth for Retichat in iOS Settings"
+        case (_, false): return "Off"
+        case (.off, _): return "Not running"
+        case (.searching, _): return "Looking for an RTNode in range"
+        case (.connecting, _): return "Connecting…"
+        case (.connected(let id), _): return "Connected to RTNode \(id)"
+        case (.unavailable(let why), _): return why
         }
     }
 
@@ -612,7 +643,7 @@ struct SettingsView: View {
         case .off: return .retichatOnSurfaceVariant
         case .searching, .connecting: return .orange
         case .connected: return .retichatSuccess
-        case .unavailable: return .retichatError
+        case .unavailable, .denied: return .retichatError
         }
     }
 
