@@ -68,7 +68,11 @@ struct OutboundAttempts {
     }
 
     /// 0x10 PROP_FALLBACK_REQUESTED: AppLinks Timer P fired while the DIRECT
-    /// attempt still runs. The copy runs beside it — two attempts in flight.
+    /// attempt still runs — 5 s undelivered with its transfer not moving
+    /// (app-links 07bea51, 2026-09-29; it used to fire 5 s after the send
+    /// whatever the transfer did). The copy runs beside it — two attempts in
+    /// flight — and the entry stays pending, so the DIRECT attempt's bar
+    /// stays up while it is SENDING (UploadProgress).
     mutating func propagationRequested() -> Step {
         guard !isComplete, mayCopy, !copyStarted else { return Step() }
         copyStarted = true

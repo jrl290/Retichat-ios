@@ -38,6 +38,7 @@ final class ConversationViewModel: ObservableObject {
         let page = repository.messages(forChatId: chatId, limit: pageSize, offset: 0)
         messages = page
         canLoadMore = page.count >= pageSize
+        refreshUploadProgress(repository: repository)
     }
 
     /// `namesVersion`: the version a `repository.$namesVersion` subscriber
@@ -52,14 +53,57 @@ final class ConversationViewModel: ObservableObject {
         let namesChanged = currentNames != namesVersion
         let changed = namesChanged || page.count != messages.count
             || zip(page, messages).contains(where: { $0.0 != $1.id || $0.1 != $1.deliveryState })
-        guard changed else { return }
-        if namesChanged {
-            namesVersion = currentNames
-            if !isGroup { chatTitle = repository.contactDisplayName(for: chatId) }
-        }
+        if changed {
+            if namesChanged {
+                namesVersion = currentNames
+                if !isGroup { chatTitle = repository.contactDisplayName(for: chatId) }
+            }
 
-        let full = repository.messages(forChatId: chatId, limit: pageSize + currentOffset, offset: 0)
-        messages = full
+            var full = repository.messages(forChatId: chatId, limit: pageSize + currentOffset, offset: 0)
+            let kept = UploadProgress.carried(from: messages.map { (id: $0.id, bar: $0.uploadProgress) },
+                                              to: full.map(\.id))
+            for index in full.indices {
+                full[index].uploadProgress = kept[index]
+            }
+            messages = full
+        }
+        // Every tick, whether or not anything structural changed: a bar
+        // moves with its transfer. Until 2026-09-29 the tick returned here
+        // when nothing had, so a bar never moved between reloads.
+        refreshUploadProgress(repository: repository)
+    }
+
+    /// A reading of the bars is on ffiQueue. Ticks while it is out start
+    /// none, so readings never pile up behind a busy ffiQueue.
+    private var readingUploadBars = false
+
+    /// Read the live rows' bars off the main actor (ChatRepository.uploadBars
+    /// on ffiQueue, §6) and assign those that changed (UploadProgress.changes).
+    /// With no row live, clear any bar left at once.
+    private func refreshUploadProgress(repository: ChatRepository) {
+        let live = repository.liveUploads(in: messages)
+        guard !live.isEmpty else {
+            applyUploadBars([:], repository: repository)
+            return
+        }
+        guard !readingUploadBars else { return }
+        readingUploadBars = true
+        Task { [weak self] in
+            let read = await repository.uploadBars(for: live)
+            guard let self else { return }
+            self.readingUploadBars = false
+            self.applyUploadBars(read, repository: repository)
+        }
+    }
+
+    /// Assign each bar that changed, and only those: a row no longer live
+    /// (its message completed while the reading was out) loses its bar.
+    private func applyUploadBars(_ read: [String: Float?], repository: ChatRepository) {
+        let live = Set(repository.liveUploads(in: messages).map(\.id))
+        let rows = messages.map { (id: $0.id, bar: $0.uploadProgress) }
+        for change in UploadProgress.changes(rows: rows, live: live, read: read) {
+            messages[change.index].uploadProgress = change.bar
+        }
     }
 
     func loadMoreMessages(chatId: String, repository: ChatRepository) {

@@ -990,6 +990,18 @@ nonisolated enum DistroMessageFFI {
         lxmf_message_clone_propagated(h)
     }
 
+    /// The message's state byte, or -1 for a handle the registry does not
+    /// hold. Takes the message's lock: never on the main actor.
+    static func state(_ h: UInt64) -> Int32 {
+        lxmf_message_state(h)
+    }
+
+    /// The message's progress (0.0–1.0), or -1.0 for a handle the registry
+    /// does not hold. Takes the message's lock: never on the main actor.
+    static func progress(_ h: UInt64) -> Float {
+        lxmf_message_progress(h)
+    }
+
     static func destroy(_ h: UInt64) {
         _ = lxmf_message_destroy(h)
     }

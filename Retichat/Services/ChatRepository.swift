@@ -1262,10 +1262,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 self.replayBufferedMessageStatesIfNeeded(for: msgHashHex)
 
                 // The propagation fallback delay is owned by Rust AppLinks
-                // Timer P. It normally uses the 5-second liveness budget, but
-                // collapses to zero when the current readiness is already
-                // DISCONNECTED (red). Swift only reacts to the resulting
-                // PROP_FALLBACK_REQUESTED callback.
+                // Timer P: the 5-second liveness budget, counted only while
+                // the send is undelivered AND its transfer is not moving (a
+                // Resource serving more of the message restarts it; app-links
+                // 07bea51, 2026-09-29). It collapses to zero when the current
+                // readiness is already DISCONNECTED (red). Swift only reacts
+                // to the resulting PROP_FALLBACK_REQUESTED callback.
                 // No iOS-side timer needed.
 
                 self.refreshChats()
@@ -1699,8 +1701,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             step = pending.attempts.delivered()
 
         case 0x10:  // PROP_FALLBACK_REQUESTED — Rust Timer P fired after its current delay.
-            // The direct send is still running; the copy runs beside it and
-            // the recipient drops whichever arrives second (same hash).
+            // The direct send is still running but has gone 5 s undelivered
+            // with its transfer not moving (or the AppLink was DISCONNECTED
+            // at send); until app-links 07bea51 (2026-09-29) it fired 5 s
+            // after the send whatever the transfer was doing, so every photo
+            // got a second, propagated upload. The copy runs beside the
+            // direct send and the recipient drops whichever arrives second
+            // (same hash). The DIRECT attempt stays SENDING, so its bar
+            // stays up (UploadProgress) and moves again if it resumes.
             // Until 2026-09-24 a message with attachments got no copy.
             step = pending.attempts.propagationRequested()
 
@@ -2725,19 +2733,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Reverse back to chronological order for display
         return entities.reversed().map { entity in
             let attachments = attachmentsByMsg[entity.id] ?? []
-            var progress: Float? = nil
-            // Not while propagating: the row still points at the DIRECT
-            // attempt, whose progress the router reset when it failed, and
-            // the copy's transfer has no handle here — a bar would sit at 0%.
-            if entity.isOutgoing && entity.nativeHandle != 0 && !attachments.isEmpty
-               && entity.deliveryState != DeliveryState.delivered
-               && entity.deliveryState != DeliveryState.failed
-               && entity.deliveryState != DeliveryState.propagating {
-                let p = LxmfClient.messageProgress(entity.nativeHandle)
-                if p >= 0 && p < 1.0 {
-                    progress = p
-                }
-            }
             let senderName = label(for: entity.senderHash, in: names)
             return ChatMessage(
                 id: entity.id,
@@ -2748,10 +2743,52 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 isOutgoing: entity.isOutgoing,
                 deliveryState: entity.deliveryState,
                 attachments: attachments,
-                uploadProgress: progress,
+                // No bar from here: it is the DIRECT attempt's progress,
+                // read off the main actor by ConversationViewModel on every
+                // tick (liveUploads, uploadBars; UploadProgress.swift).
+                uploadProgress: nil,
                 nativeHandle: entity.nativeHandle
             )
         }
+    }
+
+    // MARK: - Upload progress (read off the main actor)
+
+    /// The rows whose DIRECT attempt is read for a bar (UploadProgress.isLive),
+    /// with its handle: those whose pending entry holds the row's handle.
+    /// Main actor, no FFI.
+    func liveUploads(in rows: [ChatMessage]) -> [(id: String, handle: UInt64)] {
+        rows.compactMap { row in
+            UploadProgress.isLive(isOutgoing: row.isOutgoing,
+                                  withAttachments: !row.attachments.isEmpty,
+                                  nativeHandle: row.nativeHandle,
+                                  pendingHandle: pendingOutbound[row.id]?.msgHandle)
+                ? (id: row.id, handle: row.nativeHandle) : nil
+        }
+    }
+
+    /// Each live row's bar (UploadProgress.bar; nil for none), read on
+    /// ffiQueue: lxmf_message_state and lxmf_message_progress take the
+    /// message's lock, which the router holds for its pass over the message
+    /// and the Resource takes after each request it serves, so never on the
+    /// main actor (§6). A handle released meanwhile reads as unknown: no bar.
+    func uploadBars(for live: [(id: String, handle: UInt64)]) async -> [String: Float?] {
+        await withCheckedContinuation { continuation in
+            ffiQueue.async {
+                continuation.resume(returning: Self.readUploadBars(live))
+            }
+        }
+    }
+
+    /// nonisolated: runs on ffiQueue, so it uses DistroMessageFFI's
+    /// nonisolated wrappers (LxmfClient's statics are main-actor isolated).
+    nonisolated private static func readUploadBars(_ live: [(id: String, handle: UInt64)]) -> [String: Float?] {
+        var bars: [String: Float?] = [:]
+        for upload in live {
+            bars[upload.id] = UploadProgress.bar(state: DistroMessageFFI.state(upload.handle),
+                                                 progress: DistroMessageFFI.progress(upload.handle))
+        }
+        return bars
     }
 
     /// Lightweight query returning only (id, deliveryState) pairs — no

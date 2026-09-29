@@ -299,11 +299,14 @@ func testChatRepositoryWiring() {
     check(handle.contains("} else if !completedHashSet.contains(hashHex) {"),
           "a completed message's later states are not buffered as early states")
 
-    // A propagating attachment message shows no progress bar: the row still
-    // points at the failed DIRECT attempt, whose progress is 0.
+    // A propagating attachment message keeps its progress bar while the
+    // DIRECT attempt is still SENDING (0x10 starts the copy beside a live
+    // transfer); only the attempt's own state hides it. Until 2026-09-29 a
+    // propagating row showed none, on the reasoning that the DIRECT attempt
+    // had failed. The rule lives in UploadProgress (UploadProgressTests.swift).
     let list = method("func messages(forChatId chatId: String", in: source)
-    check(list.contains("&& entity.deliveryState != DeliveryState.propagating"),
-          "no progress bar while the copy is propagating")
+    check(!list.isEmpty && !list.contains("DeliveryState.propagating"),
+          "a propagating row is not denied its bar by the row's state")
 }
 
 @main

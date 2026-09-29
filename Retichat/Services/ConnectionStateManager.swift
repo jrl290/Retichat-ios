@@ -291,8 +291,10 @@ final class ConnectionStateManager {
     ///
     /// Strategy: always DIRECT.  AppLinks owns the full tier chain (inbound
     /// link → cached outbound → fresh path-race + link establishment) plus
-    /// Timer P which starts a parallel PROPAGATED send after the normal 5 s
-    /// budget, or immediately when the current APP_LINK status is already
+    /// Timer P which starts a parallel PROPAGATED send once the send has gone
+    /// the normal 5 s budget undelivered with its transfer not moving (a
+    /// Resource making progress restarts it; app-links 07bea51, 2026-09-29),
+    /// or immediately when the current APP_LINK status is already
     /// DISCONNECTED. Pre-empting to PROPAGATED here — even when
     /// transportHasPath is false — would bypass AppLinks entirely and skip
     /// the parallel-send mechanism, leading to a send failure if the prop
