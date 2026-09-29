@@ -558,6 +558,9 @@ struct SettingsView: View {
     /// Toggle card for the Bluetooth link to any RTNode in range. Like the
     /// default endpoints there is nothing to set up, only on or off
     /// (RTNodeBluetoothCoordinator); the line under it is the live status.
+    /// Off by default: turning it on and pressing Apply restarts a running
+    /// stack (needsRestart), whose start starts the coordinator, and only
+    /// then does iOS ask for Bluetooth permission.
     private var rtnodeBluetoothCard: some View {
         HStack {
             Circle()

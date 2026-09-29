@@ -421,7 +421,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Bluetooth to any RTNode in range, queued behind the publish above:
         // an RTNode's interface comes up the moment its link settles, and
         // that up-edge is when Transport announces the published destination
-        // on it (DESIGN_PRINCIPLES §5).
+        // on it (DESIGN_PRINCIPLES §5). Only when the user turned the Nearby
+        // RTNode switch on (off by default): start() creates the
+        // CBCentralManager, and that is what asks for Bluetooth permission.
         if UserPreferences.shared.rtnodeBluetoothEnabled {
             let bluetoothHost = Self.bluetoothEndpointHost
             ffiQueue.async {

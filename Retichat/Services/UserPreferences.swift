@@ -105,11 +105,21 @@ final class UserPreferences {
         set { defaults.set(newValue, forKey: Keys.defaultTcpEnabled) }
     }
 
-    /// When true (default), Retichat links over Bluetooth to any RTNode in
-    /// range, with no other configuration (RTNodeBluetoothCoordinator).
+    /// When true, Retichat links over Bluetooth to any RTNode in range, with
+    /// no other configuration (RTNodeBluetoothCoordinator). Off by default
+    /// (James, 2026-09-29): a user who never turns it on sees no Bluetooth
+    /// permission prompt and nothing scans, because the coordinator, and with
+    /// it the CBCentralManager that asks, is only started when this is true.
     var rtnodeBluetoothEnabled: Bool {
-        get { defaults.object(forKey: Keys.rtnodeBluetoothEnabled) != nil ? defaults.bool(forKey: Keys.rtnodeBluetoothEnabled) : true }
+        get { Self.rtnodeBluetoothEnabled(defaults) }
         set { defaults.set(newValue, forKey: Keys.rtnodeBluetoothEnabled) }
+    }
+
+    /// The saved switch; false when it was never set. Settings saves it as a
+    /// Bool, so a value the user chose, on or off, is what is read back.
+    static func rtnodeBluetoothEnabled(_ defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: Keys.rtnodeBluetoothEnabled) != nil
+            ? defaults.bool(forKey: Keys.rtnodeBluetoothEnabled) : false
     }
 
     var dropAnnounces: Bool {

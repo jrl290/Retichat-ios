@@ -18,8 +18,11 @@
 //  It keeps no timers and never re-dials on its own: the engine decides.
 //
 //  Started by ChatRepository.finishStartService() after the delivery
-//  destination is published; stopped by ChatRepository.stopService() before
-//  the stack shuts down. Both on ChatRepository's ffiQueue.
+//  destination is published, and only when the Nearby RTNode switch is on
+//  (off by default); stopped by ChatRepository.stopService() before the
+//  stack shuts down. Both on ChatRepository's ffiQueue. The CBCentralManager,
+//  which is what asks for Bluetooth permission, is created in start() and
+//  nowhere else, so a user who never turns the switch on is never asked.
 //
 
 import Foundation
