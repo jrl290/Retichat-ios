@@ -26,6 +26,10 @@ nonisolated struct DistroTransferOffer: Equatable, Identifiable, Sendable {
     let replacesCurrent: Bool
 }
 
+// BEGIN DistroInbound
+// Foundation only, with Retichat/Bridge/LxmfFields.swift:
+// tests/DistroAttachmentsTests.swift compiles this block on its own.
+
 /// A decrypted distro message, ready to be stored as an inbound DM from
 /// whoever sent it (Android ChatRepository.onDistroMessageReceived).
 nonisolated struct DistroMessage: Sendable {
@@ -33,6 +37,12 @@ nonisolated struct DistroMessage: Sendable {
     let title: String
     let content: String
     let timestamp: Double
+    /// The message's LXMF fields map (payload element 3) as msgpack, the
+    /// bytes the sender packed: the unwrap JSON's "fields". nil when the
+    /// payload has no fields map. Decoded on the main actor by
+    /// DistroMessageStore, with the decoder a direct message's fields go
+    /// through, so the attachments (0x05) reach the bubble.
+    var fields: Data? = nil
     /// The sender's 0xD1 (DISPLAY_NAMES.md §2.1) as the unwrap reports it,
     /// before the §5.2 rules, which ChatRepository applies.
     var displayName: DisplayNames.NameField = .absent
@@ -42,6 +52,85 @@ nonisolated struct DistroMessage: Sendable {
     /// notification (review of 793a542).
     var shownByNSE = false
 }
+
+nonisolated extension DistroMessage {
+    /// The message an unwrap reports. `sourceHash` is `parsed.source_hash`,
+    /// already checked by the caller.
+    init(unwrapped parsed: DistroUnwrapped, sourceHash: Data, shownByNSE: Bool) {
+        self.init(sourceHash: sourceHash, title: parsed.title ?? "",
+                  content: parsed.content ?? "",
+                  timestamp: parsed.timestamp,
+                  fields: parsed.fieldsRaw,
+                  displayName: parsed.nameField,
+                  unverifiedReason: parsed.reason,
+                  shownByNSE: shownByNSE)
+    }
+}
+
+/// retichat_distro_unwrap's JSON: lxmf_rust distro::DistroMessage::to_json,
+/// the one definition the Android bridge returns too. The NSE reads its own
+/// copy of the keys it shows (NSEDistroPull.Unwrapped).
+nonisolated struct DistroUnwrapped: Decodable, Sendable {
+    let source_hash: String
+    let timestamp: Double
+    let title: String?
+    let content: String?
+    let is_delivery_notification: Bool
+    let ticket: String?
+    let distro_transfer_key: String?
+    /// SPEC §17.11: 0xFC when the marker is present and 32 hex, else nil.
+    let sent_to: String?
+    /// SPEC §17.11: non-nil exactly when the marker is present ("" when
+    /// 0xFD is missing). Optional so an older FFI build still decodes.
+    let sent_by: String?
+    /// DISPLAY_NAMES.md §5.2: the sender's 0xD1 (0 absent, 1 clear,
+    /// 2 name) and the signature result that decides whether to take it.
+    let display_name_state: Int?
+    let display_name: String?
+    let signature_validated: Bool?
+    let unverified_reason: Int?
+    /// The LXMF fields map as msgpack, in standard base64 with padding
+    /// (RFC 4648 §4); null when the payload has no fields map ("gA==" for
+    /// an empty one). Optional so an older FFI build, which has no such
+    /// key, still decodes.
+    let fields: String?
+
+    /// `fields` as the msgpack bytes; nil when null, absent or not base64.
+    var fieldsRaw: Data? {
+        fields.flatMap { Data(base64Encoded: $0) }
+    }
+    var nameField: DisplayNames.NameField {
+        DisplayNames.distroNameField(state: display_name_state, name: display_name)
+    }
+    var reason: Int {
+        DisplayNames.distroReason(validated: signature_validated, unverifiedReason: unverified_reason)
+    }
+}
+
+/// What ChatRepository.handleDistroMessage stores for a distro message: its
+/// text and the attachments its fields carry, decoded by LxmfFieldsDecoder
+/// as a direct message's are (handleIncomingMessage, importNSEMessages), so
+/// a photo sent to the distro shows as the same bubble as one sent to this
+/// device. The placeholder stands in only when there is neither text nor an
+/// attachment to store: fields the decoder does not read as attachments
+/// (FIELD_IMAGE 0x06 and FIELD_AUDIO 0x07 are not read for any message on
+/// iOS), or an unwrap from an FFI build without "fields".
+///
+/// Main actor in the app (the module's default isolation), where
+/// LxmfFieldsDecoder runs.
+enum DistroMessageStore {
+    static let unavailablePlaceholder = "[Attachment not available via the distro address]"
+
+    static func stored(_ m: DistroMessage) -> (content: String, attachments: [(filename: String, data: Data)]) {
+        let attachments = LxmfFieldsDecoder.decode(m.fields ?? Data()).attachments
+        var content = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if content.isEmpty && attachments.isEmpty {
+            content = unavailablePlaceholder
+        }
+        return (content, attachments)
+    }
+}
+// END DistroInbound
 
 /// A message a SIBLING device sent as the distro, reported to this device by
 /// its sent copy (RFed SPEC §17.11), ready to be stored as an outgoing DM.
@@ -566,7 +655,7 @@ final class RfedDistroClient: ObservableObject {
         // Zero length is not an error: the blob was addressed to a different
         // distro, which a node may legitimately hand over.
         guard !json.isEmpty else { return }
-        guard let parsed = try? JSONDecoder().decode(UnwrappedBlob.self, from: json),
+        guard let parsed = try? JSONDecoder().decode(DistroUnwrapped.self, from: json),
               let src = Data(hexString: parsed.source_hash), src.count == 16 else {
             print("[Distro] unwrap returned unreadable JSON (\(json.count) bytes)")
             return
@@ -593,12 +682,8 @@ final class RfedDistroClient: ObservableObject {
             // notifications come back via fan-out. Storing them posts empty bubbles.
             inbound = .notification
         } else {
-            inbound = .message(DistroMessage(sourceHash: src, title: parsed.title ?? "",
-                                             content: parsed.content ?? "",
-                                             timestamp: parsed.timestamp,
-                                             displayName: parsed.nameField,
-                                             unverifiedReason: parsed.reason,
-                                             shownByNSE: shownByNSE))
+            // Carries the fields: ChatRepository stores the attachments.
+            inbound = .message(DistroMessage(unwrapped: parsed, sourceHash: src, shownByNSE: shownByNSE))
         }
 
         Task { @MainActor in
@@ -657,34 +742,6 @@ final class RfedDistroClient: ObservableObject {
             onSentCopy(DistroSentCopy(distroHash: c.source, recipientHex: recipientHex,
                                       title: c.title, content: c.content, timestamp: c.timestamp))
             return true
-        }
-    }
-
-    private nonisolated struct UnwrappedBlob: Decodable, Sendable {
-        let source_hash: String
-        let timestamp: Double
-        let title: String?
-        let content: String?
-        let is_delivery_notification: Bool
-        let ticket: String?
-        let distro_transfer_key: String?
-        /// SPEC §17.11: 0xFC when the marker is present and 32 hex, else nil.
-        let sent_to: String?
-        /// SPEC §17.11: non-nil exactly when the marker is present ("" when
-        /// 0xFD is missing). Optional so an older FFI build still decodes.
-        let sent_by: String?
-        /// DISPLAY_NAMES.md §5.2: the sender's 0xD1 (0 absent, 1 clear,
-        /// 2 name) and the signature result that decides whether to take it.
-        let display_name_state: Int?
-        let display_name: String?
-        let signature_validated: Bool?
-        let unverified_reason: Int?
-
-        var nameField: DisplayNames.NameField {
-            DisplayNames.distroNameField(state: display_name_state, name: display_name)
-        }
-        var reason: Int {
-            DisplayNames.distroReason(validated: signature_validated, unverifiedReason: unverified_reason)
         }
     }
 

@@ -2040,18 +2040,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///
     /// No allowlist check: mail to the distro is mail to this person, and the
     /// contact is always created, as on Android. The unwrap reports the
-    /// signature and the sender's 0xD1 (DISPLAY_NAMES.md §5.2) but carries no
-    /// attachments, so an attachment-only message gets a placeholder.
+    /// signature and the sender's 0xD1 (DISPLAY_NAMES.md §5.2), and the
+    /// message's fields: its attachments are stored as a direct message's
+    /// are (DistroMessageStore), and only a message with neither text nor
+    /// an attachment to store gets the placeholder.
     private func handleDistroMessage(_ m: DistroMessage) {
         guard let ctx = modelContext else {
             print("[Retichat] handleDistroMessage: DROPPED - modelContext is nil")
             return
         }
         let srcHex = m.sourceHash.hexString
-        var content = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        if content.isEmpty {
-            content = "[Attachment not available via the distro address]"
-        }
+        let (content, attachments) = DistroMessageStore.stored(m)
         // Deterministic id: the same message can arrive via the stream AND a
         // pull before the seen store records it.
         let msgId = DistroCodec.messageId(sourceHex: srcHex, timestamp: m.timestamp, content: content)
@@ -2060,14 +2059,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             print("[Retichat] handleDistroMessage: DROPPED duplicate \(msgId.prefix(8))")
             return
         }
-        print("[Retichat] handleDistroMessage: src=\(srcHex.prefix(8)) len=\(content.count)")
+        print("[Retichat] handleDistroMessage: src=\(srcHex.prefix(8)) len=\(content.count) attachments=\(attachments.count)")
         ensureContact(destHash: srcHex)
         applyMessageName(m.displayName, unverifiedReason: m.unverifiedReason, sourceHex: srcHex,
                          messageTime: m.timestamp)
         storeIncomingDirect(
             messageId: msgId, srcHash: m.sourceHash, title: m.title, content: content,
             timestamp: m.timestamp, signatureValid: m.unverifiedReason == 0,
-            attachments: [], notify: !m.shownByNSE)
+            attachments: attachments, notify: !m.shownByNSE)
     }
 
     /// A message another of our devices sent as the distro, reported by its

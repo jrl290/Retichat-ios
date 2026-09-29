@@ -215,7 +215,11 @@ enum NSEDistroPull {
 
     // MARK: - Unwrap
 
-    /// retichat_distro_unwrap's JSON (the app decodes the same fields).
+    /// retichat_distro_unwrap's JSON (the app decodes the same keys). Its
+    /// "fields" (the attachments) is not read here: the NSE shows the text,
+    /// and the app stores the attachments when it imports the saved blob
+    /// (RfedDistroClient.importNSEBlobs, DistroMessageStore). A photo with no
+    /// caption shows with an empty body, as one sent to this device does.
     private struct Unwrapped: Decodable {
         let source_hash: String
         let timestamp: Double
