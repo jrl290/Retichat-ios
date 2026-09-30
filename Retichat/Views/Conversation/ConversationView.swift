@@ -42,6 +42,11 @@ struct ConversationView: View {
     /// while this view was on screen".
     @State private var lastAutoPullGeneration: Int?
     @FocusState private var isTextFieldFocused: Bool
+    /// The clock the date markers are labelled on (DayMarkers). Moved to the
+    /// present when the day turns, the time zone or locale changes, or the
+    /// app comes back, so a screen left open across midnight relabels
+    /// "Today" as "Yesterday".
+    @State private var markerNow = Date()
 
     // DM-only state
     @State private var showAttachmentPicker = false
@@ -165,6 +170,47 @@ struct ConversationView: View {
         for delay in [0.05, 0.15, 0.35, 0.6] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: scroll)
         }
+    }
+
+    // MARK: - Date markers
+
+    /// What moves the markers' days or labels: the calendar day turning, the
+    /// time zone, the locale, and a significant time change (which a
+    /// suspended app receives when it comes back).
+    private static let markerClockChanges = Publishers.MergeMany(
+        [Notification.Name.NSCalendarDayChanged,
+         .NSSystemTimeZoneDidChange,
+         NSLocale.currentLocaleDidChangeNotification,
+         UIApplication.significantTimeChangeNotification]
+            .map { NotificationCenter.default.publisher(for: $0) }
+    )
+    .receive(on: DispatchQueue.main)
+
+    /// Move the markers' clock to now when the day has turned since it was
+    /// set, or always when `force` (the time zone or locale changed, so the
+    /// days themselves moved). Unforced, it leaves the list alone until
+    /// there is something to relabel.
+    private func advanceMarkerClock(force: Bool = false) {
+        let now = Date()
+        if force || !Calendar.autoupdatingCurrent.isDate(markerNow, inSameDayAs: now) {
+            markerNow = now
+        }
+    }
+
+    /// `items` in display order with the date marker above each, in the
+    /// device's calendar, time zone and locale. `timestamp` must be the time
+    /// the item's bubble shows.
+    private func dayRows<Item: Identifiable>(_ items: [Item],
+                                             timestamp: (Item) -> TimeInterval) -> [DayMarkers.Row<Item>] {
+        DayMarkers.rows(items, timestamp: timestamp, now: markerNow,
+                        calendar: .autoupdatingCurrent, timeZone: .autoupdatingCurrent,
+                        locale: .autoupdatingCurrent)
+    }
+
+    /// A channel post's time in the seconds its bubble shows: posts carry
+    /// Unix ms, ChatMessage seconds.
+    nonisolated private static func channelSeconds(_ msg: ChannelMessage) -> TimeInterval {
+        msg.timestamp / 1000.0
     }
 
     // MARK: - Init
@@ -305,6 +351,7 @@ struct ConversationView: View {
             if case .channel = mode {
                 channelClient.retainRfedLinkMonitor()
             }
+            advanceMarkerClock()
             isTextFieldFocused = true
         }
         .onDisappear {
@@ -319,6 +366,7 @@ struct ConversationView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
+            if phase == .active { advanceMarkerClock() }
             guard phase == .active, let channel else { return }
             let channelKey = channel.id.lowercased()
             guard !(channelClient.pullInFlight[channelKey] ?? false) else { return }
@@ -332,6 +380,12 @@ struct ConversationView: View {
                 viewModel.refreshMessages(chatId: id, repository: repository)
                 refreshPeerLinkStatus()
             }
+            // Should a day-change notification be missed, the next tick
+            // relabels (and only when the day has turned).
+            advanceMarkerClock()
+        }
+        .onReceive(Self.markerClockChanges) { _ in
+            advanceMarkerClock(force: true)
         }
         // A name learned while the chat is open shows at once in the
         // bubbles, sender labels and system messages. @Published sends in
@@ -368,9 +422,16 @@ struct ConversationView: View {
                         }
                     }
 
-                    ForEach(viewModel.messages) { msg in
-                        ChatBubble(message: msg, isGroup: viewModel.isGroup)
-                            .id(msg.id)
+                    // The date marker rides in its message's row, so the
+                    // row's identity and scroll target stay the message's.
+                    ForEach(dayRows(viewModel.messages, timestamp: \.timestamp)) { row in
+                        VStack(spacing: 8) {
+                            if let marker = row.marker {
+                                DayMarkerView(label: marker)
+                            }
+                            ChatBubble(message: row.item, isGroup: viewModel.isGroup)
+                        }
+                        .id(row.id)
                     }
                 }
                 .padding(.horizontal, 8)
@@ -446,7 +507,7 @@ struct ConversationView: View {
                         .disabled(pulling)
                     }
 
-                    ForEach(msgs) { msg in
+                    ForEach(dayRows(msgs, timestamp: Self.channelSeconds)) { row in
                         // Reuse the direct/group ChatBubble so channels share
                         // the exact same visual layout. Channel timestamps
                         // are Unix-ms; ChatMessage expects seconds. Channels
@@ -454,26 +515,33 @@ struct ConversationView: View {
                         // sender (§5.3): the local name with the channel name
                         // in grey, else the channel name with the short hash,
                         // else the contact's name or the short hash, alone.
+                        // The date marker rides in the row, as in the DM list.
+                        let msg = row.item
                         let label = msg.isOutgoing ? nil : channelClient.senderLabel(
                             channelHashHex: channel.id, senderHashHex: msg.senderHash,
                             contact: repository.contactSharedName(for: msg.senderHash))
-                        ChatBubble(
-                            message: ChatMessage(
-                                id: msg.id,
-                                senderHash: msg.senderHash,
-                                senderName: label?.label ?? "You",
-                                senderSecondary: label?.secondary,
-                                senderSecondaryIsHash: label?.secondaryIsHash ?? false,
-                                content: msg.content,
-                                timestamp: msg.timestamp / 1000.0,
-                                isOutgoing: msg.isOutgoing,
-                                deliveryState: msg.deliveryState,
-                                attachments: [],
-                                uploadProgress: nil
-                            ),
-                            isGroup: true
-                        )
-                        .id(msg.id)
+                        VStack(spacing: 4) {
+                            if let marker = row.marker {
+                                DayMarkerView(label: marker)
+                            }
+                            ChatBubble(
+                                message: ChatMessage(
+                                    id: msg.id,
+                                    senderHash: msg.senderHash,
+                                    senderName: label?.label ?? "You",
+                                    senderSecondary: label?.secondary,
+                                    senderSecondaryIsHash: label?.secondaryIsHash ?? false,
+                                    content: msg.content,
+                                    timestamp: Self.channelSeconds(msg),
+                                    isOutgoing: msg.isOutgoing,
+                                    deliveryState: msg.deliveryState,
+                                    attachments: [],
+                                    uploadProgress: nil
+                                ),
+                                isGroup: true
+                            )
+                        }
+                        .id(row.id)
                     }
 
                     // Zero-height sentinel pinned to the very end of the

@@ -215,6 +215,28 @@ struct ChatBubble: View {
     }
 }
 
+// MARK: - Date marker
+
+/// The day above the first message of a day in a message list (DayMarkers):
+/// small, centred, secondary text, as in Messages. Not a message and not
+/// tappable; VoiceOver reads it as a heading.
+struct DayMarkerView: View {
+    let label: String
+
+    var body: some View {
+        Text(label)
+            .font(.caption)
+            .fontWeight(.medium)
+            .foregroundColor(.retichatOnSurfaceVariant)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
+            .padding(.top, 8)
+            .padding(.bottom, 2)
+            .allowsHitTesting(false)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
 // MARK: - Status dot
 
 struct StatusDot: View {
