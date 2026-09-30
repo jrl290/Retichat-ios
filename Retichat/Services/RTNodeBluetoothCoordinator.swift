@@ -80,6 +80,9 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
         let peripheral: CBPeripheral
         var control: CBCharacteristic?
         var data: CBCharacteristic?
+        /// A data write held until CoreBluetooth has room for writes
+        /// without response (peripheralIsReady(toSendWriteWithoutResponse:)).
+        var waiting: Data?
 
         init(link: UInt64, peripheral: CBPeripheral) {
             self.link = link
@@ -242,8 +245,22 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
             _ = rns_prns_ble_link_write_done(link, 0)
             return
         }
-        // With response: RTNode's characteristics are write-with-response,
-        // and the response is what paces the next fragment.
+        // Data without response where the node allows it (RTNode does from
+        // its fast-link firmware): CoreBluetooth then puts several fragments
+        // in one connection event instead of one per round trip, and its own
+        // flow control paces them. The write is done once CoreBluetooth has
+        // taken it; the engine's next fragment waits for that.
+        if characteristic == 1 && target.properties.contains(.writeWithoutResponse) {
+            if node.peripheral.canSendWriteWithoutResponse {
+                node.peripheral.writeValue(bytes, for: target, type: .withoutResponse)
+                _ = rns_prns_ble_link_write_done(link, 1)
+            } else {
+                node.waiting = bytes
+            }
+            return
+        }
+        // With response: the Hello, and data to a node without the
+        // property. The response paces the next fragment.
         node.peripheral.writeValue(bytes, for: target, type: .withResponse)
     }
 
@@ -465,6 +482,8 @@ nonisolated extension RTNodeBluetoothCoordinator: CBPeripheralDelegate {
             // One ATT PDU's worth: a larger with-response write would become
             // an ATT long write, which Prns peers do not handle.
             let maxWrite = peripheral.maximumWriteValueLength(for: .withoutResponse)
+            let fast = characteristic.properties.contains(.writeWithoutResponse)
+            say("link \(node.link): data writes \(fast ? "without" : "with") response, up to \(maxWrite) bytes")
             if rns_prns_ble_link_ready(node.link, UInt32(maxWrite)) != 0 {
                 fail(node, "link_ready: \(Self.lastError())")
             }
@@ -486,5 +505,13 @@ nonisolated extension RTNodeBluetoothCoordinator: CBPeripheralDelegate {
             say("link \(node.link): write failed: \(error.localizedDescription)")
         }
         _ = rns_prns_ble_link_write_done(node.link, error == nil ? 1 : 0)
+    }
+
+    /// CoreBluetooth has room again for writes without response.
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        guard let node = node(for: peripheral), let bytes = node.waiting, let data = node.data else { return }
+        node.waiting = nil
+        peripheral.writeValue(bytes, for: data, type: .withoutResponse)
+        _ = rns_prns_ble_link_write_done(node.link, 1)
     }
 }
