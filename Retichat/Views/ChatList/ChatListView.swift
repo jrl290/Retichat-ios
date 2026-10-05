@@ -57,6 +57,9 @@ struct ChatListView: View {
     /// The pending invite whose Decline was swiped: it asks first, since a
     /// decline is the user's leave and final.
     @State private var declining: Chat?
+    /// The group whose Delete was swiped: it asks first, since deleting a
+    /// group conversation leaves the group, for good (ChatSwipe.leaveGroup).
+    @State private var leaving: Chat?
 
     private var showsStatusLine: Bool {
         repository.serviceRunning || repository.serviceStartFailed
@@ -179,7 +182,9 @@ struct ChatListView: View {
                                         selectedChatId = chat.id
                                     }
                                     .swipeActions(edge: .trailing) {
-                                        if chat.isPendingInvite {
+                                        switch ChatSwipe.of(isGroup: chat.isGroup,
+                                                            isPendingInvite: chat.isPendingInvite) {
+                                        case .invite:
                                             Button(role: .destructive) {
                                                 declining = chat
                                             } label: {
@@ -191,7 +196,13 @@ struct ChatListView: View {
                                                 Label("Accept", systemImage: "checkmark")
                                             }
                                             .tint(.green)
-                                        } else {
+                                        case .leaveGroup:
+                                            Button(role: .destructive) {
+                                                leaving = chat
+                                            } label: {
+                                                Label("Delete", systemImage: "trash")
+                                            }
+                                        case .archive:
                                             Button(role: .destructive) {
                                                 repository.archiveChat(chatId: chat.id)
                                             } label: {
@@ -225,6 +236,22 @@ struct ChatListView: View {
                     }
                     .listStyle(.plain)
                     .scrollContentBackground(.hidden)
+                    // A group's swiped Delete, worded as Delete in the chat
+                    // info (GroupDeleteText): leaves the group, then deletes it.
+                    .confirmationDialog(GroupDeleteText.title,
+                                        isPresented: Binding(get: { leaving != nil },
+                                                             set: { if !$0 { leaving = nil } }),
+                                        titleVisibility: .visible,
+                                        presenting: leaving) { chat in
+                        Button("Delete", role: .destructive) {
+                            if selectedChatId == chat.id { selectedChatId = nil }
+                            repository.deleteChat(chatId: chat.id)
+                            leaving = nil
+                        }
+                        Button("Cancel", role: .cancel) { leaving = nil }
+                    } message: { _ in
+                        Text(GroupDeleteText.message)
+                    }
                 }
             }
 

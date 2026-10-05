@@ -993,7 +993,7 @@ struct ChatInfoSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .confirmationDialog(isGroup ? "Delete and leave this group?" : "Delete this conversation?",
+            .confirmationDialog(isGroup ? GroupDeleteText.title : "Delete this conversation?",
                                  isPresented: $showDeleteConfirm,
                                  titleVisibility: .visible) {
                 Button("Delete", role: .destructive) {
@@ -1004,9 +1004,8 @@ struct ChatInfoSheet: View {
             } message: {
                 // Deleting a group conversation is leaving it (James,
                 // 2026-10-05; ChatRepository.deleteChat).
-                Text(isGroup
-                     ? "Deleting a group conversation leaves the group: the members are told you left, and you won't be able to rejoin it. All messages will be permanently deleted."
-                     : "All messages will be permanently deleted. This cannot be undone.")
+                Text(isGroup ? GroupDeleteText.message
+                             : "All messages will be permanently deleted. This cannot be undone.")
             }
             .confirmationDialog("Leave this group?", isPresented: $showLeaveConfirm,
                                  titleVisibility: .visible) {
@@ -1068,4 +1067,12 @@ struct ChatInfoSheet: View {
 enum GroupInviteText {
     static let declineTitle = "Decline this group invite?"
     static let declineMessage = "The group's members are told you declined, and you won't be able to join this group later."
+}
+
+/// What a group's Delete confirmations say (the chat info's and the chat
+/// list's swipe): deleting a group conversation is leaving it, told to the
+/// members, and final (James, 2026-10-05; ChatRepository.deleteChat).
+enum GroupDeleteText {
+    static let title = "Delete and leave this group?"
+    static let message = "Deleting a group conversation leaves the group: the members are told you left, and you won't be able to rejoin it. All messages will be permanently deleted."
 }

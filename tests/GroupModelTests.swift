@@ -336,7 +336,9 @@ func testTheDialogs() {
           "the decline dialog says the members are told and it is final")
     check(view.contains("The members are told you left, and this conversation is deleted. You won't receive future messages, and you won't be able to rejoin this group."),
           "the leave dialog says so")
-    check(view.contains("isGroup ? \"Delete and leave this group?\" : \"Delete this conversation?\"")
+    check(view.contains("isGroup ? GroupDeleteText.title : \"Delete this conversation?\"")
+            && view.contains("Text(isGroup ? GroupDeleteText.message")
+            && view.contains("static let title = \"Delete and leave this group?\"")
             && view.contains("Deleting a group conversation leaves the group: the members are told you left, and you won't be able to rejoin it."),
           "a group's delete dialog says it leaves the group")
     let list = source("Retichat/Views/ChatList/ChatListView.swift")
