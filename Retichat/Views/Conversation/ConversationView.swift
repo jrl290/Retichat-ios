@@ -734,9 +734,10 @@ struct ConversationView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .glassBackground(cornerRadius: 20)
-                .onChange(of: messageText) { _, newValue in
+                .onChange(of: messageText) { oldValue, newValue in
                     guard shouldUseReturnToSendOnMac else { return }
-                    guard newValue.hasSuffix("\n") else { return }
+                    // A typed Return, not a paste ending in a line break.
+                    guard OutgoingText.isTypedReturn(old: oldValue, new: newValue) else { return }
                     let shiftHeld: Bool = {
                         guard let kb = GCKeyboard.coalesced?.keyboardInput else { return false }
                         return kb.button(forKeyCode: .leftShift)?.isPressed == true
@@ -769,7 +770,7 @@ struct ConversationView: View {
     // MARK: - Send
 
     private func sendMessage() {
-        let content = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = OutgoingText.of(messageText)
         let atts = pendingAttachments
         guard !content.isEmpty || !atts.isEmpty else { return }
 

@@ -307,10 +307,11 @@ struct ChatRow: View {
                 }
 
                 HStack {
+                    // One line, as the web and Android show it.
                     Text(chat.lastMessage)
                         .font(.subheadline)
                         .foregroundColor(.retichatOnSurfaceVariant)
-                        .lineLimit(2)
+                        .lineLimit(1)
 
                     Spacer()
 
