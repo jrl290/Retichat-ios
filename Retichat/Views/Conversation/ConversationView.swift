@@ -316,8 +316,14 @@ struct ConversationView: View {
             Task {
                 for item in newItems {
                     if let data = try? await item.loadTransferable(type: Data.self) {
-                        let filename = "photo_\(Date().timeIntervalSince1970).jpg"
-                        pendingAttachments.append((filename, data))
+                        // Named for what is sent, and a HEIC photo sent as
+                        // JPEG (PhotoAttachment), off the main actor.
+                        let baseName = "photo_\(Date().timeIntervalSince1970)"
+                        let itemExtension = item.supportedContentTypes.first?.preferredFilenameExtension
+                        let attachment = await Task.detached(priority: .userInitiated) {
+                            PhotoAttachment.prepare(data, baseName: baseName, fallbackExtension: itemExtension)
+                        }.value
+                        pendingAttachments.append((attachment.filename, attachment.data))
                     }
                 }
                 selectedPhotos = []
