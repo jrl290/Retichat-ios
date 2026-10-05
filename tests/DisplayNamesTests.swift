@@ -506,7 +506,7 @@ func testTheReceivePaths() {
     let incoming = body(repo, "private func handleIncomingMessage(")
     check(before(incoming, "if let key = fields.distroTransferKey", "LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw)"),
           "transfers and sent copies are dropped before any name is read")
-    check(before(incoming, "if shouldProcessGroupMessage(", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                                 messageTime: timestamp)\n                handleGroupMessage("),
+    check(before(incoming, "guard let standing = admitGroupMessage(", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                             messageTime: timestamp)\n            handleGroupMessage("),
           "a group message's 0xD1 names its LXMF source, only when the group policy accepts it (audit H11), ordered by its timestamp")
     check(before(incoming, "guard allowlist.isAllowed else", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                         messageTime: timestamp)\n        storeIncomingDirect("),
           "a DM's 0xD1 is applied after the allowlist and before the bubble and notification, ordered by its timestamp")
@@ -563,12 +563,12 @@ func testTheSurfaces() {
     let repo = source("Retichat/Services/ChatRepository.swift")
     check(!repo.contains("contactDisplayName(for: srcHex)): \\\"")
             && repo.contains("content: \"Group invite from \\(DisplayNames.subjectToken): ")
-            && repo.contains("content: \"\\(DisplayNames.subjectToken) joined the group\"")
-            && repo.contains("content: \"\\(DisplayNames.subjectToken) left the group\""),
+            && repo.contains("content: accepted ? \"\\(DisplayNames.subjectToken) joined the group\"")
+            && repo.contains(": \"\\(DisplayNames.subjectToken) left the group\","),
           "system messages store the subject's hash (senderHash) and a token, never a name (audit L2)")
     check(repo.contains("let inviteMsgId = \"inv_\\(groupId.prefix(16))\"")
-            && repo.contains("let sysId = \"acc_\\(memberHex.prefix(8))_\\(groupId.prefix(8))\"")
-            && repo.contains("msgId: \"left_\" + hash.hexString)"),
+            && repo.contains("let sysId = accepted ? \"acc_\\(memberHex.prefix(8))_\\(groupId.prefix(8))\" : leaveMsgId")
+            && repo.contains("leaveMsgId: \"left_\" + hash.hexString"),
           "each system message's id has a DisplayNames.systemMessageIdPrefixes prefix (review IOS-DN-2)")
     let messages = body(repo, "func messages(forChatId chatId: String")
     check(messages.contains("content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: senderName)"),

@@ -53,6 +53,8 @@ struct ConversationView: View {
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var pendingAttachments: [(String, Data)] = []
     @State private var showChatInfo = false
+    /// A decline is the user's leave, final: it asks first.
+    @State private var showDeclineConfirm = false
 
     /// Raw direct-link status to the DM peer, refreshed on the 3 s timer.
     /// Encoding: high byte = appLinkStatus (0..4, 0xFF = unknown),
@@ -279,8 +281,7 @@ struct ConversationView: View {
                             repository.acceptGroupInvite(groupId: chatId)
                         }
                         Button("Decline Invite", role: .destructive) {
-                            repository.declineGroupInvite(groupId: chatId)
-                            dismiss()
+                            showDeclineConfirm = true
                         }
                     } label: {
                         Image(systemName: "ellipsis.circle")
@@ -295,6 +296,19 @@ struct ConversationView: View {
                     }
                 }
             }
+        }
+        // A decline is the user's leave (James, 2026-10-02: "Make the decline
+        // message the same as the leave message"), told to the members and
+        // final (ChatRepository.declineGroupInvite).
+        .confirmationDialog(GroupInviteText.declineTitle, isPresented: $showDeclineConfirm,
+                            titleVisibility: .visible) {
+            Button("Decline", role: .destructive) {
+                repository.declineGroupInvite(groupId: chatId)
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(GroupInviteText.declineMessage)
         }
         .photosPicker(isPresented: $showAttachmentPicker, selection: $selectedPhotos,
                       maxSelectionCount: 5, matching: .any(of: [.images, .videos]))
@@ -665,8 +679,7 @@ struct ConversationView: View {
                 .padding(.top, 8)
             HStack(spacing: 16) {
                 Button {
-                    repository.declineGroupInvite(groupId: chatId)
-                    dismiss()
+                    showDeclineConfirm = true
                 } label: {
                     Text("Decline")
                         .frame(maxWidth: .infinity)
@@ -973,7 +986,8 @@ struct ChatInfoSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .confirmationDialog("Delete this conversation?", isPresented: $showDeleteConfirm,
+            .confirmationDialog(isGroup ? "Delete and leave this group?" : "Delete this conversation?",
+                                 isPresented: $showDeleteConfirm,
                                  titleVisibility: .visible) {
                 Button("Delete", role: .destructive) {
                     dismiss()
@@ -981,7 +995,11 @@ struct ChatInfoSheet: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("All messages will be permanently deleted. This cannot be undone.")
+                // Deleting a group conversation is leaving it (James,
+                // 2026-10-05; ChatRepository.deleteChat).
+                Text(isGroup
+                     ? "Deleting a group conversation leaves the group: the members are told you left, and you won't be able to rejoin it. All messages will be permanently deleted."
+                     : "All messages will be permanently deleted. This cannot be undone.")
             }
             .confirmationDialog("Leave this group?", isPresented: $showLeaveConfirm,
                                  titleVisibility: .visible) {
@@ -991,7 +1009,8 @@ struct ChatInfoSheet: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("You will stop receiving messages from this group.")
+                // A leave is final (James, 2026-10-01; ChatRepository.quitGroup).
+                Text("The members are told you left, and this conversation is deleted. You won't receive future messages, and you won't be able to rejoin this group.")
             }
             .onAppear {
                 // A contact's field holds only the user's own name, so saving
@@ -1032,4 +1051,14 @@ struct ChatInfoSheet: View {
         default: return .retichatOnSurfaceVariant
         }
     }
+}
+
+// MARK: - Group invite wording
+
+/// What the decline confirmations say (the conversation's Decline and the
+/// chat list's): a decline is the user's leave, told to the members, and
+/// final (DISPLAY_NAMES.md §7, "A reject is the member's leave").
+enum GroupInviteText {
+    static let declineTitle = "Decline this group invite?"
+    static let declineMessage = "The group's members are told you declined, and you won't be able to join this group later."
 }

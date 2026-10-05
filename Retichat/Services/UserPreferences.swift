@@ -47,6 +47,7 @@ final class UserPreferences {
         static let channelDisplayName = "channel_display_name"
         static let contactNamesMigrated = "contact_names_migrated_v1"
         static let contactNamesPlaceholderPass = "contact_names_placeholder_pass_v1"
+        static let closedGroupIds = "closed_group_ids"
         static let defaultTcpEnabled = "default_tcp_enabled"
         static let rtnodeBluetoothEnabled = "rtnode_bluetooth_enabled"
         static let dropAnnounces = "drop_announces"
@@ -104,6 +105,14 @@ final class UserPreferences {
     var contactNamesPlaceholderPass: Bool {
         get { defaults.bool(forKey: Keys.contactNamesPlaceholderPass) }
         set { defaults.set(newValue, forKey: Keys.contactNamesPlaceholderPass) }
+    }
+
+    /// The groups the user declined or left, for good, oldest first
+    /// (ClosedGroups, DeliveryPolicy.swift, keeps it bounded). A later
+    /// invite to one of them is ignored.
+    var closedGroupIds: [String] {
+        get { defaults.stringArray(forKey: Keys.closedGroupIds) ?? [] }
+        set { defaults.set(newValue, forKey: Keys.closedGroupIds) }
     }
 
     /// When true (default) and no user-configured interfaces are present,

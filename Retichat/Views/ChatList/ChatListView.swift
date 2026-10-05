@@ -54,6 +54,9 @@ struct ChatListView: View {
     /// The status line prefers the distro address (Android ChatListScreen.kt:130).
     @StateObject private var distroClient = RfedDistroClient.shared
     @State private var searchText = ""
+    /// The pending invite whose Decline was swiped: it asks first, since a
+    /// decline is the user's leave and final.
+    @State private var declining: Chat?
 
     private var showsStatusLine: Bool {
         repository.serviceRunning || repository.serviceStartFailed
@@ -178,7 +181,7 @@ struct ChatListView: View {
                                     .swipeActions(edge: .trailing) {
                                         if chat.isPendingInvite {
                                             Button(role: .destructive) {
-                                                repository.declineGroupInvite(groupId: chat.id)
+                                                declining = chat
                                             } label: {
                                                 Label("Decline", systemImage: "xmark")
                                             }
@@ -246,6 +249,21 @@ struct ChatListView: View {
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
             repository.refreshChats()
+        }
+        // As the conversation's Decline asks (GroupInviteText).
+        .confirmationDialog(GroupInviteText.declineTitle,
+                            isPresented: Binding(get: { declining != nil },
+                                                 set: { if !$0 { declining = nil } }),
+                            titleVisibility: .visible,
+                            presenting: declining) { chat in
+            Button("Decline", role: .destructive) {
+                if selectedChatId == chat.id { selectedChatId = nil }
+                repository.declineGroupInvite(groupId: chat.id)
+                declining = nil
+            }
+            Button("Cancel", role: .cancel) { declining = nil }
+        } message: { _ in
+            Text(GroupInviteText.declineMessage)
         }
     }
 }

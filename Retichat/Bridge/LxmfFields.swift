@@ -137,7 +137,7 @@ nonisolated enum DistroSent {
 
 // MARK: - Group action constants
 
-enum GroupAction {
+nonisolated enum GroupAction {
     /// Initial group invite — includes GROUP_MEMBERS with the full participant list.
     static let invite       = "invite"
     /// Acceptance of an invite — each accepting member sends this to all other members.
@@ -153,7 +153,7 @@ enum GroupAction {
 
 // MARK: - Member invitation status constants
 
-enum MemberStatus {
+nonisolated enum MemberStatus {
     static let invited  = "invited"   // Invite sent, no acceptance received yet
     static let accepted = "accepted"  // Member has accepted the invite
     static let left     = "left"      // Member voluntarily left
