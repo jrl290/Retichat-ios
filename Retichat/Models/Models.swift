@@ -33,20 +33,31 @@ final class ContactEntity {
     /// Peer" as none. Replaced on every announce.
     var announceName: String?
     var lastSeen: Double
-    /// True when the contact was explicitly added by the user (via hash entry,
-    /// QR scan, or group creation).  Nil/false for contacts auto-created from
-    /// incoming messages.  Used by the "filter strangers" feature.
+    /// The privacy filter lets this peer through: the user added it, or
+    /// created or accepted a group with it, or an invite from an allowed
+    /// inviter listed it, or it accepted a group of ours. Nil/false for rows
+    /// made for anyone else. Not the same as being a contact (isContact).
     /// Optional so lightweight CoreData migration can add this column to
     /// existing stores without a default value.
     var isAllowlisted: Bool?
+    /// The user added this peer (Add Contact, New Conversation, a QR code or
+    /// an lxma:// link; ChatRepository.createDirectChat): the row is listed
+    /// in Contacts, New Chat and the New Group picker. false: a hidden row,
+    /// kept for a group member's key or a sender's names and listed nowhere
+    /// (James, 2026-10-02: contacts only when explicitly added). nil: a row
+    /// from before the flag, listed as before, when allowlisted (no cleanup;
+    /// ContactRows.isListed). Optional, so SwiftData adds the column by
+    /// lightweight migration.
+    var isContact: Bool?
 
     init(destHash: String, announceName: String? = nil, lastSeen: Double = 0,
-         isAllowlisted: Bool? = nil) {
+         isAllowlisted: Bool? = nil, isContact: Bool = false) {
         self.destHash = destHash
         self.displayName = ""
         self.announceName = announceName
         self.lastSeen = lastSeen
         self.isAllowlisted = isAllowlisted
+        self.isContact = isContact
     }
 }
 

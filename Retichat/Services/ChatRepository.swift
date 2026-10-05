@@ -2482,7 +2482,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
 
         ensureChat(id: normalizedHash, peerHash: normalizedHash)
-        ensureAllowlistedContact(destHash: normalizedHash)
+        // Every caller is the user adding this peer (Add Contact, New
+        // Conversation, a QR code, an lxma:// link): a contact.
+        addContact(destHash: normalizedHash)
 
         // Seed the scanned public key when present, then request a path and
         // keep watching announces so backbone-routed peers become reachable.
@@ -2809,17 +2811,22 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return entities.reversed().map { ($0.id, $0.deliveryState) }
     }
 
-    /// The contacts the user added (allowlisted), named by the resolver and
-    /// sorted by that name. Never this device's own address or the distro's,
-    /// nor a group id: older builds made allowlisted rows for both, which
-    /// the pickers showed as contacts (audit L4).
+    /// The contacts the user added (ContactRows.isListed: Contacts, New
+    /// Chat and the New Group picker), named by the resolver and sorted by
+    /// that name. Group members, channel posters and strangers have hidden
+    /// rows and are not listed (James, 2026-10-02); until 2026-10-05 every
+    /// allowlisted row was, so each member of a group became a contact.
+    /// Never this device's own address or the distro's, nor a group id:
+    /// older builds made allowlisted rows for both, which the pickers showed
+    /// as contacts (audit L4).
     func contacts() -> [Contact] {
         guard let ctx = modelContext,
               let entities = try? ctx.fetch(FetchDescriptor<ContactEntity>()) else { return [] }
         let groupIds = Set(((try? ctx.fetch(FetchDescriptor<ChatEntity>(
             predicate: #Predicate { $0.isGroup == true }))) ?? []).map(\.id))
         return entities
-            .filter { $0.isAllowlisted == true && !groupIds.contains($0.destHash) && !isOwnAddress($0.destHash) }
+            .filter { ContactRows.isListed(isContact: $0.isContact, isAllowlisted: $0.isAllowlisted)
+                && !groupIds.contains($0.destHash) && !isOwnAddress($0.destHash) }
             .map { Contact(id: $0.destHash,
                            displayName: resolvedName($0) ?? DisplayNames.shortHash($0.destHash),
                            lastSeen: $0.lastSeen) }
@@ -2973,19 +2980,25 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
+    /// A hidden row for a peer the app keeps something about (a sender's
+    /// names, a distro sent copy's recipient): not allowlisted, no contact.
     private func ensureContact(destHash: String) {
         guard let ctx = modelContext else { return }
         let descriptor = FetchDescriptor<ContactEntity>(
             predicate: #Predicate { $0.destHash == destHash }
         )
         if let existing = try? ctx.fetch(descriptor), existing.isEmpty {
-            let contact = ContactEntity(destHash: destHash)
+            let contact = ContactEntity(destHash: destHash, isContact: false)
             ctx.insert(contact)
             try? ctx.save()
         }
     }
 
-    /// Mark an existing contact as allowlisted, or create an allowlisted one if absent.
+    /// Let a peer through the privacy filter without making it a contact:
+    /// a group member (the creation, the user's accept, an invite from an
+    /// allowed inviter, its own accept). A new row is hidden; a row from
+    /// before the contact flag keeps the listing it had, so allowlisting a
+    /// row that was not listed never lists it (ContactRows.isListed).
     private func ensureAllowlistedContact(destHash: String) {
         guard let ctx = modelContext else { return }
         let descriptor = FetchDescriptor<ContactEntity>(
@@ -2993,14 +3006,34 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         )
         if let contact = try? ctx.fetch(descriptor).first {
             if contact.isAllowlisted != true {
+                contact.isContact = ContactRows.isListed(isContact: contact.isContact,
+                                                         isAllowlisted: contact.isAllowlisted)
                 contact.isAllowlisted = true
                 try? ctx.save()
             }
         } else {
-            let contact = ContactEntity(destHash: destHash, isAllowlisted: true)
+            let contact = ContactEntity(destHash: destHash, isAllowlisted: true, isContact: false)
             ctx.insert(contact)
             try? ctx.save()
         }
+    }
+
+    /// The user added this peer (Add Contact, New Conversation, a QR code
+    /// or an lxma:// link, all through createDirectChat): a contact, listed,
+    /// and allowlisted. The one place a row becomes a contact.
+    private func addContact(destHash: String) {
+        guard let ctx = modelContext else { return }
+        let descriptor = FetchDescriptor<ContactEntity>(
+            predicate: #Predicate { $0.destHash == destHash }
+        )
+        if let contact = try? ctx.fetch(descriptor).first {
+            guard contact.isContact != true || contact.isAllowlisted != true else { return }
+            contact.isContact = true
+            contact.isAllowlisted = true
+        } else {
+            ctx.insert(ContactEntity(destHash: destHash, isAllowlisted: true, isContact: true))
+        }
+        try? ctx.save()
     }
 
     private enum AllowlistDecision {
