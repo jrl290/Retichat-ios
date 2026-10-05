@@ -46,6 +46,7 @@ final class UserPreferences {
         static let announceDisplayName = "announce_display_name"
         static let channelDisplayName = "channel_display_name"
         static let contactNamesMigrated = "contact_names_migrated_v1"
+        static let contactNamesPlaceholderPass = "contact_names_placeholder_pass_v1"
         static let defaultTcpEnabled = "default_tcp_enabled"
         static let rtnodeBluetoothEnabled = "rtnode_bluetooth_enabled"
         static let dropAnnounces = "drop_announces"
@@ -95,6 +96,14 @@ final class UserPreferences {
     var contactNamesMigrated: Bool {
         get { defaults.bool(forKey: Keys.contactNamesMigrated) }
         set { defaults.set(newValue, forKey: Keys.contactNamesMigrated) }
+    }
+
+    /// The one-off second §5.4 pass has run (ChatRepository
+    /// .remigrateContactNamesIfNeeded): stored names lose an old web node
+    /// default and the old web announce suffix.
+    var contactNamesPlaceholderPass: Bool {
+        get { defaults.bool(forKey: Keys.contactNamesPlaceholderPass) }
+        set { defaults.set(newValue, forKey: Keys.contactNamesPlaceholderPass) }
     }
 
     /// When true (default) and no user-configured interfaces are present,

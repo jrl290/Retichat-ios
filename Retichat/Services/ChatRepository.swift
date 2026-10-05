@@ -177,6 +177,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         self.modelContext = modelContext
         chatPreviewMemo.removeAll()  // describes the previous store, if any
         normalizeMillisecondChatTimes()
+        remigrateContactNamesIfNeeded()
         GroupChatManager.shared.onTracked = { [weak self] hashHex in
             Task { @MainActor [weak self] in
                 self?.replayBufferedMessageStatesIfNeeded(for: hashHex)
@@ -2437,8 +2438,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         )
         // The announce name (DISPLAY_NAMES.md §5.1 announceName), cleaned
         // by the Rust side: replaced on every announce, none when the
-        // announce carries none. The other two slots are never touched.
-        let announceName = (displayName?.isEmpty ?? true) ? nil : displayName
+        // announce carries none. The other two slots are never touched. An
+        // old web build can still announce "<name> (<first 12 hex>)": the
+        // suffix goes (§5.4).
+        let announceName = (displayName?.isEmpty ?? true)
+            ? nil : displayName.map { DisplayNames.stripOwnHashSuffix($0, ownHash: hex) }
         if let contact = try? ctx.fetch(descriptor).first {
             if contact.announceName != announceName {
                 contact.announceName = announceName
@@ -3245,7 +3249,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         guard let client = lxmfClient, let hashData = Data(hexString: destHash) else { return }
         let generation = announceGeneration[destHash, default: 0]
         ffiQueue.async { [weak self] in
+            // Without the old web announce suffix (§5.4), as handleAnnounce.
             let recalled = client.recallDisplayName(for: hashData)
+                .map { DisplayNames.stripOwnHashSuffix($0, ownHash: destHash) }
             guard recalled != nil else { return }
             Task { @MainActor [weak self] in
                 guard let self, let ctx = self.modelContext else { return }
@@ -3305,6 +3311,28 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 self.namesChanged()
             }
         }
+    }
+
+    /// §5.4's one-off second pass (guarded by a persisted flag), for names
+    /// stored before the old web node defaults and the old web announce
+    /// suffix were placeholders: each contact's localName and announceName
+    /// go through DisplayNames.remigratedName (as Android's database 12
+    /// pass). Needs no stack; runs once the store is configured.
+    private func remigrateContactNamesIfNeeded() {
+        guard !prefs.contactNamesPlaceholderPass, let ctx = modelContext,
+              let contacts = try? ctx.fetch(FetchDescriptor<ContactEntity>()) else { return }
+        var changed = 0
+        for contact in contacts {
+            let local = DisplayNames.remigratedName(contact.localName, ownHash: contact.destHash, isLocalName: true)
+            let announce = DisplayNames.remigratedName(contact.announceName, ownHash: contact.destHash,
+                                                       isLocalName: false)
+            if local != contact.localName { contact.localName = local; changed += 1 }
+            if announce != contact.announceName { contact.announceName = announce; changed += 1 }
+        }
+        try? ctx.save()
+        prefs.contactNamesPlaceholderPass = true
+        print("[Retichat] contact names: placeholder pass changed \(changed) name(s)")
+        if changed > 0 { namesChanged() }
     }
 
     func renameGroup(chatId: String, newName: String) {

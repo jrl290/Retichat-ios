@@ -910,14 +910,37 @@ nonisolated enum DisplayNames {
     /// §5.4: a placeholder is dropped; a value equal to the contact's
     /// recalled announce name becomes announceName; anything else is a
     /// name the user typed (iOS had no rename flag) and becomes localName.
-    /// iOS has no legacyName slot: its mapping is the spec's iOS rule.
+    /// iOS has no legacyName slot: its mapping is the spec's iOS rule. A
+    /// value carrying the old web announce suffix came from an announce: it
+    /// loses the suffix, and what is left is dropped when it is a
+    /// placeholder of a name that was not typed. The recalled announce name
+    /// loses the suffix too before the two are compared.
     static func migrateLegacyName(_ value: String, hash: String, recalledAnnounceName: String?) -> LegacyName {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isPlaceholder(trimmed, ownHash: hash) { return .drop }
-        if let recalled = recalledAnnounceName, !recalled.isEmpty, recalled == trimmed {
+        let trimmed = trimWhiteSpace(value)
+        let stripped = stripOwnHashSuffix(trimmed, ownHash: hash)
+        let fromAnnounce = stripped != trimmed
+        if isPlaceholder(stripped, ownHash: hash, typed: !fromAnnounce) { return .drop }
+        if let recalled = recalledAnnounceName.map({ stripOwnHashSuffix($0, ownHash: hash) }),
+           !recalled.isEmpty, recalled == stripped {
             return .announceName(recalled)
         }
-        return .localName(trimmed)
+        return .localName(stripped)
+    }
+
+    /// The second §5.4 pass over the names already stored (iOS), for the
+    /// devices that ran migrateLegacyName before the old web node defaults
+    /// and the old web announce suffix were placeholders: a localName that
+    /// is an old web node default is dropped (nil), and a localName or
+    /// announceName carrying the suffix with the contact's own hash loses
+    /// it; what is left came from an announce, so it is dropped when it is a
+    /// placeholder of a name that was not typed. Anything else is returned
+    /// as it is. Android's database 12 pass (ContactsMigration) is the same.
+    static func remigratedName(_ value: String?, ownHash: String, isLocalName: Bool) -> String? {
+        guard let value else { return nil }
+        if isLocalName, isWebNodeDefault(value) { return nil }
+        let stripped = stripOwnHashSuffix(value, ownHash: ownHash)
+        if stripped == value { return value }
+        return isPlaceholder(stripped, ownHash: ownHash, typed: false) ? nil : stripped
     }
 
     /// The placeholder names of §5.4, all case-insensitive: "Retichat",
@@ -925,21 +948,101 @@ nonisolated enum DisplayNames {
     /// "Anonymous Peer" (MeshChatX's, Columba's and lxmd's announce).
     static let placeholderNames: Set<String> = ["retichat", "retichat web", "anonymous peer"]
 
-    /// §5.4's placeholder test: a hash form of the contact's OWN hash (8 to
-    /// 32 hex digits that prefix `ownHash`, with or without a leading "?" or a
-    /// trailing "…") or one of `placeholderNames`, case-insensitive,
-    /// surrounding white space ignored. Empty is no name at all, so it is
-    /// dropped too. iOS cannot tell a typed name from a received one, so other
-    /// hex ("deadbeef", "20260927") may have been typed and is kept, as the
-    /// Android and web migrations keep hex a user typed.
-    static func isPlaceholder(_ value: String, ownHash: String) -> Bool {
-        var v = Substring(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-        if v.isEmpty { return true }
+    /// §5.4's placeholder test, surrounding white space (§3's) ignored:
+    /// one of `placeholderNames`, case-insensitive; an old web node default
+    /// (isWebNodeDefault), which nobody types; or a hash form, 8 to 32 hex
+    /// digits with or without a leading "?" or a trailing "…". Where the
+    /// name may have been typed (`typed`, every iOS name) a hash form counts
+    /// only when it prefixes `ownHash`, the contact's own hash: other hex
+    /// ("deadbeef", "20260927") may have been typed and is kept, as the
+    /// Android and web migrations keep hex a user typed. A name that came
+    /// from an announce (it carried the old web announce suffix) is judged
+    /// as not typed. Empty is no name at all, so it is dropped too.
+    static func isPlaceholder(_ value: String, ownHash: String, typed: Bool = true) -> Bool {
+        let trimmed = trimWhiteSpace(value)
+        if trimmed.isEmpty { return true }
+        if isWebNodeDefault(trimmed) { return true }
+        var v = Substring(trimmed.lowercased())
         if placeholderNames.contains(String(v)) { return true }
         if v.hasPrefix("?") { v = v.dropFirst() }
         if v.hasSuffix("\u{2026}") { v = v.dropLast() }
         guard (8...32).contains(v.count), v.allSatisfy({ $0.isASCII && $0.isHexDigit }) else { return false }
-        return ownHash.lowercased().hasPrefix(String(v))
+        return !typed || ownHash.lowercased().hasPrefix(String(v))
+    }
+
+    /// §3's white space, which §5.4 trims (added 2026-09-30): the Unicode
+    /// White_Space characters U+0009–U+000D, U+0020, U+0085, U+00A0, U+1680,
+    /// U+2000–U+200A, U+2028, U+2029, U+202F, U+205F and U+3000, and no
+    /// others. Foundation's .whitespacesAndNewlines is not that set (it
+    /// also removes U+200B), so it is never used on a stored name.
+    static func isWhiteSpace(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x09...0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// `name` with §3's white space trimmed from both ends, over unicode
+    /// scalars.
+    static func trimWhiteSpace(_ name: String) -> String {
+        let scalars = Array(name.unicodeScalars)
+        guard let first = scalars.firstIndex(where: { !isWhiteSpace($0) }),
+              let last = scalars.lastIndex(where: { !isWhiteSpace($0) }) else { return "" }
+        var out = String.UnicodeScalarView()
+        out.append(contentsOf: scalars[first...last])
+        return String(out)
+    }
+
+    /// ASCII case folding only, as §5.4 asks (a dotless ı is not an i).
+    private static func asciiLower(_ scalars: [Unicode.Scalar]) -> [Unicode.Scalar] {
+        scalars.map { (0x41...0x5A).contains($0.value) ? Unicode.Scalar($0.value + 0x20)! : $0 }
+    }
+
+    private static func isASCIIHex(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x30...0x39, 0x41...0x46, 0x61...0x66: return true
+        default: return false
+        }
+    }
+
+    /// §5.4: an old web node default. Until 2026-09-30 each web node named
+    /// its users "Retichat Web (retichat)" or "Retichat Web (selectiv)", and
+    /// until 2026-09-23 the web announce added " (" + 12 hex + ")". The rule,
+    /// exactly: the name, §3 white space trimmed, starts with
+    /// "Retichat Web (" (ASCII case-insensitive), ends with ")", and has at
+    /// least one character between them. A placeholder even where a name
+    /// may have been typed: nobody types one.
+    static func isWebNodeDefault(_ name: String) -> Bool {
+        let v = asciiLower(Array(trimWhiteSpace(name).unicodeScalars))
+        let prefix = Array("retichat web (".unicodeScalars)
+        guard v.count > prefix.count + 1, Array(v.prefix(prefix.count)) == prefix else { return false }
+        return v.last == ")"
+    }
+
+    /// §5.4: the old web announce suffix. Until 2026-09-23 the web announced
+    /// every name as "<name> (<first 12 hex of the lxmf.delivery hash>)". A
+    /// trailing " (" + 12 hex + ")" is stripped when, and only when, the 12
+    /// hex are the first 12 of `ownHash`, the contact's own hash (ASCII
+    /// case-insensitive), §3 white space trimmed first, with something
+    /// before it; what is left is returned trimmed. One suffix, the last.
+    /// Any other `name` is returned as it is. What is left meets the
+    /// placeholder rules like any name ("Retichat (0123456789ab)" leaves a
+    /// placeholder). Stripped from every received announce name too.
+    static func stripOwnHashSuffix(_ name: String, ownHash: String) -> String {
+        let own = Array(ownHash.unicodeScalars.prefix(12))
+        guard own.count == 12, own.allSatisfy(isASCIIHex) else { return name }
+        let t = Array(trimWhiteSpace(name).unicodeScalars)
+        // " (" + 12 hex + ")" is 15 scalars, with at least one before it.
+        guard t.count > 15 else { return name }
+        let tail = Array(t[(t.count - 15)...])
+        let hex = Array(tail[2..<14])
+        guard tail[0] == " ", tail[1] == "(", tail[14] == ")", hex.allSatisfy(isASCIIHex),
+              asciiLower(hex) == asciiLower(own) else { return name }
+        var before = String.UnicodeScalarView()
+        before.append(contentsOf: t[..<(t.count - 15)])
+        return trimWhiteSpace(String(before))
     }
 
     // MARK: Notification Service Extension
@@ -1013,7 +1116,10 @@ nonisolated enum DisplayNames {
         }
         if let message, !message.isEmpty { return message }
         let appAnnounce = appName?.slot == .announce ? appName?.name : nil
-        for name in [appAnnounce, announceName] {
+        // The recalled announce name loses the old web announce suffix, as
+        // the app's does (§5.4).
+        let recalled = announceName.map { stripOwnHashSuffix($0, ownHash: hash) }
+        for name in [appAnnounce, recalled] {
             if let name, !name.isEmpty { return name }
         }
         return shortHash(hash)
