@@ -8,8 +8,10 @@
 //  and Android does not take for an image, so the web and Android saw a
 //  broken picture or a file. The name now always says what the bytes are,
 //  and a still image the other clients cannot be relied on to show goes as
-//  JPEG. Foundation and ImageIO only, so tests/PhotoAttachmentTests.swift
-//  runs it for real (on macOS, whose ImageIO is iOS's).
+//  JPEG. No photo leaves the phone with its location, whatever its format
+//  (James, 2026-10-05; PhotoMetadata). Foundation and ImageIO only, so
+//  tests/PhotoAttachmentTests.swift runs it for real (on macOS, whose
+//  ImageIO is iOS's).
 //
 
 import Foundation
@@ -24,18 +26,6 @@ nonisolated enum PhotoAttachment {
         /// major brand.
         case isoMedia(brand: String)
         case unknown
-    }
-
-    /// Kept as they are: every client shows these (Android's image types:
-    /// jpg, png, gif, webp; browsers all four).
-    static func passThroughExtension(_ format: Format) -> String? {
-        switch format {
-        case .jpeg: return "jpg"
-        case .png: return "png"
-        case .gif: return "gif"
-        case .webp: return "webp"
-        default: return nil
-        }
     }
 
     static func format(of data: Data) -> Format {
@@ -54,17 +44,38 @@ nonisolated enum PhotoAttachment {
     }
 
     /// The attachment for bytes the picker gave, named `baseName` plus the
-    /// extension of what is sent:
-    /// - JPEG, PNG, GIF and WebP are sent as they are (".jpg", ".png", ...);
-    /// - any other still image ImageIO reads (HEIC, HEIF, AVIF, TIFF, ...)
-    ///   is drawn upright (its orientation applied) and sent as JPEG;
-    /// - anything else (a video) is sent as it is, named by
+    /// extension of what is sent. No photo goes with its location: every
+    /// still image loses its metadata (PhotoMetadata), and a redrawn one
+    /// carries none.
+    /// - JPEG, PNG, GIF and WebP, which every client shows (Android's image
+    ///   types; browsers all four), keep their image bytes and lose the
+    ///   rest. A JPEG keeps its orientation as the one EXIF tag left; a PNG
+    ///   that needs turning is redrawn upright as PNG, a WebP as JPEG.
+    /// - Any other still image ImageIO reads (HEIC, HEIF, AVIF, TIFF, ...)
+    ///   is drawn upright (its orientation applied) and sent as JPEG, as is
+    ///   one of the four that cannot be read to its end.
+    /// - Anything else (a video) is sent as it is, named by
     ///   `fallbackExtension` (the picked item's own type, e.g. "mov"), else
     ///   by its container (".mov" for QuickTime, ".mp4" for another ISO
     ///   media file), else ".bin". Never ".jpg" for bytes that are not JPEG.
     static func prepare(_ data: Data, baseName: String, fallbackExtension: String? = nil) -> (filename: String, data: Data) {
         let format = format(of: data)
-        if let ext = passThroughExtension(format) { return ("\(baseName).\(ext)", data) }
+        let orientation = imageOrientation(data)
+        switch format {
+        case .jpeg:
+            if let jpeg = PhotoMetadata.strippedJPEG(data, orientation: orientation) {
+                return ("\(baseName).jpg", jpeg)
+            }
+        case .png:
+            if orientation == 1, let png = PhotoMetadata.strippedPNG(data) { return ("\(baseName).png", png) }
+            if let png = upright(data, as: .png) { return ("\(baseName).png", png) }
+        case .gif:
+            if let gif = PhotoMetadata.strippedGIF(data) { return ("\(baseName).gif", gif) }
+        case .webp:
+            if orientation == 1, let webp = PhotoMetadata.strippedWebP(data) { return ("\(baseName).webp", webp) }
+        default:
+            break
+        }
         if let jpeg = uprightJPEG(from: data) { return ("\(baseName).jpg", jpeg) }
         let ext: String
         if let fallbackExtension, !fallbackExtension.isEmpty {
@@ -77,13 +88,30 @@ nonisolated enum PhotoAttachment {
         return ("\(baseName).\(ext)", data)
     }
 
+    /// The EXIF orientation (1-8) of the first image in `data`; 1 when it
+    /// has none or is no image ImageIO reads.
+    static func imageOrientation(_ data: Data) -> Int {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let orientation = props[kCGImagePropertyOrientation] as? Int,
+              (1...8).contains(orientation) else { return 1 }
+        return orientation
+    }
+
     /// The first image in `data` as JPEG, with its orientation applied to
     /// the pixels (receivers that ignore the EXIF orientation still show it
-    /// upright) at full size; nil when `data` holds no still image.
+    /// upright) at full size, and no metadata; nil when `data` holds no
+    /// still image.
     static func uprightJPEG(from data: Data, quality: Double = 0.85) -> Data? {
+        upright(data, as: .jpeg, quality: quality)
+    }
+
+    /// The first image in `data` drawn upright at full size and encoded as
+    /// `type`, with no metadata (nothing from the original is copied).
+    static func upright(_ data: Data, as type: UTType, quality: Double = 0.85) -> Data? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let type = CGImageSourceGetType(source) as String?,
-              let uti = UTType(type), uti.conforms(to: .image),
+              let sourceType = CGImageSourceGetType(source) as String?,
+              let uti = UTType(sourceType), uti.conforms(to: .image),
               CGImageSourceGetCount(source) > 0,
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = props[kCGImagePropertyPixelWidth] as? Int,
@@ -95,7 +123,7 @@ nonisolated enum PhotoAttachment {
         ]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
         let out = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(out, UTType.jpeg.identifier as CFString, 1, nil)
+        guard let destination = CGImageDestinationCreateWithData(out, type.identifier as CFString, 1, nil)
         else { return nil }
         CGImageDestinationAddImage(destination, image,
                                    [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
