@@ -864,8 +864,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             // A transfer the NSE fetched: its key was moved to the Keychain
             // and its fields were not persisted (PendingNotification
             // .stashDistroTransferKey). Take the key off the main actor
-            // (DistroManager's Keychain rule), then offer it as usual.
+            // (DistroManager's Keychain rule), which also clears it, then
+            // offer it as handleIncomingMessage does: only when the privacy
+            // filter lets its sender through, decided now, before the await.
             if let stash = msg.distroTransfer {
+                let filterAllows = isAllowlisted(destHash: srcHex)
                 switch stash {
                 case .keychain:
                     let msgHash = msg.messageHash
@@ -873,6 +876,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                         let key = await Task.detached(priority: .userInitiated) {
                             PendingNotification.takeDistroTransferKey(messageHash: msgHash)
                         }.value
+                        guard filterAllows else {
+                            print("[Retichat] importNSEMessages: DROPPED distro identity transfer from \(srcHex.prefix(8)): the privacy filter does not let it through")
+                            return
+                        }
                         if let key {
                             print("[Retichat] importNSEMessages: distro identity transfer from \(srcHex.prefix(8))")
                             RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
@@ -882,7 +889,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     }
                 case .lost:
                     print("[Retichat] importNSEMessages: NSE could not keep a distro transfer from \(srcHex.prefix(8))")
-                    RfedDistroClient.shared.post(notice: "A distro identity transfer arrived but could not be kept. Send it again from the other device.")
+                    if filterAllows {
+                        RfedDistroClient.shared.post(notice: "A distro identity transfer arrived but could not be kept. Send it again from the other device.")
+                    }
                 }
                 continue
             }
@@ -892,10 +901,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let fields = LxmfFieldsDecoder.decode(fieldsData)
 
             // A distro transfer the NSE fetched is still an offer, not a chat
-            // message — same check as handleIncomingMessage.
+            // message, under the same filter as handleIncomingMessage.
             if let key = fields.distroTransferKey {
-                print("[Retichat] importNSEMessages: distro identity transfer from \(srcHex.prefix(8))")
-                RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
+                offerDistroTransfer(fromHashHex: srcHex, privateKeyHex: key, via: "importNSEMessages")
                 continue
             }
 
@@ -1961,11 +1969,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let fields = LxmfFieldsDecoder.decode(fieldsRaw)
 
         // Distro identity transfer from another of our devices (SPEC §17.9):
-        // an offer for the user to answer, never a chat message. Checked before
-        // the group and allowlist paths (Android kt:854-862; web app.js 927-935).
+        // never a chat message, and offered only when the privacy filter lets
+        // its sender through (filter off: anyone; on: an allowlisted row), as
+        // the web and Android offer it (James, 2026-10-05). Until then it was
+        // offered from anyone, so any stranger could put the import prompt in
+        // front of the user.
         if let key = fields.distroTransferKey {
-            print("[Retichat] handleIncomingMessage: distro identity transfer from \(srcHex.prefix(8))")
-            RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
+            offerDistroTransfer(fromHashHex: srcHex, privateKeyHex: key, via: "handleIncomingMessage")
             return
         }
 
@@ -3205,6 +3215,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return nil
         }
         return standing
+    }
+
+    /// A distro identity transfer on the device address (RFed SPEC §17.9),
+    /// offered only when the privacy filter lets its sender through (filter
+    /// off: anyone; on: an allowlisted row), as the web and Android offer it
+    /// (James, 2026-10-05). Offered or dropped, it is never a message.
+    private func offerDistroTransfer(fromHashHex srcHex: String, privateKeyHex key: String, via path: String) {
+        guard isAllowlisted(destHash: srcHex) else {
+            print("[Retichat] \(path): DROPPED distro identity transfer from \(srcHex.prefix(8)): the privacy filter does not let it through")
+            return
+        }
+        print("[Retichat] \(path): distro identity transfer from \(srcHex.prefix(8))")
+        RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
     }
 
     // MARK: - Names (LXMF-rust/DISPLAY_NAMES.md §5)
