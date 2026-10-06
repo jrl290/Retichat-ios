@@ -711,14 +711,16 @@ private func deliveryTrampoline(
 
 /// What the library calls back with for an upload: held by the library from the
 /// call on (a retain it releases through `propagationUploadRelease`), so the
-/// sink lives as long as a proof or a loss can still be reported.
-nonisolated private final class PropagationUploadSinkBox {
+/// sink lives as long as a proof or a loss can still be reported. The three
+/// trampolines below are internal, not private, so that
+/// tests/DistroChannelsFFITests.swift can call them as the library does.
+nonisolated final class PropagationUploadSinkBox {
     let sink: UploadSink
     init(_ sink: UploadSink) { self.sink = sink }
 }
 
 /// retichat_upload_event_t: 1 the node proved the upload, 2 it was lost. Runs on a stack thread.
-nonisolated private func propagationUploadEvent(context: UnsafeMutableRawPointer?, event: Int32) {
+nonisolated func propagationUploadEvent(context: UnsafeMutableRawPointer?, event: Int32) {
     guard let context else { return }
     let box = Unmanaged<PropagationUploadSinkBox>.fromOpaque(context).takeUnretainedValue()
     switch event {
@@ -729,7 +731,7 @@ nonisolated private func propagationUploadEvent(context: UnsafeMutableRawPointer
 }
 
 /// retichat_upload_release_t: the library is done with the context.
-nonisolated private func propagationUploadRelease(context: UnsafeMutableRawPointer?) {
+nonisolated func propagationUploadRelease(context: UnsafeMutableRawPointer?) {
     guard let context else { return }
     Unmanaged<PropagationUploadSinkBox>.fromOpaque(context).release()
 }
@@ -753,7 +755,7 @@ nonisolated private enum PropagationLinkEvents {
 }
 
 /// retichat_link_event_t. Runs on a stack thread and must not block.
-nonisolated private func propagationLinkEvent(
+nonisolated func propagationLinkEvent(
     context: UnsafeMutableRawPointer?,
     dest: UnsafePointer<UInt8>?, destLen: UInt32,
     status: UInt8,

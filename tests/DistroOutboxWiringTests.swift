@@ -349,12 +349,12 @@ func theCallbacksTheLibraryCallsAreTheSignaturesSwiftDeclares() {
     let flat = header.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     check(flat.contains("typedef void (*retichat_upload_event_t)(void *context, int32_t event);"), "the event typedef")
     check(flat.contains("typedef void (*retichat_upload_release_t)(void *context);"), "the release typedef")
-    check(bridge.contains("nonisolated private func propagationUploadEvent(context: UnsafeMutableRawPointer?, event: Int32)"),
+    check(bridge.contains("nonisolated func propagationUploadEvent(context: UnsafeMutableRawPointer?, event: Int32)"),
           "the event trampoline takes what the typedef says")
-    check(bridge.contains("nonisolated private func propagationUploadRelease(context: UnsafeMutableRawPointer?)"),
+    check(bridge.contains("nonisolated func propagationUploadRelease(context: UnsafeMutableRawPointer?)"),
           "the release trampoline too")
     check(bridge.contains("""
-        nonisolated private func propagationLinkEvent(
+        nonisolated func propagationLinkEvent(
             context: UnsafeMutableRawPointer?,
             dest: UnsafePointer<UInt8>?, destLen: UInt32,
             status: UInt8,
