@@ -146,6 +146,32 @@ enum DistroCodecTests {
                                               sentBy: sibling, ownDeviceHex: device) == .store(recipientHex: peer),
               "source and recipient compare case-insensitively; recipient stored lowercase")
 
+        // Channels and the distro (RFed-spec Channel.md "Distro holders", "Own posts"; James, 2026-10-03)
+        let stranger = String(repeating: "5", count: 32)
+        check(DistroCodec.postingHex(deviceHex: device, distroHex: distro) == distro,
+              "a device with a distro posts as the distro")
+        check(DistroCodec.postingHex(deviceHex: device, distroHex: nil) == device,
+              "a device with none posts as itself")
+        check(DistroCodec.postingHex(deviceHex: device, distroHex: "") == device,
+              "an empty distro hash is no distro")
+
+        check(DistroCodec.isOwnChannelPost(sourceHex: device, deviceHex: device, distroHex: distro),
+              "a post from the device is the user's own")
+        check(DistroCodec.isOwnChannelPost(sourceHex: distro, deviceHex: device, distroHex: distro),
+              "a post from the held distro is the user's own, whichever device sent it")
+        check(DistroCodec.isOwnChannelPost(sourceHex: distro.uppercased(), deviceHex: device, distroHex: distro),
+              "the comparison is case-insensitive")
+        check(DistroCodec.isOwnChannelPost(sourceHex: device, deviceHex: device, distroHex: nil),
+              "the device's own post is its own with no distro")
+        check(!DistroCodec.isOwnChannelPost(sourceHex: stranger, deviceHex: device, distroHex: distro),
+              "a stranger's post is not")
+        check(!DistroCodec.isOwnChannelPost(sourceHex: distro, deviceHex: device, distroHex: nil),
+              "a distro given up is not own any more: its later posts are another poster's")
+        check(!DistroCodec.isOwnChannelPost(sourceHex: "", deviceHex: "", distroHex: nil)
+                && !DistroCodec.isOwnChannelPost(sourceHex: "", deviceHex: "", distroHex: "")
+                && !DistroCodec.isOwnChannelPost(sourceHex: device, deviceHex: "", distroHex: nil),
+              "an empty hash matches nothing (the stack is down, no distro)")
+
         if failures.isEmpty {
             print("all tests passed")
             exit(0)

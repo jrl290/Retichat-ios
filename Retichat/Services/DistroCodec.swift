@@ -160,6 +160,31 @@ nonisolated enum DistroCodec {
         return .store(recipientHex: to)
     }
 
+    // MARK: - Channels and the distro (RFed-spec Channel.md "Distro holders")
+
+    /// The hash the device signs its channel posts with, its posting identity:
+    /// the distro's `lxmf.delivery` hash when the device holds one
+    /// (`distroHex`), otherwise the device's own (`deviceHex`). Subscribing, the
+    /// stream, pulls and push registrations are the device's whichever it is.
+    /// Android DistroCodec.postingHex.
+    static func postingHex(deviceHex: String, distroHex: String?) -> String {
+        if let distroHex, !distroHex.isEmpty { return distroHex }
+        return deviceHex
+    }
+
+    /// Channel.md "Own posts": a received channel post is the user's own when
+    /// its source is this device's `lxmf.delivery` hash or the hash of the
+    /// distro this device holds now (`distroHex`, nil when none), whichever of
+    /// the user's devices sent it. A device that gave up its distro no longer
+    /// holds it, so that distro's later posts are another poster's. An empty
+    /// hash (the stack is down, no distro) matches nothing.
+    static func isOwnChannelPost(sourceHex: String, deviceHex: String, distroHex: String?) -> Bool {
+        guard !sourceHex.isEmpty else { return false }
+        if sourceHex.lowercased() == deviceHex.lowercased() { return true }
+        if let distroHex { return sourceHex.lowercased() == distroHex.lowercased() }
+        return false
+    }
+
     // MARK: - Private hex helpers
     //
     // Own copies rather than Data.hexString: this file must compile alone

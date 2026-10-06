@@ -171,6 +171,31 @@ enum ChannelNameRules {
         !fullName(isPrivate: isPrivate, root: root, name: name).isEmpty
     }
 
+    /// RFed SPEC §17.12 rule 4: whether the join of a channel named `name` that
+    /// a sibling device made is one this client's own join accepts: the rules a
+    /// typed name must pass in the New Channel form, exactly, with nothing
+    /// trimmed, lowercased, normalized or filtered, because the channel is
+    /// derived from these bytes and a different name is a different channel. So
+    /// `name` is already lowercase and NFC, its root (up to the first ".") is
+    /// non-empty and holds only letters, digits and "-", the root "public" is the
+    /// public channel's and any other root a private channel's, and the name part
+    /// is non-empty and holds only letters, digits, "." and "-". A leave's name
+    /// is not held to this: a channel joined before these rules (for example
+    /// `public.Test`) can still be left.
+    ///
+    /// Byte equality throughout (sameBytes): Swift's String == is canonical
+    /// equivalence, which would take a decomposed "e\u{301}" for the "\u{e9}" the
+    /// form builds.
+    static func joinNameAccepted(_ name: String) -> Bool {
+        guard let dot = name.firstIndex(of: "."), dot != name.startIndex else { return false }
+        let root = String(name[..<dot])
+        let rest = String(name[name.index(after: dot)...])
+        guard sameBytes(root, filterRoot(root)), sameBytes(rest, filterName(rest)) else { return false }
+        // The very name the form would build from these parts; this is what
+        // refuses an empty name part and the root a private channel may not have.
+        return sameBytes(fullName(isPrivate: root != publicRoot, root: root, name: rest), name)
+    }
+
     // MARK: Default root
 
     /// A fresh private root: 16 lowercase hex characters from the system CSPRNG
