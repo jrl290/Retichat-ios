@@ -440,8 +440,8 @@ actor DistroOutbox {
     /// waits for the current link's next coming-up. This section's reading of the
     /// first and third rulings, not James's words.
     ///
-    /// Ready and tested, and called from nowhere in the app: the shared crates do
-    /// not say when a STALE link recovers (see DistroOutboxRuntime).
+    /// Called by DistroOutboxRuntime on AppLinks' RECOVERED event for the propagation
+    /// node's link (Reticulum-rust `link_recovered`), and from nowhere else.
     func onLinkRecovered(_ linkId: String) async {
         guard port.held()?.id == linkId else { return }
         await sendDistroOutbox(linkId, trigger: "recovered")

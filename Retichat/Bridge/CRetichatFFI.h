@@ -329,7 +329,10 @@ int32_t lxmf_app_link_register_reconnect(uint64_t client,
 ///
 /// The callback fires whenever an APP_LINK transitions state.  Status byte:
 ///   0 = NONE, 1 = PATH_REQUESTED, 2 = ESTABLISHING,
-///   3 = ACTIVE, 4 = DISCONNECTED.
+///   3 = ACTIVE, 4 = DISCONNECTED, and the event 5 = RECOVERED (a held STALE
+///   link heard from its peer again and is ACTIVE once more; never a state,
+///   so lxmf_app_link_status never returns it, and a handler that acts on
+///   ACTIVE alone ignores it).
 ///
 /// Multiple callbacks may be registered.  The callback runs on the link
 /// actor thread and MUST NOT block — copy any data and dispatch off-thread.
@@ -998,10 +1001,12 @@ uint8_t *retichat_propagation_upload(const uint8_t *node, uint32_t node_len,
                                      uint32_t *out_len);
 
 /// One app-link status change with the link it is about. status: 0 none, 1 path
-/// requested, 2 establishing, 3 ACTIVE, 4 disconnected. link_id is the link's id
-/// for establishing and ACTIVE (a new link's establishment is its ACTIVE) and
-/// NULL, 0 otherwise. The pointers are valid only during the call. Runs on a
-/// stack thread; never blocks.
+/// requested, 2 establishing, 3 ACTIVE, 4 disconnected, 5 recovered (an event,
+/// never a state: a STALE link heard from its peer again and is ACTIVE once
+/// more, told once per recovery and only for the link AppLinks still holds).
+/// link_id is the link's id for establishing, ACTIVE (a new link's establishment
+/// is its ACTIVE) and recovered, and NULL, 0 otherwise. The pointers are valid
+/// only during the call. Runs on a stack thread; never blocks.
 typedef void (*retichat_link_event_t)(void *context,
                                       const uint8_t *dest, uint32_t dest_len,
                                       uint8_t status,

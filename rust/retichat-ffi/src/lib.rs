@@ -1589,13 +1589,16 @@ type LinkEventCallback = Option<extern "C" fn(*mut c_void, *const u8, u32, u8, *
 /// Register a second AppLinks status callback that also says which link an
 /// event is about: `callback(context, dest, dest_len, status, link_id,
 /// link_id_len)` for every status change of every app-link (0 none, 1 path
-/// requested, 2 establishing, 3 ACTIVE, 4 disconnected), with the link's id for
-/// establishing and ACTIVE and an empty one (NULL, 0) otherwise. A new
-/// propagation link's establishment is its ACTIVE event. The pointers are valid
-/// only during the call. It runs on a stack thread and must not block. The
-/// existing `lxmf_app_link_register_status_callback` is left as it is. The
-/// stack's shutdown drops every callback, so register again after each start.
-/// 0 on success, -1 with `rns_last_error`.
+/// requested, 2 establishing, 3 ACTIVE, 4 disconnected, 5 recovered), with the
+/// link's id for establishing, ACTIVE and recovered and an empty one (NULL, 0)
+/// otherwise. A new propagation link's establishment is its ACTIVE event; a
+/// STALE link's recovery (it heard from its peer again) is its RECOVERED event,
+/// an event only (`AppLinks::status` never returns it), told once per recovery
+/// and only for the link AppLinks still holds. The pointers are valid only
+/// during the call. It runs on a stack thread and must not block. The existing
+/// `lxmf_app_link_register_status_callback` is left as it is and is told the
+/// same statuses. The stack's shutdown drops every callback, so register again
+/// after each start. 0 on success, -1 with `rns_last_error`.
 #[no_mangle]
 pub extern "C" fn retichat_propagation_link_events_register(callback: LinkEventCallback, context: *mut c_void) -> i32 {
     let Some(callback) = callback else {
@@ -2050,6 +2053,38 @@ mod distro_outbox_bridge_tests {
         assert_eq!(retichat_propagation_link_events_register(None, std::ptr::null_mut()), -1);
         assert!(rns::take_error().unwrap_or_default().contains("callback"));
         assert_eq!(retichat_propagation_link_events_register(Some(callback), 0xFEEE as *mut c_void), 0);
+    }
+
+    /// A STALE link's recovery is told as every other status is: AppLinks' own code and the link's id,
+    /// unchanged, so Swift can hand the link to the outbox as a coming-up.
+    #[test]
+    fn a_recovered_event_hands_over_its_link_like_an_active_one() {
+        static SEEN: Mutex<Vec<(usize, Vec<u8>, u8, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
+        extern "C" fn callback(context: *mut c_void, dest: *const u8, dest_len: u32, status: u8, id: *const u8, id_len: u32) {
+            let dest = unsafe { std::slice::from_raw_parts(dest, dest_len as usize) }.to_vec();
+            let id = if id.is_null() {
+                assert_eq!(id_len, 0);
+                None
+            } else {
+                Some(unsafe { std::slice::from_raw_parts(id, id_len as usize) }.to_vec())
+            };
+            SEEN.lock().unwrap().push((context as usize, dest, status, id));
+        }
+        deliver_link_event(callback, 0xFEEF, &[7u8; 16], app_links::APP_LINK_RECOVERED, &[9u8; 16]);
+        let seen: Vec<_> = SEEN.lock().unwrap().iter().filter(|e| e.0 == 0xFEEF).cloned().collect();
+        assert_eq!(seen, vec![(0xFEEF, vec![7u8; 16], 5, Some(vec![9u8; 16]))], "a RECOVERED event carries its link");
+    }
+
+    /// The glue relays AppLinks' status byte unchanged, and Swift's `RetichatBridge` must be the same
+    /// numbers: ACTIVE (a new link's establishment) and RECOVERED (a STALE link's recovery), which are
+    /// the two ways the propagation link comes up for the outbox.
+    #[test]
+    fn swifts_link_statuses_are_app_links_own() {
+        let swift = include_str!("../../../Retichat/Bridge/RetichatBridge.swift");
+        assert_eq!(app_links::APP_LINK_ACTIVE, 3);
+        assert_eq!(app_links::APP_LINK_RECOVERED, 5);
+        assert!(swift.contains(&format!("static let appLinkActive: UInt8 = {}", app_links::APP_LINK_ACTIVE)));
+        assert!(swift.contains(&format!("static let appLinkRecovered: UInt8 = {}", app_links::APP_LINK_RECOVERED)));
     }
 
     /// A propagation node's announce `app_data`: `[name, timebase, active, limit, sync limit, [cost, ...], {}]`.

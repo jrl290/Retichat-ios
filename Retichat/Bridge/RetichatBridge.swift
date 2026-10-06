@@ -793,6 +793,12 @@ extension RetichatBridge {
     /// An AppLinks status of an app-link: ACTIVE, with the link's id for a new link.
     nonisolated static let appLinkActive: UInt8 = 3
 
+    /// An AppLinks EVENT, never a state (`APP_LINK_RECOVERED`): the persistent link
+    /// held for the destination had gone STALE and heard from its peer again, so it
+    /// is ACTIVE once more. Told once per recovery, with the link's id, and only for
+    /// the link AppLinks still holds. A handler that acts on ACTIVE alone ignores it.
+    nonisolated static let appLinkRecovered: UInt8 = 5
+
     /// Write the membership message C's fields on an outbound message
     /// (`messageCreate`): 0x0C an empty bin, 0xFB `rfed.distro.channel`, 0xFC the
     /// native array `[op, name, at_ms]`, 0xFD `deviceHex`. False with the error
@@ -881,9 +887,10 @@ extension RetichatBridge {
     }
 
     /// Register `handler` for every app-link status change, with the link each is
-    /// about (a new link's establishment is its ACTIVE event, carrying the
-    /// link's id). Runs on a stack thread and must not block. The stack's
-    /// shutdown drops it: register again after each start.
+    /// about (a new link's establishment is its ACTIVE event, and a STALE link's
+    /// recovery its RECOVERED event, each carrying the link's id). Runs on a stack
+    /// thread and must not block. The stack's shutdown drops it: register again
+    /// after each start.
     nonisolated func propagationLinkEventsRegister(handler: @escaping (Data, UInt8, Data?) -> Void) -> Bool {
         PropagationLinkEvents.set(handler)
         let ok = retichat_propagation_link_events_register(propagationLinkEvent, nil) == 0

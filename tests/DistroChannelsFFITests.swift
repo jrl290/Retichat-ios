@@ -243,9 +243,15 @@ func aLinkEventReachesTheHandlerWithItsLinkOrNone() {
     checkEqual(seen.events.first?.1 ?? 0, 3, "ACTIVE")
     checkEqual(seen.events.first?.2, Data(id), "with its link")
     check(seen.events.last?.2 == nil, "a disconnection carries none")
+    // A STALE link's recovery is told like an establishment: its own status, and the link.
+    propagationLinkEvent(context: nil, dest: dest, destLen: 16, status: RetichatBridge.appLinkRecovered, linkId: id, linkIdLen: 16)
+    checkEqual(seen.events.count, 3, "a recovery is told")
+    checkEqual(seen.events.last?.1 ?? 0, 5, "RECOVERED")
+    checkEqual(seen.events.last?.2, Data(id), "with its link")
     bridge.propagationLinkEventsClear()
     propagationLinkEvent(context: nil, dest: dest, destLen: 16, status: 3, linkId: id, linkIdLen: 16)
-    checkEqual(seen.events.count, 2, "cleared, a status change reaches nobody")
+    propagationLinkEvent(context: nil, dest: dest, destLen: 16, status: RetichatBridge.appLinkRecovered, linkId: id, linkIdLen: 16)
+    checkEqual(seen.events.count, 3, "cleared, a status change reaches nobody")
 }
 
 // MARK: - What the unwrap hands the app: the fields as base64, read as the app reads them

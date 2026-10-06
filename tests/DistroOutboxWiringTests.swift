@@ -223,7 +223,7 @@ func anOwedMessageIsSignedByTheKeyItsSourceNames() {
           "DistroManager.signing reads both under one lock")
 }
 
-func theRuntimeStartsNoLinkAndOnlyAnEstablishmentOrTheStartUpCheckFlushes() {
+func theRuntimeStartsNoLinkAndOnlyALinksComingUpFlushes() {
     let source = code(runtime)
     // It never opens, reopens or closes the propagation link, nor sets the router's node.
     for call in ["appLinkOpen", "openHeldAppLink", "closeAppLink", "appLinkReopen", "setPropagationNode", "rotateToNext", "sync(nodeHash"] {
@@ -231,8 +231,10 @@ func theRuntimeStartsNoLinkAndOnlyAnEstablishmentOrTheStartUpCheckFlushes() {
     }
     // onLinkEstablished: the link callback's ACTIVE event and the check at start, nothing else.
     check(count(source, "onLinkEstablished(") == 2, "onLinkEstablished is called from two places")
-    // A STALE link's recovery is not observable; it is not called from anywhere in the app.
-    for path in ["Retichat/Services/DistroOutboxRuntime.swift", "Retichat/Services/ChatRepository.swift",
+    // onLinkRecovered: the link callback's RECOVERED event (a STALE link that heard the node again),
+    // from the runtime alone; no clock and no poll of the link, and nothing else in the app calls it.
+    check(count(source, "onLinkRecovered(") == 1, "onLinkRecovered is called from one place")
+    for path in ["Retichat/Services/ChatRepository.swift",
                  "Retichat/Services/RfedChannelClient.swift", "Retichat/Services/RfedDistroClient.swift",
                  "Retichat/Services/ConnectionStateManager.swift", "Retichat/RetichatApp.swift"] {
         check(count(code(read(path)), "onLinkRecovered(") == 0, "\(path) never calls onLinkRecovered")
@@ -257,6 +259,27 @@ func theRuntimeStartsNoLinkAndOnlyAnEstablishmentOrTheStartUpCheckFlushes() {
     // Start and stop run in the order asked, and a start that finds a stop after it registers nothing.
     check(runtime.contains("guard mine == generation else { return }") && count(source, "chain {") == 2,
           "start and stop are serialized, and a stopped start registers nothing")
+}
+
+func aStaleLinksRecoveryIsTheRecoveredEventForTheNodesLinkOnly() {
+    let deliver = body(runtime, "static func deliver(dest: Data, status: UInt8, linkId: Data?) {", "// MARK: - The runtime")
+    // The same guards for both events: only the propagation node's link, and only with the link's id.
+    check(deliver.contains("guard let current, dest.hexString == current.node, let linkId, !linkId.isEmpty else { return }"),
+          "only the node's link, carrying its id")
+    // An establishment is ACTIVE; a STALE link's recovery is RECOVERED. Each is its own coming-up, on the outbox's executor.
+    check(deliver.contains("if status == RetichatBridge.appLinkActive {")
+            && deliver.contains("current.outbox.spawn { await current.outbox.onLinkEstablished(id) }"),
+          "an ACTIVE event is a coming-up by establishment")
+    check(deliver.contains("else if status == RetichatBridge.appLinkRecovered {")
+            && deliver.contains("current.outbox.spawn { await current.outbox.onLinkRecovered(id) }"),
+          "a RECOVERED event is a coming-up by recovery")
+    check(before(deliver, "onLinkEstablished(id)", "onLinkRecovered(id)") && !deliver.contains("Task.sleep"),
+          "nothing in it waits")
+    // The status is AppLinks' own code 5 (a glue-crate test pins it to app-links' constant), and the docs list it.
+    check(bridge.contains("nonisolated static let appLinkRecovered: UInt8 = 5"), "RetichatBridge.appLinkRecovered is 5")
+    check(header.contains("5 recovered") && rust.contains("4 disconnected, 5 recovered"),
+          "the header and the glue crate list the status")
+    check(bridge.contains("its RECOVERED event"), "the wrapper's docs say what the event is")
 }
 
 func theChannelScreenClosesWhenASiblingLeaves() {
@@ -403,7 +426,8 @@ let allTests: [(String, () -> Void)] = [
     ("a membership message is read before the generic dedupe and the delivery-notification test", aMembershipMessageIsReadBeforeTheGenericDedupeAndTheDeliveryNotificationTest),
     ("the sent copy is owed, not handed to the router once", theSentCopyIsOwedNotHandedToTheRouterOnce),
     ("an owed message is signed by the key its source names", anOwedMessageIsSignedByTheKeyItsSourceNames),
-    ("the runtime starts no link and only an establishment or the start-up check flushes", theRuntimeStartsNoLinkAndOnlyAnEstablishmentOrTheStartUpCheckFlushes),
+    ("the runtime starts no link and only a link's coming-up flushes", theRuntimeStartsNoLinkAndOnlyALinksComingUpFlushes),
+    ("a STALE link's recovery is the recovered event for the node's link only", aStaleLinksRecoveryIsTheRecoveredEventForTheNodesLinkOnly),
     ("the channel screen closes when a sibling leaves", theChannelScreenClosesWhenASiblingLeaves),
     ("a post is packed with the posting identity and recorded under its hash", aPostIsPackedWithThePostingIdentityAndRecordedUnderItsHash),
     ("subscribing, the stream, pulls and push stay the device's", subscribingTheStreamPullsAndPushStayTheDevices),

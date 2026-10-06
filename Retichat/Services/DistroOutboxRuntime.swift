@@ -21,18 +21,19 @@
 //  Settings override (UserPreferences.effectiveLxmfPropagationHash): the one a
 //  distro's messages are fanned out from.
 //
-//  What the stack does not tell us: a STALE propagation link that recovers
-//  because the node is heard on it again (James's second coming-up, 2026-10-03).
-//  Reticulum-rust's `Link::receive` makes a STALE link ACTIVE again with no
-//  callback (link.rs, "Mark active if stale"), and AppLinks reports no status for
-//  it, so DistroOutbox.onLinkRecovered, which is ready and tested, is not called
-//  from here: nothing in this process can hear it without polling the link,
-//  which DESIGN_PRINCIPLES §1 and §3 forbid. It needs a recovered callback on
-//  `LinkHandle` that AppLinks reports, a change to the shared crates. (A held
-//  STALE link is replaced by a new one when the node announces, and a link that
-//  times out is re-opened: both are establishments, and both are observed.)
-//  Until then, what is owed when a STALE link recovers waits for the next
-//  establishment. The same gap as Android's.
+//  The link comes up in two ways (James, 2026-10-03), and both are events the
+//  stack tells, never read by polling (DESIGN_PRINCIPLES §1 and §3): a new link's
+//  establishment (AppLinks' ACTIVE, DistroOutbox.onLinkEstablished), and a STALE
+//  link's recovery because the node is heard on it again (AppLinks' RECOVERED,
+//  DistroOutbox.onLinkRecovered). The reference's `Link.__receive` makes a STALE
+//  link ACTIVE again and tells no one; Reticulum-rust's `link_recovered` callback
+//  (an API extension, PARITY-AUDIT-1.5.2.md A34) tells AppLinks, which reports
+//  RECOVERED with the link's id, for the link it still holds. Until that was
+//  wired (2026-10-06) what was owed when a STALE link recovered waited for the
+//  next establishment (about 35 s on staging). A held STALE link that is replaced
+//  by a new one, or that times out and is re-opened, is an establishment as
+//  before; the outbox itself runs a recovery only while that link is still the
+//  propagation link (DistroOutbox.onLinkRecovered). The same as Android's.
 //
 
 import Combine
@@ -151,16 +152,22 @@ nonisolated private enum PropagationLinkTarget {
         if let node, let outbox { target = (node.hexString, outbox) } else { target = nil }
     }
 
-    /// A new propagation link's establishment is its ACTIVE event, carrying the link.
+    /// A new propagation link's establishment is its ACTIVE event, carrying the link;
+    /// a STALE one's recovery (the node was heard on it again) is its RECOVERED event,
+    /// carrying the link too. Each is its own coming-up, on the outbox's own executor.
     static func deliver(dest: Data, status: UInt8, linkId: Data?) {
         lock.lock()
         let current = target
         lock.unlock()
-        guard let current, dest.hexString == current.node,
-              status == RetichatBridge.appLinkActive, let linkId, !linkId.isEmpty else { return }
+        guard let current, dest.hexString == current.node, let linkId, !linkId.isEmpty else { return }
         let id = linkId.hexString
-        print("[DistroOutbox] propagation link established \(id.prefix(8))")
-        current.outbox.spawn { await current.outbox.onLinkEstablished(id) }
+        if status == RetichatBridge.appLinkActive {
+            print("[DistroOutbox] propagation link established \(id.prefix(8))")
+            current.outbox.spawn { await current.outbox.onLinkEstablished(id) }
+        } else if status == RetichatBridge.appLinkRecovered {
+            print("[DistroOutbox] propagation link recovered \(id.prefix(8))")
+            current.outbox.spawn { await current.outbox.onLinkRecovered(id) }
+        }
     }
 }
 

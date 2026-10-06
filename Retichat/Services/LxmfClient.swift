@@ -440,7 +440,9 @@ final class LxmfClient: @unchecked Sendable {
 
     /// Register an APP_LINK status callback.  Fires whenever an APP_LINK
     /// transitions state.  `status` byte: 0=NONE, 1=PATH_REQUESTED,
-    /// 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED.
+    /// 2=ESTABLISHING, 3=ACTIVE, 4=DISCONNECTED, and the event 5=RECOVERED
+    /// (a held STALE link heard from its peer again; a handler that acts on
+    /// ACTIVE alone ignores it).
     ///
     /// The callback runs on the link-actor thread and MUST NOT block —
     /// copy the destination hash and dispatch off-thread.
