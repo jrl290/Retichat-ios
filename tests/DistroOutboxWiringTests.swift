@@ -384,7 +384,18 @@ func anUploadOnlyLeavesOnTheLinkTheStackHoldsAndNothingIsResentByTheCrate() {
           "the context is the library's before anything can fail")
 }
 
+/// What rfed pushed down a dead link waits for /rfed/pull: an accepted
+/// propagation.stream open pulls it once, as the web and Android do (staging,
+/// 2026-10-06).
+func anAcceptedStreamOpenPullsWhatRfedHeldBack() {
+    let open = body(repository, "private func sendPropagationStreamOpen()", "private static func streamOpenResponseOk")
+    check(open.contains("await RfedDistroClient.shared.pull()"), "an accepted open pulls the distro's deferred queue")
+    check(before(open, "guard Self.streamOpenResponseOk(response) else", "await RfedDistroClient.shared.pull()"),
+          "the pull comes only after the open is accepted")
+}
+
 let allTests: [(String, () -> Void)] = [
+    ("an accepted stream open pulls what rfed held back", anAcceptedStreamOpenPullsWhatRfedHeldBack),
     ("the stack starts the outbox after the links are wired and stops it first", theStackStartsTheOutboxAfterTheLinksAreWiredAndStopsItFirst),
     ("only the user's own join, leave and send owe anything", onlyTheUsersOwnJoinLeaveAndSendOweAnything),
     ("the user's own action is the only caller of recordUsersAction", theUsersOwnActionIsTheOnlyCallerOfRecordUsersAction),

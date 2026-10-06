@@ -829,6 +829,18 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 print("[Retichat] propagation.stream open rejected resp=\(response?.hexString ?? "nil")")
                 return
             }
+            // What rfed pushed down this device's previous link while it was
+            // dead went unproven and waits in its queue for /rfed/pull, and
+            // without a wake nothing fetches it. Pull once per fresh link, as
+            // the web does after its binding (Retichat-js
+            // _bindRfedLinkForDistroPush, then /distro/pull) and Android does
+            // (PropagationStream.sendOpen): an event, not a timer. Found on
+            // staging 2026-10-06, where a sibling's channel leave pushed in
+            // the seconds before Android's re-open never arrived.
+            if RfedDistroClient.shared.distro != nil {
+                let pulled = await RfedDistroClient.shared.pull()
+                print("[Retichat] propagation.stream open: pulled \(pulled) blob(s) after the open")
+            }
         }
     }
 
