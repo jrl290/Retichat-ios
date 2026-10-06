@@ -9,6 +9,12 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 reticulum_rust = { path = "../../../Reticulum-rust", default-features = false, features = ["serial", "prns-ble"] }
 lxmf_rust = { path = "../../../LXMF-rust", default-features = false }
+# The held propagation link's events and uploads (src/distro_outbox.rs and the
+# "What a device owes its distro" section of src/lib.rs); the same package
+# lxmf_rust already builds, not a second copy.
+app_links = { path = "../../../app-links" }
+# The version lxmf_rust pins: C's fields are rmpv values of its own LXMessage.
+rmpv = "=1.0.0"
 sha2 = "0.10"
 
 [dev-dependencies]

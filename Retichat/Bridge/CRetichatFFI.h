@@ -929,4 +929,88 @@ uint64_t retichat_message_create(const uint8_t *dest_hash, uint32_t dest_len,
                                  const char *content, const char *title,
                                  uint8_t method, uint64_t source_identity_handle);
 
+#pragma mark - What a device owes its distro (RFed SPEC §17.12, §17.11)
+//
+// The Swift outbox (Retichat/Services/DistroOutbox.swift) keeps what is owed
+// and decides when to upload. These are what it cannot make itself. Nothing
+// here sends on a timer or sends again; the same functions, one for one, as
+// Retichat-android's JNI crate (rust/retichat-jni/src/distro_outbox.rs).
+// All buffer-returning functions here allocate; free with rns_free_bytes.
+
+/// Write the membership message C's fields on an outbound message made by
+/// retichat_message_create: 0x0C an empty bin, 0xFB "rfed.distro.channel",
+/// 0xFC the native array [op, name, at_ms], 0xFD the sending device's own
+/// address. Returns 0, or -1 (rns_last_error) with the message unchanged when
+/// op is not "join" or "leave", name is empty, at_ms is not 0..2^53-1 or
+/// device_hex is not 32 hex characters.
+int32_t retichat_message_set_distro_channel_sync(uint64_t msg,
+                                                 const char *op,
+                                                 const char *name,
+                                                 int64_t at_ms,
+                                                 const char *device_hex);
+
+/// Pack and sign an outbound message once and return its LXMF bytes
+/// (dest | src | signature | payload); lxmf_message_hash is then its hash. A
+/// message already packed returns the bytes it was packed to: nothing is ever
+/// packed again, so every upload of it is one message. Heap bytes (free with
+/// rns_free_bytes), or NULL (rns_last_error).
+uint8_t *retichat_message_pack(uint64_t msg, uint32_t *out_len);
+
+/// The propagation upload of a packed message for the node `node` (16 bytes):
+/// encrypted to distro_public_key (64 bytes) and to no other key, stamped for
+/// the node's cost (read from its announce; unknown is an error, and the node's
+/// path is requested). BLOCKS while the stamp is mined: never on the main
+/// thread. Heap bytes, or NULL (rns_last_error) with nothing sent.
+uint8_t *retichat_propagation_build_upload(const uint8_t *distro_public_key, uint32_t key_len,
+                                           const uint8_t *packed, uint32_t packed_len,
+                                           const uint8_t *node, uint32_t node_len,
+                                           uint32_t *out_len);
+
+/// The outbound link AppLinks holds for the propagation node, as it is now:
+/// [state u8 | link id], state being the link's own (0 pending, 1 handshake,
+/// 2 ACTIVE, 3 STALE, 4 closed). Heap bytes, or NULL when none is held. A read
+/// of the registry, never a wait.
+uint8_t *retichat_propagation_link(const uint8_t *node, uint32_t node_len, uint32_t *out_len);
+
+/// Told about an upload on the held propagation link: 1 the node proved it (or
+/// the Resource completed), 2 it was lost (the packet receipt timed out, or the
+/// Resource failed). Each at most once, from a stack thread; never blocks. A
+/// proof can follow a loss.
+typedef void (*retichat_upload_event_t)(void *context, int32_t event);
+
+/// Called exactly once when the library is done with an upload's context.
+typedef void (*retichat_upload_release_t)(void *context);
+
+/// Hand an upload (retichat_propagation_build_upload) to the ACTIVE link held
+/// for the propagation node: one packet, or a Resource over the link MDU.
+/// Returns heap bytes [how u8 | link id] (how 1 a packet, 2 a Resource; the link
+/// id the upload went on), or NULL (rns_last_error) when it did not leave: then
+/// event is never called. On a loss the link the upload went on is torn down
+/// before event(context, 2). Nothing here times or resends anything: the
+/// stack's own receipt timeout is the clock. `context` is the library's from
+/// this call on, whether or not the upload leaves; release(context) is called
+/// once when the library is done with it.
+uint8_t *retichat_propagation_upload(const uint8_t *node, uint32_t node_len,
+                                     const uint8_t *upload, uint32_t upload_len,
+                                     retichat_upload_event_t event,
+                                     retichat_upload_release_t release,
+                                     void *context,
+                                     uint32_t *out_len);
+
+/// One app-link status change with the link it is about. status: 0 none, 1 path
+/// requested, 2 establishing, 3 ACTIVE, 4 disconnected. link_id is the link's id
+/// for establishing and ACTIVE (a new link's establishment is its ACTIVE) and
+/// NULL, 0 otherwise. The pointers are valid only during the call. Runs on a
+/// stack thread; never blocks.
+typedef void (*retichat_link_event_t)(void *context,
+                                      const uint8_t *dest, uint32_t dest_len,
+                                      uint8_t status,
+                                      const uint8_t *link_id, uint32_t link_id_len);
+
+/// Register a second app-link status callback that also says which link an
+/// event is about. lxmf_app_link_register_status_callback is left as it is. The
+/// stack's shutdown drops every callback: register again after each start.
+/// Returns 0, or -1 (rns_last_error).
+int32_t retichat_propagation_link_events_register(retichat_link_event_t callback, void *context);
+
 #endif /* CRetichatFFI_h */
