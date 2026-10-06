@@ -111,6 +111,12 @@ final class RfedChannelClient: ObservableObject {
     private var didResubscribeOnActive = false
     private var didLoadPersistedState = false
     private var didStartNetworkFlows = false
+    /// ChannelEntity's own name state is adopted by the device once per process
+    /// (adoptLegacyNameState).
+    private var legacyNameStateAdopted = false
+    /// Membership messages that arrived before the channel list was loaded, applied by
+    /// `start()` once it is (handleDistroChannelSync).
+    private var pendingChannelSync: [(marker: DistroChannelSync.Marker, fromDistro: Bool, signedByDistro: Bool)] = []
 
     private enum PendingRfedOperation {
         case send(content: String, channel: Channel, optimisticId: String)
@@ -162,6 +168,8 @@ final class RfedChannelClient: ObservableObject {
             didLoadPersistedState = true
         }
 
+        drainPendingChannelSync()
+
         guard identityHandle != 0 else { return }
         if !didStartNetworkFlows {
             didStartNetworkFlows = true
@@ -180,6 +188,20 @@ final class RfedChannelClient: ObservableObject {
         didStartNetworkFlows = false
         didResubscribeOnActive = false
         stopRfedLinkMonitor()
+    }
+
+    /// Judge the membership messages held until the channel list was loaded (§17.12
+    /// rules 1-6), in the order they came. Needs this device's address, which the
+    /// stack gives `configure`: with it still unknown they stay held.
+    private func drainPendingChannelSync() {
+        guard didLoadPersistedState, modelContext != nil, !ownHashHex.isEmpty,
+              !pendingChannelSync.isEmpty else { return }
+        let held = pendingChannelSync
+        pendingChannelSync.removeAll()
+        print("[RfedChannel] judging \(held.count) membership message(s) held until the channel list was loaded")
+        for item in held {
+            _ = handleDistroChannelSync(marker: item.marker, fromDistro: item.fromDistro, signedByDistro: item.signedByDistro)
+        }
     }
 
     private var canIssueRfedOperations: Bool {
@@ -391,17 +413,38 @@ final class RfedChannelClient: ObservableObject {
                               isSubscribed: true, stampCost: stampCost)
         channels.append(channel)
         reconfigureChannelStreams()
+        // The user's own join of a channel not in the list: recorded for RFed SPEC §17.12
+        // rule 5 and, with a distro, owed to the other devices as a membership message.
+        // A join of one already in the list (above) is no change. Applying a sibling's join
+        // is applyDistroChannelSync, which sends nothing.
+        await recordUsersAction(op: DistroChannelSync.opJoin, channelHash: channelHashHex, channelName: name)
         return channel
     }
 
     /// Leave a channel. Unsubscribes from the rfed node and removes local data.
+    /// The user's own leave is recorded for RFed SPEC §17.12 rule 5 and, with a
+    /// distro, owed to the other devices ([recordUsersAction]); the list changed
+    /// when the user acted, whatever becomes of the message.
     func leaveChannel(channelHashHex: String) async {
         guard let channel = channels.first(where: { $0.id == channelHashHex }) else { return }
+        guard leaveHere(channelHashHex: channelHashHex) else { return }
+        await recordUsersAction(op: DistroChannelSync.opLeave, channelHash: channelHashHex, channelName: channel.channelName)
+    }
+
+    /// Leave a channel on this device, by the user's action or a sibling's (§17.12
+    /// rule 6): unsubscribe with the device key, remove the channel's push
+    /// registration, its posts, its senders and its names, and drop it from the
+    /// stream's filter. Sends no membership message, and leaves rule 5's record
+    /// alone. False, with nothing done, when the channel is unknown or its hash is
+    /// not one.
+    @discardableResult
+    private func leaveHere(channelHashHex: String) -> Bool {
+        guard let channel = channels.first(where: { $0.id == channelHashHex }) else { return false }
         let unsubscribeDestHex = Self.rfedDestHash(identityHashHex: channel.rfedNodeHash,
                                 app: "rfed",
                                 aspects: ["channel"])
         guard let channelHashData = Data(hexString: channelHashHex),
-              let rfedDest = Data(hexString: unsubscribeDestHex) else { return }
+              let rfedDest = Data(hexString: unsubscribeDestHex) else { return false }
 
         let pubkey = bridge.identityPublicKey(handle: identityHandle)
         let sig    = pubkey != nil ? bridge.identitySign(handle: identityHandle, data: channelHashData) : nil
@@ -448,6 +491,8 @@ final class RfedChannelClient: ObservableObject {
             ))) ?? []
             for e in senderEntities { ctx.delete(e) }
             try? ctx.save()
+            // The channel's name state, for every posting identity, goes with it.
+            ChannelNameStateStore.forget(channelHash: hash, in: ctx)
         }
         let hadNames = senderNames.removeValue(forKey: channelHashHex) != nil
         if sharedSenderNames.removeValue(forKey: channelHashHex) != nil || hadNames {
@@ -459,6 +504,151 @@ final class RfedChannelClient: ObservableObject {
         openedChannelStreamHashes.remove(Self.normalizedHex(channelHashHex))
         messages[channelHashHex] = nil
         reconfigureChannelStreams()
+        return true
+    }
+
+    // MARK: - Channels and the distro (RFed SPEC §17.12)
+
+    /// The user's own join or leave of a channel on this device: recorded for rule
+    /// 5, stamped after any record held (so an action made after this device took
+    /// a sibling's record is newer than it on every device, even with this
+    /// device's clock behind), with or without a distro. With a distro the change
+    /// is owed to its other devices as one membership message
+    /// (DistroOutboxRuntime.oweChannelSync), kept until the propagation node
+    /// proves it. Nothing else sends one: not applying a received message, not
+    /// the start's re-subscription, not a stamp refresh, not a join of a channel
+    /// already in the list.
+    private func recordUsersAction(op: String, channelHash: String, channelName: String) async {
+        guard let ctx = modelContext else { return }
+        do {
+            let recorded = ChannelMembershipStore.record(channelHash: channelHash, in: ctx)
+            let atMs = try DistroChannelSync.stampLocal(recorded: recorded,
+                                                        nowMs: Int64(Date().timeIntervalSince1970 * 1000))
+            ChannelMembershipStore.upsert(channelHash: channelHash,
+                                          record: .init(op: op, atMs: atMs), in: ctx)
+            if !DistroManager.shared.has { return }
+            await DistroOutboxRuntime.shared.oweChannelSync(op: op, channelName: channelName,
+                                                            channelHashHex: channelHash, atMs: atMs)
+        } catch {
+            // The list changed when the user acted, whatever becomes of the message: said, never thrown at the screen.
+            print("[RfedChannel] The \(op) of #\(channelName) was not recorded or sent to the distro (§17.12): \(error)")
+        }
+    }
+
+    /// A membership message C unwrapped from the distro (§17.12 "Receiving"):
+    /// rules 1-5 (DistroChannelSync.disposition), then rule 6
+    /// (applyDistroChannelSync). `fromDistro` and `signedByDistro` are rules 1
+    /// and 2's facts, which the caller knows from the unwrap. Returns true when
+    /// C is held (applied, this device's own echo, or stale: each recorded as
+    /// seen), false when it is dropped (rules 1, 2 and 4, each with a log line),
+    /// so a later copy of it is judged again.
+    func handleDistroChannelSync(marker: DistroChannelSync.Marker, fromDistro: Bool, signedByDistro: Bool) -> Bool {
+        // A membership message that arrives before the channel list is loaded (the NSE's saved
+        // blobs are ingested while the app starts) is held, and judged once it is: it is
+        // recorded as seen when handed over, and a blob the NSE pulled will not come again.
+        guard didLoadPersistedState, modelContext != nil, !ownHashHex.isEmpty else {
+            pendingChannelSync.append((marker, fromDistro, signedByDistro))
+            print("[RfedChannel] channel membership message held until the channel list is loaded")
+            return true
+        }
+        let name = marker.sync?.name ?? "?"
+        let ctx = modelContext
+        let disposition = DistroChannelSync.disposition(
+            marker: marker, fromDistro: fromDistro, signedByDistro: signedByDistro,
+            ownDeviceHex: ownHashHex,
+            joinNameAccepted: ChannelNameRules.joinNameAccepted,
+            channelHashOf: { (try? Self.channelHash(name: $0).hexString) ?? "" },
+            recordOf: { hash in ctx.flatMap { ChannelMembershipStore.record(channelHash: hash, in: $0) } })
+        let device = marker.byHex.isEmpty ? "?" : String(marker.byHex.prefix(12))
+        switch disposition {
+        case .drop(let rule, let reason):
+            print("[RfedChannel] Channel membership message for #\(name) from device \(device) dropped: \(reason) (§17.12 rule \(rule))")
+            return false
+        case .echo:
+            print("[RfedChannel] own channel \(marker.sync?.op ?? "membership") echo for #\(name) — dropped (§17.12 rule 3)")
+            return true
+        case .stale(let op, _, let atMs, _, let recorded):
+            print("[RfedChannel] channel \(op) of #\(name) at \(atMs) is older than the \(recorded.op) at \(recorded.atMs) held here — dropped (§17.12 rule 5)")
+            return true
+        case .apply(let op, let name, let atMs, let channelHash):
+            applyDistroChannelSync(op: op, name: name, atMs: atMs, channelHash: channelHash, byHex: marker.byHex)
+            return true
+        }
+    }
+
+    /// §17.12 rule 6: apply a sibling's join or leave on this device, with this
+    /// device's own key and its own configured RFed node, as the user's own join
+    /// or leave here would, then record it. No membership message is sent
+    /// (nothing loops), and nothing asks the user anything: the channel list
+    /// simply changes.
+    ///  - join of a channel not in the list: stored, then subscribed. It is stored
+    ///    first, so a subscription that cannot be made now is made by the start's
+    ///    subscription of stored channels (resubscribePersistedChannels), never by
+    ///    a retry (DESIGN_PRINCIPLES §3, §5). Not opened: its posts wait at RFed
+    ///    until the user opens it, as for any stored channel;
+    ///  - join of a channel already in the list: nothing but the record;
+    ///  - leave of a channel in the list: leaveHere;
+    ///  - leave of a channel not in the list: nothing but the record.
+    private func applyDistroChannelSync(op: String, name: String, atMs: Int64, channelHash: String, byHex: String) {
+        let held = channels.first(where: { $0.id == channelHash })
+        var applied = "recorded"
+        if op == DistroChannelSync.opJoin && held == nil {
+            let node = prefs.effectiveRfedNodeIdentityHash.trimmingCharacters(in: .whitespaces).lowercased()
+            if node.count < 32 {
+                // Not this device's to join without a node; the record still orders a later message.
+                print("[RfedChannel] Channel join of #\(name) from device \(byHex.prefix(12)): no RFed node configured here — recorded, not joined")
+            } else {
+                let now = Date().timeIntervalSince1970
+                if let ctx = modelContext {
+                    ctx.insert(ChannelEntity(channelHash: channelHash, channelName: name, rfedNodeHash: node,
+                                             lastMessageTime: now, isSubscribed: true, stampCost: nil))
+                    try? ctx.save()
+                }
+                let channel = Channel(id: channelHash, channelName: name, rfedNodeHash: node,
+                                      lastMessageTime: now, isSubscribed: true, stampCost: nil)
+                channels.append(channel)
+                applied = "joined"
+                reconfigureChannelStreams()
+                Task { await self.subscribeStoredChannel(channel) }
+            }
+        } else if op == DistroChannelSync.opLeave && held != nil {
+            leaveHere(channelHashHex: channelHash)
+            applied = "left"
+        }
+        if let ctx = modelContext {
+            ChannelMembershipStore.upsert(channelHash: channelHash, record: .init(op: op, atMs: atMs), in: ctx)
+        }
+        print("[RfedChannel] Channel \(op) of #\(name) at \(atMs) from device \(byHex.prefix(12)): \(applied) (§17.12)")
+    }
+
+    /// Subscribe a channel the device has stored but not subscribed (a sibling's
+    /// join), with the device's own key, once: the readiness of the link is the
+    /// only wait, and a failure is logged, never retried. The start's
+    /// resubscribePersistedChannels subscribes it if this could not.
+    private func subscribeStoredChannel(_ channel: Channel) async {
+        guard identityHandle != 0, let channelHashData = Data(hexString: channel.id) else { return }
+        do {
+            let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
+                                                        rfedNodeIdentityHashHex: channel.rfedNodeHash)
+            if let idx = channels.firstIndex(where: { $0.id == channel.id }) {
+                channels[idx] = Channel(id: channel.id, channelName: channel.channelName,
+                                        rfedNodeHash: channel.rfedNodeHash,
+                                        lastMessageTime: channels[idx].lastMessageTime,
+                                        isSubscribed: true, stampCost: stampCost)
+            }
+            if let ctx = modelContext {
+                let hash = channel.id
+                if let entity = try? ctx.fetch(FetchDescriptor<ChannelEntity>(
+                    predicate: #Predicate { $0.channelHash == hash })).first {
+                    entity.stampCost = stampCost
+                    try? ctx.save()
+                }
+            }
+            reconfigureChannelStreams()
+            print("[RfedChannel] Subscribed to '\(channel.channelName)' joined on another device (stampCost=\(stampCost.map { "\($0)" } ?? "nil"))")
+        } catch {
+            print("[RfedChannel] Subscribing to '\(channel.channelName)', joined on another device, failed: \(error)")
+        }
     }
 
     // MARK: - Channel push, for the NSE
@@ -594,9 +784,24 @@ final class RfedChannelClient: ObservableObject {
         Task { await self.sendMessageAsync(content: content, toChannel: channel) }
     }
 
+    /// RFed-spec/Channel.md "Distro holders" (James, 2026-10-03): a post is signed by
+    /// the posting identity, the distro when this device holds one (as a DM is,
+    /// DistroManager.sendingIdentity), otherwise the device: its source, the key in
+    /// its prelude and its signature are that identity's, so readers see one sender
+    /// for all of the user's devices. Decided once per post: the record, the echo
+    /// id, the packing and the name state all take this one. Subscribing, the
+    /// stream, pulls and push registrations stay the device's (`identityHandle`):
+    /// RFed keys all of them by subscriber hash.
+    private func postingIdentity() -> (hex: String, handle: UInt64) {
+        let device = Data(hexString: ownHashHex) ?? Data()
+        let (hash, handle) = DistroManager.shared.sendingIdentity(deviceHash: device, deviceHandle: identityHandle)
+        return (hash.hexString, handle)
+    }
+
     private func sendMessageAsync(content: String,
                                   toChannel channel: Channel,
                                   optimisticId existingOptimisticId: String? = nil) async {
+        let (postingHex, postingHandle) = postingIdentity()
         // --- Optimistic bubble: insert IMMEDIATELY in `pending` so the user
         // sees the message and a “sending” indicator without waiting on the
         // PoW stamp + FFI hop. We update its state in place once trySend
@@ -611,7 +816,7 @@ final class RfedChannelClient: ObservableObject {
             let optimisticTs = Date().timeIntervalSince1970 * 1000.0
             let optimisticEntity = ChannelMessageEntity(
                 id: optimisticId, channelHash: channel.id,
-                senderHash: ownHashHex,
+                senderHash: postingHex,
                 content: content, timestamp: optimisticTs, isOutgoing: true,
                 deliveryState: DeliveryState.pending
             )
@@ -619,7 +824,7 @@ final class RfedChannelClient: ObservableObject {
             try? modelContext?.save()
             appendMessage(
                 ChannelMessage(id: optimisticId, channelHash: channel.id,
-                               senderHash: ownHashHex,
+                               senderHash: postingHex,
                                content: content, timestamp: optimisticTs, isOutgoing: true,
                                deliveryState: DeliveryState.pending),
                 toChannelHash: channel.id
@@ -647,7 +852,8 @@ final class RfedChannelClient: ObservableObject {
             }
         }
 
-        if await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId) {
+        if await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId,
+                         postingHex: postingHex, postingHandle: postingHandle) {
             return
         }
 
@@ -665,7 +871,8 @@ final class RfedChannelClient: ObservableObject {
             markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
             return
         }
-        if !(await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId)) {
+        if !(await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId,
+                           postingHex: postingHex, postingHandle: postingHandle)) {
             markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
         }
     }
@@ -696,7 +903,8 @@ final class RfedChannelClient: ObservableObject {
     /// `deliveryState = sent` (so the echo from RFed dedupes against it
     /// in `dispatchVerifiedLxmf`).
     private func trySend(content: String, toChannel channel: Channel,
-                          optimisticId: String) async -> Bool {
+                          optimisticId: String,
+                          postingHex: String, postingHandle: UInt64) async -> Bool {
         // Build the wire payload as an LXMF-authenticated channel message.
         // The FFI returns both the on-wire bytes AND the LXMF timestamp it
         // baked into the signed body — we use the same timestamp as the
@@ -705,9 +913,9 @@ final class RfedChannelClient: ObservableObject {
         let contentData = Data(content.utf8)
         // The Channel Display Name, by the §4.2 rule (DISPLAY_NAMES.md):
         // never the Message Display Name.
-        let postName = channelPostName(for: channel)
+        let postName = channelPostName(for: channel, postingHex: postingHex)
         guard let packed = bridge.channelLxmPack(name: channel.channelName,
-                                                  senderIdentityHandle: identityHandle,
+                                                  senderIdentityHandle: postingHandle,
                                                   content: contentData,
                                                   title: Data(),
                                                   displayName: postName) else {
@@ -754,13 +962,13 @@ final class RfedChannelClient: ObservableObject {
             return false
         }
         // Handed to RFed: record what this post carried (§4.2).
-        recordPostName(postName, channelHashHex: channel.id)
+        recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)
 
         // SEND succeeded — upgrade the optimistic entity in place to the
         // canonical id (sender_hex+lxmf_ts) and mark it `sent` (= published
         // to RFed). Using the same id format as `dispatchVerifiedLxmf` so
         // the inevitable echo from RFed is suppressed by dedup.
-        let canonicalId = (Data(hexString: ownHashHex) ?? Data()).hexString
+        let canonicalId = (Data(hexString: postingHex) ?? Data()).hexString
             + String(format: "%016llx", tsMs)
         if let ctx = modelContext {
             // If a previous trySend attempt already promoted this entity,
@@ -774,7 +982,7 @@ final class RfedChannelClient: ObservableObject {
                    predicate: { let oid = optimisticId; return #Predicate { $0.id == oid } }()
                )).first {
                 temp.id = canonicalId
-                temp.senderHash = ownHashHex
+                temp.senderHash = postingHex
                 temp.timestamp = Double(tsMs)
                 temp.deliveryState = DeliveryState.sent
                 try? ctx.save()
@@ -798,7 +1006,7 @@ final class RfedChannelClient: ObservableObject {
                     list.remove(at: idx)
                     list.append(ChannelMessage(
                         id: canonicalId, channelHash: upgraded.channelHash,
-                        senderHash: ownHashHex.isEmpty ? upgraded.senderHash : ownHashHex,
+                        senderHash: postingHex.isEmpty ? upgraded.senderHash : postingHex,
                         content: upgraded.content, timestamp: Double(tsMs),
                         isOutgoing: true,
                         deliveryState: DeliveryState.sent
@@ -996,7 +1204,24 @@ final class RfedChannelClient: ObservableObject {
         }
         print("[RfedChannel] dispatchVerifiedLxmf DELIVERING sender=\(senderHashHex.prefix(8)) content='\(content.prefix(40))'")
 
-        let isOutgoing = senderHashHex == ownHashHex
+        // RFed-spec/Channel.md "Own posts": a post is the user's own when its source
+        // is this device's lxmf.delivery hash or the hash of the distro this device
+        // holds now, whichever of the user's devices sent it. It is stored and shown
+        // as outgoing, SENT (it came from RFed, so RFed has it; a channel post has no
+        // per-reader confirmation, so never DELIVERED), never notified, never counted
+        // as a sender seen in the channel. A device that gave up its distro no longer
+        // holds it: that distro's later posts are another poster's to it.
+        let distroHex = DistroManager.shared.deliveryHashHex
+        let isOutgoing = DistroCodec.isOwnChannelPost(sourceHex: senderHashHex, deviceHex: ownHashHex, distroHex: distroHex)
+        // DISPLAY_NAMES.md §4.2 "Learning from the channel": a post from the current
+        // posting identity (the echo of this device's own post, or one a sibling
+        // signed with the same distro), after the key binding and signature passed,
+        // tells this device what readers last got from it, but only a value equal to
+        // the one it would send itself.
+        let postingHex = DistroCodec.postingHex(deviceHex: ownHashHex, distroHex: distroHex)
+        if isOutgoing && senderHashHex.lowercased() == postingHex.lowercased() {
+            learnPostName(channelHashHex: channelHashHex, postingHex: postingHex, field: result.displayName, postMs: tsMs)
+        }
         // The sender in this channel: seen (§4.2) and named (§5.2; the
         // unpack reports a name only for a validated signature, and only
         // validated posts reach here).
@@ -1440,40 +1665,74 @@ final class RfedChannelClient: ObservableObject {
         shareSenderNames()
     }
 
-    /// §4.2: whether this post carries the Channel Display Name, from the
-    /// channel's persisted state.
-    private func channelPostName(for channel: Channel) -> DisplayNames.NameField {
-        let current = LxmfClient.cleanDisplayName(prefs.channelDisplayName)
+    /// This device's Channel Display Name, cleaned, or nil while it is unset (§4.2).
+    private func ownChannelName() -> String? {
+        LxmfClient.cleanDisplayName(prefs.channelDisplayName)
+    }
+
+    /// The name state ChannelEntity kept before there was one per posting
+    /// identity was made when the device posted as itself, the only posting
+    /// identity then: the device takes it as its own, once per process, before it
+    /// first reads its state (ChannelNameStateStore.adoptLegacy).
+    private func adoptLegacyNameState() {
+        guard !legacyNameStateAdopted, !ownHashHex.isEmpty, let ctx = modelContext else { return }
+        let adopted = ChannelNameStateStore.adoptLegacy(deviceHash: ownHashHex.lowercased(), in: ctx)
+        legacyNameStateAdopted = true
+        if adopted > 0 { print("[RfedChannel] adopted the name state of \(adopted) channel(s) as this device's (§4.2)") }
+    }
+
+    /// §4.2: whether this post carries the Channel Display Name, from the persisted
+    /// state of the channel and the posting identity (`postingHex`: the distro's
+    /// hash when the device holds one, else its own). Readers have never had a name
+    /// from a new posting identity, so one with no state starts from none and its
+    /// first post carries the name (rule 1). The user's own posting identities,
+    /// this device's hash and the held distro's, are never a sender "not seen
+    /// before" (rule 2).
+    private func channelPostName(for channel: Channel, postingHex: String) -> DisplayNames.NameField {
+        adoptLegacyNameState()
+        let current = ownChannelName()
         let hash = channel.id
-        let entity = try? modelContext?.fetch(FetchDescriptor<ChannelEntity>(
-            predicate: #Predicate { $0.channelHash == hash })).first
-        let lastIncludedAt = entity?.nameLastIncludedAt
-        let lastDigest = entity?.nameLastDigestHex.flatMap { Data(hexString: $0) }
-        let own = ownHashHex
+        let state = modelContext.flatMap { ChannelNameStateStore.state(channelHash: hash, postingHash: postingHex, in: $0) }
+        let lastIncludedAt = state?.at
+        let lastDigest = state.flatMap { Data(hexString: $0.digestHex) }
+        var own = Set([ownHashHex.lowercased()])
+        if let distro = DistroManager.shared.deliveryHashHex { own.insert(distro.lowercased()) }
         let senders = (try? modelContext?.fetch(FetchDescriptor<ChannelSenderEntity>(
             predicate: #Predicate { $0.channelHash == hash }))) ?? []
-        let newSender = senders.contains { $0.senderHash != own && $0.firstSeenAt > (lastIncludedAt ?? -Double.infinity) }
+        let newSender = senders.contains { !own.contains($0.senderHash.lowercased()) && $0.firstSeenAt > (lastIncludedAt ?? -Double.infinity) }
         return DisplayNames.channelPostName(current: current, lastDigest: lastDigest,
                                             lastIncludedAt: lastIncludedAt,
                                             newSenderSinceIncluded: newSender,
                                             now: Date().timeIntervalSince1970)
     }
 
-    /// After a post is handed to RFed: what it carried and when (§4.2).
-    private func recordPostName(_ name: DisplayNames.NameField, channelHashHex: String) {
+    /// After a post is handed to RFed: what it carried and when, for the posting identity (§4.2).
+    private func recordPostName(_ name: DisplayNames.NameField, channelHashHex: String, postingHex: String) {
         let digest: Data
         switch name {
         case .absent: return
         case .clear: digest = DisplayNames.digest(nil)
         case .name(let n): digest = DisplayNames.digest(n)
         }
-        let hash = channelHashHex
-        guard let ctx = modelContext,
-              let entity = try? ctx.fetch(FetchDescriptor<ChannelEntity>(
-                predicate: #Predicate { $0.channelHash == hash })).first else { return }
-        entity.nameLastDigestHex = digest.hexString
-        entity.nameLastIncludedAt = Date().timeIntervalSince1970
-        try? ctx.save()
+        guard let ctx = modelContext else { return }
+        ChannelNameStateStore.upsert(channelHash: channelHashHex, postingHash: postingHex,
+                                     digestHex: digest.hexString, at: Date().timeIntervalSince1970, in: ctx)
+    }
+
+    /// §4.2 "Learning from the channel": a post this device received in
+    /// `channelHashHex` from its current posting identity `postingHex`, key binding
+    /// and signature passed, with 0xD1 `field` and the post's time `postMs`. What
+    /// it carries is recorded only when it is the value this device would send now
+    /// (DisplayNames.learnedPostName); a name it does not hold is never recorded,
+    /// so its own clear never follows a sibling's name.
+    private func learnPostName(channelHashHex: String, postingHex: String, field: DisplayNames.NameField, postMs: UInt64) {
+        adoptLegacyNameState()
+        guard let ctx = modelContext else { return }
+        let state = ChannelNameStateStore.state(channelHash: channelHashHex, postingHash: postingHex, in: ctx)
+        guard let learned = DisplayNames.learnedPostName(ownName: ownChannelName(), field: field,
+                                                         postAt: Double(postMs) / 1000, lastIncludedAt: state?.at) else { return }
+        ChannelNameStateStore.upsert(channelHash: channelHashHex, postingHash: postingHex,
+                                     digestHex: learned.digest.hexString, at: learned.at, in: ctx)
     }
 
     // MARK: - Static helpers

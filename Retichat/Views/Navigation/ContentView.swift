@@ -90,6 +90,14 @@ struct ContentView: View {
                 selectedChatId = nil
             }
         }
+        // A sibling device's leave (RFed SPEC §17.12 rule 6) removes a channel while it
+        // is open here: the screen closes and asks nothing, as the web closes it. The
+        // user's own leave removes it from the list too, and closes it the same way.
+        .onChange(of: channelClient.channels.map(\.id)) { _, ids in
+            if let current = selectedChannel, !ids.contains(current.id) {
+                selectedChannel = nil
+            }
+        }
     }
 
     // MARK: - Compact layout (iPhone)

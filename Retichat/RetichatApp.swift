@@ -58,6 +58,10 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         repository.configure(modelContext: modelContainer.mainContext)
         // What this device owes its distro (RFed SPEC §17.12, §17.11) is kept in the same store.
         DistroOutboxRuntime.shared.configure(container: modelContainer)
+        // A channel membership message from another device of the distro lands here (§17.12 rule 6).
+        RfedDistroClient.shared.onChannelSync = { [weak channelClient = self.channelClient] marker, fromDistro, signedByDistro in
+            channelClient?.handleDistroChannelSync(marker: marker, fromDistro: fromDistro, signedByDistro: signedByDistro) ?? false
+        }
         return true
     }
 

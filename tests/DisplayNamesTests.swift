@@ -404,6 +404,183 @@ func testTheChannelRule() {
     check(post("", d, now - 10) == .clear, "an empty name is unset")
 }
 
+// MARK: - Channel posts as the distro (§4.2 "Learning from the channel", narrowed 2026-10-03)
+
+/// A reader's slot for the distro's channel name (§5.2 order, as RfedChannelClient.noteSender keeps it).
+final class NameReader {
+    var name: String?
+    var at: Double?
+
+    func hear(_ field: DisplayNames.NameField, at postAt: Double) {
+        guard DisplayNames.isNewer(postAt, than: at) else { return }
+        switch field {
+        case .absent: return
+        case .clear: name = nil
+        case .name(let n): name = n
+        }
+        at = postAt
+    }
+}
+
+/// One of the user's devices posting as the distro: its own name, what it last included as the
+/// distro, and what it learned from the distro's posts (`learns` false is the mutation "learning
+/// nothing", `learnsEverything` the mutation "learning every value").
+final class NameDevice {
+    var ownName: String?
+    let learns: Bool
+    let learnsEverything: Bool
+    var digest: Data?
+    var includedAt: Double?
+    var included = 0
+    var cleared = 0
+
+    init(_ ownName: String?, learns: Bool = true, learnsEverything: Bool = false) {
+        self.ownName = ownName
+        self.learns = learns
+        self.learnsEverything = learnsEverything
+    }
+
+    func post(_ now: Double) -> DisplayNames.NameField {
+        let field = DisplayNames.channelPostName(current: ownName, lastDigest: digest, lastIncludedAt: includedAt,
+                                                 newSenderSinceIncluded: false, now: now)
+        switch field {
+        case .absent: break
+        case .clear: digest = DisplayNames.digest(nil); includedAt = now; cleared += 1
+        case .name(let n): digest = DisplayNames.digest(n); includedAt = now; included += 1
+        }
+        return field
+    }
+
+    /// The distro's post reaches this device.
+    func hear(_ field: DisplayNames.NameField, at postAt: Double) {
+        guard learns else { return }
+        if learnsEverything {
+            let d: Data
+            switch field {
+            case .absent: return
+            case .clear: d = DisplayNames.digest(nil)
+            case .name(let n): d = DisplayNames.digest(n)
+            }
+            if postAt > (includedAt ?? 0) { digest = d; includedAt = postAt }
+            return
+        }
+        if let learned = DisplayNames.learnedPostName(ownName: ownName, field: field, postAt: postAt, lastIncludedAt: includedAt) {
+            digest = learned.digest
+            includedAt = learned.at
+        }
+    }
+}
+
+/// `from` posts at `now`; the reader and `others` hear it.
+func send(_ from: NameDevice, _ now: Double, _ reader: NameReader, _ others: NameDevice...) {
+    let field = from.post(now)
+    reader.hear(field, at: now)
+    others.forEach { $0.hear(field, at: now) }
+}
+
+func testLearningFromTheChannel() {
+    typealias Learned = DisplayNames.LearnedPostName
+    func learn(_ own: String?, _ field: DisplayNames.NameField, _ at: Double, _ last: Double?) -> Learned? {
+        DisplayNames.learnedPostName(ownName: own, field: field, postAt: at, lastIncludedAt: last)
+    }
+    let day = DisplayNames.channelNameRefreshSecs
+
+    // The rule itself.
+    check(learn("Nik", .name("Nik"), 5_000, nil) == Learned(digest: DisplayNames.digest("Nik"), at: 5_000),
+          "a name equal to the device's own is learned at the post's time")
+    check(learn(nil, .clear, 9_000, 1_000) == Learned(digest: DisplayNames.digest(nil), at: 9_000)
+            && learn("", .clear, 9_000, 1_000) == Learned(digest: DisplayNames.digest(nil), at: 9_000),
+          "a clear is learned while the device's name is unset (an empty name is unset)")
+    check(learn("Nik", .clear, 9_000, 1_000) == nil, "a clear while the device has a name teaches nothing")
+    check(learn("Nik", .name("Bea"), 9_000, nil) == nil
+            && learn(nil, .name("Bea"), 9_000, nil) == nil
+            && learn("Nik", .absent, 9_000, nil) == nil
+            && learn(nil, .absent, 9_000, nil) == nil,
+          "a value the device does not hold teaches nothing: another name, a name while it has none, no key 0")
+    check(learn("Nik", .name("Nik"), 5_000, 5_000) == nil && learn("Nik", .name("Nik"), 4_000, 5_000) == nil
+            && learn("Nik", .name("Nik"), 5_001, 5_000)?.digest == DisplayNames.digest("Nik"),
+          "a post not later than what is recorded teaches nothing")
+
+    // Two devices posting as one distro to one reader slot: the four things DISPLAY_NAMES.md asks.
+    do {   // 1. A device with no name never sends a clear while its sibling posts a name, and the reader keeps that name.
+        let reader = NameReader(), withName = NameDevice("Bee"), noName = NameDevice(nil)
+        send(withName, 1_000, reader, noName)
+        check(reader.name == "Bee", "the reader has the name")
+        send(noName, 2_000, reader, withName)
+        check(reader.name == "Bee" && noName.cleared == 0, "the reader keeps the name and the nameless device never clears")
+        send(noName, 3_000, reader, withName)
+        check(reader.name == "Bee", "still")
+    }
+    do {   // mutation: learning every value
+        let reader = NameReader(), withName = NameDevice("Bee"), noName = NameDevice(nil, learnsEverything: true)
+        send(withName, 1_000, reader, noName)
+        send(noName, 2_000, reader, withName)
+        check(reader.name == nil, "mutation: learning a name it does not hold makes the device clear that name")
+    }
+    do {   // 2. Two devices with the same name include it once within 24 hours.
+        let reader = NameReader(), a = NameDevice("Nik"), b = NameDevice("Nik")
+        send(a, 1_000, reader, b); send(b, 2_000, reader, a); send(a, 3_000, reader, b); send(b, 4_000, reader, a)
+        check(reader.name == "Nik" && a.included + b.included == 1, "the same name is included once")
+        // The refresh is the one thing that reaches silent readers, after a day.
+        send(b, 1_000 + day + 1, reader, a)
+        check(a.included + b.included == 2, "and again after a day")
+    }
+    do {   // mutation: learning nothing
+        let reader = NameReader(), a = NameDevice("Nik", learns: false), b = NameDevice("Nik", learns: false)
+        send(a, 1_000, reader, b); send(b, 2_000, reader, a)
+        check(a.included + b.included == 2, "mutation: learning nothing makes both include it")
+    }
+    do {   // 3. Two devices with different names include theirs only on their own triggers, not on every post.
+        let reader = NameReader(), ann = NameDevice("Ann"), bob = NameDevice("Bob")
+        send(ann, 1_000, reader, bob)
+        check(reader.name == "Ann", "Ann's name")
+        send(bob, 2_000, reader, ann)
+        check(reader.name == "Bob" && ann.included == 1 && bob.included == 1, "Bob's first post as the distro is his own trigger (rule 1)")
+        send(ann, 3_000, reader, bob); send(bob, 4_000, reader, ann); send(ann, 5_000, reader, bob)
+        check(ann.included == 1 && bob.included == 1, "a sibling posting never makes a device include its name again")
+        send(ann, 1_000 + day + 1, reader, bob)
+        check(ann.included == 2 && reader.name == "Ann", "each device's own 24-hour refresh is its trigger")
+    }
+    do {   // mutation: learning every value
+        let reader = NameReader(), ann = NameDevice("Ann", learnsEverything: true), bob = NameDevice("Bob", learnsEverything: true)
+        send(ann, 1_000, reader, bob); send(bob, 2_000, reader, ann); send(ann, 3_000, reader, bob); send(bob, 4_000, reader, ann)
+        check(ann.included + bob.included == 4, "mutation: each finds the other's name recorded and includes its own on every post")
+    }
+    do {   // 4. When both have unset their names, one clear is sent.
+        let reader = NameReader(), a = NameDevice("Ann"), b = NameDevice("Ann")
+        send(a, 1_000, reader, b)
+        check(reader.name == "Ann", "the name")
+        a.ownName = nil; b.ownName = nil
+        send(a, 2_000, reader, b)
+        check(reader.name == nil, "cleared")
+        send(b, 3_000, reader, a); send(a, 4_000, reader, b); send(b, 5_000, reader, a)
+        check(a.cleared + b.cleared == 1, "one clear is enough")
+    }
+    do {   // mutation: learning nothing
+        let reader = NameReader(), a = NameDevice("Ann", learns: false), b = NameDevice("Ann", learns: false)
+        send(a, 1_000, reader, b); send(b, 1_500, reader, a)
+        a.ownName = nil; b.ownName = nil
+        send(a, 2_000, reader, b); send(b, 3_000, reader, a)
+        check(a.cleared + b.cleared == 2, "mutation: learning nothing makes both send the clear")
+    }
+
+    // The wiring: the state is per channel and posting identity, and what is learned is only from the posting identity.
+    let client = source("Retichat/Services/RfedChannelClient.swift")
+    let dispatch = body(client, "private func dispatchVerifiedLxmf(")
+    check(dispatch.contains("if isOutgoing && senderHashHex.lowercased() == postingHex.lowercased() {\n            learnPostName(")
+            && before(dispatch, "learnPostName(", "if !isOutgoing {\n            noteSender("),
+          "a post from the current posting identity teaches the name state; an own post is never counted as a sender")
+    check(body(client, "private func learnPostName(").contains("DisplayNames.learnedPostName("),
+          "what is learned is DisplayNames.learnedPostName's, never the post's value as it is")
+    let rule = body(client, "private func channelPostName(for channel: Channel, postingHex: String)")
+    check(rule.contains("ChannelNameStateStore.state(channelHash: hash, postingHash: postingHex")
+            && rule.contains("if let distro = DistroManager.shared.deliveryHashHex { own.insert(distro.lowercased()) }")
+            && rule.contains("!own.contains($0.senderHash.lowercased())"),
+          "the rule reads the posting identity's own state, and neither of the user's identities is a new sender (§4.2 rule 2)")
+    check(before(body(client, "private func channelPostName(for channel: Channel, postingHex: String)"), "adoptLegacyNameState()", "let current = ownChannelName()"),
+          "the state ChannelEntity kept is the device's before it is first read")
+}
+
 func testTheDigestMatchesTheRustVectors() {
     let url = workspace.appendingPathComponent("LXMF-rust/tests/display_name_vectors.json")
     guard let data = try? Data(contentsOf: url),
@@ -651,13 +828,15 @@ func testTheSurfaces() {
 
 func testTheChannelSend() {
     let client = source("Retichat/Services/RfedChannelClient.swift")
-    let rule = body(client, "private func channelPostName(for channel: Channel)")
-    check(rule.contains("LxmfClient.cleanDisplayName(prefs.channelDisplayName)") && !rule.contains("messageDisplayName"),
+    let rule = body(client, "private func channelPostName(for channel: Channel, postingHex: String)")
+    let own = body(client, "private func ownChannelName()")
+    check(own.contains("LxmfClient.cleanDisplayName(prefs.channelDisplayName)") && !own.contains("messageDisplayName")
+            && rule.contains("let current = ownChannelName()") && !rule.contains("messageDisplayName"),
           "posts carry the Channel Display Name only, never the Message Display Name (§1)")
     let send = body(client, "private func trySend(")
-    check(before(send, "let postName = channelPostName(for: channel)", "displayName: postName)"),
-          "the pack gets the §4.2 decision")
-    check(before(send, "let ok = await ConnectionStateManager.shared.appLinkSendData(", "recordPostName(postName, channelHashHex: channel.id)")
+    check(before(send, "let postName = channelPostName(for: channel, postingHex: postingHex)", "displayName: postName)"),
+          "the pack gets the §4.2 decision, for the posting identity")
+    check(before(send, "let ok = await ConnectionStateManager.shared.appLinkSendData(", "recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)")
             && before(send, "if !ok {", "recordPostName(postName"),
           "the name is recorded only after RFed took the post")
     let note = body(client, "private func noteSender(")
@@ -668,9 +847,10 @@ func testTheChannelSend() {
             && DisplayNames.isNewer(0, than: nil), "newer means strictly later; nothing held takes anything")
     check(body(client, "private func dispatchVerifiedLxmf(").contains("if !isOutgoing {\n            noteSender("),
           "only other senders' verified posts are noted")
-    check(source("Retichat/Models/Models.swift").contains("var nameLastDigestHex: String?")
-            && source("Retichat/RetichatApp.swift").contains("ChannelSenderEntity.self"),
-          "the channel state is persisted (§4.2)")
+    check(source("Retichat/Models/Models.swift").contains("final class ChannelNameStateEntity")
+            && source("Retichat/RetichatApp.swift").contains("ChannelSenderEntity.self")
+            && source("Retichat/RetichatApp.swift").contains("ChannelNameStateEntity.self"),
+          "the channel state is persisted (§4.2), per channel and posting identity")
 }
 
 func testTheSettings() {
@@ -782,6 +962,7 @@ enum DisplayNamesTests {
         testTheChatNamesFile()
         testTheChannelSenderNamesFile()
         testTheChannelRule()
+        testLearningFromTheChannel()
         testTheDigestMatchesTheRustVectors()
         testTheDistroUnwrapKeys()
         testTheContactMigration()

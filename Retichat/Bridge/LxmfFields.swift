@@ -900,6 +900,44 @@ nonisolated enum DisplayNames {
         return now - lastIncludedAt > channelNameRefreshSecs ? .name(current) : .absent
     }
 
+    /// What a received post teaches the send rule: the digest to record as the
+    /// last one included, and its time (seconds, as `lastIncludedAt` is).
+    struct LearnedPostName: Equatable {
+        let digest: Data
+        let at: Double
+    }
+
+    /// §4.2 "Learning from the channel" (narrowed 2026-10-03). A post this
+    /// device received in a channel from its current posting identity (the echo
+    /// of its own post, or one a sibling device signed with the same distro),
+    /// after the key binding and the signature passed, carries `field`, key 0 of
+    /// its 0xD1, and was made at `postAt` (seconds). It is recorded, as what
+    /// readers last got and when, only when it is later than `lastIncludedAt`
+    /// (nil when nothing is recorded) and its value is the one this device would
+    /// send itself now:
+    ///  - `.name(s)` where `s` is this device's Channel Display Name `ownName`
+    ///    (the same digest), or
+    ///  - `.clear` while `ownName` is unset.
+    /// Any other post teaches nothing: one with no key 0, a name other than this
+    /// device's, a name while this device has none, a clear while it has one. A
+    /// device never records, and so never clears, a name it does not hold: with
+    /// no name it would otherwise learn a sibling's and clear it on its next
+    /// post, after each of the sibling's posts; two devices with different names
+    /// would each find the other's recorded and include their own on every post.
+    /// Returns nil when nothing is learned. Android DisplayNames.learnedPostName.
+    static func learnedPostName(ownName: String?, field: NameField, postAt: Double,
+                                lastIncludedAt: Double?) -> LearnedPostName? {
+        guard postAt > (lastIncludedAt ?? 0) else { return nil }
+        if let own = ownName, !own.isEmpty {
+            if case .name(let seen) = field, digest(seen) == digest(own) {
+                return LearnedPostName(digest: digest(own), at: postAt)
+            }
+            return nil
+        }
+        if case .clear = field { return LearnedPostName(digest: digest(nil), at: postAt) }
+        return nil
+    }
+
     /// Where a name from before the three slots goes (§5.4, iOS).
     enum LegacyName: Equatable {
         case drop
