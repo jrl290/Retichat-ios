@@ -255,8 +255,12 @@ func testChatRepositoryWiring() {
 
     let handle = method("private func handleMessageState(hashHex: String, state: UInt8)", in: source)
     check(inOrder(["GroupChatManager.shared.handleMessageState(", "DistroTransferTracker.shared.handleMessageState(",
-                   "distroSentCopies.contains(hashHex)", "pendingOutbound[hashHex]"], in: handle),
-          "group, transfer and distro sent-copy states are routed before the pending entry")
+                   "pendingOutbound[hashHex]"], in: handle),
+          "group and transfer states are routed before the pending entry")
+    // A distro sent copy (§17.11) is no longer a router message: the distro outbox packs it once and
+    // uploads it itself (DistroOutboxRuntime.oweSentCopy), so no state of it reaches this handler.
+    check(!source.contains("distroSentCopies") && !source.contains("Self.sendDistroSentCopy("),
+          "a distro sent copy has no router handle and no state here: the outbox owes it")
     check(inOrder(["if state == 0x08 {", "updateDeliveryState(messageId: hashHex, state: DeliveryState.delivered)",
                    "earlyMessageStates[hashHex, default: []].append(state)"], in: handle),
           "a DELIVERED for a completed message still reaches its row; other early states are buffered")

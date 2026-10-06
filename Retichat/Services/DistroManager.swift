@@ -141,6 +141,20 @@ nonisolated final class DistroManager: @unchecked Sendable {
         return false
     }
 
+    /// Whether the Keychain has said what this device holds: a distro (loaded) or
+    /// none (absent). Not while it has not been read yet, cannot be read (a
+    /// background launch before the first unlock) or holds a key that will not
+    /// load: then "no distro" is no finding. What is owed to a distro
+    /// (DistroOutbox) is never dropped on it, and the outbox starts only once this
+    /// is true (DistroOutboxRuntime).
+    var isSettled: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        switch state {
+        case .loaded, .absent: return true
+        case .notLoaded, .unavailable, .undecodable: return false
+        }
+    }
+
     func info() -> DistroInfo? {
         stateLock.lock(); defer { stateLock.unlock() }
         guard _handle != 0, let delivery = _deliveryHash, let pub = publicKeyHex,
@@ -155,6 +169,19 @@ nonisolated final class DistroManager: @unchecked Sendable {
         stateLock.lock(); defer { stateLock.unlock() }
         if _handle != 0, let delivery = _deliveryHash { return (delivery, _handle) }
         return (deviceHash, deviceHandle)
+    }
+
+    /// The distro this device holds and the identity handle that signs as it,
+    /// read together under one lock: a generate, import or forget cannot come
+    /// between them, so a message made from them is signed by the key its source
+    /// names. nil when no distro is held. A handle it returned stays valid when
+    /// the distro is replaced meanwhile (replaced handles are never destroyed).
+    /// Android DistroManager.signing.
+    func signing() -> (info: DistroInfo, handle: UInt64)? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard _handle != 0, let delivery = _deliveryHash, let pub = publicKeyHex,
+              let idHex = identityHashHex else { return nil }
+        return (DistroInfo(deliveryHashHex: delivery.hexString, identityHashHex: idHex, publicKeyHex: pub), _handle)
     }
 
     /// The private key as hex. Only for the encrypted device-to-device

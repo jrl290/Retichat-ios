@@ -56,6 +56,8 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         PendingNotification.cleanup()
         // Wire up model context early so push handler can use the repository
         repository.configure(modelContext: modelContainer.mainContext)
+        // What this device owes its distro (RFed SPEC §17.12, §17.11) is kept in the same store.
+        DistroOutboxRuntime.shared.configure(container: modelContainer)
         return true
     }
 

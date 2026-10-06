@@ -701,6 +701,200 @@ private func deliveryTrampoline(
     )
 }
 
+// MARK: - What a device owes its distro (RFed SPEC §17.12, §17.11)
+
+// Mirrors Retichat-android RetichatBridge.kt: messageSetDistroChannelSync,
+// messagePack, propagationBuildUpload, propagationLink, propagationUpload and
+// propagationLinkEventsRegister. The outbox itself is Services/DistroOutbox.swift;
+// these are what it cannot make from Swift (rust/retichat-ffi distro_outbox.rs
+// has the parts that need no stack). Nothing here sends on a timer or sends again.
+
+/// What the library calls back with for an upload: held by the library from the
+/// call on (a retain it releases through `propagationUploadRelease`), so the
+/// sink lives as long as a proof or a loss can still be reported.
+nonisolated private final class PropagationUploadSinkBox {
+    let sink: UploadSink
+    init(_ sink: UploadSink) { self.sink = sink }
+}
+
+/// retichat_upload_event_t: 1 the node proved the upload, 2 it was lost. Runs on a stack thread.
+nonisolated private func propagationUploadEvent(context: UnsafeMutableRawPointer?, event: Int32) {
+    guard let context else { return }
+    let box = Unmanaged<PropagationUploadSinkBox>.fromOpaque(context).takeUnretainedValue()
+    switch event {
+    case 1: box.sink.proved()
+    case 2: box.sink.lost()
+    default: break
+    }
+}
+
+/// retichat_upload_release_t: the library is done with the context.
+nonisolated private func propagationUploadRelease(context: UnsafeMutableRawPointer?) {
+    guard let context else { return }
+    Unmanaged<PropagationUploadSinkBox>.fromOpaque(context).release()
+}
+
+/// The one handler of `RetichatBridge.propagationLinkEventsRegister`, read on stack threads.
+nonisolated private enum PropagationLinkEvents {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var handler: ((Data, UInt8, Data?) -> Void)?
+
+    static func set(_ handler: ((Data, UInt8, Data?) -> Void)?) {
+        lock.lock(); defer { lock.unlock() }
+        self.handler = handler
+    }
+
+    static func deliver(dest: Data, status: UInt8, linkId: Data?) {
+        lock.lock()
+        let current = handler
+        lock.unlock()
+        current?(dest, status, linkId)
+    }
+}
+
+/// retichat_link_event_t. Runs on a stack thread and must not block.
+nonisolated private func propagationLinkEvent(
+    context: UnsafeMutableRawPointer?,
+    dest: UnsafePointer<UInt8>?, destLen: UInt32,
+    status: UInt8,
+    linkId: UnsafePointer<UInt8>?, linkIdLen: UInt32
+) {
+    guard let dest, destLen > 0 else { return }
+    let id: Data? = (linkId != nil && linkIdLen > 0) ? Data(bytes: linkId!, count: Int(linkIdLen)) : nil
+    PropagationLinkEvents.deliver(dest: Data(bytes: dest, count: Int(destLen)), status: status, linkId: id)
+}
+
+extension RetichatBridge {
+
+    /// `LinkHandle::status()`, as `propagationLink` reports it.
+    nonisolated enum LinkState {
+        static let pending: UInt8 = 0
+        static let handshake: UInt8 = 1
+        static let active: UInt8 = 2
+        static let stale: UInt8 = 3
+        static let closed: UInt8 = 4
+    }
+
+    /// The link AppLinks holds for the propagation node: its id (hex) and `LinkState`.
+    nonisolated struct PropagationLink: Equatable, Sendable {
+        let id: String
+        let state: UInt8
+        var active: Bool { state == RetichatBridge.LinkState.active }
+    }
+
+    /// An upload that left: how (a packet or a Resource) and the link (hex) it went on.
+    nonisolated struct PropagationUploadStart: Equatable, Sendable {
+        let resource: Bool
+        let linkId: String
+    }
+
+    /// An AppLinks status of an app-link: ACTIVE, with the link's id for a new link.
+    nonisolated static let appLinkActive: UInt8 = 3
+
+    /// Write the membership message C's fields on an outbound message
+    /// (`messageCreate`): 0x0C an empty bin, 0xFB `rfed.distro.channel`, 0xFC the
+    /// native array `[op, name, at_ms]`, 0xFD `deviceHex`. False with the error
+    /// slot set when `op` is not join or leave, `name` is empty, `atMs` is not
+    /// 0..2^53-1 or `deviceHex` is not 32 hex.
+    nonisolated func messageSetDistroChannelSync(handle: UInt64, op: String, name: String, atMs: Int64,
+                                                 deviceHex: String) -> Bool {
+        op.withCString { cOp in
+            name.withCString { cName in
+                deviceHex.withCString { cDevice in
+                    retichat_message_set_distro_channel_sync(handle, cOp, cName, atMs, cDevice) == 0
+                }
+            }
+        }
+    }
+
+    /// Pack and sign an outbound message once and return its LXMF bytes
+    /// (`dest | src | signature | payload`); `DistroMessageFFI.hash` is then its
+    /// hash. What the outbox keeps: never packed again, so every upload is one message.
+    nonisolated func messagePack(handle: UInt64) -> Data? {
+        var outLen: UInt32 = 0
+        guard let ptr = retichat_message_pack(handle, &outLen) else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return Data(bytes: ptr, count: Int(outLen))
+    }
+
+    /// The propagation upload of the packed message `packed` for the node `node`:
+    /// encrypted to `distroPublicKey` and to no other key, stamped for the node's
+    /// cost. BLOCKS while the stamp is mined: never on the main thread. Nil with
+    /// the error slot set when it cannot be built; nothing has left.
+    nonisolated func propagationBuildUpload(distroPublicKey: Data, packed: Data, node: Data) -> Data? {
+        var outLen: UInt32 = 0
+        let ptr = distroPublicKey.withUnsafeBytes { key in
+            packed.withUnsafeBytes { packedBuf in
+                node.withUnsafeBytes { nodeBuf in
+                    retichat_propagation_build_upload(
+                        key.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(distroPublicKey.count),
+                        packedBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(packed.count),
+                        nodeBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(node.count),
+                        &outLen)
+                }
+            }
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return Data(bytes: ptr, count: Int(outLen))
+    }
+
+    /// The link held for `node` as it is now, or nil when none is held. A read, never a wait.
+    nonisolated func propagationLink(node: Data) -> PropagationLink? {
+        var outLen: UInt32 = 0
+        let ptr = node.withUnsafeBytes { buf in
+            retichat_propagation_link(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(node.count), &outLen)
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        let raw = Data(bytes: ptr, count: Int(outLen))
+        guard raw.count >= 2 else { return nil }
+        return PropagationLink(id: raw.dropFirst().hexString, state: raw[raw.startIndex])
+    }
+
+    /// Hand `upload` (`propagationBuildUpload`) to the ACTIVE link held for `node`.
+    /// Nil with the error slot set when it did not leave (no active link held, or
+    /// it could not be queued): `sink` is then never called. Once it has left,
+    /// `sink` hears the node's proof or the loss, each at most once and from a
+    /// stack thread, and on a loss the link the upload went on has already been
+    /// torn down (the receipt's timeout, as LXMF does). Nothing here resends or
+    /// times anything.
+    nonisolated func propagationUpload(node: Data, upload: Data, sink: UploadSink) -> PropagationUploadStart? {
+        // The library owns this retain from the call on and releases it once.
+        let context = Unmanaged.passRetained(PropagationUploadSinkBox(sink)).toOpaque()
+        var outLen: UInt32 = 0
+        let ptr = node.withUnsafeBytes { nodeBuf in
+            upload.withUnsafeBytes { uploadBuf in
+                retichat_propagation_upload(
+                    nodeBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(node.count),
+                    uploadBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(upload.count),
+                    propagationUploadEvent, propagationUploadRelease, context, &outLen)
+            }
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        let raw = Data(bytes: ptr, count: Int(outLen))
+        guard raw.count >= 2 else { return nil }
+        return PropagationUploadStart(resource: raw[raw.startIndex] == 2, linkId: raw.dropFirst().hexString)
+    }
+
+    /// Register `handler` for every app-link status change, with the link each is
+    /// about (a new link's establishment is its ACTIVE event, carrying the
+    /// link's id). Runs on a stack thread and must not block. The stack's
+    /// shutdown drops it: register again after each start.
+    nonisolated func propagationLinkEventsRegister(handler: @escaping (Data, UInt8, Data?) -> Void) -> Bool {
+        PropagationLinkEvents.set(handler)
+        let ok = retichat_propagation_link_events_register(propagationLinkEvent, nil) == 0
+        if !ok { PropagationLinkEvents.set(nil) }
+        return ok
+    }
+
+    /// Forget the handler (the stack is stopping): a status change after this reaches nobody.
+    nonisolated func propagationLinkEventsClear() {
+        PropagationLinkEvents.set(nil)
+    }
+}
+
 /// Called from Rust on a background thread when an announce is received.
 private func announceTrampoline(
     context: UnsafeMutableRawPointer?,

@@ -106,12 +106,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private var completedHashSet: Set<String> = []
     private static let completedHashCapacity = 256
 
-    /// Hashes of distro sent copies in flight (RFed SPEC §17.11). A copy has
-    /// no bubble and no pending entry; this keeps its states out of
-    /// earlyMessageStates and away from any bubble, and puts its failure
-    /// in the log. Removed on SENT or failure, cleared on stop.
-    private var distroSentCopies: Set<String> = []
-
     /// A send made before the stack could carry it: everything the send path
     /// needs, plus the id of the bubble already in the chat so the release
     /// reuses it rather than inserting a second one.
@@ -345,6 +339,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///      announce. Both on ffiQueue, in that order.
     ///   8. Side-tasks: periodic poll (seeds the router's
     ///      propagation node at once), rfed notify register.
+    ///   8b. What the device owes its distro (DistroOutboxRuntime): after the
+    ///      propagation node is on the router, before any send can go out.
     ///   9. Distro registration with RFed (after ConnectionStateManager is
     ///      registered; Android StackRuntime 310-313).
     ///  10. Release the sends held while the stack was starting — last, so
@@ -437,6 +433,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Start propagation polling
         startPropagationPolling()
 
+        // What this device owes its distro (RFed SPEC §17.12, §17.11): load what a previous
+        // run left owed and listen for the propagation link, whose coming-up uploads it. The
+        // link is the router's, opened by the node the line above gave it and by the polls:
+        // this never starts it.
+        DistroOutboxRuntime.shared.start(client: client)
+
         // Register with rfed notify service so the relay can wake this device.
         registerRfedNotify()
 
@@ -488,7 +490,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         earlyMessageStates.removeAll()
         completedHashes.removeAll()
         completedHashSet.removeAll()
-        distroSentCopies.removeAll()
         propagationStreamDest = nil
         lastPollTime = .distantPast
         psyncNeededOnForeground = false
@@ -505,6 +506,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Before deregister (Android shutdownNow:324): drops in-flight distro
         // results and the armed ACTIVE handler while CSM still owns it.
         RfedDistroClient.shared.onStackStopped()
+        // No proof can come for an upload still open: each is decided not proved, and
+        // nothing is sent. The stack's shutdown drops the link callbacks; the next
+        // start registers them again.
+        DistroOutboxRuntime.shared.stop()
         ConnectionStateManager.shared.deregister()
         NetworkMonitor.shared.onConnect = nil
 
@@ -1295,79 +1300,36 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             // Group sends never call this function, and transfers and
             // channel messages use their own send paths.
             if DistroCodec.needsSentCopy(sentAsDistro: sentAsDistro, destHex: destHashHex,
-                                         distroHex: DistroManager.shared.deliveryHashHex),
-               let copyHash = Self.sendDistroSentCopy(
-                   bridge: bridgeRef, deviceHash: deviceHash, deviceHandle: deviceHandle,
-                   recipient: destData, content: content, title: "", method: propagatedMethod) {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.distroSentCopies.insert(copyHash)
-                    // States that raced ahead of this hop were buffered.
-                    self.replayBufferedMessageStatesIfNeeded(for: copyHash)
-                }
+                                         distroHex: DistroManager.shared.deliveryHashHex) {
+                Self.oweDistroSentCopy(recipient: destData, title: "", content: content)
             }
         }  // ffiQueue.async
     }
 
-    /// Send the sent copy of a message just sent as the distro (RFed SPEC
-    /// §17.11): to the distro, as the distro, PROPAGATED — RFed intercepts it
-    /// and fans it out to every device of the distro, this one included —
-    /// with 0xFB = "rfed.distro.sent", 0xFC = the recipient and 0xFD = this
-    /// device's own address, so siblings file it as sent and this device
-    /// recognises its own echo. Text only: attachments are not copied.
+    /// RFed SPEC §17.11 "Sent-message sync": after the user's message to
+    /// `recipient` went out as the distro, owe the distro one copy so every
+    /// sibling device can file it as sent. To the distro, as the distro, signed
+    /// with its key; text only (attachments are not copied); 0xFB/0xFC/0xFD carry
+    /// the marker, the recipient and this device's own address, so this device
+    /// recognises and drops its own echo of the fan-out. PROPAGATED, because only
+    /// RFed answers for the distro address (the outbox uploads it to the
+    /// propagation node as a propagation upload).
     ///
-    /// Fire-and-forget: the registry handle is released once submitted (the
-    /// router keeps its own reference, as for DistroTransferTracker's
-    /// propagated clone). Returns the copy's hash hex, or nil when it was not
-    /// sent (logged).
+    /// The copy is packed and signed once, here, and kept in the distro outbox
+    /// until the propagation node proves it (DistroOutboxRuntime.oweSentCopy,
+    /// "The phones' outbox"): uploaded at once when the propagation link is up,
+    /// otherwise when it comes up, and again when it next comes up after an
+    /// upload that was not proved (James's decided exception, 2026-10-03). Until
+    /// then it handed the copy to the LXMF router once and kept nothing, so one
+    /// whose upload was not proved, or that was made while no propagation link
+    /// could be had, was lost. No bubble, and the copy never touches the user's
+    /// message state.
     ///
     /// nonisolated: runs on ffiQueue.
-    nonisolated private static func sendDistroSentCopy(
-        bridge: RetichatBridge, deviceHash: Data, deviceHandle: UInt64,
-        recipient: Data, content: String, title: String, method: UInt8
-    ) -> String? {
-        let (distro, identity) = DistroManager.shared.sendingIdentity(
-            deviceHash: deviceHash, deviceHandle: deviceHandle)
-        // The distro was forgotten between M and here: nobody to tell.
-        guard distro != deviceHash else { return nil }
-        // The router encrypts C to the distro by recalling D's public key,
-        // which only a heard announce puts in the known-destinations table.
-        // This device holds D's key, so record it rather than depend on
-        // having heard RFed's replay of D's announce (§5: readiness before
-        // the send). Android does the same in ChatRepository.kt
-        // sendDistroSentCopy; the web encrypts to DistroManager.pubKey.
-        if !bridge.transportIdentityKnown(destHash: distro) {
-            guard let pub = bridge.identityPublicKey(handle: identity),
-                  bridge.rememberLxmfDelivery(destHash: distro, publicKey: pub) else {
-                print("[Retichat] distro sent copy: could not remember the distro's key: \(DistroMessageFFI.rnsLastError()) — no copy for \(recipient.hexString.prefix(8))")
-                return nil
-            }
+    nonisolated private static func oweDistroSentCopy(recipient: Data, title: String, content: String) {
+        Task { @MainActor in
+            await DistroOutboxRuntime.shared.oweSentCopy(recipient: recipient, title: title, content: content)
         }
-        let h = bridge.messageCreate(
-            destHash: distro, sourceHash: distro, content: content, title: title,
-            method: method, identityHandle: identity)
-        guard h != 0 else {
-            print("[Retichat] distro sent copy: not created (messageCreate logged why)")
-            return nil
-        }
-        defer { DistroMessageFFI.destroy(h) }
-        guard DistroMessageFFI.addField(h, key: LxmfFieldKey.customType, value: DistroSent.customType),
-              DistroMessageFFI.addField(h, key: LxmfFieldKey.customData, value: recipient.hexString),
-              DistroMessageFFI.addField(h, key: LxmfFieldKey.customMeta, value: deviceHash.hexString) else {
-            print("[Retichat] distro sent copy: add field failed: \(DistroMessageFFI.lastError())")
-            return nil
-        }
-        guard DistroMessageFFI.sendViaAppLinks(h) else {
-            print("[Retichat] distro sent copy: send failed: \(DistroMessageFFI.lastError())")
-            return nil
-        }
-        guard let hash = DistroMessageFFI.hash(h), !hash.isEmpty else {
-            // Submitted; only its state can no longer be told apart.
-            print("[Retichat] distro sent copy: submitted without a message hash")
-            return nil
-        }
-        print("[Retichat] distro sent copy \(hash.hexString.prefix(8)) for \(recipient.hexString.prefix(8)) submitted")
-        return hash.hexString
     }
 
     /// Create an outbound DM whose source is the distro when one is held, so
@@ -1699,20 +1661,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         if let client = lxmfClient,
            DistroTransferTracker.shared.handleMessageState(hashHex: hashHex, state: state, client: client) {
-            return
-        }
-        if distroSentCopies.contains(hashHex) {
-            // SPEC §17.11: a copy's state never touches M's bubble. PROPAGATED
-            // as the distro, SENT is its last state (see 0x04 below).
-            switch state {
-            case 0x04:
-                distroSentCopies.remove(hashHex)
-            case 0xFD, 0xFE, 0xFF:
-                distroSentCopies.remove(hashHex)
-                print("[Retichat] distro sent copy \(hashHex.prefix(8)) failed (state 0x\(String(format: "%02X", state))); siblings will not see that message")
-            default:
-                break
-            }
             return
         }
         guard var pending = pendingOutbound[hashHex] else {

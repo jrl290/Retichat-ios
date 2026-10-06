@@ -189,6 +189,11 @@ final class RfedDistroClient: ObservableObject {
 
     var hasDistro: Bool { distro != nil }
 
+    /// The Keychain has said what this device holds (DistroManager.isSettled): a
+    /// distro or none. False before it is read and while it cannot be (a background
+    /// launch before the first unlock), when `distro == nil` says nothing.
+    @Published private(set) var distroSettled = false
+
     /// Sink for decrypted distro messages (ChatRepository.handleDistroMessage).
     /// A blob is recorded as seen only once this has taken it.
     var onMessage: ((DistroMessage) -> Void)?
@@ -196,6 +201,14 @@ final class RfedDistroClient: ObservableObject {
     /// Sink for siblings' sent copies (ChatRepository.handleDistroSentCopy),
     /// recorded as seen under the same rule as onMessage.
     var onSentCopy: ((DistroSentCopy) -> Void)?
+
+    /// Sink for a channel membership message (RFed SPEC §17.12), with rules 1 and
+    /// 2's facts: the source is our distro, and its LXMF signature is the distro's
+    /// (RfedChannelClient.handleDistroChannelSync). True when it is held (applied,
+    /// our own echo, stale, or kept until the channel list is loaded): recorded as
+    /// seen. False when it is dropped (rules 1, 2 and 4): not recorded, so a later
+    /// copy is judged again.
+    var onChannelSync: ((DistroChannelSync.Marker, _ fromDistro: Bool, _ signedByDistro: Bool) -> Bool)?
 
     /// Up to this many `/rfed/pull` rounds per pull (Android PULL_ROUNDS_MAX).
     private static let pullRoundsMax = 8
@@ -293,6 +306,7 @@ final class RfedDistroClient: ObservableObject {
     private func refresh() {
         distro = DistroManager.shared.info()
         storedKeyUnreadable = DistroManager.shared.storedKeyUnreadable
+        distroSettled = DistroManager.shared.isSettled
     }
 
     private func fail(_ k: RegKey, _ reason: String) {
@@ -594,6 +608,17 @@ final class RfedDistroClient: ObservableObject {
         /// Carries the sent marker (SPEC §17.11); judged on the main actor,
         /// where this device's own address is known.
         case sentCopy(SentCopyCandidate)
+        /// Carries the membership marker (SPEC §17.12); rules 1-6 are judged on the
+        /// main actor, where the channel list is.
+        case channelSync(ChannelSyncCandidate)
+    }
+
+    private nonisolated struct ChannelSyncCandidate: Sendable {
+        let marker: DistroChannelSync.Marker
+        /// Rule 1: the unwrapped source is our distro.
+        let fromDistro: Bool
+        /// Rule 2: its LXMF signature is the distro's. Only a message from the distro can have it.
+        let signedByDistro: Bool
     }
 
     private nonisolated struct SentCopyCandidate: Sendable {
@@ -661,6 +686,31 @@ final class RfedDistroClient: ObservableObject {
             return
         }
         let srcHex = src.hexString
+
+        // RFed SPEC §17.12: a channel membership message from another device of this
+        // distro. Read before the generic fan-out dedupe and before the delivery-
+        // notification test below, which C also passes: it carries an empty 0x0C and
+        // no content so that clients older than §17.12 drop it. It is judged on its
+        // own repeat key: every C has source D and empty content, so the generic key
+        // (source and timestamp) would drop the second of two siblings' Cs made in
+        // the same instant, and the devices would end in different states.
+        if let marker = DistroChannelSync.read(parsed.fieldsRaw) {
+            let key = DistroChannelSync.repeatKey(sourceHex: srcHex, timestamp: parsed.timestamp, marker: marker)
+            guard !seen.contains(key) else {
+                print("[Distro] duplicate membership message from \(srcHex.prefix(8)) — skipped")
+                return
+            }
+            let fromDistro = !distroHex.isEmpty && srcHex == distroHex
+            let candidate = ChannelSyncCandidate(marker: marker, fromDistro: fromDistro,
+                                                 signedByDistro: fromDistro && (parsed.signature_validated ?? false))
+            Task { @MainActor in
+                let held = RfedDistroClient.shared.deliver(.channelSync(candidate))
+                // Only a message held is recorded as seen: a dropped one is judged again.
+                if held { blobQueue.async { seen.record(key) } }
+            }
+            return
+        }
+
         let key = DistroCodec.seenKey(sourceHex: srcHex, timestamp: parsed.timestamp)
         guard !seen.contains(key) else { return }
 
@@ -708,6 +758,12 @@ final class RfedDistroClient: ObservableObject {
             return true
         case .sentCopy(let c):
             return deliverSentCopy(c)
+        case .channelSync(let c):
+            guard let onChannelSync else {
+                print("[Distro] no channel-sync sink; not recorded")
+                return false
+            }
+            return onChannelSync(c.marker, c.fromDistro, c.signedByDistro)
         }
     }
 
