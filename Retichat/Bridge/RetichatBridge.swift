@@ -14,10 +14,20 @@ import Foundation
 /// `unverifiedReason`: 0 validated, 1 source unknown (no key for the source
 /// yet), 2 signature invalid. DISPLAY_NAMES.md §5.2 accepts a 0xD1 name
 /// differently for 1 and 2, so names are decided on it, not on signatureValid.
+///
+/// An accept or a leave of a group carries its sender's own key (RFed-spec
+/// Group.md, "The sender's key"): `senderKey` is that key (64 bytes) when it binds
+/// to the message's source, and the glue crate has then checked the signature
+/// under it for a source the router held no key for, so `unverifiedReason` is 0 or
+/// 2 for it, never 1 for want of a key. `packed` is the whole message as received
+/// (an accept or leave of at most 2144 bytes), what a creator keeps. Both are nil
+/// for every other message. Nothing is remembered: the group code remembers the
+/// key once the group rule has passed (GroupStatusEngine.onKept).
 protocol MessageCallback: AnyObject {
     @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
                               title: String, content: String, timestamp: Double,
-                              signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data)
+                              signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
+                              senderKey: Data?, packed: Data?)
 }
 
 /// `displayName` is the announce's name cleaned by the Rust side with the
@@ -94,8 +104,8 @@ final class RetichatBridge: @unchecked Sendable {
         self.announceCallback = announceCallback
         self.messageStateCallback = messageStateCallback
         let ctx = Unmanaged.passUnretained(self).toOpaque()
-        if !client.setDeliveryCallback(deliveryTrampoline, context: ctx) {
-            print("[RetichatBridge] wireCallbacks: setDeliveryCallback FAILED — inbound messages will be silently dropped")
+        if !client.setDeliveryCallbackReceipt(deliveryTrampoline, context: ctx) {
+            print("[RetichatBridge] wireCallbacks: setDeliveryCallbackReceipt FAILED — inbound messages will be silently dropped")
         }
         if announceCallback != nil {
             if !client.setAnnounceCallback(announceTrampoline, context: ctx) {
@@ -630,7 +640,8 @@ final class RetichatBridge: @unchecked Sendable {
 
     func handleDelivery(hash: Data, srcHash: Data, destHash: Data,
                         title: String, content: String, timestamp: Double,
-                        signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data) {
+                        signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
+                        senderKey: Data?, packed: Data?) {
         // Capture the callback before hopping to MainActor so a transient
         // lifecycle change cannot nil out the weak reference after Rust has
         // already accepted the delivery.
@@ -644,7 +655,7 @@ final class RetichatBridge: @unchecked Sendable {
                 hash: hash, srcHash: srcHash, destHash: destHash,
                 title: title, content: content, timestamp: timestamp,
                 signatureValid: signatureValid, unverifiedReason: unverifiedReason,
-                fieldsRaw: fieldsRaw
+                fieldsRaw: fieldsRaw, senderKey: senderKey, packed: packed
             )
         }
     }
@@ -681,7 +692,9 @@ private func deliveryTrampoline(
     timestamp: Double,
     signatureValid: Int32,
     unverifiedReason: Int32,
-    fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32
+    fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32,
+    senderKey: UnsafePointer<UInt8>?, senderKeyLen: UInt32,
+    packed: UnsafePointer<UInt8>?, packedLen: UInt32
 ) {
     guard let context = context else { return }
     let bridge = Unmanaged<RetichatBridge>.fromOpaque(context).takeUnretainedValue()
@@ -692,12 +705,14 @@ private func deliveryTrampoline(
     let titleStr = title.map { String(cString: $0) } ?? ""
     let contentStr = content.map { String(cString: $0) } ?? ""
     let fieldsData = fieldsRaw.map { Data(bytes: $0, count: Int(fieldsLen)) } ?? Data()
+    let keyData = senderKey.flatMap { senderKeyLen > 0 ? Data(bytes: $0, count: Int(senderKeyLen)) : nil }
+    let packedData = packed.flatMap { packedLen > 0 ? Data(bytes: $0, count: Int(packedLen)) : nil }
 
     bridge.handleDelivery(
         hash: hashData, srcHash: srcData, destHash: destData,
         title: titleStr, content: contentStr, timestamp: timestamp,
         signatureValid: signatureValid != 0, unverifiedReason: Int(unverifiedReason),
-        fieldsRaw: fieldsData
+        fieldsRaw: fieldsData, senderKey: keyData, packed: packedData
     )
 }
 
@@ -946,6 +961,60 @@ extension RetichatBridge {
     nonisolated func interfaceUpClear() {
         InterfaceUpEvents.set(nil)
         retichat_interface_up_clear()
+    }
+
+    // MARK: Member statuses and keys (RFed-spec Group.md, 2026-10-06)
+
+    /// An element of a `status`, or an entry held for its sender's key (a member's own packed
+    /// accept or leave, 97..=2144 bytes), unpacked and checked as if it had arrived directly: what
+    /// its signature is worth under the key held for its source, else under the key it carries
+    /// for its own sender when that binds. Nothing is remembered. Nil, with the error slot set,
+    /// when it is not an LXMF message of that size.
+    nonisolated func groupUnpackPacked(_ packed: Data) -> UnpackedGroupMessage? {
+        var outLen: UInt32 = 0
+        let ptr = packed.withUnsafeBytes { buf in
+            retichat_group_unpack_packed(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(packed.count), &outLen)
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return UnpackedGroupMessage.parse(Data(bytes: ptr, count: Int(outLen)))
+    }
+
+    /// Write key 10 (GROUP_STATUSES) on an outbound message: a native array of bin in the
+    /// Retichat field, in both forms (it has no old field), `elements` being the members' own
+    /// packed accepts and leaves exactly as the creator received them. An empty list is a valid
+    /// answer. False, with the error slot set and the message unchanged, for an element no
+    /// receiver would read.
+    nonisolated func messageSetRetichatStatuses(handle: UInt64, elements: [Data]) -> Bool {
+        var flat = Data()
+        func put(_ n: Int) { withUnsafeBytes(of: UInt32(n).bigEndian) { flat.append(contentsOf: $0) } }
+        put(elements.count)
+        for element in elements {
+            put(element.count)
+            flat.append(element)
+        }
+        return flat.withUnsafeBytes { buf in
+            retichat_message_set_retichat_statuses(handle, buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(flat.count)) == 0
+        }
+    }
+}
+
+/// The group follow-up's native layer (GroupNative) over the glue crate: an element of a
+/// `status`, or an entry held for its key, checked as if it had arrived directly, and a
+/// member's key remembered the way an invite chunk's is.
+@MainActor
+final class FFIGroupNative: GroupNative {
+    private let bridge: RetichatBridge
+
+    init(bridge: RetichatBridge) { self.bridge = bridge }
+
+    func unpack(_ packed: Data) -> UnpackedGroupMessage? { bridge.groupUnpackPacked(packed) }
+
+    /// Remembered only when the key produces `memberHex` as an `lxmf.delivery` destination
+    /// (`retichat_identity_remember_lxmf_delivery` checks it).
+    func rememberKey(memberHex: String, publicKey: Data) -> Bool {
+        guard let hash = Data(hexString: memberHex), hash.count == 16, publicKey.count == 64 else { return false }
+        return bridge.rememberLxmfDelivery(destHash: hash, publicKey: publicKey)
     }
 }
 

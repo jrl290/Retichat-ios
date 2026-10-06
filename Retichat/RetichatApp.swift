@@ -36,7 +36,9 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 ChannelSenderEntity.self,
                 ChannelNameStateEntity.self,
                 ChannelMembershipEntity.self,
-                DistroOutboxEntity.self
+                DistroOutboxEntity.self,
+                GroupStatusCopyEntity.self,
+                GroupHeldEntity.self
             )
         } catch {
             fatalError("Failed to create ModelContainer: \(error)")

@@ -235,6 +235,18 @@ final class LxmfClient: @unchecked Sendable {
         lxmf_client_set_delivery_callback(handle, callback, context) == 0
     }
 
+    /// Set the delivery callback with the group follow-up's receipt (RFed-spec Group.md, "Member
+    /// statuses and keys"): `lxmf_client_set_delivery_callback`'s arguments, and for an accept or
+    /// leave the key it carries for its own sender and the message as received. Replaces any
+    /// delivery callback (fires on a background thread).
+    @discardableResult
+    func setDeliveryCallbackReceipt(
+        _ callback: retichat_group_delivery_callback_t,
+        context: UnsafeMutableRawPointer? = nil
+    ) -> Bool {
+        retichat_client_set_delivery_callback_receipt(handle, callback, context) == 0
+    }
+
     /// Set the announce callback.
     @discardableResult
     func setAnnounceCallback(

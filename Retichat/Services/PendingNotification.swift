@@ -33,6 +33,14 @@ nonisolated enum PendingNotification {
         /// 2 invalid. The app accepts the sender's name (field 0xD1) by it
         /// (DISPLAY_NAMES.md §5.2). nil in files written by older builds.
         var unverifiedReason: Int? = nil
+        /// An accept or leave of a group carries its sender's own key (RFed-spec Group.md,
+        /// "Member statuses and keys"): the 64-byte key (hex) when it binds to the source, which
+        /// the NSE's glue has already checked the signature under, and the message as received
+        /// (base64, at most 2144 bytes), which a creator keeps. nil for every other message and
+        /// in files written by older builds. The app reads them as the router's path does
+        /// (ChatRepository.importNSEMessages).
+        var senderKeyHex: String? = nil
+        var packedBase64: String? = nil
         /// Set when this message was a distro identity transfer (SPEC §17.9).
         /// Its fields are then NOT persisted — see stashDistroTransferKey.
         /// Optional so files written by older builds still decode.

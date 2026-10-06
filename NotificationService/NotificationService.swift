@@ -91,7 +91,9 @@ private func nseDeliveryTrampoline(
     timestamp: Double,
     signatureValid: Int32,
     unverifiedReason: Int32,
-    fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32
+    fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32,
+    senderKey: UnsafePointer<UInt8>?, senderKeyLen: UInt32,
+    packed: UnsafePointer<UInt8>?, packedLen: UInt32
 ) {
     let msgHash  = hash.map     { Data(bytes: $0, count: Int(hashLen)) }  ?? Data()
     let src      = srcHash.map  { Data(bytes: $0, count: Int(srcLen)) }   ?? Data()
@@ -115,7 +117,12 @@ private func nseDeliveryTrampoline(
         timestamp:       timestamp,
         signatureValid:  signatureValid != 0,
         fieldsRawBase64: fields.base64EncodedString(),
-        unverifiedReason: Int(unverifiedReason)
+        unverifiedReason: Int(unverifiedReason),
+        // An accept or leave brings its sender's key and the message as received, which the
+        // app's group rule needs as the router's path gives it (RFed-spec Group.md, "Member
+        // statuses and keys"); nothing else carries either.
+        senderKeyHex:    senderKey.flatMap { senderKeyLen > 0 ? Data(bytes: $0, count: Int(senderKeyLen)).map { String(format: "%02x", $0) }.joined() : nil },
+        packedBase64:    packed.flatMap { packedLen > 0 ? Data(bytes: $0, count: Int(packedLen)).base64EncodedString() : nil }
     ))
 }
 
@@ -527,7 +534,7 @@ class NotificationService: UNNotificationServiceExtension {
                 NSLog("[NSE] announce name not set: %@", LxmfClient.lastError ?? "unknown error")
             }
 
-            client.setDeliveryCallback(nseDeliveryTrampoline)
+            client.setDeliveryCallbackReceipt(nseDeliveryTrampoline)
             client.setSyncCompleteCallback(nseSyncCompleteTrampoline)
             self.lxmfClient = client
             return true

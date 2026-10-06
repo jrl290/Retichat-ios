@@ -744,8 +744,8 @@ func testTheSurfaces() {
             && repo.contains(": \"\\(DisplayNames.subjectToken) left the group\","),
           "system messages store the subject's hash (senderHash) and a token, never a name (audit L2)")
     check(repo.contains("let inviteMsgId = \"inv_\\(groupId.prefix(16))\"")
-            && repo.contains("let sysId = accepted ? \"acc_\\(memberHex.prefix(8))_\\(groupId.prefix(8))\" : leaveMsgId")
-            && repo.contains("leaveMsgId: \"left_\" + hash.hexString"),
+            && repo.contains("let sysId = accepted ? id : \"left_\" + id")
+            && source("Retichat/Services/GroupStatuses.swift").contains("id: accepted ? \"acc_\\(src.prefix(8))_\\(groupId.prefix(8))\" : msgId"),
           "each system message's id has a DisplayNames.systemMessageIdPrefixes prefix (review IOS-DN-2)")
     let messages = body(repo, "func messages(forChatId chatId: String")
     check(messages.contains("content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: senderName)"),
@@ -889,7 +889,7 @@ func testTheSettings() {
     check(before(nseStart, "let client = try LxmfClient.start(config: config)",
                  "client.setAnnounceDisplayName(PendingNotification.readAnnounceDisplayName())")
             && before(nseStart, "client.setAnnounceDisplayName(PendingNotification.readAnnounceDisplayName())",
-                      "client.setDeliveryCallback(nseDeliveryTrampoline)"),
+                      "client.setDeliveryCallbackReceipt(nseDeliveryTrampoline)"),
           "the NSE's copy of the delivery destination answers path requests with the name (review IOS-DN-1)")
     check(source("Retichat/Services/RfedDistroClient.swift").contains(
             "announceName: UserPreferences.shared.announceDisplayName"),

@@ -46,6 +46,12 @@ nonisolated enum RetichatField {
     static let displayNameKey: UInt8 = 0
     /// RF_MAX_KEY: keys are positive fixints, one byte on the wire.
     static let maxKey: UInt8 = 127
+    /// RF_GROUP_STATUSES, key 10: an array of bin, a `status`'s GROUP_STATUSES (the members'
+    /// own packed accept and leave messages). The one group entry that is not in `GroupEntry`'s
+    /// table of nine: it has no old top-level field, so it is read from the Retichat field only
+    /// and written there in both forms (a released build, which reads only the old fields,
+    /// skips it). RFed-spec Group.md "Member statuses and keys"; DISPLAY_NAMES.md §10.
+    static let groupStatusesKey: UInt8 = 10
 
     /// §10, GROUP_ENTRIES_IN_RETICHAT_FIELD in Rust, Kotlin and JS: where
     /// this client writes group entries. false until the switch (around
@@ -148,6 +154,10 @@ nonisolated enum GroupAction {
     static let relayRequest = "relay_req"
     /// Confirmation that a relay was completed.
     static let relayDone    = "relay_done"
+    /// The creator's answer to an accept (RFed-spec Group.md, "Member statuses and keys",
+    /// 2026-10-06): the other members' own accepts and leaves, as their own signed messages,
+    /// in GROUP_STATUSES (key 10 of the Retichat field).
+    static let status       = "status"
     // nil / absent = regular group message
 }
 
@@ -178,6 +188,11 @@ struct LxmfFields {
     var groupRelayFor: String?       // hash of member requesting relay
     var groupRelayDone: Bool?        // relay-complete signal
     var groupMemberKeys: [String: String]?
+    /// Key 10 of the Retichat field 0xD1, a `status`'s GROUP_STATUSES: the array as decoded,
+    /// nil when 0xD1 is absent or not a map, holds no key 10, or holds one that is not an
+    /// array. Each element is a packed message (Data) or whatever else the sender put there
+    /// (nil), and a reader checks each on its own. Never read from a top-level field.
+    var groupStatuses: [Data?]?
     // Custom-type fields
     var customType: String?          // FIELD_CUSTOM_TYPE (0xFB)
     var customData: String?          // FIELD_CUSTOM_DATA (0xFC), decoded from msgpack str OR bin (UTF-8)
@@ -220,6 +235,7 @@ final class LxmfFieldsDecoder {
         var legacyGroup: [GroupEntry: Scalar] = [:]
         var retichatGroup: [GroupEntry: Scalar] = [:]
         var sawRetichatField = false
+        var statuses: [Data?]?
 
         for _ in 0..<mapCount {
             guard offset < bytes.count else { break }
@@ -240,7 +256,9 @@ final class LxmfFieldsDecoder {
                     skipValue(bytes, &offset)
                 } else {
                     sawRetichatField = true
-                    retichatGroup = readRetichatGroupEntries(bytes, &offset)
+                    let read = readRetichatGroupEntries(bytes, &offset)
+                    retichatGroup = read.entries
+                    statuses = read.statuses
                 }
                 continue
             }
@@ -283,6 +301,7 @@ final class LxmfFieldsDecoder {
 
         fields.groupEntries = resolveGroupEntries(retichat: retichatGroup, legacy: legacyGroup)
         applyGroupEntries(&fields)
+        fields.groupStatuses = statuses
         return fields
     }
 
@@ -372,25 +391,56 @@ final class LxmfFieldsDecoder {
     }
 
     /// The Retichat field's value: its group entries (keys 1-9, first of
-    /// each), consuming exactly the one value. A value that is not a map is
-    /// ignored whole (§2.1); keys that are not integers 1-9 are ignored. Key
-    /// 0, the name, is the Rust side's (lxmf_display_name_decode).
-    private static func readRetichatGroupEntries(_ bytes: [UInt8], _ offset: inout Int) -> [GroupEntry: Scalar] {
+    /// each) and key 10, a status's GROUP_STATUSES (first of it), consuming
+    /// exactly the one value. A value that is not a map is ignored whole
+    /// (§2.1); keys that are not integers 1-10 are ignored. Key 0, the name,
+    /// is the Rust side's (lxmf_display_name_decode).
+    private static func readRetichatGroupEntries(_ bytes: [UInt8], _ offset: inout Int)
+        -> (entries: [GroupEntry: Scalar], statuses: [Data?]?) {
         var entries: [GroupEntry: Scalar] = [:]
+        var statuses: [Data?]?
+        var sawStatuses = false
         guard let count = readMapLength(bytes, &offset) else {
             skipValue(bytes, &offset)
-            return entries
+            return (entries, nil)
         }
         for _ in 0..<count {
             guard offset < bytes.count else { break }
             let key = readKey(bytes, &offset)
+            if key == UInt64(RetichatField.groupStatusesKey) {
+                // Key 10: an array, whose elements are packed messages (bin) or whatever else
+                // the sender put there; each element is consumed whole, so a malformed one
+                // costs the entries after it nothing. Not an array: none.
+                var end = offset
+                skipValue(bytes, &end)
+                if !sawStatuses {
+                    sawStatuses = true
+                    var at = offset
+                    if let n = readArrayLength(bytes, &at) {
+                        var elements: [Data?] = []
+                        for _ in 0..<n {
+                            guard at < end else { break }
+                            var next = at
+                            skipValue(bytes, &next)
+                            // A packed message is a bin: a str is not one, whatever readBin tolerates elsewhere.
+                            var probe = at
+                            let isBin = bytes[at] == 0xC4 || bytes[at] == 0xC5 || bytes[at] == 0xC6
+                            elements.append(isBin ? readBin(bytes, &probe) : nil)
+                            at = next
+                        }
+                        statuses = elements
+                    }
+                }
+                offset = end
+                continue
+            }
             let value = readScalar(bytes, &offset)
             if let key, key <= UInt64(RetichatField.maxKey),
                let entry = GroupEntry(rawValue: UInt8(key)), entries[entry] == nil {
                 entries[entry] = value
             }
         }
-        return entries
+        return (entries, statuses)
     }
 
     /// One map key, consuming exactly one value: the integer when it is one

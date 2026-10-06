@@ -56,6 +56,41 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private var pollTimer: Timer?
     private var serviceStarting = false
 
+    /// Member statuses and keys (RFed-spec Group.md, 2026-10-06): what an accept or leave is
+    /// worth by its signature, what it changes, the creator's copies and its `status` answer,
+    /// and the entries held for a key. See GroupStatuses.swift: the decisions are the engine's,
+    /// the storage SwiftData's (GroupStatusStore.swift), the checks the glue crate's.
+    private lazy var groupStatuses = GroupStatusEngine(
+        store: SwiftDataGroupStatusStore(
+            context: { [weak self] in self?.modelContext },
+            allowMember: { [weak self] in self?.ensureAllowlistedContact(destHash: $0) },
+            watchMember: { member, watch in
+                guard let hashData = Data(hexString: member) else { return }
+                if watch { RetichatBridge.shared.watchAnnounce(destHash: hashData) }
+                else { RetichatBridge.shared.unwatchAnnounce(destHash: hashData) }
+            },
+            line: { [weak self] chatId, member, joined, id, timestamp in
+                self?.insertGroupMemberLine(chatId: chatId, memberHex: member, joined: joined,
+                                            id: id, timestamp: timestamp)
+            }),
+        native: FFIGroupNative(bridge: RetichatBridge.shared),
+        selfHex: { [weak self] in self?.ownHashHex ?? "" },
+        answer: { [weak self] chat, member, statuses in
+            // The creator's answer: one status to that member, fire and forget (FFI off the main
+            // thread), once per accept: nothing sends it again.
+            guard let self, let client = self.lxmfClient else {
+                print("[GroupChat] status for \(chat.id.prefix(8)) to \(member.prefix(8)) not sent: stack offline")
+                return
+            }
+            let selfHash = self.ownHashHex
+            let groupId = chat.id
+            self.ffiQueue.async {
+                GroupChatManager.shared.sendStatus(groupId: groupId, to: member, statuses: statuses,
+                                                   from: selfHash, via: client)
+            }
+        },
+        log: { print("[GroupChat] \($0)") })
+
     /// Last time `pollPropagationNode` was actually allowed to issue an FFI
     /// `client.sync(...)`. Used to throttle redundant callers (background-task
     /// expiry, NSE bridges, etc.) so the propagation node sees at most one
@@ -955,7 +990,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                         fields: fields,
                         groupId: groupId,
                         standing: standing,
-                        signature: signature
+                        signature: signature,
+                        senderKey: msg.senderKeyHex.flatMap { Data(hexString: $0) },
+                        packed: msg.packedBase64.flatMap { Data(base64Encoded: $0) }
                     )
                 }
                 continue
@@ -1516,6 +1553,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
+        // Every member's key is here now, so an accept or leave held for its key (from the
+        // switch) is decided before the group is joined.
+        groupStatuses.decideHeld()
+
         // Promote from pending to active, only now that the accept goes out:
         // until 2026-10-05 a deferred accept already made the group active
         // (autosaved), so the group counted as joined with nothing sent.
@@ -1529,8 +1570,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                          inviteStatus: MemberStatus.accepted))
         }
 
-        // Add all group members to allowlist (key spec requirement); not
-        // this device, and not the group id (phantom contacts, audit L4).
+        // Add all group members to allowlist (key spec requirement): from the user's accept, not
+        // from the invite's arrival (RFed-spec Group.md, "The privacy filter"); not this device,
+        // and not the group id (phantom contacts, audit L4).
         for hash in allHashes where hash != ownHashHex {
             ensureAllowlistedContact(destHash: hash)
             if let hashData = Data(hexString: hash) {
@@ -1893,17 +1935,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
                                title: String, content: String, timestamp: Double,
-                               signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data) {
+                               signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
+                               senderKey: Data?, packed: Data?) {
         handleIncomingMessage(
             hash: hash, srcHash: srcHash, destHash: destHash,
             title: title, content: content, timestamp: timestamp,
-            signatureValid: signatureValid, unverifiedReason: unverifiedReason, fieldsRaw: fieldsRaw
+            signatureValid: signatureValid, unverifiedReason: unverifiedReason, fieldsRaw: fieldsRaw,
+            senderKey: senderKey, packed: packed
         )
     }
 
     private func handleIncomingMessage(hash: Data, srcHash: Data, destHash: Data,
                                         title: String, content: String, timestamp: Double,
-                                        signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data) {
+                                        signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
+                                        senderKey: Data?, packed: Data?) {
         let content = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let srcHexForLog = srcHash.hexString
         let msgHashHexForLog = hash.hexString
@@ -1967,7 +2012,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                              messageTime: timestamp)
             handleGroupMessage(
                 hash: hash, srcHash: srcHash, content: content, timestamp: timestamp,
-                fields: fields, groupId: groupId, standing: standing, signature: signature
+                fields: fields, groupId: groupId, standing: standing, signature: signature,
+                senderKey: senderKey, packed: packed
             )
             return
         }
@@ -2147,19 +2193,37 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// pending group relays for nobody.
     private func handleGroupMessage(hash: Data, srcHash: Data, content: String, timestamp: Double,
                                     fields: LxmfFields, groupId: String, standing: GroupStanding,
-                                    signature: Int) {
+                                    signature: Int, senderKey: Data? = nil, packed: Data? = nil) {
         let srcHex = srcHash.hexString
         let action = fields.groupAction  // nil = regular message
+
+        // What any group message the rule kept brings: the key an accept or leave carries is
+        // remembered (after the rule, never for a message it dropped), and a message its source
+        // signed shows that source's key is here, so what was held for it is decided now, before
+        // this message.
+        groupStatuses.onKept(src: srcHex, action: action, signature: signature, senderKey: senderKey)
 
         switch action {
         case GroupAction.invite:
             handleGroupInvite(srcHex: srcHex, timestamp: timestamp, fields: fields,
                               groupId: groupId, standing: standing)
         case GroupAction.accept, GroupAction.leave:
-            // The source's own, never GROUP_SENDER's ("left_": a system
-            // message, DisplayNames.isSystemMessageId).
-            applyGroupStatus(action: action ?? "", memberHex: srcHex, groupId: groupId,
-                             timestamp: timestamp, leaveMsgId: "left_" + hash.hexString, standing: standing)
+            // The source's own, never GROUP_SENDER's (the rule took it only from a current member
+            // naming nobody else, not forged). Verified (under a key held, or the one it
+            // carries), it counts; one no key can verify counts until the switch and is held
+            // from it. What it changes (a member that left stays left; a decline arrives as a
+            // leave from a member still invited), the creator's copy and its answer are the
+            // engine's.
+            guard let chat = standing.chat else { return }
+            groupStatuses.takeDirect(GroupArrival(
+                msgId: hash.hexString, src: srcHex, chat: Self.groupInfo(chat), action: action ?? "",
+                timestamp: timestamp, signature: signature, senderKey: senderKey, packed: packed))
+        case GroupAction.status:
+            // The creator's answer to the user's accept (the rule took it only from the group's
+            // creator, for a group the user joined, signed by it): each element is a member's own
+            // accept or leave, checked on its own.
+            guard let chat = standing.chat else { return }
+            groupStatuses.takeStatuses(chat: Self.groupInfo(chat), elements: fields.groupStatuses)
         case GroupAction.relayRequest:
             handleGroupRelayRequest(srcHex: srcHex, content: content, fields: fields,
                                     groupId: groupId, standing: standing, signature: signature)
@@ -2195,13 +2259,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// allows, for a group the user never declined or left, not forged).
     ///
     /// Each listed member whose key checks out is kept (the user's accept
-    /// needs every key) and, with the inviter, allowlisted as the invite is
-    /// processed: v0.1.8's filter behaviour, which James chose for this
-    /// release (2026-10-05); the rows stay hidden (no contact). A group held
-    /// here keeps the list its creation or first invite gave it (James,
-    /// 2026-10-01: "There are no membership changes for a group"): another
-    /// invite brings keys only, for members on that list. Until 2026-10-05
-    /// a later invite marked its sender accepted, adding it.
+    /// needs every key). Nobody passes the privacy filter by it: the members
+    /// pass from the user's accept (James, 2026-10-01: "If the invite is
+    /// accepted, the other group members are considered allowed"; RFed-spec
+    /// Group.md, "The privacy filter", 2026-10-06), and the creator's answer
+    /// to that accept (`status`) brings back the accepts the filter dropped
+    /// before. Between 2026-10-05 and that change the members and the
+    /// inviter were let through as the invite was processed, as v0.1.8 does.
+    /// A group held here keeps the list its creation or first invite gave it
+    /// (James, 2026-10-01: "There are no membership changes for a group"):
+    /// another invite brings keys only, for members on that list. Until
+    /// 2026-10-05 a later invite marked its sender accepted, adding it. The
+    /// invite's source is recorded as the group's creator, once, with the
+    /// group: a `status` counts only from it.
     private func handleGroupInvite(srcHex: String, timestamp: Double, fields: LxmfFields,
                                    groupId: String, standing: GroupStanding) {
         guard let ctx = modelContext else { return }
@@ -2237,14 +2307,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 print("[GroupChat] ignored a member key that does not hash to \(hash.prefix(8))")
                 continue
             }
-            // v0.1.8's filter behaviour (above): a listed member passes the
-            // privacy filter once its key checks out.
-            ensureAllowlistedContact(destHash: hash)
+            // The key is kept (the user's accept waits for every one). Nobody passes the privacy
+            // filter by an invite: the members pass from the user's accept.
         }
-        // The inviter too, when it is on the list, so the user can talk back.
-        if members.contains(srcHex), srcHex != ownHashHex {
-            ensureAllowlistedContact(destHash: srcHex)
-        }
+        // A key this invite brought may be one an accept or leave is held for (from the switch):
+        // each such one is decided now.
+        groupStatuses.decideHeld()
 
         if let chat = standing.chat {
             print("[GroupChat] invite for held group \(chat.id.prefix(8)) from \(srcHex.prefix(8)): member keys only")
@@ -2256,7 +2324,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // inviter started it, so it is accepted; everyone else is invited.
         let groupName = fields.groupName ?? "Group"
         ctx.insert(ChatEntity(id: groupId, peerHash: srcHex, isGroup: true,
-                              groupName: groupName, groupStatus: "pending"))
+                              groupName: groupName, groupStatus: "pending", creatorHash: srcHex))
         for memberHash in distinct(listed + [srcHex, ownHashHex]) {
             ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: memberHash,
                                          inviteStatus: memberHash == srcHex ? MemberStatus.accepted
@@ -2288,41 +2356,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         refreshChats()
     }
 
-    /// A member's own accept or leave (the rule took it only from a current
-    /// member of the list naming nobody else, never forged). A member that
-    /// left stays left; an accept from one already accepted is nothing new;
-    /// a decline arrives as a leave from a member still invited. Until
-    /// 2026-10-05 this took an accept or a leave for whichever member
-    /// GROUP_SENDER named, from any source, added that member when it was
-    /// not on the list, and let a member that left accept again.
-    private func applyGroupStatus(action: String, memberHex: String, groupId: String, timestamp: Double,
-                                  leaveMsgId: String, standing: GroupStanding) {
+    /// The group a stored chat is, as the group engine reads it.
+    private static func groupInfo(_ chat: ChatEntity) -> GroupChatInfo {
+        GroupChatInfo(id: chat.id, creatorHex: chat.creatorHash, groupStatus: chat.groupStatus)
+    }
+
+    /// The system line about a member who joined or left, written by the group store after
+    /// the engine moved the member (GroupStatusEngine.applyChange decides what changes, and when
+    /// nothing does, no line: a member that left stays left, an accept from one already accepted
+    /// is nothing new, a decline arrives as a leave from a member still invited). The name is
+    /// resolved when shown, DisplayNames.subjectToken. A leave's id is "left_" + the message hash
+    /// (a system message, DisplayNames.isSystemMessageId); a join's is the engine's `acc_...`.
+    private func insertGroupMemberLine(chatId groupId: String, memberHex: String, joined accepted: Bool,
+                                       id: String, timestamp: Double) {
         guard let ctx = modelContext else { return }
-        guard let next = GroupMemberStatuses.statusChange(current: standing.sourceStatus, action: action) else {
-            print("[GroupChat] \(action) from \(memberHex.prefix(8)) changes nothing in \(groupId.prefix(8)) (was \(standing.sourceStatus ?? "not listed"))")
-            return
-        }
-        let memberDesc = FetchDescriptor<GroupMemberEntity>(
-            predicate: #Predicate { $0.groupId == groupId && $0.memberHash == memberHex }
-        )
-        for entry in (try? ctx.fetch(memberDesc)) ?? [] { entry.inviteStatus = next }
-        let accepted = next == MemberStatus.accepted
-        print("[GroupChat] \(memberHex.prefix(8)) \(accepted ? "accepted" : "left") group \(groupId.prefix(8))")
-
-        let hashData = Data(hexString: memberHex)
-        if accepted {
-            // A member's own accept passes the privacy filter, in a pending
-            // group too: v0.1.8's filter behaviour, which James chose for this
-            // release (2026-10-05). A hidden row, no contact.
-            if memberHex != ownHashHex { ensureAllowlistedContact(destHash: memberHex) }
-            if let hashData { RetichatBridge.shared.watchAnnounce(destHash: hashData) }
-        } else if let hashData {
-            RetichatBridge.shared.unwatchAnnounce(destHash: hashData)
-        }
-
-        // A system line about the member (the name resolved when shown,
-        // DisplayNames.subjectToken).
-        let sysId = accepted ? "acc_\(memberHex.prefix(8))_\(groupId.prefix(8))" : leaveMsgId
+        let sysId = accepted ? id : "left_" + id
         let dupDesc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == sysId })
         if (try? ctx.fetch(dupDesc).first) == nil {
             let msg = MessageEntity(
@@ -2429,6 +2477,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         ConnectionStateManager.shared.didReceiveAnnounce(destHash: destHash)
 
         let hex = destHash.hexString
+        // The key an announce brings may be one an accept or leave is held for (from the switch).
+        groupStatuses.decideHeld(source: hex)
         // Remember that this address is a distro (announce app_data carried
         // SF_RFED_DISTRO, SPEC §17.10) — the ONLY source of that fact; links
         // never set it. Before any early return: a distro announce carries no
@@ -2540,7 +2590,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let now = Date().timeIntervalSince1970
         let chat = ChatEntity(
             id: groupId, peerHash: "", lastMessageTime: now,
-            isGroup: true, groupName: name, groupStatus: "active"
+            isGroup: true, groupName: name, groupStatus: "active", creatorHash: ownHashHex
         )
         ctx.insert(chat)
 
@@ -2684,6 +2734,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         if let members = try? ctx.fetch(memberDescriptor) {
             for member in members { ctx.delete(member) }
         }
+        // The creator's copies and the entries held for a key go with the group.
+        SwiftDataGroupStatusStore.deleteRows(groupId: chatId, in: ctx)
 
         // Delete the chat entity
         let chatDescriptor = FetchDescriptor<ChatEntity>(
@@ -3028,8 +3080,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// Let a peer through the privacy filter without making it a contact:
-    /// a group member (the creation, the user's accept, an invite from an
-    /// allowed inviter, its own accept). A new row is hidden; a row from
+    /// a group member (the creation, the user's accept, a member's own accept
+    /// in a group the user joined: never an invite's arrival). A new row is hidden; a row from
     /// before the contact flag keeps the listing it had, so allowlisting a
     /// row that was not listed never lists it (ContactRows.isListed).
     private func ensureAllowlistedContact(destHash: String) {
@@ -3118,13 +3170,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// What the group rule asks about a message naming group `groupId` from
     /// a packet source: the group as held here (`chat`, its member rows),
     /// where the user stands in it, the source's status on its list (nil
-    /// when not listed), and whether the user declined or left it.
+    /// when not listed), whether the user declined or left it, and whether
+    /// the source is the group's creator (a `status` counts only from it;
+    /// false for a group whose creator is not recorded, one held before it
+    /// was).
     private struct GroupStanding {
         let chat: ChatEntity?
         let members: [GroupMemberStatuses.Row]
         let held: DeliveryPolicy.Held
         let sourceStatus: String?
         let closed: Bool
+        let sourceIsCreator: Bool
     }
 
     private func groupStanding(groupId: String, sourceHex: String) -> GroupStanding {
@@ -3147,7 +3203,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             members: rows,
             held: GroupMemberStatuses.held(groupExists: chat != nil, groupStatus: chat?.groupStatus),
             sourceStatus: GroupMemberStatuses.statusOf(rows, sourceHex),
-            closed: ClosedGroups.contains(prefs.closedGroupIds, groupId)
+            closed: ClosedGroups.contains(prefs.closedGroupIds, groupId),
+            sourceIsCreator: chat?.creatorHash != nil && chat?.creatorHash == sourceHex
         )
     }
 
@@ -3168,10 +3225,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             sourceStatus: standing.sourceStatus,
             namesOther: DeliveryPolicy.namesOther(groupSender: fields.groupSender, source: sourceHex),
             closed: standing.closed,
-            signature: signature
+            signature: signature,
+            sourceIsCreator: standing.sourceIsCreator
         )
         guard allowed else {
-            print("[GroupChat] DROPPED \(action ?? "message") for \(groupId.prefix(8)) from \(sourceHex.prefix(8)) (group \(standing.held), source \(standing.sourceStatus ?? "not listed"), closed=\(standing.closed), signature=\(signature))")
+            print("[GroupChat] DROPPED \(action ?? "message") for \(groupId.prefix(8)) from \(sourceHex.prefix(8)) (group \(standing.held), source \(standing.sourceStatus ?? "not listed"), closed=\(standing.closed), signature=\(signature), creator=\(standing.sourceIsCreator))")
             return nil
         }
         return standing

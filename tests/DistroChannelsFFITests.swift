@@ -32,6 +32,9 @@
 //     Retichat-ios/Retichat/Services/PropagationNodeManager.swift \
 //     Retichat-ios/Retichat/Services/DistroOutbox.swift \
 //     Retichat-ios/Retichat/Services/DistroChannelSync.swift \
+//     Retichat-ios/Retichat/Services/DeliveryPolicy.swift \
+//     Retichat-ios/Retichat/Services/GroupStatuses.swift \
+//     Retichat-ios/Retichat/Services/GroupEnvelopes.swift \
 //     Retichat-ios/tests/DistroChannelsFFITests.swift \
 //     Retichat-ios/Frameworks/RetichatFFI.xcframework/ios-arm64_x86_64-maccatalyst/libretichat_ffi.a \
 //     -Xlinker -framework -Xlinker CoreBluetooth -Xlinker -framework -Xlinker IOKit \
@@ -280,6 +283,158 @@ func anInterfaceUpEventReachesTheHandlerWithItsNameUntilItIsCleared() {
     bridge.interfaceUpClear()
 }
 
+// MARK: - Member statuses and keys, through the real library (RFed-spec Group.md, 2026-10-06)
+
+/// Pack an outbound message once and read it back as a status's element is read: through the library's own unpack and check.
+func unpacked(_ packed: Data) -> UnpackedGroupMessage? { bridge.groupUnpackPacked(packed) }
+
+/// An accept or leave the library makes, written as GroupChatManager writes it (GroupEnvelopes, both forms are the sender's), packed once.
+/// `signer` is the identity that signs; `source` the one whose hash and key it carries.
+func realControl(_ action: String, source: (handle: UInt64, delivery: Data, publicKey: Data),
+                 signer: (handle: UInt64, delivery: Data, publicKey: Data)? = nil, to: Data, groupId: String,
+                 carryKey: Bool = true) -> Data? {
+    let msg = bridge.messageCreate(destHash: to, sourceHash: source.delivery, content: "", title: "",
+                                   method: LxmfMethod.direct, identityHandle: (signer ?? source).handle)
+    guard msg != 0 else { return nil }
+    defer { _ = lxmf_message_destroy(msg) }
+    let own = carryKey ? GroupEnvelopes.ownKeyEntry(selfHex: hex(source.delivery), publicKey: source.publicKey) : nil
+    let entries = action == GroupAction.accept
+        ? GroupEnvelopes.accept(groupId: groupId, selfHex: hex(source.delivery), ownKey: own)
+        : GroupEnvelopes.leave(groupId: groupId, selfHex: hex(source.delivery), ownKey: own)
+    for entry in entries { check(LxmfClient.messageSetGroupEntry(msg, entry.entry, .str(entry.value)), "the entry \(entry.entry) is written") }
+    return bridge.messagePack(handle: msg)
+}
+
+func aRealAcceptCarryingItsSendersKeyIsValidatedByThatKeyAndAForgeryIsInvalidAndNoKeyIsUnverifiable() {
+    let alice = newIdentity(), mallory = newIdentity(), creator = newIdentity()
+    let group = String(repeating: "5e", count: 16)
+    guard let accept = realControl(GroupAction.accept, source: alice, to: creator.delivery, groupId: group) else { check(false, "an accept"); return }
+    // Nobody holds alice's key: the key the accept carries decides, and it validates.
+    guard let u = unpacked(accept) else { check(false, "the library unpacks it"); return }
+    checkEqual(u.signature, DeliveryPolicy.Signature.validated, "validated by the key it carries")
+    checkEqual(u.senderKey, alice.publicKey, "and that key is alice's own, bound to her address")
+    checkEqual(u.source, alice.delivery, "from alice")
+    checkEqual(u.destination, creator.delivery, "to the creator")
+    let fields = LxmfFieldsDecoder.decode(u.fieldsRaw)
+    checkEqual(fields.groupId, group, "the group")
+    checkEqual(fields.groupAction, GroupAction.accept, "the action")
+    checkEqual(fields.groupMemberKeys?[hex(alice.delivery)], alice.publicKey.base64EncodedString(), "the entry as GroupEnvelopes spells it")
+    // The message hash the library reports is the LXMF hash: SHA-256 of destination, source and payload.
+    checkEqual(u.hash.count, 32, "a 32-byte message hash")
+
+    // A signature that is not alice's under her name and her key (one bit of it flipped, as a forger's is): invalid, never counted.
+    var tampered = accept
+    tampered[40] ^= 0x01
+    if let f = unpacked(tampered) {
+        checkEqual(f.signature, DeliveryPolicy.Signature.invalid, "a signature that does not verify under the key it carries: invalid")
+        checkEqual(f.senderKey, alice.publicKey, "the key it carries is still reported (the group rule drops it)")
+    } else { check(false, "a forgery") }
+    // The library signs as the identity that makes the message: mallory cannot sign as alice with it, so her message is her own,
+    // and carries alice's key under alice's hash, which is not its source's: no key binds, and she is not heard as alice.
+    if let impostor = realControl(GroupAction.accept, source: alice, signer: mallory, to: creator.delivery, groupId: group),
+       let i = unpacked(impostor) {
+        check(i.source != alice.delivery || i.signature != DeliveryPolicy.Signature.validated, "mallory's message is never validated as alice's")
+    } else { check(false, "an impostor's message") }
+
+    // No key carried and none held: unverifiable, as a client from before this change sends it.
+    if let keyless = realControl(GroupAction.leave, source: alice, to: creator.delivery, groupId: group, carryKey: false),
+       let k = unpacked(keyless) {
+        checkEqual(k.signature, DeliveryPolicy.Signature.sourceUnknown, "no key carried and none held: unverifiable")
+        check(k.senderKey == nil, "no key reported")
+    } else { check(false, "a keyless leave") }
+
+    // A key that does not bind (another member's key under alice's hash) is no key.
+    let msg = bridge.messageCreate(destHash: creator.delivery, sourceHash: alice.delivery, content: "", title: "",
+                                   method: LxmfMethod.direct, identityHandle: mallory.handle)
+    let entries = GroupEnvelopes.accept(groupId: group, selfHex: hex(alice.delivery),
+                                        ownKey: GroupStatuses.keyEntry(hashHex: hex(alice.delivery), publicKey: mallory.publicKey))
+    for entry in entries { _ = LxmfClient.messageSetGroupEntry(msg, entry.entry, .str(entry.value)) }
+    if let packed = bridge.messagePack(handle: msg), let n = unpacked(packed) {
+        checkEqual(n.signature, DeliveryPolicy.Signature.sourceUnknown, "a key that does not produce alice's address is no key")
+        check(n.senderKey == nil, "and is not reported")
+    } else { check(false, "a message with a key that does not bind") }
+    _ = lxmf_message_destroy(msg)
+}
+
+func theLibrariesUnpackRefusesWhatIsNoAcceptOrLeaveInSizeOrKind() {
+    check(unpacked(Data()) == nil, "nothing")
+    check(unpacked(Data(repeating: 0, count: 96)) == nil, "a header and no payload")
+    check(unpacked(Data(repeating: 7, count: 2145)) == nil, "over the size of an accept or leave")
+    check(unpacked(Data(repeating: 7, count: 300)) == nil, "bytes that are no LXMF message")
+}
+
+func aStatusTheLibraryWritesHoldsItsElementsAsAnArrayOfBinAndReadsBackExactlyAsWritten() {
+    let creator = newIdentity(), alice = newIdentity(), bob = newIdentity(), frank = newIdentity()
+    let group = String(repeating: "5e", count: 16)
+    guard let a = realControl(GroupAction.accept, source: alice, to: creator.delivery, groupId: group),
+          let b = realControl(GroupAction.leave, source: bob, to: creator.delivery, groupId: group) else { check(false, "elements"); return }
+    let msg = bridge.messageCreate(destHash: frank.delivery, sourceHash: creator.delivery, content: "", title: "",
+                                   method: LxmfMethod.direct, identityHandle: creator.handle)
+    for entry in GroupEnvelopes.status(groupId: group, selfHex: hex(creator.delivery)) {
+        check(LxmfClient.messageSetGroupEntry(msg, entry.entry, .str(entry.value)), "the entry \(entry.entry)")
+    }
+    check(bridge.messageSetRetichatStatuses(handle: msg, elements: [a, b]), "key 10 is written")
+    guard let packed = bridge.messagePack(handle: msg), let u = unpacked(packed) else { check(false, "the status packs and unpacks"); return }
+    let fields = LxmfFieldsDecoder.decode(u.fieldsRaw)
+    checkEqual(fields.groupAction, GroupAction.status, "a status")
+    checkEqual(fields.groupSender, hex(creator.delivery), "from the creator")
+    checkEqual(fields.groupStatuses, [a, b], "the elements, exactly as written: never wrapped again")
+    // Key 10 starts with an array head and each element with a bin head (CHECK_THESE_THINGS_FIRST §11).
+    let raw = [UInt8](u.fieldsRaw)
+    let key10 = zip(raw, raw.dropFirst()).enumerated().first { $0.element == (0x0A, 0x92) }?.offset
+    check(key10 != nil && raw[key10! + 2] == 0xC5, "a native array of bin16: the first element is a packed message of 256..=65535 bytes")
+    // The creator's signature validates the status under its own key (carried by none: this receiver holds none).
+    checkEqual(u.signature, DeliveryPolicy.Signature.sourceUnknown, "a status carries no key: unverifiable for a receiver that does not hold the creator's")
+    // An element no receiver would read is refused and nothing is written.
+    let refused = bridge.messageCreate(destHash: frank.delivery, sourceHash: creator.delivery, content: "", title: "",
+                                       method: LxmfMethod.direct, identityHandle: creator.handle)
+    check(!bridge.messageSetRetichatStatuses(handle: refused, elements: [Data(repeating: 1, count: 96)]), "an element with no payload is refused")
+    check(!bridge.messageSetRetichatStatuses(handle: refused, elements: [Data(repeating: 1, count: 2145)]), "so is one over the limit")
+    check(bridge.messageSetRetichatStatuses(handle: refused, elements: []), "an empty list is a valid answer")
+    _ = lxmf_message_destroy(msg)
+    _ = lxmf_message_destroy(refused)
+}
+
+func theSharedVectorsPackedMessagesAreUnpackedByTheRealLibraryAsTheFileSaysForAReceiverHoldingNoKeys() {
+    let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("rust/retichat-ffi/tests/data/group_status_vectors.json")
+    guard let raw = try? Data(contentsOf: url), let json = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
+          let messages = json["messages"] as? [[String: Any]] else { check(false, "the vectors are readable"); return }
+    func unhexed(_ h: String) -> Data {
+        Data((0..<h.count / 2).map { i in let at = h.index(h.startIndex, offsetBy: 2 * i); return UInt8(h[at..<h.index(at, offsetBy: 2)], radix: 16)! })
+    }
+    var verdicts: [String: Int] = [:]
+    for m in messages {
+        let name = m["name"] as! String
+        let packed = unhexed(m["packed_hex"] as! String)
+        guard let u = unpacked(packed) else { check(false, "\(name) unpacks"); continue }
+        let want = ((m["verdict"] as! [String: String])["none"])!
+        let got: String
+        switch u.signature {
+        case DeliveryPolicy.Signature.validated: got = "verified"
+        case DeliveryPolicy.Signature.invalid: got = "forged"
+        default: got = "unverifiable"
+        }
+        checkEqual(got, want, "\(name): the real library, holding no key")
+        checkEqual(hex(u.hash), m["message_hash_hex"] as! String, "\(name): the message hash")
+        checkEqual(hex(u.fieldsRaw), m["fields_msgpack_hex"] as! String, "\(name): the fields")
+        checkEqual(u.timestamp, m["timestamp"] as! Double, "\(name): the time")
+        verdicts[name] = u.signature
+    }
+    checkEqual(verdicts.count, 9, "every message")
+}
+
+func aMemberKeyThatDoesNotProduceTheMembersAddressIsNotRememberedByTheRealLibrary() {
+    let alice = newIdentity(), mallory = newIdentity()
+    // The check is the library's: a key that does not derive the destination is refused, and nothing is remembered.
+    MainActor.assumeIsolated {
+        let native = FFIGroupNative(bridge: bridge)
+        check(!native.rememberKey(memberHex: hex(alice.delivery), publicKey: mallory.publicKey), "mallory's key is not alice's")
+        check(!native.rememberKey(memberHex: "zz", publicKey: alice.publicKey), "a hash that is no hex")
+        check(!native.rememberKey(memberHex: hex(alice.delivery), publicKey: Data(repeating: 1, count: 63)), "a key of the wrong size")
+    }
+}
+
 // MARK: - What the unwrap hands the app: the fields as base64, read as the app reads them
 
 func theUnwrapsFieldsAreTheBytesTheReaderTakes() {
@@ -310,6 +465,11 @@ let allTests: [(String, () -> Void)] = [
     ("the upload trampolines report each event and the release frees the sink", theUploadTrampolinesReportEachEventAndTheReleaseFreesTheSink),
     ("a link event reaches the handler with its link or none", aLinkEventReachesTheHandlerWithItsLinkOrNone),
     ("an interface up-edge reaches the handler with its name until it is cleared", anInterfaceUpEventReachesTheHandlerWithItsNameUntilItIsCleared),
+    ("a real accept carrying its sender's key is validated by it, a forgery is invalid, no key is unverifiable", aRealAcceptCarryingItsSendersKeyIsValidatedByThatKeyAndAForgeryIsInvalidAndNoKeyIsUnverifiable),
+    ("the library's unpack refuses what is no accept or leave in size or kind", theLibrariesUnpackRefusesWhatIsNoAcceptOrLeaveInSizeOrKind),
+    ("a status the library writes holds its elements as an array of bin and reads back as written", aStatusTheLibraryWritesHoldsItsElementsAsAnArrayOfBinAndReadsBackExactlyAsWritten),
+    ("the shared vectors' messages are unpacked by the real library as the file says", theSharedVectorsPackedMessagesAreUnpackedByTheRealLibraryAsTheFileSaysForAReceiverHoldingNoKeys),
+    ("a member key that does not produce the member's address is not remembered", aMemberKeyThatDoesNotProduceTheMembersAddressIsNotRememberedByTheRealLibrary),
     ("the unwrap's fields are the bytes the reader takes", theUnwrapsFieldsAreTheBytesTheReaderTakes),
 ]
 

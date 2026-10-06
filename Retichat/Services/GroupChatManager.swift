@@ -88,44 +88,98 @@ final class GroupChatManager {
 
     // MARK: - Accept
 
-    /// Broadcast acceptance to every member in the list (excluding self).
+    /// Broadcast acceptance to every member in the list (excluding self). Every accept
+    /// carries the user's own key (GroupEnvelopes, RFed-spec Group.md "The sender's key",
+    /// James 2026-10-06), so a member that never heard of this device can verify it, and
+    /// the creator answers it with a `status`.
     func sendAccept(
         groupId: String,
         to members: [String],
         from selfHash: String,
         via client: LxmfClient
     ) {
+        let ownKey = ownKeyEntry(selfHash: selfHash, client: client)
         for target in members where target != selfHash {
             guard let destData = Data(hexString: target) else { continue }
             let handle = client.createMessage(
                 to: destData, content: "", title: "", method: LxmfMethod.direct
             )
             guard handle != 0 else { continue }
-            _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
-            _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.accept))
-            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
+            write(GroupEnvelopes.accept(groupId: groupId, selfHex: selfHash, ownKey: ownKey), on: handle)
             destroyAfterSend(client: client, handle: handle)
         }
     }
 
+    /// The user's own GROUP_MEMBER_KEYS entry, `hash:base64-public-key`: the form an invite
+    /// chunk uses. Read from the identity, not the router, so a leave sent with no connection
+    /// carries it too. Nil, and logged, when the identity's key cannot be read (it is always
+    /// held): the accept or leave then goes without it, as a build from before this change
+    /// sent it, rather than not at all.
+    private func ownKeyEntry(selfHash: String, client: LxmfClient) -> String? {
+        guard let publicKey = RetichatBridge.shared.identityPublicKey(handle: client.identityHandle),
+              publicKey.count == 64 else {
+            print("[GroupChat] own key not readable, the accept/leave carries none: \(LxmfClient.lastError ?? "unknown")")
+            return nil
+        }
+        return GroupEnvelopes.ownKeyEntry(selfHex: selfHash, publicKey: publicKey)
+    }
+
+    /// Write the envelope's entries on the native message `handle`, in the form the switch picks.
+    private func write(_ entries: [GroupEnvelopes.Entry], on handle: UInt64) {
+        for entry in entries {
+            _ = LxmfClient.messageSetGroupEntry(handle, entry.entry, .str(entry.value))
+        }
+    }
+
+    // MARK: - Status (the creator's answer to an accept)
+
+    /// The creator's answer to an accept that counted and carried its sender's key (RFed-spec
+    /// Group.md, "The creator's answer: status"): one `status` to `memberHex` alone, `statuses`
+    /// being every OTHER listed member's newest counted accept or leave exactly as this device
+    /// received it, by member hash ascending (the caller chose them; an empty list is a valid
+    /// answer). It goes like every group control message: DIRECT, with the propagated fallback,
+    /// and as a Resource when too large for a packet. Once per accept received: nothing here
+    /// sends it again (DESIGN_PRINCIPLES §3). A status that cannot be built is not sent.
+    func sendStatus(
+        groupId: String,
+        to memberHex: String,
+        statuses: [Data],
+        from selfHash: String,
+        via client: LxmfClient
+    ) {
+        guard let destData = Data(hexString: memberHex) else { return }
+        let handle = client.createMessage(
+            to: destData, content: "", title: "", method: LxmfMethod.direct
+        )
+        guard handle != 0 else { return }
+        write(GroupEnvelopes.status(groupId: groupId, selfHex: selfHash), on: handle)
+        guard RetichatBridge.shared.messageSetRetichatStatuses(handle: handle, elements: statuses) else {
+            print("[GroupChat] the status for \(memberHex.prefix(8)) could not be built, not sent: \(LxmfClient.lastError ?? "unknown")")
+            LxmfClient.messageDestroy(handle)
+            return
+        }
+        destroyAfterSend(client: client, handle: handle)
+    }
+
     // MARK: - Leave
 
-    /// Notify accepted members that we are leaving the group.
+    /// Notify accepted members that we are leaving the group. Like an accept it carries the
+    /// user's own key (GroupEnvelopes), so a member that never heard of this device can verify
+    /// it before it makes the leave final.
     func sendLeave(
         groupId: String,
         to members: [String],
         from selfHash: String,
         via client: LxmfClient
     ) {
+        let ownKey = ownKeyEntry(selfHash: selfHash, client: client)
         for target in members where target != selfHash {
             guard let destData = Data(hexString: target) else { continue }
             let handle = client.createMessage(
                 to: destData, content: "", title: "", method: LxmfMethod.direct
             )
             guard handle != 0 else { continue }
-            _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
-            _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.leave))
-            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
+            write(GroupEnvelopes.leave(groupId: groupId, selfHex: selfHash, ownKey: ownKey), on: handle)
             destroyAfterSend(client: client, handle: handle)
         }
     }

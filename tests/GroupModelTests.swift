@@ -256,18 +256,23 @@ func testTheReceiveWiring() {
           "so does the NSE import")
     check(!repo.contains("fields.groupSender ?? srcHex"), "GROUP_SENDER is never taken as the source")
     let handle = body(repo, "private func handleGroupMessage(")
-    check(handle.contains("applyGroupStatus(action: action ?? \"\", memberHex: srcHex,"),
-          "an accept or a leave is the packet source's own")
+    check(handle.contains("groupStatuses.takeDirect(GroupArrival(")
+            && handle.contains("msgId: hash.hexString, src: srcHex, chat: Self.groupInfo(chat)"),
+          "an accept or a leave is the packet source's own (decided by the group engine, GroupStatuses.swift)")
     check(handle.contains("author: groupAuthor(fields: fields, sourceHex: srcHex,"),
           "a plain post's author is decided by DeliveryPolicy.author")
     check(handle.contains("default:\n") && !handle.contains("default:\n            // Regular group message"),
           "an unknown action is not stored as a post")
-    let status = body(repo, "private func applyGroupStatus(")
-    check(status.contains("GroupMemberStatuses.statusChange(current: standing.sourceStatus, action: action)")
-            && !status.contains("ctx.insert(GroupMemberEntity("),
+    let engine = source("Retichat/Services/GroupStatuses.swift")
+    let change = body(engine, "private func applyChange(")
+    check(change.contains("GroupMemberStatuses.statusChange(current: GroupMemberStatuses.statusOf(rows, src),")
+            && !change.contains("GroupMemberEntity("),
           "a status moves only for a listed member, never back from left, and nobody is added")
-    check(status.contains("if memberHex != ownHashHex { ensureAllowlistedContact(destHash: memberHex) }"),
-          "a member's own accept allowlists it, in a pending group too (v0.1.8)")
+    // RFed-spec Group.md, "The privacy filter" (2026-10-06): the members pass from the user's accept, so a member's
+    // accept lets it through only in a group the user joined (until then, in a pending group too: v0.1.8, James 2026-10-05).
+    check(change.contains("if accepted, src != me, chat.held == .joined { store.allow(memberHex: src) }"),
+          "a member's own accept allowlists it only in a group the user joined")
+    check(!repo.contains("func applyGroupStatus("), "the old status path is gone: the engine decides")
     let relay = body(repo, "private func handleGroupRelayRequest(")
     check(relay.contains("GroupMemberStatuses.acceptedMembers(standing.members, selfHash: ownHashHex)")
             && relay.contains("let originalSender = groupAuthor("),
@@ -280,9 +285,12 @@ func testTheInviteWiring() {
     check(invite.contains("let members = held ? distinct(standing.members.map(\\.hash)) : distinct(listed + [srcHex])")
             && invite.contains("guard let hash = DeliveryPolicy.hash(memberHash), members.contains(hash), hash != ownHashHex,"),
           "an invite brings keys only for members on the held list, or for a new group the list it gives")
-    check(invite.contains("ensureAllowlistedContact(destHash: hash)")
-            && invite.contains("if members.contains(srcHex), srcHex != ownHashHex {\n            ensureAllowlistedContact(destHash: srcHex)"),
-          "an invite from an allowed inviter allowlists its listed members and the inviter at once (v0.1.8, James 2026-10-05)")
+    // RFed-spec Group.md, "The privacy filter" (2026-10-06): an invite lets nobody through; the members pass from the
+    // user's accept (acceptGroupInvite), and the creator's status brings back what the filter dropped before.
+    check(!invite.contains("ensureAllowlistedContact("),
+          "an invite allowlists nobody: neither its listed members nor the inviter (the members pass from the user's accept)")
+    check(invite.contains("groupStatuses.decideHeld()") && invite.contains("creatorHash: srcHex"),
+          "an invite's keys decide what was held for them, and its source is recorded as the group's creator")
     check(before(invite, "member keys only", "ctx.insert(ChatEntity(")
             && !invite.contains("existing.inviteStatus = MemberStatus.accepted"),
           "a held group keeps its list: another invite changes nobody's status")
@@ -316,10 +324,12 @@ func testDeclineLeaveAndDelete() {
     let manager = source("Retichat/Services/GroupChatManager.swift")
     let leave = body(manager, "func sendLeave(")
     check(leave.contains("createMessage(\n                to: destData, content: \"\", title: \"\", method: LxmfMethod.direct")
-            && leave.contains(".action, .str(GroupAction.leave)")
-            && leave.contains(".sender, .str(selfHash)")
-            && leave.contains(".id, .str(groupId)"),
-          "the leave is GROUP_ID, GROUP_ACTION leave and GROUP_SENDER the user, no content (as Android and the web)")
+            && leave.contains("GroupEnvelopes.leave(groupId: groupId, selfHex: selfHash, ownKey: ownKey)"),
+          "the leave is GROUP_ID, GROUP_ACTION leave and GROUP_SENDER the user, no content, and the user's own key (GroupEnvelopes)")
+    let envelopes = body(source("Retichat/Services/GroupEnvelopes.swift"), "private static func control(")
+    check(envelopes.contains("Entry(entry: .id, value: groupId)") && envelopes.contains("Entry(entry: .action, value: action)")
+            && envelopes.contains("Entry(entry: .sender, value: selfHex)") && envelopes.contains(".memberKeys"),
+          "GROUP_ID, the action, GROUP_SENDER the user and the user's own key")
     check(!(body(repo, "func leaveGroup(") + quit).contains("MemberStatus.accepted"),
           "the leave no longer goes to the accepted members only")
 }

@@ -405,8 +405,10 @@ func appSources() -> [(String, String)] {
 func testEveryGroupWriteGoesThroughTheHelper() {
     let manager = source("Retichat/Services/GroupChatManager.swift")
     check(!manager.contains("messageAddField"), "GroupChatManager sets no top-level field itself")
-    check(manager.components(separatedBy: "LxmfClient.messageSetGroupEntry(handle, ").count - 1 == 29,
-          "GroupChatManager's 29 group entry writes all use messageSetGroupEntry")
+    // Since the statuses (2026-10-06) an accept, a leave and a status are written from GroupEnvelopes' entries by one loop (`write`),
+    // which is the one place the three put their entries on the message: the other sites are the invite, the fan-out and the relay.
+    check(manager.components(separatedBy: "LxmfClient.messageSetGroupEntry(handle, ").count - 1 == 24,
+          "GroupChatManager's 24 group entry writes all use messageSetGroupEntry")
     for entry in ["id", "members", "name", "action", "sender", "relaySeen", "relayFor", "relayDone", "memberKeys"] {
         check(manager.contains("messageSetGroupEntry(handle, .\(entry), "), "GroupChatManager writes .\(entry) through the helper")
     }
@@ -424,10 +426,22 @@ func testEveryGroupWriteGoesThroughTheHelper() {
     for (path, code) in appSources() {
         check(!code.contains("LxmfFieldKey.group"), "\(path): no group field constant outside GroupEntry")
         if path.hasSuffix("LxmfClient.swift") || path.hasSuffix("Bridge/LxmfFields.swift") { continue }
-        check(!code.contains("legacyField") && !code.contains("GroupFieldWrite"),
+        // GroupEnvelopes only says where each entry of an accept, a leave or a status goes, by the helper's own GroupFieldWrite.of; it
+        // picks no form itself.
+        let envelopes = path.hasSuffix("Services/GroupEnvelopes.swift")
+        check(!code.contains("legacyField") && (envelopes || !code.contains("GroupFieldWrite")),
               "\(path): nothing but the helper picks a group entry's form")
-        check(!code.contains("lxmf_message_set_retichat") && !code.contains("messageSetRetichat"),
+        if envelopes { check(code.contains("GroupFieldWrite.of(") && !code.contains("inRetichatField ?"), "GroupEnvelopes takes each form from GroupFieldWrite.of") }
+        // Key 10, a status's GROUP_STATUSES, is the one Retichat entry with no old field: the bridge writes it, always in the
+        // Retichat field, and only GroupChatManager asks it to.
+        let withoutStatuses = code.replacingOccurrences(of: "messageSetRetichatStatuses", with: "")
+            .replacingOccurrences(of: "retichat_message_set_retichat_statuses", with: "")
+        check(!withoutStatuses.contains("lxmf_message_set_retichat") && !withoutStatuses.contains("messageSetRetichat"),
               "\(path): nothing but the helper sets a Retichat field entry")
+        if code.contains("messageSetRetichatStatuses") || code.contains("retichat_message_set_retichat_statuses") {
+            check(path.hasSuffix("Bridge/RetichatBridge.swift") || path.hasSuffix("Services/GroupChatManager.swift"),
+                  "\(path): key 10 is written by the bridge for GroupChatManager's status alone")
+        }
         // An old group field number as a field key (fixstr headers such as
         // `0xa0 | len` elsewhere are msgpack, not field numbers).
         let asKey = try! NSRegularExpression(
@@ -447,8 +461,10 @@ func testNothingReadsATopLevelNameInSwift() {
               "\(path): no code touches field 0xD1 directly")
     }
     let lxmf = source("Retichat/Bridge/LxmfFields.swift")
-    check(lxmf.contains("retichatGroup = readRetichatGroupEntries(bytes, &offset)"),
-          "the fields decoder reads only group entries out of 0xD1")
+    // Group entries 1-9, and since the statuses (2026-10-06) key 10, a status's GROUP_STATUSES: never the name (key 0).
+    check(lxmf.contains("let read = readRetichatGroupEntries(bytes, &offset)")
+            && lxmf.contains("retichatGroup = read.entries") && lxmf.contains("statuses = read.statuses"),
+          "the fields decoder reads only group entries and key 10 out of 0xD1")
     check(!lxmf.contains("displayName = read"), "the fields decoder does not read the name")
     let client = source("Retichat/Services/LxmfClient.swift")
     check(client.contains("lxmf_display_name_decode("), "decodeDisplayName asks the Rust side (key 0 of the map)")

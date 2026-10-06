@@ -72,10 +72,17 @@ final class ChatEntity {
     /// For group chats: "active" (full member) or "pending" (invite not yet accepted).
     /// Nil is treated as "active" for backward compatibility.
     var groupStatus: String?
+    /// For group chats: the group's creator (32-hex `lxmf.delivery` hash), which a `status`
+    /// counts from and which alone answers an accept with one (RFed-spec Group.md, "Member
+    /// statuses and keys", 2026-10-06). This device's own hash for a group it creates, the
+    /// invite's authenticated source for one it is invited into. Nil for every group held
+    /// before it was recorded: such a group neither answers nor counts a status. A new
+    /// optional attribute is a lightweight migration (tests/GroupStatusesMigrationTests.swift).
+    var creatorHash: String?
 
     init(id: String, peerHash: String, lastMessageTime: Double = 0,
          isArchived: Bool = false, isGroup: Bool = false, groupName: String? = nil,
-         groupStatus: String? = nil) {
+         groupStatus: String? = nil, creatorHash: String? = nil) {
         self.id = id
         self.peerHash = peerHash
         self.lastMessageTime = lastMessageTime
@@ -83,6 +90,7 @@ final class ChatEntity {
         self.isGroup = isGroup
         self.groupName = groupName
         self.groupStatus = groupStatus
+        self.creatorHash = creatorHash
     }
 }
 
@@ -455,6 +463,55 @@ final class DistroOutboxEntity {
         self.name = name
         self.atMs = atMs
         self.toHex = toHex
+        self.seq = seq
+    }
+}
+
+/// The creator's copy of a member's newest accept or leave that counted (RFed-spec Group.md,
+/// "Member statuses and keys", 2026-10-06): the packed LXMF message exactly as received
+/// (destination, source, signature, payload), which the creator passes on as an element of a
+/// `status`. One row per group and member, the newest replacing it, kept only by the group's
+/// creator. `key` is "<groupId>|<memberHash>". Retichat-android's `group_statuses` table.
+@Model
+final class GroupStatusCopyEntity {
+    @Attribute(.unique) var key: String
+    var groupId: String
+    var memberHash: String
+    var action: String                            // "accept" | "leave"
+    var packed: Data
+
+    init(groupId: String, memberHash: String, action: String, packed: Data) {
+        self.key = Self.key(groupId: groupId, memberHash: memberHash)
+        self.groupId = groupId
+        self.memberHash = memberHash
+        self.action = action
+        self.packed = packed
+    }
+
+    static func key(groupId: String, memberHash: String) -> String { "\(groupId)|\(memberHash)" }
+}
+
+/// An accept or leave held until its sender's key is here (RFed-spec Group.md, "Verifying an
+/// accept or leave": from the switch around 2026-10-26 an unverifiable one is held, not
+/// counted): `packed` is the message as received, the bytes its signature covers, decided
+/// once the key arrives. `msgHash` (the LXMF message hash) is its identity; `seq` orders
+/// them, oldest first. Bounded (4 a member, 128 in all) and released with its group.
+/// Retichat-android's `group_held` table.
+@Model
+final class GroupHeldEntity {
+    @Attribute(.unique) var msgHash: String
+    var groupId: String
+    var srcHash: String
+    var action: String                            // "accept" | "leave"
+    var packed: Data
+    var seq: Int
+
+    init(msgHash: String, groupId: String, srcHash: String, action: String, packed: Data, seq: Int) {
+        self.msgHash = msgHash
+        self.groupId = groupId
+        self.srcHash = srcHash
+        self.action = action
+        self.packed = packed
         self.seq = seq
     }
 }

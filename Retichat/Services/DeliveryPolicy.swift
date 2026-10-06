@@ -19,10 +19,15 @@
 //  rejoin." The source every rule asks about is the packet's own LXMF
 //  source, never GROUP_SENDER.
 //
-//  For this release (James, 2026-10-05) the filter keeps v0.1.8's
-//  behaviour: an invite processed from an allowed inviter allowlists the
-//  members it lists whose keys check out, and a member's own accept
-//  allowlists it (ChatRepository.handleGroupInvite / applyGroupStatus).
+//  Until 2026-10-06 (James, 2026-10-05) the filter kept v0.1.8's behaviour:
+//  an invite processed from an allowed inviter allowlisted the members it
+//  listed whose keys check out, and a member's own accept allowlisted it,
+//  in a pending group too, so that no accept was lost before the user
+//  accepted. Since "Member statuses and keys" (RFed-spec Group.md,
+//  2026-10-06) the members pass the filter from the user's accept (or from
+//  creating the group), and a member's accept lets it through only in a
+//  group the user joined; the creator's `status` answer to the user's own
+//  accept brings back what the filter dropped before (GroupStatuses.swift).
 //
 
 import Foundation
@@ -32,8 +37,10 @@ nonisolated enum DeliveryPolicy {
     enum Held: Equatable {
         /// No such group here.
         case none
-        /// Invited, not accepted yet: the group relays for nobody, and its
-        /// chat asks nothing of the members.
+        /// Invited, not accepted yet: the group relays for nobody, takes no
+        /// status, lets nobody through the privacy filter (the members pass
+        /// from the user's accept, RFed-spec Group.md "The privacy filter"),
+        /// and its chat asks nothing of the members.
         case pending
         /// Created or accepted by the user.
         case joined
@@ -100,17 +107,31 @@ nonisolated enum DeliveryPolicy {
     /// - An accept or a leave: only from a current member of the list
     ///   (`sourceStatus`, the packet source's status there, nil when it is
     ///   not listed) that names nobody else (`namesOther`), never with a
-    ///   signature that fails. One from a source whose key is not here yet
-    ///   counts, as v0.1.8 counts it (James, 2026-10-05). The risk: anyone
-    ///   who knows the group id can forge a listed member's leave, and a
-    ///   leave is final; the next release carries the member's key in each
-    ///   accept and leave.
+    ///   signature that fails. One that is not verified passes this rule
+    ///   and is decided by what it is worth (GroupStatuses.verdict): each
+    ///   carries its sender's own key since 2026-10-06, so a source nobody
+    ///   held a key for is verified by the key it carries (validated, or
+    ///   invalid and dropped here). One that no key can verify (a client
+    ///   from before that sends none) counts until the switch
+    ///   (RetichatField.groupEntriesInRetichatField, around 2026-10-26),
+    ///   as v0.1.8 counts it, and from then on is held until its sender's
+    ///   key arrives.
     /// - A relay request: only for a group the user joined, from a member
     ///   that accepted it, with a validated signature.
+    /// - A status (RFed-spec Group.md, "Receiving a status", James
+    ///   2026-10-06): the creator's answer to the user's accept, only from
+    ///   the group's creator (`sourceIsCreator`: the invite's authenticated
+    ///   source, which the group records; false for a group held before
+    ///   that was recorded), only for a group the user joined, and only
+    ///   with a validated signature: the creator's key is held, as every
+    ///   member's is when the user accepts. Whether the creator has left
+    ///   decides nothing: a status is a carrier, and each element in it is
+    ///   checked on its own.
     /// - Any other action: only from a current member of a joined group,
     ///   with a validated signature.
     static func shouldProcess(action: String?, sourceAllowed: Bool, held: Held, sourceStatus: String?,
-                              namesOther: Bool, closed: Bool, signature: Int) -> Bool {
+                              namesOther: Bool, closed: Bool, signature: Int,
+                              sourceIsCreator: Bool = false) -> Bool {
         let forged = signature == Signature.invalid
         let proven = signature == Signature.validated
         if action == GroupAction.invite { return sourceAllowed && !closed && !forged }
@@ -119,6 +140,8 @@ nonisolated enum DeliveryPolicy {
         switch action {
         case GroupAction.relayRequest:
             return held == .joined && sourceStatus == MemberStatus.accepted && proven
+        case GroupAction.status:
+            return held == .joined && sourceIsCreator && proven
         case GroupAction.accept, GroupAction.leave:
             return isCurrent(sourceStatus) && !namesOther && !forged
         default:

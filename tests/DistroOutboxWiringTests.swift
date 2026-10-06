@@ -394,7 +394,8 @@ func everyCFunctionTheSwiftWrapperCallsIsDeclaredAndExported() {
     let functions = ["retichat_message_set_distro_channel_sync", "retichat_message_pack",
                      "retichat_propagation_build_upload", "retichat_propagation_link",
                      "retichat_propagation_upload", "retichat_propagation_link_events_register",
-                     "retichat_interface_up_register", "retichat_interface_up_clear"]
+                     "retichat_interface_up_register", "retichat_interface_up_clear",
+                     "retichat_group_unpack_packed", "retichat_message_set_retichat_statuses"]
     let wrapper = code(bridge)
     for name in functions {
         check(header.contains("\(name)("), "\(name) is declared in the header")
