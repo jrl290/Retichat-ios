@@ -1035,4 +1035,46 @@ int32_t retichat_interface_up_register(retichat_interface_up_t callback, void *c
 /// Stop telling the host (the stack is stopping).
 void retichat_interface_up_clear(void);
 
+#pragma mark - Member statuses and keys (RFed-spec Group.md, 2026-10-06)
+
+/// The delivery callback with what the group follow-up needs of an accept or a
+/// leave (lxmf_delivery_callback_t's arguments, and two more). An accept or leave
+/// carries its sender's own key: `sender_key` is that key (64 bytes) when it binds
+/// to the message's source, and a source the router held no key for is checked
+/// under it, so `unverified_reason` is 0 or 2 for it, never 1 for want of a key.
+/// `packed` is the whole message as received (destination | source | signature |
+/// payload) for an accept or leave of at most 2144 bytes. Both are NULL, 0 for every
+/// other message. Nothing is remembered by the library. Pointers are valid only
+/// during the call; it runs on a background thread.
+typedef void (*retichat_group_delivery_callback_t)(void *context,
+    const uint8_t *hash, uint32_t hash_len,
+    const uint8_t *src_hash, uint32_t src_len,
+    const uint8_t *dest_hash, uint32_t dest_len,
+    const char *title,
+    const char *content,
+    double timestamp,
+    int32_t signature_valid,
+    int32_t unverified_reason,
+    const uint8_t *fields_raw, uint32_t fields_len,
+    const uint8_t *sender_key, uint32_t sender_key_len,
+    const uint8_t *packed, uint32_t packed_len);
+
+/// Register the client's delivery callback with the group receipt; it replaces
+/// lxmf_client_set_delivery_callback's. Returns 0, or -1 (rns_last_error).
+int32_t retichat_client_set_delivery_callback_receipt(uint64_t client,
+                                                      retichat_group_delivery_callback_t callback,
+                                                      void *context);
+
+/// An element of a `status`, or an entry held for its sender's key (a member's own
+/// packed accept or leave, 97..=2144 bytes), unpacked and checked as if it had
+/// arrived directly. Returns heap bytes (free with rns_free_bytes), laid out as
+/// Swift's UnpackedGroupMessage.parse reads them, or NULL (rns_last_error).
+uint8_t *retichat_group_unpack_packed(const uint8_t *packed, uint32_t packed_len, uint32_t *out_len);
+
+/// Write key 10 (GROUP_STATUSES) on an outbound message: a native array of bin in
+/// the Retichat field, in both forms. `elements` is `count u32 | (length u32 |
+/// bytes) * count`, big endian; an empty list is a valid answer. Returns 0, or -1
+/// (rns_last_error) with the message unchanged.
+int32_t retichat_message_set_retichat_statuses(uint64_t msg, const uint8_t *elements, uint32_t elements_len);
+
 #endif /* CRetichatFFI_h */

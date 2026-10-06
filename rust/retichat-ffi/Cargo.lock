@@ -1330,10 +1330,12 @@ name = "retichat-ffi"
 version = "0.1.0"
 dependencies = [
  "app_links",
+ "base64",
  "hex",
  "lxmf_rust",
  "reticulum_rust",
  "rmpv",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
 ]

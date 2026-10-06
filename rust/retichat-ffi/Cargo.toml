@@ -16,7 +16,12 @@ app_links = { path = "../../../app-links" }
 # The version lxmf_rust pins: C's fields are rmpv values of its own LXMessage.
 rmpv = "=1.0.0"
 sha2 = "0.10"
+# A member's own key as an accept or leave carries it (src/group_status.rs): the
+# version lxmf_rust already builds, not a second copy.
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
 hex = "0.4"
+# The shared vectors (tests/data/group_status_vectors.json).
+serde_json = "1.0"

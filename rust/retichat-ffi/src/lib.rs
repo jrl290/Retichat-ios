@@ -21,6 +21,7 @@ pub use lxmf_rust::cffi::*;
 pub use reticulum_rust::cffi::*;
 
 mod distro_outbox;
+mod group_status;
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
@@ -1662,6 +1663,189 @@ pub extern "C" fn retichat_interface_up_clear() {
     *INTERFACE_UP_HOST.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+// ---------------------------------------------------------------------------
+// Member statuses and keys (RFed-spec Group.md, "Member statuses and keys
+// (2026-10-06)"; LXMF-rust/DISPLAY_NAMES.md §10 key 10)
+//
+// What Swift cannot make of an accept or leave and of a status: the key an
+// accept or leave carries for its own sender, bound and checked where the
+// router's message is still in hand (the delivery callback below); an element
+// of a status unpacked and checked as if it had arrived directly; key 10 written
+// as a native array of bin. The pure parts, and the shared vectors they run
+// against, are in `group_status.rs`. The same functions, one for one, as
+// Retichat-android's JNI crate.
+// ---------------------------------------------------------------------------
+
+type GroupDeliveryFn = extern "C" fn(
+    context: *mut c_void,
+    hash: *const u8, hash_len: u32,
+    src_hash: *const u8, src_len: u32,
+    dest_hash: *const u8, dest_len: u32,
+    title: *const c_char,
+    content: *const c_char,
+    timestamp: f64,
+    signature_valid: i32,
+    unverified_reason: i32,
+    fields_raw: *const u8, fields_len: u32,
+    sender_key: *const u8, sender_key_len: u32,
+    packed: *const u8, packed_len: u32,
+);
+type GroupDeliveryCallback = Option<GroupDeliveryFn>;
+
+/// The host's context for the delivery callback; the router's callback holds it.
+struct DeliveryContext(usize);
+
+/// A byte slice as a pointer and a length, or NULL and 0 for none.
+fn optional_bytes(data: Option<&[u8]>) -> (*const u8, u32) {
+    match data {
+        Some(bytes) => (bytes.as_ptr(), bytes.len() as u32),
+        None => (std::ptr::null(), 0),
+    }
+}
+
+/// Register the delivery callback of `client` (a `lxmf_client_start_*` handle) with what the
+/// group follow-up needs of a message: it is `lxmf_client_set_delivery_callback`'s callback
+/// with two arguments more. `lxmf_client_set_delivery_callback` hands over a `ReceivedMessage`
+/// snapshot, which holds neither the packed bytes nor the signature, so this registers on the
+/// router itself to be given the message (`LXMRouter::register_delivery_callback`, which that
+/// wrapper calls too). It replaces any delivery callback the client had.
+///
+/// An accept or a leave of a group carries its sender's own key (RFed-spec Group.md, "The
+/// sender's key"): `sender_key` is that key (64 bytes) when it binds to the message's source,
+/// and a source the router held no key for is then checked under it, so `unverified_reason` is
+/// 0 or 2 for it, as for any signature (`group_status::receipt`). `packed` is the whole message
+/// as received (`destination | source | signature | payload`), for an accept or leave of at most
+/// 2144 bytes: what a creator keeps. Both are NULL, 0 for every other message. Nothing is
+/// remembered here: Swift remembers `sender_key` after the group rule has passed, never for a
+/// message it drops. The callback runs on a background thread and its pointers are valid only
+/// during the call. 0 on success, -1 with `rns_last_error`.
+#[no_mangle]
+pub extern "C" fn retichat_client_set_delivery_callback_receipt(
+    client: u64,
+    callback: GroupDeliveryCallback,
+    context: *mut c_void,
+) -> i32 {
+    let Some(callback) = callback else {
+        rns::set_error("a delivery callback is required".to_string());
+        return -1;
+    };
+    let Some(client) = rns::get_handle::<Arc<Mutex<lxmf_rust::LxmfClient>>>(client) else {
+        rns::set_error("invalid client handle".to_string());
+        return -1;
+    };
+    let router_handle = match client.lock() {
+        Ok(client) => client.router_handle,
+        Err(e) => {
+            rns::set_error(e.to_string());
+            return -1;
+        }
+    };
+    let Some(router) = rns::get_handle::<Arc<Mutex<lxmf_rust::LXMRouter>>>(router_handle) else {
+        rns::set_error("invalid router handle".to_string());
+        return -1;
+    };
+    let context = DeliveryContext(context as usize);
+    let registered = match router.lock() {
+        Ok(mut router) => {
+            router.register_delivery_callback(Arc::new(move |message: &lxmf_rust::LXMessage| {
+                deliver_with_receipt(callback, &context, message);
+            }));
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    match registered {
+        Ok(()) => 0,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// The router's delivery callback: a received message to the host with its receipt.
+fn deliver_with_receipt(callback: GroupDeliveryFn, context: &DeliveryContext, message: &lxmf_rust::LXMessage) {
+    let snapshot = lxmf_rust::ffi::ReceivedMessage::from_lxmessage(message);
+    // An accept or leave's carried key, checked here for a source the router holds no key for;
+    // the key and the packed message for Swift.
+    let receipt = group_status::receipt(message, snapshot.signature_validated, snapshot.unverified_reason);
+    let title = std::ffi::CString::new(snapshot.title.as_str()).unwrap_or_default();
+    let content = std::ffi::CString::new(snapshot.content.as_str()).unwrap_or_default();
+    let (key, key_len) = optional_bytes(receipt.sender_key.as_deref());
+    let (packed, packed_len) = optional_bytes(receipt.packed.as_deref());
+    callback(
+        context.0 as *mut c_void,
+        snapshot.hash.as_ptr(), snapshot.hash.len() as u32,
+        snapshot.source_hash.as_ptr(), snapshot.source_hash.len() as u32,
+        snapshot.destination_hash.as_ptr(), snapshot.destination_hash.len() as u32,
+        title.as_ptr(),
+        content.as_ptr(),
+        snapshot.timestamp,
+        if receipt.validated { 1 } else { 0 },
+        receipt.unverified_reason as i32,
+        snapshot.fields_raw.as_ptr(), snapshot.fields_raw.len() as u32,
+        key, key_len,
+        packed, packed_len,
+    );
+}
+
+/// An element of a `status` (a member's own packed accept or leave, as the creator received it)
+/// or an entry held for its sender's key, unpacked and checked as if it had arrived directly:
+/// the router's own unpack and signature check under the key held for the source, then the key
+/// the message carries for its own sender when none is held (`group_status::unpack_element`).
+/// Nothing is remembered. Returns heap bytes (free with `rns_free_bytes`): the buffer
+/// `group_status::encode_element` documents (verdict, bound key flag, destination, source,
+/// message hash, timestamp, the key, the fields), or NULL with `rns_last_error` when `packed`
+/// is not an LXMF message of the size of an accept or leave (97..=2144 bytes). The bytes are
+/// another member's: a panic is caught and reported as NULL.
+#[no_mangle]
+pub extern "C" fn retichat_group_unpack_packed(packed: *const u8, packed_len: u32, out_len: *mut u32) -> *mut u8 {
+    let packed = slice_from_raw(packed, packed_len);
+    let result = std::panic::catch_unwind(|| {
+        group_status::unpack_element(&packed).map(|element| group_status::encode_element(&element))
+    })
+    .unwrap_or_else(|_| Err("unpacking the message panicked".to_string()));
+    match result {
+        Ok(bytes) => emit_buffer(bytes, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// Write key 10 (`GROUP_STATUSES`) on the outbound message `msg` (a `retichat_message_create`
+/// handle): a native array of bin, one for each element of `elements` (a member's own packed
+/// accept or leave as the creator received it), always in the Retichat field 0xD1 (key 10 has
+/// no old top-level field), beside the entries already there. An empty array is a creator's
+/// valid answer. `elements` is `count u32 | (length u32 | bytes)*count`, big endian. Each
+/// element is as it was received, never wrapped again (CHECK_THESE_THINGS_FIRST §11). 0 on
+/// success; -1 with `rns_last_error` and the message unchanged for an element no receiver would
+/// read (no payload, or over 2144 bytes) or a buffer that does not hold what it says.
+#[no_mangle]
+pub extern "C" fn retichat_message_set_retichat_statuses(msg: u64, elements: *const u8, elements_len: u32) -> i32 {
+    let flat = slice_from_raw(elements, elements_len);
+    let list = match group_status::decode_elements(&flat) {
+        Ok(list) => list,
+        Err(e) => {
+            rns::set_error(e);
+            return -1;
+        }
+    };
+    let Some(message) = rns::get_handle::<Arc<Mutex<lxmf_rust::lx_message::LXMessage>>>(msg) else {
+        rns::set_error("invalid message handle".to_string());
+        return -1;
+    };
+    let result = match message.lock() {
+        Ok(mut m) => group_status::set_statuses(&mut m, &list),
+        Err(e) => Err(e.to_string()),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
 /// One status change to the host: the link id as a pointer and a length, or
 /// NULL and 0 when the event is about no link.
 fn deliver_link_event(
@@ -2288,6 +2472,10 @@ mod distro_outbox_bridge_tests {
             "typedef void (*retichat_interface_up_t)(void *context, const uint8_t *name, uint32_t name_len);",
             "int32_t retichat_interface_up_register(retichat_interface_up_t callback, void *context);",
             "void retichat_interface_up_clear(void);",
+            "typedef void (*retichat_group_delivery_callback_t)(void *context, const uint8_t *hash, uint32_t hash_len, const uint8_t *src_hash, uint32_t src_len, const uint8_t *dest_hash, uint32_t dest_len, const char *title, const char *content, double timestamp, int32_t signature_valid, int32_t unverified_reason, const uint8_t *fields_raw, uint32_t fields_len, const uint8_t *sender_key, uint32_t sender_key_len, const uint8_t *packed, uint32_t packed_len);",
+            "int32_t retichat_client_set_delivery_callback_receipt(uint64_t client, retichat_group_delivery_callback_t callback, void *context);",
+            "uint8_t *retichat_group_unpack_packed(const uint8_t *packed, uint32_t packed_len, uint32_t *out_len);",
+            "int32_t retichat_message_set_retichat_statuses(uint64_t msg, const uint8_t *elements, uint32_t elements_len);",
         ] {
             assert!(flat.contains(declaration), "the header lacks: {declaration}");
         }
@@ -2304,5 +2492,36 @@ mod distro_outbox_bridge_tests {
             retichat_propagation_link_events_register;
         let _: extern "C" fn(Option<extern "C" fn(*mut c_void, *const u8, u32)>, *mut c_void) -> i32 = retichat_interface_up_register;
         let _: extern "C" fn() = retichat_interface_up_clear;
+        let _: extern "C" fn(*const u8, u32, *mut u32) -> *mut u8 = retichat_group_unpack_packed;
+        let _: extern "C" fn(u64, *const u8, u32) -> i32 = retichat_message_set_retichat_statuses;
+        let _: extern "C" fn(u64, GroupDeliveryCallback, *mut c_void) -> i32 = retichat_client_set_delivery_callback_receipt;
+    }
+
+    /// The statuses reach a real outbound message through the C function: key 10 in the Retichat field,
+    /// an array of bin, in the form the receiver's reader takes, and a list the buffer cannot hold changes nothing.
+    #[test]
+    fn the_c_function_writes_key_10_as_an_array_of_bin_and_refuses_a_bad_list() {
+        let (identity, delivery, _key) = distro();
+        let msg = message_from(identity, &delivery);
+        assert_ne!(msg, 0);
+        let element = vec![7u8; 97];
+        let flat = group_status::encode_elements(&[element.clone()]);
+        assert_eq!(retichat_message_set_retichat_statuses(msg, flat.as_ptr(), flat.len() as u32), 0);
+        let message = rns::get_handle::<Arc<Mutex<lxmf_rust::lx_message::LXMessage>>>(msg).unwrap();
+        let fields = message.lock().unwrap().fields.clone();
+        let rf = lxmf_rust::retichat_field::read_entry(&fields, group_status::RF_GROUP_STATUSES).cloned();
+        assert_eq!(rf, Some(rmpv::Value::Array(vec![rmpv::Value::Binary(element)])), "an array of bin, never a bin of packed msgpack");
+        // A list that does not hold what it says, and an element too short to be a message, change nothing.
+        assert_eq!(retichat_message_set_retichat_statuses(msg, [0u8, 0, 0, 2, 0, 0, 0, 1].as_ptr(), 8), -1);
+        assert!(rns::take_error().unwrap_or_default().contains("element"));
+        let tiny = group_status::encode_elements(&[vec![1u8; 96]]);
+        assert_eq!(retichat_message_set_retichat_statuses(msg, tiny.as_ptr(), tiny.len() as u32), -1);
+        assert_eq!(retichat_message_set_retichat_statuses(0xdead_beef, flat.as_ptr(), flat.len() as u32), -1);
+        // An empty list is a creator's valid answer.
+        let none = group_status::encode_elements(&[]);
+        assert_eq!(retichat_message_set_retichat_statuses(msg, none.as_ptr(), none.len() as u32), 0);
+        let fields = message.lock().unwrap().fields.clone();
+        let rf = lxmf_rust::retichat_field::read_entry(&fields, group_status::RF_GROUP_STATUSES).cloned();
+        assert_eq!(rf, Some(rmpv::Value::Array(vec![])));
     }
 }
