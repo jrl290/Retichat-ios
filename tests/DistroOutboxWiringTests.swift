@@ -282,6 +282,40 @@ func aStaleLinksRecoveryIsTheRecoveredEventForTheNodesLinkOnly() {
     check(bridge.contains("its RECOVERED event"), "the wrapper's docs say what the event is")
 }
 
+/// James, 2026-10-06 (DESIGN_PRINCIPLES §3, what a device owes its distro): an owed upload that never
+/// left the device goes when an interface comes back online, as well as at the next coming-up. The
+/// event is the Reticulum interface's own up-edge (Transport::set_interface_online), never the
+/// system's "the network is available", and the runtime hands it to the outbox from one place.
+func anInterfaceComingBackIsTheStacksOwnUpEdgeHandedToTheOutboxFromOnePlace() {
+    let source = code(runtime)
+    check(count(source, "onInterfaceUp(") == 1, "onInterfaceUp is called from one place in the runtime")
+    for path in ["Retichat/Services/ChatRepository.swift", "Retichat/Services/RfedChannelClient.swift",
+                 "Retichat/Services/RfedDistroClient.swift", "Retichat/Services/ConnectionStateManager.swift",
+                 "Retichat/RetichatApp.swift", "Retichat/Services/DistroOutbox.swift"] {
+        check(count(code(read(path)), ".onInterfaceUp(") == 0, "\(path) never calls onInterfaceUp on the outbox")
+    }
+    let deliver = body(runtime, "static func deliverInterfaceUp(name: String) {", "// MARK: - The runtime")
+    check(deliver.contains("current.outbox.spawn { await current.outbox.onInterfaceUp(name) }") && !deliver.contains("Task.sleep"),
+          "an up-edge is handed to the outbox's own executor, and nothing waits")
+    // Not the system's reachability, and no link of its own.
+    for text in ["NWPathMonitor", "SCNetworkReachability", "Reachability", "NetworkMonitor"] {
+        check(!source.contains(text), "the runtime does not listen to \(text)")
+    }
+    // Registered at start with the link events, cleared at stop with them; the stack's listener is added once.
+    let listen = body(runtime, "private func listen(", "/// The stack is stopping")
+    check(listen.contains("bridge.interfaceUpRegister(handler: { name in PropagationLinkTarget.deliverInterfaceUp(name: name) })")
+            && before(listen, "propagationLinkEventsRegister", "interfaceUpRegister"),
+          "start registers the interface up-edge after the link events")
+    let stop = body(runtime, "func stop() {", "// MARK: What the user's actions owe")
+    check(stop.contains("bridge.interfaceUpClear()") && stop.contains("interfaceUpRegistered = false"),
+          "stop clears it, so a start registers it again")
+    check(count(code(rust), "Transport::add_interface_up_listener(") == 1, "the glue adds one listener for the process")
+    check(rust.contains("INTERFACE_UP_HOOKED.call_once("), "once, whatever the number of starts")
+    // The outbox reads only the port's answer for "never left": nothing else decides it.
+    let outbox = code(read("Retichat/Services/DistroOutbox.swift"))
+    check(count(outbox, "return .neverLeft") == 1, "one never-left decision, the port's nil with the link up")
+}
+
 func theChannelScreenClosesWhenASiblingLeaves() {
     let content = read("Retichat/Views/Navigation/ContentView.swift")
     check(content.contains(".onChange(of: channelClient.channels.map(\\.id)) { _, ids in\n            if let current = selectedChannel, !ids.contains(current.id) {\n                selectedChannel = nil"),
@@ -359,7 +393,8 @@ func aReceivedPostIsOwnByTheSharedRuleAndOwnPostsAreNeverNotifiedOrCountedAsSend
 func everyCFunctionTheSwiftWrapperCallsIsDeclaredAndExported() {
     let functions = ["retichat_message_set_distro_channel_sync", "retichat_message_pack",
                      "retichat_propagation_build_upload", "retichat_propagation_link",
-                     "retichat_propagation_upload", "retichat_propagation_link_events_register"]
+                     "retichat_propagation_upload", "retichat_propagation_link_events_register",
+                     "retichat_interface_up_register", "retichat_interface_up_clear"]
     let wrapper = code(bridge)
     for name in functions {
         check(header.contains("\(name)("), "\(name) is declared in the header")
@@ -376,6 +411,10 @@ func theCallbacksTheLibraryCallsAreTheSignaturesSwiftDeclares() {
           "the event trampoline takes what the typedef says")
     check(bridge.contains("nonisolated func propagationUploadRelease(context: UnsafeMutableRawPointer?)"),
           "the release trampoline too")
+    check(flat.contains("typedef void (*retichat_interface_up_t)(void *context, const uint8_t *name, uint32_t name_len);"),
+          "the interface up-edge typedef")
+    check(bridge.contains("nonisolated func interfaceUpEvent(context: UnsafeMutableRawPointer?, name: UnsafePointer<UInt8>?, nameLen: UInt32)"),
+          "and its trampoline takes what the typedef says")
     check(bridge.contains("""
         nonisolated func propagationLinkEvent(
             context: UnsafeMutableRawPointer?,
@@ -428,6 +467,7 @@ let allTests: [(String, () -> Void)] = [
     ("an owed message is signed by the key its source names", anOwedMessageIsSignedByTheKeyItsSourceNames),
     ("the runtime starts no link and only a link's coming-up flushes", theRuntimeStartsNoLinkAndOnlyALinksComingUpFlushes),
     ("a STALE link's recovery is the recovered event for the node's link only", aStaleLinksRecoveryIsTheRecoveredEventForTheNodesLinkOnly),
+    ("an interface coming back is the stack's own up-edge, handed to the outbox from one place", anInterfaceComingBackIsTheStacksOwnUpEdgeHandedToTheOutboxFromOnePlace),
     ("the channel screen closes when a sibling leaves", theChannelScreenClosesWhenASiblingLeaves),
     ("a post is packed with the posting identity and recorded under its hash", aPostIsPackedWithThePostingIdentityAndRecordedUnderItsHash),
     ("subscribing, the stream, pulls and push stay the device's", subscribingTheStreamPullsAndPushStayTheDevices),

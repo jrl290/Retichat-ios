@@ -1018,4 +1018,21 @@ typedef void (*retichat_link_event_t)(void *context,
 /// Returns 0, or -1 (rns_last_error).
 int32_t retichat_propagation_link_events_register(retichat_link_event_t callback, void *context);
 
+/// One Reticulum interface came online: the stack's own up-edge
+/// (Transport::set_interface_online), not the system's "the network is
+/// available". `name` is the interface's name; valid only during the call. Runs
+/// on a thread of its own; never blocks.
+typedef void (*retichat_interface_up_t)(void *context, const uint8_t *name, uint32_t name_len);
+
+/// Tell the host each time an interface comes online (James, 2026-10-06: an owed
+/// distro upload that never left the device goes then). One host callback at a
+/// time: a second register replaces the first. The stack's listener is added
+/// once for the process and survives a restart of the stack, so call
+/// retichat_interface_up_clear when the stack stops. Returns 0, or -1
+/// (rns_last_error) when callback is NULL.
+int32_t retichat_interface_up_register(retichat_interface_up_t callback, void *context);
+
+/// Stop telling the host (the stack is stopping).
+void retichat_interface_up_clear(void);
+
 #endif /* CRetichatFFI_h */

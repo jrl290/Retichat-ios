@@ -1613,6 +1613,55 @@ pub extern "C" fn retichat_propagation_link_events_register(callback: LinkEventC
     0
 }
 
+type InterfaceUpCallback = Option<extern "C" fn(*mut c_void, *const u8, u32)>;
+
+/// The host's interface up-edge callback and its context, or none. Replaced by each
+/// `retichat_interface_up_register` and dropped by `retichat_interface_up_clear`; the stack's
+/// own listener below reads it and never holds this lock while it calls the host.
+static INTERFACE_UP_HOST: Mutex<Option<(extern "C" fn(*mut c_void, *const u8, u32), usize)>> = Mutex::new(None);
+
+/// `Transport::add_interface_up_listener` takes a listener that is never taken out again (the
+/// stack's shutdown does not drop it, as it drops AppLinks' status callbacks), so ours is added
+/// once for the process, whatever the number of starts, and reads the host callback above.
+static INTERFACE_UP_HOOKED: std::sync::Once = std::sync::Once::new();
+
+/// An interface came online (the stack's `Transport::set_interface_online(name, true)` on an
+/// interface that was not): tell the host, if it is listening, the interface's name.
+fn deliver_interface_up(name: &str) {
+    let host = *INTERFACE_UP_HOST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((callback, context)) = host {
+        callback(context as *mut c_void, name.as_ptr(), name.len() as u32);
+    }
+}
+
+/// Tell the host, through `callback(context, name, name_len)`, each time a Reticulum interface
+/// comes online: the stack's own up-edge (`Transport::set_interface_online`), not the operating
+/// system's "the network is available". It is the event on which an owed distro upload that never
+/// left the device, because no interface could carry its packet, goes (James, 2026-10-06,
+/// DESIGN_PRINCIPLES §3, what a device owes its distro). `name` is the interface's name, a
+/// pointer valid only during the call. Runs on a thread of its own and must not block. One host
+/// callback at a time: a second register replaces the first. Nothing here repeats or times
+/// anything. 0 on success, -1 with `rns_last_error` when `callback` is NULL.
+#[no_mangle]
+pub extern "C" fn retichat_interface_up_register(callback: InterfaceUpCallback, context: *mut c_void) -> i32 {
+    let Some(callback) = callback else {
+        rns::set_error("an interface up callback is required".to_string());
+        return -1;
+    };
+    *INTERFACE_UP_HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some((callback, context as usize));
+    INTERFACE_UP_HOOKED.call_once(|| {
+        Transport::add_interface_up_listener(Arc::new(|name: &str| deliver_interface_up(name)));
+    });
+    0
+}
+
+/// The host stops listening (the stack is stopping): an interface that comes online after this
+/// reaches nobody, until the next register.
+#[no_mangle]
+pub extern "C" fn retichat_interface_up_clear() {
+    *INTERFACE_UP_HOST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// One status change to the host: the link id as a pointer and a length, or
 /// NULL and 0 when the event is about no link.
 fn deliver_link_event(
@@ -2087,6 +2136,72 @@ mod distro_outbox_bridge_tests {
         assert!(swift.contains(&format!("static let appLinkRecovered: UInt8 = {}", app_links::APP_LINK_RECOVERED)));
     }
 
+    /// The interface up-edge reaches the host with the interface's name, once per edge, from the
+    /// stack's own `Transport::set_interface_online`: not on a repeat of "online", not on a down-edge,
+    /// and not after the host cleared it. (One test: the host callback is process-wide.)
+    #[test]
+    fn an_interface_up_edge_reaches_the_host_once_with_its_name_until_it_is_cleared() {
+        use reticulum_rust::transport::{InterfaceStub, InterfaceStubConfig};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        static SEEN: Mutex<Option<mpsc::Sender<(usize, String)>>> = Mutex::new(None);
+        extern "C" fn callback(context: *mut c_void, name: *const u8, name_len: u32) {
+            let name = String::from_utf8(unsafe { std::slice::from_raw_parts(name, name_len as usize) }.to_vec()).unwrap();
+            if let Some(tx) = SEEN.lock().unwrap().as_ref() {
+                let _ = tx.send((context as usize, name));
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        *SEEN.lock().unwrap() = Some(tx);
+
+        // No host yet: an edge reaches nobody.
+        deliver_interface_up("nobody-listens");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "no host, nothing delivered");
+
+        assert_eq!(retichat_interface_up_register(None, std::ptr::null_mut()), -1);
+        assert!(rns::take_error().unwrap_or_default().contains("callback"));
+        assert_eq!(retichat_interface_up_register(Some(callback), 0xFACE as *mut c_void), 0);
+        // Registering again (a restart of the stack) replaces the host callback and adds no listener.
+        assert_eq!(retichat_interface_up_register(Some(callback), 0xFACE as *mut c_void), 0);
+
+        deliver_interface_up("tcp-direct");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), (0xFACE, "tcp-direct".to_string()), "the name and the context");
+
+        // Through the stack: an interface registered offline, brought online, offline and online again.
+        let name = "retichat-ffi-up-edge-test";
+        let mut config = InterfaceStubConfig::default();
+        config.name = name.to_string();
+        config.online = Some(false);
+        config.out = true;
+        config.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(config);
+        let wait_for_name = |expected: &str, within: Duration| -> bool {
+            let end = std::time::Instant::now() + within;
+            while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
+                match rx.recv_timeout(left) {
+                    Ok((_, got)) if got == expected => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+            false
+        };
+        Transport::set_interface_online(name, true);
+        assert!(wait_for_name(name, Duration::from_secs(5)), "the stack's up-edge reaches the host, with the interface's name");
+        Transport::set_interface_online(name, true);    // already online: no edge
+        Transport::set_interface_online(name, false);   // a down-edge: told to nobody
+        assert!(!wait_for_name(name, Duration::from_millis(300)), "a repeat and a down-edge are no up-edge");
+        Transport::set_interface_online(name, true);
+        assert!(wait_for_name(name, Duration::from_secs(5)), "each up-edge is told");
+
+        retichat_interface_up_clear();
+        Transport::set_interface_online(name, false);
+        Transport::set_interface_online(name, true);
+        assert!(!wait_for_name(name, Duration::from_millis(300)), "after clear nobody hears it");
+        Transport::deregister_interface_stub(name);
+    }
+
     /// A propagation node's announce `app_data`: `[name, timebase, active, limit, sync limit, [cost, ...], {}]`.
     fn node_app_data(cost: i64) -> Vec<u8> {
         let value = rmpv::Value::Array(vec![
@@ -2170,6 +2285,9 @@ mod distro_outbox_bridge_tests {
             "uint8_t *retichat_propagation_upload(const uint8_t *node, uint32_t node_len, const uint8_t *upload, uint32_t upload_len, retichat_upload_event_t event, retichat_upload_release_t release, void *context, uint32_t *out_len);",
             "typedef void (*retichat_link_event_t)(void *context, const uint8_t *dest, uint32_t dest_len, uint8_t status, const uint8_t *link_id, uint32_t link_id_len);",
             "int32_t retichat_propagation_link_events_register(retichat_link_event_t callback, void *context);",
+            "typedef void (*retichat_interface_up_t)(void *context, const uint8_t *name, uint32_t name_len);",
+            "int32_t retichat_interface_up_register(retichat_interface_up_t callback, void *context);",
+            "void retichat_interface_up_clear(void);",
         ] {
             assert!(flat.contains(declaration), "the header lacks: {declaration}");
         }
@@ -2184,5 +2302,7 @@ mod distro_outbox_bridge_tests {
         ) -> *mut u8 = retichat_propagation_upload;
         let _: extern "C" fn(Option<extern "C" fn(*mut c_void, *const u8, u32, u8, *const u8, u32)>, *mut c_void) -> i32 =
             retichat_propagation_link_events_register;
+        let _: extern "C" fn(Option<extern "C" fn(*mut c_void, *const u8, u32)>, *mut c_void) -> i32 = retichat_interface_up_register;
+        let _: extern "C" fn() = retichat_interface_up_clear;
     }
 }

@@ -766,6 +766,31 @@ nonisolated func propagationLinkEvent(
     PropagationLinkEvents.deliver(dest: Data(bytes: dest, count: Int(destLen)), status: status, linkId: id)
 }
 
+/// The one handler of `RetichatBridge.interfaceUpRegister`, read on stack threads.
+nonisolated private enum InterfaceUpEvents {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var handler: ((String) -> Void)?
+
+    static func set(_ handler: ((String) -> Void)?) {
+        lock.lock(); defer { lock.unlock() }
+        self.handler = handler
+    }
+
+    static func deliver(name: String) {
+        lock.lock()
+        let current = handler
+        lock.unlock()
+        current?(name)
+    }
+}
+
+/// retichat_interface_up_t: a Reticulum interface came online. Runs on a thread of the
+/// stack's own and must not block.
+nonisolated func interfaceUpEvent(context: UnsafeMutableRawPointer?, name: UnsafePointer<UInt8>?, nameLen: UInt32) {
+    guard let name, nameLen > 0 else { return }
+    InterfaceUpEvents.deliver(name: String(decoding: UnsafeBufferPointer(start: name, count: Int(nameLen)), as: UTF8.self))
+}
+
 extension RetichatBridge {
 
     /// `LinkHandle::status()`, as `propagationLink` reports it.
@@ -901,6 +926,26 @@ extension RetichatBridge {
     /// Forget the handler (the stack is stopping): a status change after this reaches nobody.
     nonisolated func propagationLinkEventsClear() {
         PropagationLinkEvents.set(nil)
+    }
+
+    /// Register `handler` for each Reticulum interface that comes online, with its name: the
+    /// stack's own up-edge (`Transport::set_interface_online`), never the system saying the
+    /// network is available (James, 2026-10-06: an owed distro upload that never left the
+    /// device goes then, DESIGN_PRINCIPLES §3, what a device owes its distro). Runs on a
+    /// thread of the stack's own and must not block. The stack's listener lives for the
+    /// process, so this is cleared when the stack stops (`interfaceUpClear`) and registered
+    /// again at each start.
+    nonisolated func interfaceUpRegister(handler: @escaping (String) -> Void) -> Bool {
+        InterfaceUpEvents.set(handler)
+        let ok = retichat_interface_up_register(interfaceUpEvent, nil) == 0
+        if !ok { InterfaceUpEvents.set(nil) }
+        return ok
+    }
+
+    /// Forget the handler (the stack is stopping): an interface that comes online after this reaches nobody.
+    nonisolated func interfaceUpClear() {
+        InterfaceUpEvents.set(nil)
+        retichat_interface_up_clear()
     }
 }
 

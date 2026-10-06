@@ -254,6 +254,32 @@ func aLinkEventReachesTheHandlerWithItsLinkOrNone() {
     checkEqual(seen.events.count, 3, "cleared, a status change reaches nobody")
 }
 
+func anInterfaceUpEventReachesTheHandlerWithItsNameUntilItIsCleared() {
+    // The library's own up-edge listener (Transport::set_interface_online) is exercised by the glue crate's cargo
+    // test; here the registration and the trampoline are the real ones, called as the library calls them.
+    final class Seen: @unchecked Sendable {
+        let lock = NSLock()
+        var names: [String] = []
+    }
+    let seen = Seen()
+    check(bridge.interfaceUpRegister(handler: { name in
+        seen.lock.lock(); seen.names.append(name); seen.lock.unlock()
+    }), "the handler is registered with the library")
+    check(bridge.interfaceUpRegister(handler: { name in
+        seen.lock.lock(); seen.names.append(name); seen.lock.unlock()
+    }), "registered again, as every start of the stack does, it is no error")
+    let name = Array("tcp-direct".utf8)
+    interfaceUpEvent(context: nil, name: name, nameLen: UInt32(name.count))
+    interfaceUpEvent(context: nil, name: nil, nameLen: 0)
+    interfaceUpEvent(context: nil, name: name, nameLen: 0)
+    checkEqual(seen.names, ["tcp-direct"], "an event with no name is ignored, and the name arrives whole")
+    bridge.interfaceUpClear()
+    interfaceUpEvent(context: nil, name: name, nameLen: UInt32(name.count))
+    checkEqual(seen.names.count, 1, "cleared, an up-edge reaches nobody")
+    check(bridge.interfaceUpRegister(handler: { _ in }), "and it registers again after a clear")
+    bridge.interfaceUpClear()
+}
+
 // MARK: - What the unwrap hands the app: the fields as base64, read as the app reads them
 
 func theUnwrapsFieldsAreTheBytesTheReaderTakes() {
@@ -283,6 +309,7 @@ let allTests: [(String, () -> Void)] = [
     ("a node that is not held has no link, and an upload on it is refused with its sink released once", aNodeThatIsNotHeldHasNoLinkAndAnUploadOnItIsRefusedWithItsSinkReleasedOnce),
     ("the upload trampolines report each event and the release frees the sink", theUploadTrampolinesReportEachEventAndTheReleaseFreesTheSink),
     ("a link event reaches the handler with its link or none", aLinkEventReachesTheHandlerWithItsLinkOrNone),
+    ("an interface up-edge reaches the handler with its name until it is cleared", anInterfaceUpEventReachesTheHandlerWithItsNameUntilItIsCleared),
     ("the unwrap's fields are the bytes the reader takes", theUnwrapsFieldsAreTheBytesTheReaderTakes),
 ]
 

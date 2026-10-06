@@ -155,7 +155,7 @@ struct TestError: Error, LocalizedError {
 
 final class FakePort: PropagationPort, @unchecked Sendable {
     private let state = Locked<(held: HeldLink?, resource: Bool, builds: [OwedEntry], sent: [Sent],
-                                gates: [Gate], failNext: Error?)>((nil, false, [], [], [], nil))
+                                gates: [Gate], failNext: Error?, cannotQueue: Bool, refused: Int)>((nil, false, [], [], [], nil, false, 0))
 
     /// The link the stack holds for the propagation node now (what `held()` reads).
     var current: HeldLink? {
@@ -167,6 +167,14 @@ final class FakePort: PropagationPort, @unchecked Sendable {
         get { state.with { $0.resource } }
         set { state.with { $0.resource = newValue } }
     }
+    /// No interface can carry a packet: the link is held and ACTIVE, and `upload` still
+    /// returns nil, as the glue does when `send_on_held_link` cannot queue the packet.
+    var cannotQueue: Bool {
+        get { state.with { $0.cannotQueue } }
+        set { state.with { $0.cannotQueue = newValue } }
+    }
+    /// How many uploads `cannotQueue` refused.
+    var refused: Int { state.with { $0.refused } }
     var builds: [OwedEntry] { state.with { $0.builds } }
     var sent: [Sent] { state.with { $0.sent } }
 
@@ -193,6 +201,7 @@ final class FakePort: PropagationPort, @unchecked Sendable {
 
     func upload(_ upload: Data, sink: UploadSink) throws -> UploadLeft? {
         guard let link = current, link.active else { return nil }
+        if state.with({ s -> Bool in if s.cannotQueue { s.refused += 1 }; return s.cannotQueue }) { return nil }
         let parts = String(decoding: upload, as: UTF8.self).components(separatedBy: "|")
         state.with { $0.sent.append(Sent(linkId: link.id, entryId: parts[0], msgHash: parts[1], key: parts[2], sink: sink)) }
         return UploadLeft(linkId: link.id, resource: resource)
@@ -1315,6 +1324,366 @@ func anEntryOwedWhileTheLinkIsNotActiveBuildsNothingAndSaysNothingWentWrong() as
     }
 }
 
+// MARK: - an upload that never left the device (James, 2026-10-06)
+
+// DESIGN_PRINCIPLES §3, what a device owes its distro: an upload that never left
+// the device, because no interface could carry it (the glue's send could not queue
+// the packet), is not a failure: nothing was sent. It goes when an interface comes
+// back online, an event like the others, as well as at the next coming-up; a loss
+// after the packet left still waits for the next coming-up. On staging a short
+// network drop left the propagation link up, so no coming-up followed and the owed
+// upload waited 35 s for an unrelated close. The web's cases (Retichat-js
+// distro_channels.test.mjs, 136d13d), with `FakePort.cannotQueue` as the interface
+// that cannot carry a packet and `onInterfaceUp` as its return.
+
+func aMessageWhosePacketNeverLeftIsNoFailureAndGoesWhenAnInterfaceIsBackOnceTheSameMessage() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let join = channel("join", "public.tea", "join")
+        let comingUps = await rig.outbox.propComingUps
+        await rig.outbox.owe(join)
+        await rig.settle()
+        checkEqual(rig.port.refused, 1, "the stack could not queue its packet")
+        check(rig.port.sent.isEmpty, "nothing was sent")
+        check(rig.lines.error.isEmpty, "no failure, so no error for the client to show")
+        check(rig.lines.warn.isEmpty, "and no warning")
+        check(rig.lines.info.contains { $0.contains("never left the device") && $0.contains("no failure") }, "said, as information")
+        checkEqual(await rig.outbox.owed(), [join], "still owed")
+        check(rig.store.has(join.id), "and kept in storage")
+        check(await rig.outbox.neverLeft(join), "recorded as never left")
+        checkEqual(await rig.outbox.unprovedCount(), 0, "no failure record")
+        check(await rig.outbox.unprovedAt(join) == nil, "no coming-up recorded, so no failure holds it back")
+        checkEqual(await rig.outbox.propComingUps, comingUps, "and no coming-up counted")
+
+        // The interface is back and can carry it: it goes, once, the message packed when the user acted.
+        rig.port.cannotQueue = false
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "the interface is back: it goes")
+        checkEqual(nth(rig.port.sent, 0).msgHash, "join", "the same message, not another")
+        checkEqual(nth(rig.port.sent, 0).linkId, "L1", "on the propagation link that is up")
+        check(!(await rig.outbox.neverLeft(join)), "an upload of it has begun: the record has done its work")
+        checkEqual(await rig.outbox.propComingUps, comingUps, "it is no coming-up and counted none")
+        nth(rig.port.sent, 0).proved()
+        await rig.settle()
+        check(await rig.outbox.owed().isEmpty, "proved: owed no more")
+        check(rig.store.held.isEmpty, "and out of storage")
+        checkEqual(await rig.outbox.neverLeftCount(), 0, "no record")
+
+        // The next up-edge sends nothing: it is proved.
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "nothing more")
+        check(rig.lines.error.isEmpty && rig.lines.warn.isEmpty, "nothing was ever an error or a warning")
+    }
+}
+
+func aLossAfterThePacketLeftDoesNotGoWhenAnInterfaceIsBackAndWaitsForTheNextComingUp() async {
+    await withRig { rig in
+        rig.link("L1")
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "it left")
+        nth(rig.port.sent, 0).lost()
+        await rig.settle()
+        check(rig.lines.error.contains { $0.contains("was not proved") && $0.contains("still owed") }, "a loss is a failure, and is said")
+        check(!(await rig.outbox.neverLeft(join)), "not a packet that never left")
+        let comingUps = await rig.outbox.propComingUps
+        check(await rig.outbox.unprovedAt(join) == comingUps, "its failure is recorded at the coming-up it was decided at")
+
+        // Mutation: an up-edge that sends every owed message retries on a failure alone.
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "an interface coming back is no coming-up: a failure is not retried on it")
+        checkEqual(await rig.outbox.propComingUps, comingUps, "and it counted none")
+        checkEqual(await rig.outbox.owed(), [join], "still owed")
+
+        rig.link("L2")
+        await rig.outbox.onLinkEstablished("L2")
+        await rig.settle()
+        checkEqual(links(rig.port.sent), ["L1", "L2"], "the next coming-up sends it")
+        nth(rig.port.sent, 1).proved()
+        await rig.settle()
+        check(await rig.outbox.owed().isEmpty, "proved")
+    }
+}
+
+func aBuildThatThrowsIsAFailureAndAnInterfaceComingBackDoesNotRetryIt() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.failNextBuild("the stamp cannot be mined")
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        check(rig.lines.error.contains { $0.contains("the stamp cannot be mined") }, "said")
+        check(!(await rig.outbox.neverLeft(join)), "nothing was queued and refused: not a message that never left")
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        check(rig.port.sent.isEmpty, "a build's failure waits for the next coming-up")
+        checkEqual(rig.port.builds.count, 1, "and is not built again")
+    }
+}
+
+func aNeverLeftMessageGoesAtTheNextComingUpTooAndTheInterfacesReturnAfterThatSendsNothingMore() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        check(rig.port.sent.isEmpty, "never left")
+        // The interface can carry it again and the propagation link is replaced by a new one: a flush
+        // sends it, like a message never uploaded; it has no failure to wait out.
+        rig.port.cannotQueue = false
+        rig.link("L2")
+        await rig.outbox.onLinkEstablished("L2")
+        await rig.settle()
+        checkEqual(links(rig.port.sent), ["L2"], "it went at the coming-up")
+        checkEqual(await rig.outbox.neverLeftCount(), 0, "and its record ended")
+        // The return while that upload is in flight sends nothing: one upload of a message at a time.
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "no double send")
+        nth(rig.port.sent, 0).proved()
+        await rig.settle()
+        check(await rig.outbox.owed().isEmpty, "proved")
+    }
+}
+
+func aNeverLeftMessageThatGoesAtAComingUpAndIsThenLostAfterItLeftIsAFailureLikeAny() async {
+    // The record of a message that never left ends when an upload of it begins (uploadOwed); left standing,
+    // the up-edge would send on the strength of a failure alone, which §3 allows only at a coming-up.
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        check(await rig.outbox.neverLeft(join), "never left")
+        rig.port.cannotQueue = false
+        rig.link("L2")
+        await rig.outbox.onLinkEstablished("L2")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "the coming-up sent it")
+        check(!(await rig.outbox.neverLeft(join)), "an upload of it has begun")
+        nth(rig.port.sent, 0).lost()
+        await rig.settle()
+        check(rig.lines.error.contains { $0.contains("was not proved") && $0.contains("still owed") }, "it left, and was lost: a failure")
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "no retry on a failure at an interface's return")
+        rig.link("L3")
+        await rig.outbox.onLinkEstablished("L3")
+        await rig.settle()
+        checkEqual(links(rig.port.sent), ["L2", "L3"], "the next coming-up sends it")
+    }
+}
+
+func twoInterfacesComingBackInARowTheSecondWhileTheFirstsUploadIsBuiltSendOneUpload() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        await rig.outbox.owe(channel("join", "public.tea", "join"))
+        await rig.settle()
+        rig.port.cannotQueue = false
+        let gate = rig.port.gateNextBuild()
+        let first = rig.launch { await rig.outbox.onInterfaceUp("tcp0") }
+        await rig.settle()
+        let second = rig.launch { await rig.outbox.onInterfaceUp("tcp1") }
+        await rig.settle()
+        checkEqual(rig.port.builds.count, 2, "the second finds the first's upload being built, and its record ended: one build more")
+        gate.release()
+        await first.value
+        await second.value
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "one upload, one stamp")
+    }
+}
+
+func aFlushAtAComingUpAlreadyRunningDoesNotSendTwiceWhatAnInterfacesReturnSends() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let a = channel("join", "public.tea", "a")
+        let b = sentCopy("b")
+        await rig.outbox.owe(a)
+        await rig.outbox.owe(b)
+        await rig.settle()
+        checkEqual(await rig.outbox.neverLeftCount(), 2, "both never left")
+        // A coming-up's flush lists both and builds a first (a stamp that takes a while).
+        rig.port.cannotQueue = false
+        let gate = rig.port.gateNextBuild()
+        let flush = rig.launch { await rig.outbox.onLinkEstablished("L1") }
+        await rig.settle()
+        // The interface returns meanwhile: a is being built (its record ended), b goes.
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(ids(rig.port.sent), [b.id], "the return sent b, and left a to the flush that is building it")
+        gate.release()
+        await flush.value
+        await rig.settle()
+        checkEqual(Set(ids(rig.port.sent)), Set([a.id, b.id]), "the flush sent a")
+        checkEqual(rig.port.sent.count, 2, "and found b in flight: no second upload of it")
+    }
+}
+
+func anInterfacesPassBuildingAnEarlierEntryDoesNotSendALaterOneThatAFlushOrAGivenUpDistroTookMeanwhile() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let a = sentCopy("a")
+        let b = sentCopy("b")
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(a)
+        await rig.outbox.owe(b)
+        await rig.outbox.owe(join)
+        await rig.settle()
+        checkEqual(await rig.outbox.neverLeftCount(), 3, "all three never left")
+        rig.port.cannotQueue = false
+        // The up-edge's pass lists a, b and the join, and builds a first (a stamp that takes a while).
+        let gate = rig.port.gateNextBuild()
+        let pass = rig.launch { await rig.outbox.onInterfaceUp("tcp0") }
+        await rig.settle()
+        // Meanwhile a coming-up's flush sends b (a is in flight, the join is owed to the distro...),
+        // and the distro is given up before the pass reaches the join.
+        rig.setDistro(nil)
+        await rig.outbox.onDistroChanged()
+        await rig.outbox.onLinkEstablished("L1")
+        await rig.settle()
+        checkEqual(ids(rig.port.sent), [b.id], "the flush sent b; a is being built by the pass; the join was dropped with its distro")
+        // Mutation: a pass that does not look again sends b twice when it reaches it.
+        gate.release()
+        await pass.value
+        await rig.settle()
+        checkEqual(ids(rig.port.sent), [b.id, a.id], "the pass sent a, found b already uploaded, and the join gone")
+        checkEqual(rig.port.uploads(of: b.id).count, 1, "b went once")
+    }
+}
+
+func aNeverLeftMessageReplacedByALaterActionIsNotSentAndItsRecordIsGone() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let leave = channel("leave", "public.tea", "leave", at: 1)
+        let join = channel("join", "public.tea", "join", at: 2)
+        await rig.outbox.owe(leave)
+        await rig.settle()
+        check(await rig.outbox.neverLeft(leave), "the leave never left")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        check(!(await rig.outbox.neverLeft(leave)), "the replaced message's record went with it")
+        check(await rig.outbox.neverLeft(join), "the join never left either")
+        checkEqual(await rig.outbox.neverLeftCount(), 1, "one record")
+        rig.port.cannotQueue = false
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.map(\.msgHash), ["join"], "only the newest action goes, the replaced leave never")
+        checkEqual(await rig.outbox.owed(), [join], "and the join is owed until proved")
+    }
+}
+
+func aNeverLeftMembershipMessageOwedToADistroGivenUpIsDroppedAndNeverSentAtTheReturn() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let join = channel("join", "public.tea", "join")
+        let copy = sentCopy("copy")
+        await rig.outbox.owe(join)
+        await rig.outbox.owe(copy)
+        await rig.settle()
+        checkEqual(await rig.outbox.neverLeftCount(), 2, "both never left")
+        rig.setDistro(nil)
+        await rig.outbox.onDistroChanged()
+        checkEqual(await rig.outbox.owed(), [copy], "the membership message is dropped with its distro, the sent-copy stays owed")
+        checkEqual(await rig.outbox.neverLeftCount(), 1, "and its record went with it, only its own")
+        rig.setDistro(d1)
+        rig.port.cannotQueue = false
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(ids(rig.port.sent), [copy.id], "the dropped message is not sent though the distro is held again; the sent-copy still goes to its own distro")
+    }
+}
+
+func theInterfacesReturnWithThePropagationLinkNotUpSendsNothingAndTheLinksComingUpSendsWhatNeverLeft() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        rig.port.cannotQueue = false
+        rig.link("L1", active: false)           // STALE: held, not ACTIVE
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        check(rig.port.sent.isEmpty, "a STALE link carries nothing")
+        rig.port.current = nil                  // none held
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        check(rig.port.sent.isEmpty, "no link, nothing to do")
+        check(await rig.outbox.neverLeft(join), "and the record stands")
+        check(rig.lines.error.isEmpty, "nothing went wrong")
+        rig.link("L2")
+        await rig.outbox.onLinkEstablished("L2")
+        await rig.settle()
+        checkEqual(links(rig.port.sent), ["L2"], "the link's coming-up sends it with everything owed")
+    }
+}
+
+func severalNeverLeftMessagesGoOldestFirstAndASentCopyGoesTheSameWay() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let copy = sentCopy("copy")
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(copy)
+        await rig.outbox.owe(join)
+        await rig.settle()
+        rig.port.cannotQueue = false
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(ids(rig.port.sent), [copy.id, join.id], "oldest first, the sent-copy as the membership message")
+    }
+}
+
+func anInterfaceThatStillCannotCarryItRefusesItAgainWithNoLoopAndTheNextReturnTriesOnce() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        checkEqual(rig.port.refused, 1, "refused when the user acted")
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.refused, 2, "refused at the return: one attempt per up-edge")
+        await rig.settle()
+        checkEqual(rig.port.refused, 2, "and no loop")
+        check(await rig.outbox.neverLeft(join), "recorded again")
+        check(rig.lines.error.isEmpty && rig.lines.warn.isEmpty, "still no failure")
+        await rig.outbox.onInterfaceUp("tcp1")
+        await rig.settle()
+        checkEqual(rig.port.refused, 3, "the next return tries once")
+        checkEqual(await rig.outbox.owed(), [join], "still owed")
+    }
+}
+
+func theStacksStopSendsNothingAtAnInterfacesReturn() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        await rig.outbox.owe(channel("join", "public.tea", "join"))
+        await rig.settle()
+        rig.port.cannotQueue = false
+        await rig.outbox.onStop()
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        check(rig.port.sent.isEmpty, "the stack is gone: nothing is sent")
+        checkEqual(rig.port.builds.count, 1, "nothing is built")
+    }
+}
+
 // MARK: - who may call what (DESIGN_PRINCIPLES §3, the distro exception)
 
 let outboxSource = source("Retichat/Services/DistroOutbox.swift")
@@ -1368,14 +1737,48 @@ func onlyTheLinkComingUpStartsAFlush() {
     checkEqual(callersOf("sendDistroOutbox"), ["onLinkEstablished", "onLinkRecovered"], "callers of the flush")
 }
 
-func anOwedUploadIsMadeByThreePathsAndNoOther() {
-    // The coming-up pass, which reads the failure record with its coming-up, and uploadOwedAtOnce,
-    // which reads none: the user's own action (owe) and the third ruling's send (inside uploadOwed's
-    // loss handler). Anything else calling either would send an upload again on its own failure.
-    checkEqual(callersOf("uploadOwed"), ["sendDistroOutbox", "uploadOwedAtOnce"], "callers of uploadOwed")
+func anOwedUploadIsMadeByFourPathsAndNoOther() {
+    // The coming-up pass, which reads the failure record with its coming-up, uploadOwedAtOnce, which
+    // reads none: the user's own action (owe) and the third ruling's send (inside uploadOwed's loss
+    // handler), and an interface's return, which sends only what never left (James, 2026-10-06).
+    // Anything else calling either would send an upload again on its own failure.
+    checkEqual(callersOf("uploadOwed"), ["sendDistroOutbox", "sendDistroNeverLeft", "uploadOwedAtOnce"], "callers of uploadOwed")
     checkEqual(callersOf("uploadOwedAtOnce"), ["owe", "uploadOwed"], "callers of uploadOwedAtOnce")
     // The upload it makes has one caller too.
     checkEqual(callersOf("uploadFor"), ["uploadOwed"], "callers of uploadFor")
+}
+
+func onlyAnInterfaceComingBackSendsWhatNeverLeftAndItSendsNothingElse() {
+    // James, 2026-10-06: the interface's up-edge is the event, told by the runtime (the stack's own
+    // up-edge, never the OS's "the network is available"), and nothing else calls it.
+    checkEqual(callersOf("sendDistroNeverLeft"), ["onInterfaceUp"], "callers of the never-left send")
+    checkEqual(callersOf("onInterfaceUp"), [], "onInterfaceUp is called from the runtime alone")
+    guard let from = outboxCode.range(of: "private func sendDistroNeverLeft("), let to = outboxCode.range(of: "private func uploadOwedAtOnce(") else {
+        check(false, "the never-left send is in the source")
+        return
+    }
+    let send = String(outboxCode[from.lowerBound..<to.lowerBound])
+    check(send.contains("unproved.neverLeft("), "it sends only a message recorded never left")
+    // It is no coming-up and reads and writes no failure record.
+    for text in ["propComingUps", "unprovedSince(", "recordUnproved", "unproved.at(", "unproved.since(", "unproved.record(", "sendDistroOutbox("] {
+        check(!send.contains(text), "the never-left send does not touch \(text)")
+    }
+    // Each checked again when its turn comes, as a flush's are.
+    for guardText in ["stillOwed(entry)", "distroAttemptOpen(entry, linkId)", "!unproved.neverLeft(entry)", "!linkUp(linkId)", "held.active"] {
+        check(send.contains(guardText), "the never-left send checks \(guardText)")
+    }
+}
+
+func theNeverLeftDecisionAndItsRecordAreMadeInOnePlaceEach() {
+    // The port's nil with the link up is the one never-left decision, recorded in one place, and the
+    // record ended where an upload of the message begins (and in forget, which ends both records).
+    checkEqual(outboxCode.components(separatedBy: "return .neverLeft").count - 1, 1, "one decision")
+    checkEqual(outboxCode.components(separatedBy: "unproved.recordNeverLeft(entry)").count - 1, 1, "one record")
+    checkEqual(outboxCode.components(separatedBy: "recordNeverLeft()").count - 1, 2, "declared once, called once")
+    checkEqual(outboxCode.components(separatedBy: "unproved.clearNeverLeft(entry)").count - 1, 1, "one place an upload begins")
+    check(outboxCode.contains("func forget(_ entry: OwedEntry) {\n        clearNeverLeft(entry)"), "forget ends the never-left record with the failure's")
+    // A never-left upload records no failure: recordUnproved is called from a build that throws, and from the loss.
+    checkEqual(outboxCode.components(separatedBy: "recordUnproved()").count - 1, 3, "declared once, called by a failed build and by a loss")
 }
 
 func theThirdRulingsSendIsTheLossOfAnUploadOnAnotherLinkAndNothingElse() {
@@ -1459,6 +1862,20 @@ let allTests: [(String, () async -> Void)] = [
     ("a Resource's failure decides it like a packet's timeout", aResourcesFailureDecidesItLikeAPacketsTimeoutAndNeedsNoPacketProofClock),
     ("a Resource's failure on a replaced link with a newer link up goes once on the newer link at once", aResourcesFailureOnAReplacedLinkWithANewerLinkUpGoesOnceOnTheNewerLinkAtOnce),
     ("an entry owed while the link is not active builds nothing and says nothing went wrong", anEntryOwedWhileTheLinkIsNotActiveBuildsNothingAndSaysNothingWentWrong),
+    ("a message whose packet never left is no failure and goes when an interface is back, once, the same message", aMessageWhosePacketNeverLeftIsNoFailureAndGoesWhenAnInterfaceIsBackOnceTheSameMessage),
+    ("a loss after the packet left does not go when an interface is back and waits for the next coming-up", aLossAfterThePacketLeftDoesNotGoWhenAnInterfaceIsBackAndWaitsForTheNextComingUp),
+    ("a build that throws is a failure and an interface coming back does not retry it", aBuildThatThrowsIsAFailureAndAnInterfaceComingBackDoesNotRetryIt),
+    ("a never-left message goes at the next coming-up too, and the return after that sends nothing more", aNeverLeftMessageGoesAtTheNextComingUpTooAndTheInterfacesReturnAfterThatSendsNothingMore),
+    ("a never-left message that goes at a coming-up and is then lost after it left is a failure like any", aNeverLeftMessageThatGoesAtAComingUpAndIsThenLostAfterItLeftIsAFailureLikeAny),
+    ("two interfaces coming back in a row, the second while the first's upload is built, send one upload", twoInterfacesComingBackInARowTheSecondWhileTheFirstsUploadIsBuiltSendOneUpload),
+    ("a flush at a coming-up already running does not send twice what an interface's return sends", aFlushAtAComingUpAlreadyRunningDoesNotSendTwiceWhatAnInterfacesReturnSends),
+    ("an interface's pass building an earlier entry does not send a later one that a flush or a given-up distro took meanwhile", anInterfacesPassBuildingAnEarlierEntryDoesNotSendALaterOneThatAFlushOrAGivenUpDistroTookMeanwhile),
+    ("a never-left message replaced by a later action is not sent and its record is gone", aNeverLeftMessageReplacedByALaterActionIsNotSentAndItsRecordIsGone),
+    ("a never-left membership message owed to a distro given up is dropped and never sent at the return", aNeverLeftMembershipMessageOwedToADistroGivenUpIsDroppedAndNeverSentAtTheReturn),
+    ("the interface's return with the propagation link not up sends nothing; the link's coming-up sends what never left", theInterfacesReturnWithThePropagationLinkNotUpSendsNothingAndTheLinksComingUpSendsWhatNeverLeft),
+    ("several never-left messages go oldest first and a sent copy goes the same way", severalNeverLeftMessagesGoOldestFirstAndASentCopyGoesTheSameWay),
+    ("an interface that still cannot carry it refuses it again with no loop and the next return tries once", anInterfaceThatStillCannotCarryItRefusesItAgainWithNoLoopAndTheNextReturnTriesOnce),
+    ("the stack's stop sends nothing at an interface's return", theStacksStopSendsNothingAtAnInterfacesReturn),
 ]
 
 @main
@@ -1473,7 +1890,9 @@ enum DistroOutboxTests {
         }
         let pins: [(String, () -> Void)] = [
             ("only the link coming up starts a flush", onlyTheLinkComingUpStartsAFlush),
-            ("an owed upload is made by three paths and no other", anOwedUploadIsMadeByThreePathsAndNoOther),
+            ("an owed upload is made by four paths and no other", anOwedUploadIsMadeByFourPathsAndNoOther),
+            ("only an interface coming back sends what never left, and it sends nothing else", onlyAnInterfaceComingBackSendsWhatNeverLeftAndItSendsNothingElse),
+            ("the never-left decision and its record are made in one place each", theNeverLeftDecisionAndItsRecordAreMadeInOnePlaceEach),
             ("the third ruling's send is the loss of an upload on another link and nothing else", theThirdRulingsSendIsTheLossOfAnUploadOnAnotherLinkAndNothingElse),
             ("an upload is decided only by its proof, its loss or the stack's stop", anUploadIsDecidedOnlyByItsProofItsLossOrTheStacksStop),
             ("the outbox starts no link and waits on no clock", theOutboxStartsNoLinkAndWaitsOnNoClock),

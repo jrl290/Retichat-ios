@@ -35,6 +35,13 @@
 //  before; the outbox itself runs a recovery only while that link is still the
 //  propagation link (DistroOutbox.onLinkRecovered). The same as Android's.
 //
+//  An upload that never left the device, because no interface could carry its
+//  packet (the glue's send could not queue it), is no failure: it goes when an
+//  interface comes back online as well as at the next coming-up (James, 2026-10-06).
+//  That third event is the stack's own interface up-edge (Transport's
+//  `set_interface_online`, told by `retichat_interface_up_register`), never the
+//  OS's "the network is available" (DistroOutbox.onInterfaceUp).
+//
 
 import Combine
 import Foundation
@@ -169,6 +176,17 @@ nonisolated private enum PropagationLinkTarget {
             current.outbox.spawn { await current.outbox.onLinkRecovered(id) }
         }
     }
+
+    /// A Reticulum interface came online: what never left the device goes now, if the
+    /// propagation link is up (DistroOutbox.onInterfaceUp), on the outbox's own executor.
+    static func deliverInterfaceUp(name: String) {
+        lock.lock()
+        let current = target
+        lock.unlock()
+        guard let current else { return }
+        print("[DistroOutbox] interface \(name) online")
+        current.outbox.spawn { await current.outbox.onInterfaceUp(name) }
+    }
 }
 
 // MARK: - The runtime
@@ -190,6 +208,7 @@ final class DistroOutboxRuntime: ObservableObject {
     /// Waiting for the Keychain to say what distro this device holds (`start`).
     private var settledWatch: AnyCancellable?
     private var linkEventsRegistered = false
+    private var interfaceUpRegistered = false
 
     /// Bumped by start and stop: a start that finds it changed has been stopped.
     private var generation = 0
@@ -297,6 +316,14 @@ final class DistroOutboxRuntime: ObservableObject {
                 print("[DistroOutbox] link events not registered: \(DistroMessageFFI.rnsLastError())")
             }
         }
+        // An interface that comes back online sends what never left the device (James, 2026-10-06).
+        if !interfaceUpRegistered {
+            if bridge.interfaceUpRegister(handler: { name in PropagationLinkTarget.deliverInterfaceUp(name: name) }) {
+                interfaceUpRegistered = true
+            } else {
+                print("[DistroOutbox] interface up-edges not registered: \(DistroMessageFFI.rnsLastError())")
+            }
+        }
         // Not awaited: a flush builds stamps, and the lifecycle must not wait for it.
         let port = port
         if let held = port.held(), held.active {
@@ -306,12 +333,14 @@ final class DistroOutboxRuntime: ObservableObject {
 
     /// The stack is stopping: no proof can come for an upload still open, so each is
     /// decided not proved, and nothing is sent. The stack's shutdown drops the link
-    /// callbacks; the next `start` registers them again.
+    /// callbacks and `interfaceUpClear` the interface one; the next `start` registers them again.
     func stop() {
         generation += 1
         settledWatch = nil
         linkEventsRegistered = false
         bridge.propagationLinkEventsClear()
+        interfaceUpRegistered = false
+        bridge.interfaceUpClear()
         PropagationLinkTarget.set(node: nil, outbox: nil)
         guard let outbox else { return }
         chain { await outbox.onStop() }
