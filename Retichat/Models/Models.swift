@@ -356,6 +356,109 @@ final class ChannelSenderEntity {
     }
 }
 
+/// The channel send rule's persisted state (DISPLAY_NAMES.md §4.2), kept per
+/// channel AND posting identity (RFed SPEC §17.12): a device that holds a
+/// distro signs its channel posts as the distro, and readers have never had a
+/// name from it, so the state is kept for each identity a device has posted as
+/// (the `lxmf.delivery` hash the posts are signed with, `postingHash`) and a
+/// new identity starts from none, never carrying the old one's over. The
+/// digest (hex, 16 bytes) is that of the Channel Display Name last included in
+/// a post as that identity (the empty-name digest after a clear), and the time
+/// (seconds) when.
+///
+/// Until this entity the state was two columns of ChannelEntity
+/// (nameLastDigestHex, nameLastIncludedAt), made when the device posted as
+/// itself, the only posting identity then. Those columns stay where they are
+/// and are the device's from the first time the device looks for its own state
+/// (RfedChannelClient.adoptLegacyNameState moves them here and clears them),
+/// as Android adopts its rows from before database 13. A new entity is a
+/// lightweight migration: the store opens, and no message or channel is
+/// touched (tests/DistroChannelsMigrationTests.swift opens a store written
+/// by the previous build).
+@Model
+final class ChannelNameStateEntity {
+    /// "<channelHash>|<postingHash>", the one row per channel and identity.
+    @Attribute(.unique) var key: String
+    var channelHash: String                       // 32-char hex
+    var postingHash: String                       // 32-char hex
+    var lastDigestHex: String
+    var lastIncludedAt: Double
+
+    init(channelHash: String, postingHash: String, lastDigestHex: String, lastIncludedAt: Double) {
+        self.key = Self.key(channelHash: channelHash, postingHash: postingHash)
+        self.channelHash = channelHash
+        self.postingHash = postingHash
+        self.lastDigestHex = lastDigestHex
+        self.lastIncludedAt = lastIncludedAt
+    }
+
+    static func key(channelHash: String, postingHash: String) -> String { "\(channelHash)|\(postingHash)" }
+}
+
+/// RFed SPEC §17.12 rule 5's record: per channel, the last membership action
+/// (`op`, "join" or "leave") this device made or applied, with its time
+/// (`atMs`, the action's own milliseconds since the epoch). Persisted, and
+/// kept after a leave: a leave's record is what stops an older join from
+/// coming back. Written for every join and leave the user makes here, whether
+/// or not the device holds a distro.
+@Model
+final class ChannelMembershipEntity {
+    @Attribute(.unique) var channelHash: String   // 32-char hex
+    var op: String
+    var atMs: Int
+
+    init(channelHash: String, op: String, atMs: Int) {
+        self.channelHash = channelHash
+        self.op = op
+        self.atMs = atMs
+    }
+}
+
+/// One message this device owes its distro (RFed SPEC §17.12 "On the sending
+/// device", §17.11): kept here until the propagation node proves the upload.
+/// `id` is `channel:<channel hash>` for a membership message (one per
+/// channel: a later action replaces it) or `sent:<LXMF message hash>` for a
+/// sent copy. `packed` is the LXMF message as the distro packed and signed it
+/// when the user acted, never packed again; `msgHash` is its LXMF message
+/// hash, which is what tells one message from another under the same `id`.
+/// `distro` is the distro's `lxmf.delivery` hash and `distroKey` its public key
+/// (hex), so a sent copy is still encrypted to its own distro after the device
+/// gives that distro up. A channel entry adds `op`, `name` and `atMs`; a sent
+/// entry adds `toHex`. `seq` orders what is owed, oldest first. Retichat-android's
+/// `distro_outbox` table, field for field.
+@Model
+final class DistroOutboxEntity {
+    @Attribute(.unique) var id: String
+    var kind: String                              // "channel" | "sent"
+    var distro: String
+    var distroKey: String
+    var msgHash: String
+    var packed: Data
+    var label: String
+    var op: String?
+    var name: String?
+    var atMs: Int?
+    var toHex: String?
+    var seq: Int
+
+    init(id: String, kind: String, distro: String, distroKey: String, msgHash: String, packed: Data,
+         label: String, op: String? = nil, name: String? = nil, atMs: Int? = nil, toHex: String? = nil,
+         seq: Int) {
+        self.id = id
+        self.kind = kind
+        self.distro = distro
+        self.distroKey = distroKey
+        self.msgHash = msgHash
+        self.packed = packed
+        self.label = label
+        self.op = op
+        self.name = name
+        self.atMs = atMs
+        self.toHex = toHex
+        self.seq = seq
+    }
+}
+
 // MARK: - Channel View Models
 
 struct Channel: Identifiable, Hashable {
