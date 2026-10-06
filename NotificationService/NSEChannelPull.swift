@@ -17,6 +17,14 @@ import Foundation
 // app first (the pull drained RFed's queue); the app ingests them as a pull of
 // its own (RfedChannelClient.importNSEBlobs). The NSE shows a message only
 // when its signature verifies, as the app accepts only those.
+//
+// A post signed by the user's own distro is the user's own, as one signed by
+// this device is (RFed-spec Channel.md "Own posts", 2026-10-03): a device that
+// holds a distro posts as it, and RFed fans every post out to the subscribers,
+// the sender's other devices included. It is saved for the app (which stores it
+// as outgoing) and never shown. The distro's hash is derived from the key the
+// app shared in the App Group Keychain (PendingNotification.readSharedDistroKey),
+// the one the distro pull uses; with no key shared the device holds no distro.
 
 enum NSEChannelPull {
 
@@ -77,6 +85,8 @@ enum NSEChannelPull {
         // msgpack bin(16): the channel, as the app's pull sends it
         // (RfedChannelClient.pullDeferred, msgpackBin).
         let payload = Data([0xC4, 0x10]) + channel
+        // The hash of the distro this device holds, if it holds one (its posts are its own).
+        let distroHex = sharedDistroHash().map { $0.map { String(format: "%02x", $0) }.joined() }
         for round in 1...roundsMax {
             let left = deadline.timeIntervalSinceNow
             guard left > 1 else {
@@ -106,7 +116,7 @@ enum NSEChannelPull {
                 let ownHex = ownHash.map { String(format: "%02x", $0) }.joined()
                 for blob in blobs {
                     if let shown = unpackToShow(name: entry.name, lxmfData: channel + blob),
-                       shown.senderHash != ownHex {
+                       !NSEChannelOwnPost.isOwn(sourceHex: shown.senderHash, deviceHex: ownHex, distroHex: distroHex) {
                         result.shown.append(shown)
                     }
                 }
@@ -115,6 +125,25 @@ enum NSEChannelPull {
             if !more { break }
         }
         return result
+    }
+
+    /// The `lxmf.delivery` hash of the distro this device holds, from the key the app
+    /// shared in the App Group Keychain; nil when it holds none (or the key does not
+    /// load). Not the identity hash: the distro's address is the hash its posts name
+    /// as their source.
+    static func sharedDistroHash() -> Data? {
+        guard let key = PendingNotification.readSharedDistroKey() else { return nil }
+        let handle = key.withUnsafeBytes { raw -> UInt64 in
+            retichat_identity_from_bytes(raw.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(key.count))
+        }
+        guard handle != 0 else {
+            NSLog("[NSE-Channel] shared distro key did not load")
+            return nil
+        }
+        defer { _ = retichat_identity_destroy(handle) }
+        var hash = [UInt8](repeating: 0, count: 16)
+        guard retichat_distro_delivery_hash(handle, &hash, 16) == 16 else { return nil }
+        return Data(hash)
     }
 
     private static func unpackToShow(name: String, lxmfData: Data) -> Shown? {
@@ -139,6 +168,21 @@ enum NSEChannelPull {
 // BEGIN NSEChannelUnpackDecoder
 // Foundation only: tests/NSEChannelPullTests.swift compiles this block on its
 // own, with Retichat/Bridge/LxmfFields.swift (ChannelUnpackLayout, DisplayNames).
+
+/// RFed-spec Channel.md "Own posts": a post is the user's own when its source is
+/// this device's `lxmf.delivery` hash or the hash of the distro this device holds
+/// (`distroHex`, nil when none), whichever of the user's devices sent it. The
+/// NSE never shows one. The same rule as the app's DistroCodec.isOwnChannelPost
+/// (the NSE target does not compile DistroCodec.swift; the test pins the two
+/// together). An empty hash matches nothing.
+enum NSEChannelOwnPost {
+    static func isOwn(sourceHex: String, deviceHex: String, distroHex: String?) -> Bool {
+        guard !sourceHex.isEmpty else { return false }
+        if sourceHex.lowercased() == deviceHex.lowercased() { return true }
+        if let distroHex { return sourceHex.lowercased() == distroHex.lowercased() }
+        return false
+    }
+}
 
 /// The output of retichat_channel_lxm_unpack, as the NSE shows it. The layout
 /// is read by ChannelUnpackLayout, the parser RetichatBridge.channelLxmUnpack

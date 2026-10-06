@@ -17,6 +17,7 @@
 //     /private/tmp/claude-501/NSEChannelUnpackDecoder.swift \
 //     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
 //     Retichat-ios/Retichat/Services/PendingNotification.swift \
+//     Retichat-ios/Retichat/Services/DistroCodec.swift \
 //     Retichat-ios/tests/NSEChannelPullTests.swift && \
 //     /private/tmp/claude-501/nse-channel-pull
 //
@@ -132,6 +133,40 @@ func testTheUnpackLayoutDecodes() {
           "no trailer reads as no name")
 }
 
+/// RFed-spec Channel.md "Own posts" (James, 2026-10-03): a post signed by the user's own distro is
+/// the user's own, as one signed by this device is, and the NSE never shows it. The NSE target does
+/// not compile DistroCodec.swift, so it has its own copy of the rule: this pins it to the app's.
+func testAPostSignedByTheUsersOwnDistroIsNeverShown() {
+    let device = String(repeating: "a", count: 32)
+    let distro = String(repeating: "d", count: 32)
+    let stranger = String(repeating: "5", count: 32)
+    check(NSEChannelOwnPost.isOwn(sourceHex: device, deviceHex: device, distroHex: nil),
+          "a post from this device is the user's own")
+    check(NSEChannelOwnPost.isOwn(sourceHex: device, deviceHex: device, distroHex: distro),
+          "and still when a distro is held")
+    check(NSEChannelOwnPost.isOwn(sourceHex: distro, deviceHex: device, distroHex: distro),
+          "a post signed by the held distro is the user's own, whichever device sent it")
+    check(NSEChannelOwnPost.isOwn(sourceHex: distro.uppercased(), deviceHex: device, distroHex: distro),
+          "in any case")
+    check(!NSEChannelOwnPost.isOwn(sourceHex: stranger, deviceHex: device, distroHex: distro),
+          "a stranger's post is shown")
+    check(!NSEChannelOwnPost.isOwn(sourceHex: distro, deviceHex: device, distroHex: nil),
+          "with no distro held (no key shared) the distro's posts are another poster's")
+    check(!NSEChannelOwnPost.isOwn(sourceHex: "", deviceHex: "", distroHex: nil)
+            && !NSEChannelOwnPost.isOwn(sourceHex: "", deviceHex: device, distroHex: distro),
+          "an empty source matches nothing")
+    let hashes = [device, distro, stranger, "", distro.uppercased()]
+    for source in hashes {
+        for deviceHex in hashes {
+            for distroHex in [nil] + hashes.map(Optional.some) {
+                check(NSEChannelOwnPost.isOwn(sourceHex: source, deviceHex: deviceHex, distroHex: distroHex)
+                        == DistroCodec.isOwnChannelPost(sourceHex: source, deviceHex: deviceHex, distroHex: distroHex),
+                      "the NSE's rule is the app's: \(source.prefix(2)) \(deviceHex.prefix(2)) \(distroHex?.prefix(2) ?? "nil")")
+            }
+        }
+    }
+}
+
 func testTheWiring() {
     let pull = source("NotificationService/NSEChannelPull.swift")
     check(before(pull, "NSEDistroPull.ensurePath(to: dest", "NSEDistroPull.linkRequest("),
@@ -141,7 +176,12 @@ func testTheWiring() {
           "every pulled blob is saved before any is unpacked (the pull drained RFed)")
     check(pull.contains("if entry.notify {"), "nothing is unpacked to show when the channel's Notifications are off")
     check(pull.contains("message.signatureValidated else { return nil }"), "only a signature-verified message is shown")
-    check(pull.contains("shown.senderHash != ownHex"), "our own echoed message is not shown (the app never notifies it)")
+    check(pull.contains("!NSEChannelOwnPost.isOwn(sourceHex: shown.senderHash, deviceHex: ownHex, distroHex: distroHex)"),
+          "our own echoed message is not shown (the app never notifies it), nor is one signed by our own distro")
+    check(before(pull, "let distroHex = sharedDistroHash()", "for round in 1...roundsMax {")
+            && pull.contains("PendingNotification.readSharedDistroKey()")
+            && pull.contains("retichat_distro_delivery_hash(handle, &hash, 16) == 16"),
+          "the distro's hash comes from the key the app shared in the App Group Keychain, before the first round")
 
     let nse = source("NotificationService/NotificationService.swift")
     check(nse.contains("(request.content.userInfo[\"rfed\"] as? [String: Any])?[\"channel\"] as? String"),
@@ -193,6 +233,7 @@ enum NSEChannelPullTests {
         testTheDirectoryRoundTrips()
         testSavedChannelBlobsComeBackOnceWithTheirChannel()
         testTheUnpackLayoutDecodes()
+        testAPostSignedByTheUsersOwnDistroIsNeverShown()
         testTheWiring()
         if failures.isEmpty {
             print("all NSE channel pull tests passed")
