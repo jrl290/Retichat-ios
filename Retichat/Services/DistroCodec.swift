@@ -62,6 +62,28 @@ nonisolated enum DistroCodec {
         return false
     }
 
+    /// RFed's answer that is not a yes, said as it happened (James's truth rule):
+    /// nil is no answer at all (the link did not come up inside its 5 s, or the
+    /// request got no response), never a refusal; an answer that is not a yes is
+    /// a refusal, said with what came back. Android DistroCodec.notAYes. Until
+    /// 2026-10-10 a device that got no answer printed "RFed refused the
+    /// pre-signed announce".
+    static func notAYes(_ request: String, _ resp: Data?) -> String {
+        guard let resp else { return "RFed did not answer the \(request)" }
+        return "RFed refused the \(request) (it answered \(describeAnswer(resp)))"
+    }
+
+    /// An answer for the log: RFed's refusals are msgpack `false` (destinations.rs
+    /// `fail`) or nil, said as such; anything else as its size and first bytes.
+    static func describeAnswer(_ resp: Data) -> String {
+        if resp.count == 1 {
+            if resp.first == 0xC2 { return "false" }
+            if resp.first == 0xC0 { return "nil" }
+        }
+        let head = resp.prefix(16).map { String(format: "%02x", $0) }.joined()
+        return "\(resp.count) byte(s): \(head)\(resp.count > 16 ? "…" : "")"
+    }
+
     /// A `/rfed/pull` refusal is a single error byte, raw or as msgpack uint8
     /// (`[0xCC, code]`). Anything else is a pull envelope (or garbage, which
     /// the envelope decoder rejects).
@@ -214,5 +236,58 @@ nonisolated enum DistroCodec {
         case 0x41...0x46: return c - 0x41 + 10
         default: return nil
         }
+    }
+}
+
+/// The app's start on a device that holds a distro: its queue first, then the
+/// persisted channels (DESIGN_PRINCIPLES §5, strict ordering; Android
+/// DistroFirst.kt, Retichat-js _distroFirst).
+///
+/// RFed holds the siblings' channel joins and leaves for this device (RFed SPEC
+/// §17.12; with the distro sync proof, §17.13, one no longer wakes it). Found on
+/// Android in private staging, 2026-10-10: the start re-subscribed a channel the
+/// distro had left on another device, the pull applied that leave 0.3 s later,
+/// and a post fanned out between the two reached the device. iOS had the same
+/// order: RfedChannelClient re-subscribed on rfed.channel reachability while
+/// RfedDistroClient pulled after its registration, the two unsynchronised.
+///
+/// The pull's outcome, whatever it is, is the event the re-subscription waits
+/// for: drained, stopped at its round cap, no answer, refused, malformed, the
+/// stack stopped under it. Each is said, and the re-subscription goes on: no
+/// timer, never forever, never silent. No distro: re-subscribed at once.
+@MainActor
+enum DistroFirst {
+    /// How one distro pull ended (RfedDistroClient.pullOutcome).
+    struct PullOutcome: Sendable, Equatable {
+        /// Blobs it handled.
+        let blobs: Int
+        /// Why it stopped short of RFed's last answer, or nil when every round it ran was answered.
+        let unfinished: String?
+        /// RFed still had more when the round cap stopped it.
+        let morePending: Bool
+    }
+
+    static func thenResubscribe(hasDistro: Bool,
+                                pull: () async -> PullOutcome,
+                                say: (_ line: String, _ warning: Bool) -> Void,
+                                resubscribe: () async -> Void) async {
+        if hasDistro {
+            let s = said(await pull())
+            say(s.line, s.warning)
+        }
+        await resubscribe()
+    }
+
+    nonisolated static func said(_ o: PullOutcome) -> (line: String, warning: Bool) {
+        let later = "a sibling's leave still queued at RFed, if any, is applied when a later pull brings it"
+        if let why = o.unfinished {
+            return ("Distro pull before re-subscribing stopped after \(o.blobs) blob(s): \(why); "
+                    + "re-subscribing persisted channels now; \(later)", true)
+        }
+        if o.morePending {
+            return ("Distro pull before re-subscribing applied \(o.blobs) blob(s) and stopped at its round cap "
+                    + "with more pending: re-subscribing persisted channels now; the rest is applied when a later pull brings it", true)
+        }
+        return ("Distro queue pulled and applied first (\(o.blobs) blob(s)): re-subscribing persisted channels", false)
     }
 }

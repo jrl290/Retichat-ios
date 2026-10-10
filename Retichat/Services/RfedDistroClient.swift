@@ -240,7 +240,7 @@ final class RfedDistroClient: ObservableObject {
     /// Forget is draining an in-flight register and unregistering; nothing
     /// may start a new register meanwhile.
     private var forgetInProgress = false
-    private var pullTask: Task<Int, Never>?
+    private var pullTask: Task<DistroFirst.PullOutcome, Never>?
     private var pullTaskKey: RegKey?
     /// Destination whose ACTIVE edge re-runs registerIfNeeded, if armed.
     private var armedRetryDest: Data?
@@ -415,9 +415,11 @@ final class RfedDistroClient: ObservableObject {
         }
         guard let resp else {
             // Re-arm: the one-shot handler may have fired (and removed itself)
-            // while this request was in flight.
+            // while this request was in flight. No answer is not a refusal, and
+            // the link was ACTIVE when it went: until 2026-10-10 this read "RFed
+            // link not reachable".
             armRetryOnActive(dest)
-            fail(k, "RFed link not reachable")
+            fail(k, DistroCodec.notAYes("registration", nil))
             return
         }
         guard DistroCodec.isAffirmative(resp) else {
@@ -425,7 +427,7 @@ final class RfedDistroClient: ObservableObject {
             // parity): a refusal while the link stays up waits for that edge
             // or the next stack start. Retrying at once would be a retry loop.
             armRetryOnActive(dest)
-            fail(k, "RFed refused registration")
+            fail(k, DistroCodec.notAYes("registration", resp))
             return
         }
 
@@ -472,9 +474,12 @@ final class RfedDistroClient: ObservableObject {
         } else {
             // Not fatal: registration stands and fan-out still works for anyone
             // who already holds a path; new senders cannot resolve the address.
+            // No answer is said as no answer, a refusal with what came back:
+            // until 2026-10-10 both printed "RFed refused the pre-signed announce".
+            let said = DistroCodec.notAYes("pre-signed announce", aresp)
             status.announced = false
-            status.lastError = "RFed refused the pre-signed announce"
-            print("[Distro] RFed refused the pre-signed announce")
+            status.lastError = said
+            print("[Distro] \(said)")
         }
         return true
     }
@@ -542,48 +547,99 @@ final class RfedDistroClient: ObservableObject {
     /// blobs received.
     @discardableResult
     func pull() async -> Int {
+        await pullOutcome().blobs
+    }
+
+    /// `pull`, with how it ended (DistroFirst.PullOutcome).
+    func pullOutcome() async -> DistroFirst.PullOutcome {
         if let running = pullTask, let rk = pullTaskKey, isCurrent(rk) {
             return await running.value
         }
-        guard client != nil, let k = currentKey(),
-              let dest = Data(hexString: registerDestHex), dest.count == 16 else { return 0 }
-        let task = Task { [weak self] () -> Int in
-            guard let self else { return 0 }
+        guard client != nil else { return .init(blobs: 0, unfinished: "the stack is not started", morePending: false) }
+        guard let k = currentKey() else { return .init(blobs: 0, unfinished: "no distro held", morePending: false) }
+        guard let dest = Data(hexString: registerDestHex), dest.count == 16 else {
+            print("[Distro] pull: no RFed node configured")
+            return .init(blobs: 0, unfinished: "no RFed node configured", morePending: false)
+        }
+        let task = Task { [weak self] () -> DistroFirst.PullOutcome in
+            guard let self else { return .init(blobs: 0, unfinished: "the distro client is gone", morePending: false) }
             return await self.runPull(k, dest)
         }
         pullTask = task
         pullTaskKey = k
-        let n = await task.value
+        let outcome = await task.value
         if pullTask == task {
             pullTask = nil
             pullTaskKey = nil
         }
-        return n
+        return outcome
+    }
+
+    /// The start's pull (DistroFirst, RfedChannelClient): what the NSE pulled
+    /// and saved, then RFed's queue, every blob of both handed to its sink
+    /// (a sibling's leave applied) before this returns.
+    func pullForStart() async -> DistroFirst.PullOutcome {
+        Self.importNSEBlobs()
+        let outcome = await pullOutcome()
+        await Self.ingested()
+        return outcome
+    }
+
+    /// Returns once every blob ingested before the call has been unwrapped on
+    /// `blobQueue` (serial) and its main-actor hand-off has run: the barrier
+    /// is queued behind them on both, so it is their completion signal, not a
+    /// wait for time to pass (DESIGN_PRINCIPLES §5).
+    nonisolated static func ingested() async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            blobQueue.async {
+                Task { @MainActor in done.resume() }
+            }
+        }
     }
 
     /// Rounds are sequential and awaited, never concurrent. Each round is
     /// still its own one-shot link request (ConnectionStateManager's
     /// ephemeral design for non-stream RFed aspects).
-    private func runPull(_ k: RegKey, _ dest: Data) async -> Int {
+    private func runPull(_ k: RegKey, _ dest: Data) async -> DistroFirst.PullOutcome {
         var total = 0
+        var unfinished: String?
+        var more = false
         for round in 1...Self.pullRoundsMax {
-            guard isCurrent(k) else { break }
+            guard isCurrent(k) else {
+                // Said, never silent: until 2026-10-10 a superseded pull broke off without a word.
+                unfinished = "cancelled: the stack stopped or the distro changed before round \(round)"
+                print("[Distro] pull \(unfinished ?? "")")
+                break
+            }
             let resp = await ConnectionStateManager.shared.appLinkSend(
                 destHash: dest, app: "rfed", aspects: ["distro", "register"],
                 path: "/rfed/pull", payload: DistroCodec.msgpackNil)
-            guard isCurrent(k) else { break }
+            guard isCurrent(k) else {
+                // A stop (Settings, the stack's restart), a forget or an adopt while
+                // the round waited: cancelled by it, not failed (the truth rule), and
+                // what came back is not used, as before; now it is said.
+                let what = resp.map { "its answer (\($0.count) bytes) is not used" } ?? "no answer had come"
+                unfinished = "cancelled: the stack stopped or the distro changed while round \(round) waited for RFed"
+                print("[Distro] pull round \(round): \(unfinished ?? ""); \(what)")
+                break
+            }
             guard let resp else {
-                status.lastError = "RFed pull: link not reachable"
-                print("[Distro] pull round \(round): link not reachable")
+                // No answer, which is not "link not reachable" when the link was up
+                // and the request went unanswered (until 2026-10-10 it said that).
+                unfinished = "no answer from RFed (no link inside 5 s, or the request went unanswered)"
+                status.lastError = "RFed pull: no answer"
+                print("[Distro] pull round \(round): \(unfinished ?? "")")
                 break
             }
             if let code = DistroCodec.pullErrorCode(resp) {
                 status.lastError = String(format: "RFed pull refused (0x%02X)", code)
+                unfinished = String(format: "refused (0x%02X)", code)
                 print("[Distro] pull round \(round): \(status.lastError ?? "")")
                 break
             }
             guard let decoded = RfedChannelClient.decodePullResponse(resp) else {
                 status.lastError = "RFed pull: malformed response"
+                unfinished = "malformed response (\(resp.count) bytes)"
                 print("[Distro] pull round \(round): malformed response (\(resp.count) bytes)")
                 break
             }
@@ -592,11 +648,12 @@ final class RfedDistroClient: ObservableObject {
             // already starts with it (dest(16)|encrypted).
             for pair in decoded.pairs { Self.ingestBlob(pair.1) }
             total += decoded.pairs.count
+            more = decoded.morePending
             if status.lastError?.hasPrefix("RFed pull") == true { status.lastError = nil }
             if !decoded.morePending { break }
         }
         if isCurrent(k) { status.lastPullCount = total }
-        return total
+        return .init(blobs: total, unfinished: unfinished, morePending: unfinished == nil && more)
     }
 
     // MARK: - Inbound

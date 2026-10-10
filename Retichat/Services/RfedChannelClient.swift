@@ -1401,14 +1401,34 @@ final class RfedChannelClient: ObservableObject {
     /// Re-subscribe to every persisted-subscribed channel once the rfed.channel
     /// route is reachable. Idempotent so reconnect storms don't spam the node.
     /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    ///
+    /// With a distro, its queue first (DistroFirst, DESIGN_PRINCIPLES §5): what
+    /// the NSE pulled and RFed's queue are applied, a sibling's leave included,
+    /// before any channel is subscribed again or has its push registered again
+    /// (the loop below does both). Until 2026-10-10 this ran beside
+    /// RfedDistroClient's pull after its registration, unsynchronised, so a
+    /// channel left on another device could be subscribed here and only then
+    /// left. The pull's outcome, whatever it is, is the event: said, and the
+    /// re-subscription goes on.
     private func scheduleResubscribeOnRfedChannelActive() {
         Task { [weak self] in
             guard let self else { return }
-            guard await ConnectionStateManager.shared.waitForRfedReachable(timeoutSecs: 5.0) else { return }
-            guard !self.didResubscribeOnActive else { return }
-            self.didResubscribeOnActive = true
-            print("[RfedChannel] rfed.channel reachable → re-subscribing persisted channels")
-            self.resubscribePersistedChannels()
+            await DistroFirst.thenResubscribe(
+                hasDistro: DistroManager.shared.has,
+                pull: { await RfedDistroClient.shared.pullForStart() },
+                say: { line, _ in print("[RfedChannel] \(line)") }
+            ) {
+                guard await ConnectionStateManager.shared.waitForRfedReachable(timeoutSecs: 5.0) else {
+                    // Said, never silent: until 2026-10-10 this returned without a word.
+                    let n = self.channels.filter { $0.isSubscribed }.count
+                    print("[RfedChannel] RFed not reachable within 5 s: \(n) persisted channel(s) not re-subscribed at this start")
+                    return
+                }
+                guard !self.didResubscribeOnActive else { return }
+                self.didResubscribeOnActive = true
+                print("[RfedChannel] rfed.channel reachable → re-subscribing persisted channels")
+                self.resubscribePersistedChannels()
+            }
         }
     }
 

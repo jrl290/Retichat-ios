@@ -92,7 +92,9 @@ enum NSEDistroPull {
             }
             guard let response = pullRequest(dest: dest, identityHandle: identityHandle,
                                              timeoutSecs: min(left, 10)) else {
-                NSLog("[NSE-Distro] pull round %d: RFed not reachable", round)
+                // No answer: the path was there, so the link did not come up or the
+                // request went unanswered. Until 2026-10-10 this said "RFed not reachable".
+                NSLog("[NSE-Distro] pull round %d: no answer from RFed (the link did not come up, or the request went unanswered)", round)
                 result.failed = true
                 break
             }
