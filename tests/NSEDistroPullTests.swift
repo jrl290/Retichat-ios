@@ -167,6 +167,33 @@ func testMorePendingKeepsTheAlert() {
     }
 }
 
+/// Review of 2026-10-10: when a round failed after one that said more, `morePending` still
+/// held that `true`, and the closing line said "more pending after 8 rounds" though fewer ran
+/// and the pull failed rather than reaching its cap. The line counts the rounds that completed
+/// and says whether the cap or a failed round stopped the pull.
+func testTheMorePendingLineCountsTheRoundsThatRan() {
+    let pull = source("NotificationService/NSEDistroPull.swift")
+    guard let loop = pull.range(of: "for round in 1...roundsMax {"),
+          let end = pull.range(of: "return result\n    }", range: loop.upperBound..<pull.endIndex) else {
+        check(false, "the pull loop and its end are found"); return
+    }
+    let after = String(pull[loop.lowerBound..<end.lowerBound])
+    check(pull.contains("var completed = 0") && after.contains("completed = round\n            result.morePending = more"),
+          "a round counts as completed only once it has decoded and saved, where `more` is set")
+    let breaks = after.components(separatedBy: "result.failed = true\n                break").count - 1
+    check(breaks == 3, "the three failures end the loop before `completed` is set (\(breaks))")
+    if let lines = after.range(of: "if result.morePending && completed == roundsMax {") {
+        let closing = String(after[lines.lowerBound...])
+        check(!closing.contains("roundsMax, result.pulled"), "the closing line never claims the cap's round count")
+        check(closing.contains("completed, result.pulled)"), "it counts the rounds that ran at the cap")
+        check(closing.contains("} else if result.morePending {")
+                && closing.contains("completed + 1, completed, result.pulled)"),
+              "and names the failed round, and those that ran, when a failure stopped it")
+    } else {
+        check(false, "the closing line tells the cap from a failed round")
+    }
+}
+
 @main
 enum NSEDistroPullTests {
     static func main() {
@@ -176,6 +203,7 @@ enum NSEDistroPullTests {
         testThePullRouteRoundTrips()
         testTheWiring()
         testMorePendingKeepsTheAlert()
+        testTheMorePendingLineCountsTheRoundsThatRan()
         if failures.isEmpty {
             print("all NSE distro pull tests passed")
             exit(0)

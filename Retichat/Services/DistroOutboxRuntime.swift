@@ -488,7 +488,9 @@ final class DistroOutboxRuntime: ObservableObject {
             }
             let sealed = bridge.distroSeal(distroHandle: signer, packed: packed)
             if sealed == nil {
-                print("[DistroOutbox] ERROR: \(label) could not be sealed for the distro sync proof "
+                // Through the outbox's log, as its other errors: it also keeps the error for a
+                // screen that shows it, since every upload of this entry now goes without the proof.
+                DistroOutboxLog().error("\(label) could not be sealed for the distro sync proof "
                       + "(\(DistroMessageFFI.rnsLastError())): it is owed without the proof, and RFed wakes the "
                       + "distro's devices for it as before (RFed SPEC §17.13)")
             }

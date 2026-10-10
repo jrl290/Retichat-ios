@@ -39,8 +39,9 @@ enum NSEDistroPull {
         var failed = false
         /// This device has no distro (or the app has not shared it yet).
         var noDistro = false
-        /// The last round still reported more in RFed: the pull stopped at its
-        /// round cap, so the message this push is for may be behind the ones
+        /// The last round that completed still reported more in RFed: the pull
+        /// stopped at its round cap, or the round after it failed (and `failed`
+        /// says so). The message this push is for may be behind the ones
         /// pulled. Incomplete like `failed`, and the push must not be suppressed
         /// (DISTRO-SYNC-PROOF-DESIGN.md §7: a woken sync backlog ahead of real
         /// mail).
@@ -79,6 +80,9 @@ enum NSEDistroPull {
             return result
         }
 
+        // The rounds that completed: a round that fails ends the pull without
+        // completing, so the line below counts only what ran.
+        var completed = 0
         for round in 1...roundsMax {
             let left = deadline.timeIntervalSinceNow
             guard left > 1 else {
@@ -106,12 +110,19 @@ enum NSEDistroPull {
                 if let shown = unwrapToShow(blob, distroHandle: distroHandle) { result.shown.append(shown) }
             }
             NSLog("[NSE-Distro] pull round %d: %d blob(s), more=%d", round, blobs.count, more ? 1 : 0)
+            completed = round
             result.morePending = more
             if !more { break }
         }
-        if result.morePending {
-            NSLog("[NSE-Distro] more pending after %d rounds (%d blobs): the rest waits for the next pull",
-                  roundsMax, result.pulled)
+        // More pending ends the loop only two ways: every round ran and the cap
+        // stopped it, or the round after the last completed one failed (said on
+        // its own line above). The line says which, with the rounds that ran.
+        if result.morePending && completed == roundsMax {
+            NSLog("[NSE-Distro] more pending after %d rounds, the round cap (%d blobs): the rest waits for the next pull",
+                  completed, result.pulled)
+        } else if result.morePending {
+            NSLog("[NSE-Distro] more pending when round %d failed, after %d completed round(s) (%d blobs): the rest waits for the next pull",
+                  completed + 1, completed, result.pulled)
         }
         return result
     }

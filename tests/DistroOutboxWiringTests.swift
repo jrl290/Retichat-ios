@@ -490,8 +490,15 @@ func anOwedMessageIsSealedOnceAndItsProofGoesOnlyToTheRfedsOwnNode() {
     check(count(pack, "bridge.distroSeal(distroHandle: signer, packed: packed)") == 1,
           "sealed once, with the handle that packed it, from the packed bytes")
     check(before(pack, "bridge.messagePack(handle: handle)", "bridge.distroSeal("), "after packing")
-    check(pack.contains("print(\"[DistroOutbox] ERROR: \\(label) could not be sealed"),
+    check(pack.contains("DistroOutboxLog().error(\"\\(label) could not be sealed"),
           "a seal that fails is said as an error and the message still owed")
+    // Review of 2026-10-10: a bare print left the outbox's last error unset, and every upload
+    // of the entry then went without the proof with nothing to show it.
+    check(!pack.contains("print(\"[DistroOutbox] ERROR"), "through the outbox's log, not a bare print")
+    let log = body(runtime, "final class DistroOutboxLog: OutboxLog", "\n}\n")
+    check(log.contains("func error(_ message: String) {")
+            && log.contains("DistroOutboxRuntime.shared.lastError = message"),
+          "whose error keeps the last error, as every other outbox error")
     check(count(code(runtime), "distroSeal(") == 1, "nothing else seals")
     for (name, from, to) in [("C", "func oweChannelSync(", "func oweSentCopy("), ("sent copy", "func oweSentCopy(", "private func fail(")] {
         let owe = body(runtime, from, to)
