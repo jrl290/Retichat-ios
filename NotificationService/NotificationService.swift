@@ -307,13 +307,15 @@ class NotificationService: UNNotificationServiceExtension {
                 if start.addingTimeInterval(20).timeIntervalSinceNow > 8 {
                     distro = NSEDistroPull.run(identityHandle: client.identityHandle,
                                                deadline: start.addingTimeInterval(20))
-                    NSLog("[NSE] distro pull after the channel: noDistro=%d pulled=%d shown=%d failed=%d",
-                          distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0)
+                    NSLog("[NSE] distro pull after the channel: noDistro=%d pulled=%d shown=%d failed=%d more=%d",
+                          distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0,
+                          distro.morePending ? 1 : 0)
                 }
             } else {
                 distro = NSEDistroPull.run(identityHandle: client.identityHandle, deadline: start.addingTimeInterval(20))
-                NSLog("[NSE] distro pull: noDistro=%d pulled=%d shown=%d failed=%d",
-                      distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0)
+                NSLog("[NSE] distro pull: noDistro=%d pulled=%d shown=%d failed=%d more=%d",
+                      distro.noDistro ? 1 : 0, distro.pulled, distro.shown.count, distro.failed ? 1 : 0,
+                      distro.morePending ? 1 : 0)
             }
         }
 
@@ -428,6 +430,13 @@ class NotificationService: UNNotificationServiceExtension {
             // This device has a distro and its pull did not complete: the
             // push may be for a message still waiting in RFed. Not "0 new".
             NSLog("[NSE] distro pull incomplete — showing generic alert after %ds", elapsed)
+
+        } else if distro.morePending {
+            // The distro pull stopped at its round cap with more still in
+            // RFed (a woken sync backlog ahead of real mail): the push may be
+            // for a message behind the ones pulled, so this pull is incomplete
+            // too. Not "0 new" (DISTRO-SYNC-PROOF-DESIGN.md §7).
+            NSLog("[NSE] distro pull stopped with more pending — showing generic alert after %ds", elapsed)
 
         } else if channelPull.silenced {
             // A push for a channel whose Notifications are off: nothing about

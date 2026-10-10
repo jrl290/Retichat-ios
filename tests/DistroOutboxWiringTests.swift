@@ -395,7 +395,9 @@ func everyCFunctionTheSwiftWrapperCallsIsDeclaredAndExported() {
                      "retichat_propagation_build_upload", "retichat_propagation_link",
                      "retichat_propagation_upload", "retichat_propagation_link_events_register",
                      "retichat_interface_up_register", "retichat_interface_up_clear",
-                     "retichat_group_unpack_packed", "retichat_message_set_retichat_statuses"]
+                     "retichat_group_unpack_packed", "retichat_message_set_retichat_statuses",
+                     "retichat_distro_seal", "retichat_propagation_build_sealed_upload",
+                     "retichat_interface_up_mark", "retichat_interface_came_up_since"]
     let wrapper = code(bridge)
     for name in functions {
         check(header.contains("\(name)("), "\(name) is declared in the header")
@@ -434,17 +436,94 @@ func theCallbacksTheLibraryCallsAreTheSignaturesSwiftDeclares() {
 
 func anUploadOnlyLeavesOnTheLinkTheStackHoldsAndNothingIsResentByTheCrate() {
     let upload = body(rust, "pub extern \"C\" fn retichat_propagation_upload(", "type LinkEventCallback")
-    // The one send is AppLinks::send_on_held_link: no race, no tiers, no second try.
-    check(count(upload, "send_on_held_link(") == 1
-            && upload.contains("AppLinks::send_on_held_link(&node, data, true, on_delivered, on_failed, None)"),
-          "one send, on the held link")
+    // The one send is AppLinks::send_on_held_link_owed (2026-10-10, Stage 0): no race, no tiers,
+    // no second try, and a Resource whose first advertisement no interface carried is told as
+    // never-left, not lost.
+    check(count(upload, "send_on_held_link") == 1
+            && upload.contains("AppLinks::send_on_held_link_owed(&node, data, true, on_delivered, on_failed, Some(watch.on_progress()), on_never_left)"),
+          "one send, on the held link, with the Resource's progress watched and its never-left told")
     check(!upload.contains("thread::sleep") && !upload.contains("thread::spawn"), "no clock and no thread of its own")
     // A loss tears down the link the upload went on, then says so.
     check(before(upload, "tear_down_link_of_upload(&lost_node, &link)", "lost_report.lost()"),
           "a loss tears the link down before it is reported")
+    // Never left: nothing was sent, the link did nothing wrong. No teardown.
+    let neverLeft = body(upload, "let on_never_left:", "});")
+    check(neverLeft.contains("never_left_report.never_left();") && !neverLeft.contains("tear_down"),
+          "a never-left upload is told, and its link kept")
     // Made first, so that every way out releases the context.
-    check(before(upload, "let report = Arc::new(UploadReport {", "let node = slice_from_raw(node, node_len);"),
+    check(before(upload, "let report = Arc::new(UploadReport::new(event, release, context));", "let node = slice_from_raw(node, node_len);"),
           "the context is the library's before anything can fail")
+}
+
+/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-10-10, "Panic at the end"): the watch's
+/// `finish` is the last call of whichever outcome concludes the upload, once the host has been
+/// told, and of a send that returned an error; the progress callback only feeds it.
+func theResourceWatchIsFinishedLastByEveryOutcomeAndDecidesNothing() {
+    let upload = body(rust, "pub extern \"C\" fn retichat_propagation_upload(", "type LinkEventCallback")
+    check(upload.contains("let watch = ResourceSilenceWatch::new("), "one watch per upload")
+    for (name, from, told, finish) in [
+        ("proved", "let on_delivered:", "proved_report.proved();", "proved_watch.finish();"),
+        ("lost", "let on_failed:", "lost_report.lost();", "lost_watch.finish();"),
+        ("never left", "let on_never_left:", "never_left_report.never_left();", "never_left_watch.finish();"),
+    ] {
+        let outcome = body(upload, from, "});")
+        let lines = outcome.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("//") }
+        check(lines.last == finish, "\(name): finish is the last call")
+        check(before(outcome, told, finish), "\(name): after the host is told")
+        check(count(outcome, ".finish()") == 1, "\(name): once")
+    }
+    check(before(body(upload, "let on_delivered:", "});"), "proved_watch.delivered();", "proved_report.proved();"),
+          "the proof marks the watch delivered first")
+    let err = body(upload, "Err(e) => {", "emit_error(out_len, e)")
+    check(err.contains("watch.finish();"), "a send that returned an error finishes the watch")
+    check(count(upload, ".finish()") == 4, "and nothing else finishes it")
+    check(!upload.contains("watch.decid") && !upload.contains("watch.on_progress()(") ,
+          "the watch is fed, never asked to decide")
+}
+
+/// The distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5.1, §5.4, §12.16): each
+/// owed message is sealed once, by the distro handle it was packed with, in the write that owes
+/// it; the build sends the proof only to the configured RFed's own lxmf.propagation.
+func anOwedMessageIsSealedOnceAndItsProofGoesOnlyToTheRfedsOwnNode() {
+    let pack = body(runtime, "private static func pack(", "}.value\n    }")
+    check(count(pack, "bridge.distroSeal(distroHandle: signer, packed: packed)") == 1,
+          "sealed once, with the handle that packed it, from the packed bytes")
+    check(before(pack, "bridge.messagePack(handle: handle)", "bridge.distroSeal("), "after packing")
+    check(pack.contains("print(\"[DistroOutbox] ERROR: \\(label) could not be sealed"),
+          "a seal that fails is said as an error and the message still owed")
+    check(count(code(runtime), "distroSeal(") == 1, "nothing else seals")
+    for (name, from, to) in [("C", "func oweChannelSync(", "func oweSentCopy("), ("sent copy", "func oweSentCopy(", "private func fail(")] {
+        let owe = body(runtime, from, to)
+        check(owe.contains("guard let (packed, hash, sealed) = await Self.pack(")
+                && owe.contains("sealed: sealed?.sealed, syncSig: sealed?.syncSig))"),
+              "\(name): both kinds are owed with their seal, in the one owe")
+    }
+    let build = body(runtime, "nonisolated(nonsending) func build(_ entry: OwedEntry)", "func upEdgeMark()")
+    check(build.contains("let how = UploadBuild.of(entry, node: node, rfedDerived: rfedDerived)"), "the build asks the gate")
+    check(build.contains("withClaim: withClaim, node: node)") && count(build, "propagationBuildSealedUpload(") == 1
+            && count(build, "propagationBuildUpload(") == 1,
+          "the claim goes only as the gate says; an unsealed entry goes the legacy way")
+    check(runtime.contains("rfedDerived: hash16(UserPreferences.shared.rfedDerivedLxmfPropagationHash)"),
+          "the RFed's own node is derived from its identity, never the override")
+    check(read("Retichat/Services/UserPreferences.swift").contains("var rfedDerivedLxmfPropagationHash: String {"),
+          "UserPreferences derives it")
+    // The proof is kept with the entry: the store maps it both ways, the model holds it.
+    let rows = body(read("Retichat/Services/DistroChannelStores.swift"), "nonisolated enum DistroOutboxRows {", "/// The distro outbox's storage")
+    check(count(rows, "sealed: entry.sealed, syncSig: entry.syncSig") == 1
+            && rows.contains("row.sealed = entry.sealed") && rows.contains("row.syncSig = entry.syncSig")
+            && rows.contains("sealed: row.sealed, syncSig: row.syncSig"),
+          "the rows keep and give back the seal and the proof")
+    let model = body(read("Retichat/Models/Models.swift"), "final class DistroOutboxEntity {", "init(")
+    check(model.contains("var sealed: Data?") && model.contains("var syncSig: Data?"),
+          "optional attributes: an old store opens by lightweight migration")
+    // The stack's never-left reaches the outbox; the watch notes it decided.
+    check(bridge.contains("case 3: box.sink.neverLeft()"), "event 3 is never-left")
+    let watched = body(runtime, "nonisolated private final class WatchedSink", "\n}\n")
+    check(watched.contains("func neverLeft() { mark(); inner.neverLeft() }"), "the §1 watch notes a never-left as decided")
+    check(runtime.contains("func upEdgeMark() -> UInt64 { bridge.interfaceUpMark() }")
+            && runtime.contains("func cameUpSince(_ mark: UInt64) -> Bool { bridge.interfaceCameUpSince(mark) }"),
+          "the mark is Transport's up-edge count")
 }
 
 /// What rfed pushed down a dead link waits for /rfed/pull: an accepted
@@ -476,6 +555,8 @@ let allTests: [(String, () -> Void)] = [
     ("every C function the Swift wrapper calls is declared and exported", everyCFunctionTheSwiftWrapperCallsIsDeclaredAndExported),
     ("the callbacks the library calls are the signatures Swift declares", theCallbacksTheLibraryCallsAreTheSignaturesSwiftDeclares),
     ("an upload only leaves on the link the stack holds and nothing is resent by the crate", anUploadOnlyLeavesOnTheLinkTheStackHoldsAndNothingIsResentByTheCrate),
+    ("the Resource watch is finished last by every outcome and decides nothing", theResourceWatchIsFinishedLastByEveryOutcomeAndDecidesNothing),
+    ("an owed message is sealed once and its proof goes only to the RFed's own node", anOwedMessageIsSealedOnceAndItsProofGoesOnlyToTheRfedsOwnNode),
 ]
 
 @main

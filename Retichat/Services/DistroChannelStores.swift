@@ -123,7 +123,8 @@ nonisolated enum DistroOutboxRows {
         DistroOutboxEntity(id: entry.id, kind: entry.kind.rawValue, distro: entry.distro,
                            distroKey: entry.distroKey, msgHash: entry.msgHash, packed: entry.packed,
                            label: entry.label, op: entry.op, name: entry.name,
-                           atMs: entry.atMs.map { Int($0) }, toHex: entry.toHex, seq: seq)
+                           atMs: entry.atMs.map { Int($0) }, toHex: entry.toHex, seq: seq,
+                           sealed: entry.sealed, syncSig: entry.syncSig)
     }
 
     /// The row of an id already stored, made `entry` (the same fields `row` writes).
@@ -139,6 +140,8 @@ nonisolated enum DistroOutboxRows {
         row.atMs = entry.atMs.map { Int($0) }
         row.toHex = entry.toHex
         row.seq = seq
+        row.sealed = entry.sealed
+        row.syncSig = entry.syncSig
     }
 
     /// Nil for a row of a kind this build does not know: it is left alone and never uploaded.
@@ -146,7 +149,8 @@ nonisolated enum DistroOutboxRows {
         guard let kind = OwedKind(rawValue: row.kind) else { return nil }
         return OwedEntry(id: row.id, kind: kind, distro: row.distro, distroKey: row.distroKey,
                          msgHash: row.msgHash, packed: row.packed, label: row.label,
-                         op: row.op, name: row.name, atMs: row.atMs.map { Int64($0) }, toHex: row.toHex)
+                         op: row.op, name: row.name, atMs: row.atMs.map { Int64($0) }, toHex: row.toHex,
+                         sealed: row.sealed, syncSig: row.syncSig)
     }
 }
 

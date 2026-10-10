@@ -1097,6 +1097,43 @@ pub extern "C" fn retichat_distro_register_payload(
     }
 }
 
+/// Seal the packed message `packed` for the distro sync proof (RFed SPEC §17.13;
+/// DISTRO-SYNC-PROOF-DESIGN.md §5.1), once, when the outbox owes it: encrypt it to
+/// the distro D (`distro_handle`, which must hold D's private key) and sign the
+/// sealed bytes with D's key. `packed` is the message as `retichat_message_pack`
+/// returned it, from D to D. Returns heap bytes `sig(64) | sealed` (free with
+/// `rns_free_bytes`): `sealed = D_hash | D.encrypt(packed[16..])`, LXMF's
+/// `lxmf_data` before the stamp, and `sig` D's Ed25519 signature over
+/// `"rfed.distro.sync" | 0x01 | D_hash | SHA-256(sealed)`. The outbox stores both
+/// with the entry, in the write that owes it, and every upload of it carries the
+/// same sealed bytes (`retichat_propagation_build_sealed_upload`). NULL with
+/// `rns_last_error` when D has no private key, `packed` is not addressed to D, or
+/// the encryption or the signature fails: the entry is then owed without them and
+/// built the legacy way (`retichat_propagation_build_upload`). A thin wrapper over
+/// `lxmf_rust::distro::seal_for_sync`, as Retichat-android's `nativeDistroSeal`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_seal(
+    distro_handle: u64,
+    packed: *const u8,
+    packed_len: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let Some(distro) = distro_identity(distro_handle, "distro") else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    };
+    let packed = slice_from_raw(packed, packed_len);
+    match lxmf_rust::distro::seal_for_sync(&distro, &packed) {
+        Ok(sealed) => {
+            let mut out = Vec::with_capacity(64 + sealed.sealed.len());
+            out.extend_from_slice(&sealed.sig);
+            out.extend_from_slice(&sealed.sealed);
+            emit_buffer(out, out_len)
+        }
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
 /// msgpack payload for `/rfed/distro/list`.
 #[no_mangle]
 pub extern "C" fn retichat_distro_list_payload(distro_handle: u64, out_len: *mut u32) -> *mut u8 {
@@ -1316,12 +1353,14 @@ pub extern "C" fn retichat_message_create(
 // The same functions, one for one, as Retichat-android's JNI crate.
 // ---------------------------------------------------------------------------
 
-use app_links::{link_representation, AppLinks, LinkRepresentation};
+use app_links::{link_representation, AppLinks, LinkRepresentation, ResourceSilenceWatch};
 use reticulum_rust::link::{LinkHandle, STATE_ACTIVE};
 
-/// `retichat_upload_event_t`'s `event`: the node proved the upload, or it was lost.
+/// `retichat_upload_event_t`'s `event`: the node proved the upload, or it was lost, or (a
+/// Resource whose first advertisement no interface could carry) it never left the device.
 const UPLOAD_EVENT_PROVED: i32 = 1;
 const UPLOAD_EVENT_LOST: i32 = 2;
+const UPLOAD_EVENT_NEVER_LEFT: i32 = 3;
 
 /// Write the membership message C's fields on the outbound message `msg`
 /// (a `retichat_message_create` handle): 0x0C an empty bin, 0xFB
@@ -1397,19 +1436,63 @@ pub extern "C" fn retichat_propagation_build_upload(
     let key = slice_from_raw(distro_public_key, key_len);
     let packed = slice_from_raw(packed, packed_len);
     let node = slice_from_raw(node, node_len);
-    if node.len() != 16 {
-        return emit_error(out_len, format!("a propagation node is 16 bytes, not {}", node.len()));
-    }
-    let cost = match distro_outbox::node_stamp_cost(Identity::recall_app_data(&node).as_deref()) {
+    let cost = match propagation_node_stamp_cost(&node) {
         Ok(cost) => cost,
-        Err(e) => {
-            // As the router does when it has no cost (LXMRouter::get_outbound_propagation_cost):
-            // ask for the announce that carries it. The upload waits for the next coming-up.
-            Transport::request_path(&node, None, None, None, None);
-            return emit_error(out_len, e);
-        }
+        Err(e) => return emit_error(out_len, e),
     };
     match distro_outbox::build_propagation_upload(&key, &packed, cost) {
+        Ok(bytes) => emit_buffer(bytes, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// The stamp cost the propagation node `node` (16 bytes) asks, read from its announce. Unknown is
+/// an error, and then the node's path is requested, as the router does when it has no cost
+/// (LXMRouter::get_outbound_propagation_cost): its announce carries the cost. The upload waits for
+/// the next coming-up.
+fn propagation_node_stamp_cost(node: &[u8]) -> Result<u32, String> {
+    if node.len() != 16 {
+        return Err(format!("a propagation node is 16 bytes, not {}", node.len()));
+    }
+    distro_outbox::node_stamp_cost(Identity::recall_app_data(node).as_deref()).map_err(|e| {
+        Transport::request_path(node, None, None, None, None);
+        e
+    })
+}
+
+/// Build the propagation upload of an entry sealed when it was owed (`retichat_distro_seal`) for
+/// the node `node` (16 bytes): `sealed` exactly as stored, never encrypted again, stamped for the
+/// node's cost (read from its announce; unknown is an error, and the node's path is requested), with
+/// the timebase now (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5.2). With `with_claim` non-zero
+/// it carries the distro sync proof `[id, distro_public_key, sig]`, so RFed delivers it to the
+/// distro's devices without waking them; the caller sets it only when `node` is the configured
+/// RFed's own `lxmf.propagation` (the gate, §5.4): any other node gets LXMF's two-element upload,
+/// which every LXMF propagation node reads. A stored proof that does not hold for this message is
+/// not sent: the upload goes without it, and that is logged as an error. BLOCKS while the stamp is
+/// mined: never on the main thread. Heap bytes (free with `rns_free_bytes`), or NULL with
+/// `rns_last_error` and nothing sent. As Retichat-android's `nativePropagationBuildSealedUpload`.
+#[no_mangle]
+pub extern "C" fn retichat_propagation_build_sealed_upload(
+    distro_public_key: *const u8,
+    key_len: u32,
+    sealed: *const u8,
+    sealed_len: u32,
+    sig: *const u8,
+    sig_len: u32,
+    with_claim: i32,
+    node: *const u8,
+    node_len: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let key = slice_from_raw(distro_public_key, key_len);
+    let sealed = slice_from_raw(sealed, sealed_len);
+    let sig = slice_from_raw(sig, sig_len);
+    let node = slice_from_raw(node, node_len);
+    let cost = match propagation_node_stamp_cost(&node) {
+        Ok(cost) => cost,
+        Err(e) => return emit_error(out_len, e),
+    };
+    match distro_outbox::build_sealed_propagation_upload(&key, &sealed, &sig, with_claim != 0, cost) {
         Ok(bytes) => emit_buffer(bytes, out_len),
         Err(e) => emit_error(out_len, e),
     }
@@ -1441,20 +1524,34 @@ pub extern "C" fn retichat_propagation_link(node: *const u8, node_len: u32, out_
 type UploadEventCallback = Option<extern "C" fn(*mut c_void, i32)>;
 type UploadReleaseCallback = Option<extern "C" fn(*mut c_void)>;
 
-/// What reports an upload to the host: each of proved and lost at most once, from
-/// whatever thread the stack decides it on. A proof can follow a loss (the receipt
-/// stays listed, and a late proof still concludes it): both are told, in the
-/// order they happen. The host's `context` is released, once, when the last
-/// closure holding this report is dropped (or at once when the upload never left).
+/// What reports an upload to the host: each of proved, lost and never-left at most
+/// once, from whatever thread the stack decides it on. A proof can follow a loss (the
+/// receipt stays listed, and a late proof still concludes it): both are told, in the
+/// order they happen. Never-left is told instead of either, never with them: AppLinks
+/// decides a Resource's upload once (`send_on_held_link_owed`). The host's `context` is
+/// released, once, when the last closure holding this report is dropped (or at once
+/// when the upload did not leave this call).
 struct UploadReport {
     event: UploadEventCallback,
     release: UploadReleaseCallback,
     context: usize,
     proved: AtomicBool,
     lost: AtomicBool,
+    never_left: AtomicBool,
 }
 
 impl UploadReport {
+    fn new(event: UploadEventCallback, release: UploadReleaseCallback, context: *mut c_void) -> Self {
+        Self {
+            event,
+            release,
+            context: context as usize,
+            proved: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
+            never_left: AtomicBool::new(false),
+        }
+    }
+
     fn tell(&self, event: i32) {
         if let Some(callback) = self.event {
             callback(self.context as *mut c_void, event);
@@ -1470,6 +1567,13 @@ impl UploadReport {
     fn lost(&self) {
         if !self.lost.swap(true, Ordering::SeqCst) {
             self.tell(UPLOAD_EVENT_LOST);
+        }
+    }
+
+    /// The Resource's first advertisement went out on no interface: nothing was sent.
+    fn never_left(&self) {
+        if !self.never_left.swap(true, Ordering::SeqCst) {
+            self.tell(UPLOAD_EVENT_NEVER_LEFT);
         }
     }
 }
@@ -1500,25 +1604,37 @@ fn tear_down_link_of_upload(node: &[u8], link: &LinkHandle) {
     }
 }
 
-/// Hand `upload` (a `retichat_propagation_build_upload` result) to the link
-/// AppLinks holds for the propagation node `node` (16 bytes), which must be
-/// ACTIVE: one packet, or a Resource over the link MDU. Returns heap bytes (free
-/// with `rns_free_bytes`) `[how u8 | link id]` (how 1 a packet, 2 a Resource; the
-/// link id the upload went on), or NULL with `rns_last_error` when it did not
-/// leave (no active link held, or the packet could not be queued): then `event`
-/// is never called.
+/// Hand `upload` (a `retichat_propagation_build_upload` or
+/// `retichat_propagation_build_sealed_upload` result) to the link AppLinks holds for the
+/// propagation node `node` (16 bytes), which must be ACTIVE: one packet, or a Resource over
+/// the link MDU. Returns heap bytes (free with `rns_free_bytes`) `[how u8 | link id]` (how 1 a
+/// packet, 2 a Resource; the link id the upload went on), or NULL with `rns_last_error` when it
+/// did not leave (no active link held, or the packet could not be queued: no interface could
+/// carry it): then `event` is never called.
 ///
-/// Once it has left, `event(context, 1)` is called when the node proves the packet
-/// (or the Resource completes) and `event(context, 2)` when the packet receipt
-/// times out or the Resource fails, each at most once, from a stack thread: it
-/// must not block. Nothing here races, resends or times anything: the stack's own
-/// receipt timeout is the clock. On a loss the link the upload went on is torn
-/// down before `event(context, 2)` is called, so the close that follows is what
-/// the loss is.
+/// Once handed over, `event(context, 1)` is called when the node proves the packet (or the
+/// Resource completes) and `event(context, 2)` when the packet receipt times out or the Resource
+/// fails, each at most once, from a stack thread: it must not block. Nothing here races, resends
+/// or times anything: the stack's own receipt timeout is the clock. On a loss the link the upload
+/// went on is torn down before `event(context, 2)` is called, so the close that follows is what the
+/// loss is.
 ///
-/// `context` is owned by the library from this call on, whether or not the
-/// upload leaves: `release(context)` is called exactly once when the library is
-/// done with it (after the last event it can still give).
+/// A Resource whose first advertisement no interface could carry never left the device
+/// (DESIGN_PRINCIPLES §3, James 2026-10-06, for a Resource 2026-10-10; DISTRO-SYNC-PROOF-DESIGN.md
+/// §5.3(a)): AppLinks cancels it here and keeps the link, and `event(context, 3)` is called once,
+/// instead of 1 or 2 and with no teardown, like the NULL of a packet that could not be queued. The
+/// host takes `retichat_interface_up_mark()` just before this call and, once it has recorded the
+/// upload as owed, asks `retichat_interface_came_up_since(mark)` (AppLinks' `UpEdgeMark`): an
+/// interface that came up meanwhile was this upload's up-edge, and it goes at once.
+///
+/// A Resource's progress feeds the §1 watch (DESIGN_PRINCIPLES §1, bulk transfers: progress at
+/// least every 5 s from its advertisement on), which logs a silence as the violation it is and
+/// decides nothing (AppLinks' `ResourceSilenceWatch`); its end point is the last thing each
+/// outcome does here, after the host has been told.
+///
+/// `context` is owned by the library from this call on, whether or not the upload leaves:
+/// `release(context)` is called exactly once when the library is done with it (after the last
+/// event it can still give).
 #[no_mangle]
 pub extern "C" fn retichat_propagation_upload(
     node: *const u8,
@@ -1531,13 +1647,7 @@ pub extern "C" fn retichat_propagation_upload(
     out_len: *mut u32,
 ) -> *mut u8 {
     // Made first, so that every way out of this function releases the context.
-    let report = Arc::new(UploadReport {
-        event,
-        release,
-        context: context as usize,
-        proved: AtomicBool::new(false),
-        lost: AtomicBool::new(false),
-    });
+    let report = Arc::new(UploadReport::new(event, release, context));
     let node = slice_from_raw(node, node_len);
     let data = slice_from_raw(upload, upload_len);
     if node.len() != 16 || data.is_empty() {
@@ -1555,20 +1665,46 @@ pub extern "C" fn retichat_propagation_upload(
     // between reading it and the send (a replacement is then the newer one).
     let used: Arc<Mutex<LinkHandle>> = Arc::new(Mutex::new(before.clone()));
 
+    // DESIGN_PRINCIPLES §1, bulk transfers: a Resource's silence over 5 s is logged where it
+    // is found and decides nothing. Its end point, `finish`, is the last call of whichever
+    // outcome concludes the upload, once the host has been told (James, 2026-10-10, "Panic at
+    // the end": in a debug build the logged violations panic then, on a thread of their own).
+    let node_hex: String = node.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let watch = ResourceSilenceWatch::new(format!("the distro outbox upload to {node_hex}"));
+
     let proved_report = report.clone();
-    let on_delivered: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || proved_report.proved());
+    let proved_watch = watch.clone();
+    let on_delivered: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+        proved_watch.delivered();
+        proved_report.proved();
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        proved_watch.finish();
+    });
     let lost_report = report.clone();
     let lost_node = node.clone();
     let lost_used = used.clone();
+    let lost_watch = watch.clone();
     let on_failed: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
         let link = lost_used.lock().map(|l| l.clone());
         if let Ok(link) = link {
             tear_down_link_of_upload(&lost_node, &link);
         }
         lost_report.lost();
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        lost_watch.finish();
+    });
+    // Never left: nothing was sent, so this is no loss and the link did nothing wrong. No
+    // teardown: the host keeps the upload owed and sends it at the next interface up-edge or
+    // coming-up (DESIGN_PRINCIPLES §3, the distro exception).
+    let never_left_report = report.clone();
+    let never_left_watch = watch.clone();
+    let on_never_left: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+        never_left_report.never_left();
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        never_left_watch.finish();
     });
 
-    match AppLinks::send_on_held_link(&node, data, true, on_delivered, on_failed, None) {
+    match AppLinks::send_on_held_link_owed(&node, data, true, on_delivered, on_failed, Some(watch.on_progress()), on_never_left) {
         Ok(()) => {
             let link = match AppLinks::get_handle(&node) {
                 Some(after) if !after.same_link(&before) => after,
@@ -1581,7 +1717,11 @@ pub extern "C" fn retichat_propagation_upload(
             out.extend_from_slice(&link.link_id());
             emit_buffer(out, out_len)
         }
-        Err(e) => emit_error(out_len, e),
+        Err(e) => {
+            // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+            watch.finish();
+            emit_error(out_len, e)
+        }
     }
 }
 
@@ -1661,6 +1801,27 @@ pub extern "C" fn retichat_interface_up_register(callback: InterfaceUpCallback, 
 #[no_mangle]
 pub extern "C" fn retichat_interface_up_clear() {
     *INTERFACE_UP_HOST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// AppLinks' `UpEdgeMark::now()`, for the host: the number of Reticulum interface up-edges
+/// (`Transport::interface_up_edges`) so far. The host takes it just before each
+/// `retichat_propagation_upload` (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a); app-links
+/// `send_on_held_link_owed`).
+#[no_mangle]
+pub extern "C" fn retichat_interface_up_mark() -> u64 {
+    Transport::interface_up_edges()
+}
+
+/// AppLinks' `UpEdgeMark::came_up_since`, for the host: 1 when a Reticulum interface has come up
+/// since `mark` (`retichat_interface_up_mark`), else 0. Asked only once an upload that never left
+/// (the NULL of `retichat_propagation_upload` with the link up, or its event 3) is recorded as owed:
+/// the up-edge it waits for may have reached the host's up-edge listener in between, while nothing
+/// was owed yet, and the link stays up, so no coming-up would follow. When it is 1 the upload goes
+/// at once, with a new mark. An ordering check at an event: no timer, no retry; each send answers
+/// one up-edge.
+#[no_mangle]
+pub extern "C" fn retichat_interface_came_up_since(mark: u64) -> i32 {
+    i32::from(Transport::interface_up_edges() != mark)
 }
 
 // ---------------------------------------------------------------------------
@@ -2240,13 +2401,7 @@ mod distro_outbox_bridge_tests {
         extern "C" fn release(context: *mut c_void) {
             RELEASED.lock().unwrap().push(context as usize);
         }
-        let report = Arc::new(UploadReport {
-            event: Some(event),
-            release: Some(release),
-            context: 0xC0FFEE,
-            proved: AtomicBool::new(false),
-            lost: AtomicBool::new(false),
-        });
+        let report = Arc::new(UploadReport::new(Some(event), Some(release), 0xC0FFEE as *mut c_void));
         let on_delivered = report.clone();
         let on_failed = report.clone();
         // The packet's receipt times out, the host hears the loss once; then the node proves it
@@ -2263,6 +2418,37 @@ mod distro_outbox_bridge_tests {
         assert!(!RELEASED.lock().unwrap().contains(&0xC0FFEE));
         drop(on_delivered);
         assert_eq!(RELEASED.lock().unwrap().iter().filter(|c| **c == 0xC0FFEE).count(), 1);
+    }
+
+    /// A Resource upload whose first advertisement no interface carried never left the device
+    /// (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a)): the host hears event 3, once, and nothing else, and the
+    /// context goes with the last holder as for any other outcome.
+    #[test]
+    fn a_never_left_upload_is_told_once_as_event_3_and_releases_its_context_with_the_last_holder() {
+        static LOG: Mutex<Vec<(usize, i32)>> = Mutex::new(Vec::new());
+        static RELEASED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        extern "C" fn event(context: *mut c_void, event: i32) {
+            LOG.lock().unwrap().push((context as usize, event));
+        }
+        extern "C" fn release(context: *mut c_void) {
+            RELEASED.lock().unwrap().push(context as usize);
+        }
+        assert_eq!((UPLOAD_EVENT_PROVED, UPLOAD_EVENT_LOST, UPLOAD_EVENT_NEVER_LEFT), (1, 2, 3), "the numbers Swift's trampoline reads");
+        let report = Arc::new(UploadReport::new(Some(event), Some(release), 0xBEEF as *mut c_void));
+        let on_never_left = report.clone();
+        on_never_left.never_left();
+        on_never_left.never_left();
+        let told: Vec<i32> = LOG.lock().unwrap().iter().filter(|(c, _)| *c == 0xBEEF).map(|(_, e)| *e).collect();
+        assert_eq!(told, vec![UPLOAD_EVENT_NEVER_LEFT], "told once");
+        drop(report);
+        assert!(!RELEASED.lock().unwrap().contains(&0xBEEF));
+        drop(on_never_left);
+        assert_eq!(RELEASED.lock().unwrap().iter().filter(|c| **c == 0xBEEF).count(), 1);
+        // Swift's trampoline maps each number to its sink call.
+        let swift = include_str!("../../../Retichat/Bridge/RetichatBridge.swift");
+        for case in ["case 1: box.sink.proved()", "case 2: box.sink.lost()", "case 3: box.sink.neverLeft()"] {
+            assert!(swift.contains(case), "RetichatBridge.swift lacks: {case}");
+        }
     }
 
     #[test]
@@ -2360,6 +2546,10 @@ mod distro_outbox_bridge_tests {
         config.out = true;
         config.mode = InterfaceStub::MODE_FULL;
         Transport::register_interface_stub_config(config);
+        // AppLinks' UpEdgeMark for the host: a mark taken now hears of the up-edge below, and a mark
+        // taken after it does not. (Only this test brings an interface up in this crate's tests.)
+        let mark = retichat_interface_up_mark();
+        assert_eq!(retichat_interface_came_up_since(mark), 0, "no edge since the mark");
         let wait_for_name = |expected: &str, within: Duration| -> bool {
             let end = std::time::Instant::now() + within;
             while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
@@ -2372,10 +2562,15 @@ mod distro_outbox_bridge_tests {
             false
         };
         Transport::set_interface_online(name, true);
+        assert_eq!(retichat_interface_came_up_since(mark), 1, "counted before the listeners run");
         assert!(wait_for_name(name, Duration::from_secs(5)), "the stack's up-edge reaches the host, with the interface's name");
+        let after = retichat_interface_up_mark();
+        assert_eq!(after, mark + 1, "one edge");
+        assert_eq!(retichat_interface_came_up_since(after), 0, "a mark taken after the edge has not seen one since");
         Transport::set_interface_online(name, true);    // already online: no edge
         Transport::set_interface_online(name, false);   // a down-edge: told to nobody
         assert!(!wait_for_name(name, Duration::from_millis(300)), "a repeat and a down-edge are no up-edge");
+        assert_eq!(retichat_interface_came_up_since(after), 0, "nor do they move the mark");
         Transport::set_interface_online(name, true);
         assert!(wait_for_name(name, Duration::from_secs(5)), "each up-edge is told");
 
@@ -2453,6 +2648,102 @@ mod distro_outbox_bridge_tests {
         assert!(ptr.is_null());
     }
 
+    /// `sig(64) | sealed` from `retichat_distro_seal`.
+    fn seal(identity: u64, packed: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut len = 0u32;
+        let ptr = retichat_distro_seal(identity, packed.as_ptr(), packed.len() as u32, &mut len);
+        if ptr.is_null() {
+            return None;
+        }
+        let out = take(ptr, len);
+        assert!(out.len() > 64 + 16);
+        Some((out[..64].to_vec(), out[64..].to_vec()))
+    }
+
+    /// The seal goes through the C API as `lxmf_rust::distro::seal_for_sync` makes it (RFed SPEC
+    /// §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5.1): addressed to D in the clear, the message packed when
+    /// the user acted inside it, and D's signature over the 65 signed bytes; a message not addressed to
+    /// the distro, or a distro handle that is not one, is refused at the C boundary.
+    #[test]
+    fn a_message_is_sealed_once_through_the_c_api_and_signed_by_its_distro() {
+        let (identity, delivery, key) = distro();
+        let msg = message_from(identity, &delivery);
+        assert_eq!(set_c(msg, "join", "public.general", 1_767_225_600_000, DEVICE), 0);
+        let packed = pack(msg);
+        let (sig, sealed) = seal(identity, &packed).expect("sealed");
+        assert_eq!(&sealed[..16], &delivery[..], "D_hash in the clear: what the node and RFed read");
+        let transient_id = lxmf_rust::distro::sync_transient_id(&sealed);
+        let signed = lxmf_rust::distro::sync_signed_bytes(&delivery, &transient_id);
+        assert_eq!(&signed[..17], b"rfed.distro.sync\x01", "the tag and the version");
+        let d = Identity::from_public_key(&key).unwrap();
+        assert!(d.validate(&sig, &signed), "D's Ed25519 signature over tag | 01 | D_hash | SHA-256(sealed)");
+        let mut holder = rns::get_handle::<Identity>(identity).unwrap();
+        let m = lxmf_rust::distro::unwrap_blob(&mut holder, &sealed).unwrap().expect("addressed to the distro");
+        assert!(m.signature_validated);
+        assert!(m.is_delivery_notification, "C still passes for a delivery notification with an older client");
+        // A second seal is another encryption (a fresh ephemeral key): the outbox seals once, when it owes.
+        let (_, again) = seal(identity, &packed).unwrap();
+        assert_ne!(again, sealed);
+
+        // Another distro's message, a handle that is not one, nothing at all: refused, with the reason.
+        let (other, _other_delivery, _) = distro();
+        assert!(seal(other, &packed).is_none());
+        assert!(rns::take_error().unwrap_or_default().contains("not addressed to the distro"));
+        assert!(seal(0xdead_beef, &packed).is_none());
+        assert!(rns::take_error().unwrap_or_default().contains("invalid distro identity handle"));
+        assert!(seal(identity, &[]).is_none());
+    }
+
+    /// The sealed build through the C API: a node not heard is an error (and its path is asked for),
+    /// as the legacy build; once heard, `with_claim` 1 gives the three-element upload whose claim RFed
+    /// accepts and 0 the two-element one, both carrying the stored sealed bytes unchanged.
+    #[test]
+    fn a_sealed_upload_carries_the_claim_only_when_asked_and_a_node_not_heard_is_an_error() {
+        let (identity, delivery, key) = distro();
+        let msg = message_with(identity, &delivery, "a sent copy");
+        let packed = pack(msg);
+        let (sig, sealed) = seal(identity, &packed).unwrap();
+
+        let build = |node: &[u8; 16], with_claim: i32| {
+            let mut len = 0u32;
+            let ptr = retichat_propagation_build_sealed_upload(
+                key.as_ptr(), key.len() as u32, sealed.as_ptr(), sealed.len() as u32, sig.as_ptr(), sig.len() as u32,
+                with_claim, node.as_ptr(), 16, &mut len,
+            );
+            if ptr.is_null() { None } else { Some(take(ptr, len)) }
+        };
+        let unheard = [0x7bu8; 16];
+        assert!(build(&unheard, 1).is_none());
+        assert!(rns::take_error().unwrap_or_default().contains("not known"));
+
+        let heard = [0x7cu8; 16];
+        let node_identity = Identity::new(true);
+        Identity::remember_destination(&heard, &node_identity.get_public_key().unwrap(), Some(node_app_data(0))).unwrap();
+        for (with_claim, elements) in [(1, 3usize), (0, 2)] {
+            let upload = build(&heard, with_claim).expect("an upload");
+            let rmpv::Value::Array(items) = rmpv::decode::read_value(&mut &upload[..]).unwrap() else { panic!("an array") };
+            assert_eq!(items.len(), elements, "with_claim {with_claim}");
+            let rmpv::Value::Array(ref messages) = items[1] else { panic!("messages") };
+            let rmpv::Value::Binary(ref data) = messages[0] else { panic!("a bin") };
+            assert_eq!(&data[..data.len() - 32], &sealed[..], "the stored sealed bytes, never encrypted again");
+            if elements == 3 {
+                let claims = lxmf_rust::distro::decode_sync_extension(&items[2], 1);
+                assert_eq!(claims.by_id.len(), 1);
+                let claim = claims.by_id.values().next().unwrap();
+                let transient_id = lxmf_rust::distro::sync_transient_id(&sealed);
+                assert!(lxmf_rust::distro::verify_sync_claim(claim, &transient_id, &sealed).is_ok(), "RFed accepts the claim");
+            }
+        }
+        // A node that is not 16 bytes is an error too.
+        let mut len = 0u32;
+        let ptr = retichat_propagation_build_sealed_upload(
+            key.as_ptr(), key.len() as u32, sealed.as_ptr(), sealed.len() as u32, sig.as_ptr(), sig.len() as u32,
+            1, heard.as_ptr(), 15, &mut len,
+        );
+        assert!(ptr.is_null());
+        assert_eq!(len, 0);
+    }
+
     /// The Swift header must say what the Rust library does: the six functions and the two callback
     /// typedefs of the distro outbox, with the signatures the library exports.
     #[test]
@@ -2476,9 +2767,18 @@ mod distro_outbox_bridge_tests {
             "int32_t retichat_client_set_delivery_callback_receipt(uint64_t client, retichat_group_delivery_callback_t callback, void *context);",
             "uint8_t *retichat_group_unpack_packed(const uint8_t *packed, uint32_t packed_len, uint32_t *out_len);",
             "int32_t retichat_message_set_retichat_statuses(uint64_t msg, const uint8_t *elements, uint32_t elements_len);",
+            "uint8_t *retichat_distro_seal(uint64_t distro_handle, const uint8_t *packed, uint32_t packed_len, uint32_t *out_len);",
+            "uint8_t *retichat_propagation_build_sealed_upload(const uint8_t *distro_public_key, uint32_t key_len, const uint8_t *sealed, uint32_t sealed_len, const uint8_t *sig, uint32_t sig_len, int32_t with_claim, const uint8_t *node, uint32_t node_len, uint32_t *out_len);",
+            "uint64_t retichat_interface_up_mark(void);",
+            "int32_t retichat_interface_came_up_since(uint64_t mark);",
         ] {
             assert!(flat.contains(declaration), "the header lacks: {declaration}");
         }
+        let _: extern "C" fn(u64, *const u8, u32, *mut u32) -> *mut u8 = retichat_distro_seal;
+        let _: extern "C" fn(*const u8, u32, *const u8, u32, *const u8, u32, i32, *const u8, u32, *mut u32) -> *mut u8 =
+            retichat_propagation_build_sealed_upload;
+        let _: extern "C" fn() -> u64 = retichat_interface_up_mark;
+        let _: extern "C" fn(u64) -> i32 = retichat_interface_came_up_since;
         let _: extern "C" fn(u64, *const c_char, *const c_char, i64, *const c_char) -> i32 = retichat_message_set_distro_channel_sync;
         let _: extern "C" fn(u64, *mut u32) -> *mut u8 = retichat_message_pack;
         let _: extern "C" fn(*const u8, u32, *const u8, u32, *const u8, u32, *mut u32) -> *mut u8 = retichat_propagation_build_upload;

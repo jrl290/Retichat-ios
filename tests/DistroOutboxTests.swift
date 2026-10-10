@@ -133,12 +133,15 @@ struct Sent {
     let sink: UploadSink
     func proved() { sink.proved() }
     func lost() { sink.lost() }
+    /// The stack's never-left for a Resource whose first advertisement no interface carried.
+    func neverLeft() { sink.neverLeft() }
 }
 
 /// A sink that hears nothing: what `nth` hands back for an upload that never left.
 final class NoSink: UploadSink, @unchecked Sendable {
     func proved() {}
     func lost() {}
+    func neverLeft() {}
 }
 
 /// The `i`th upload that left. One that did not is a failed check, not a crash that ends the run.
@@ -156,6 +159,18 @@ struct TestError: Error, LocalizedError {
 final class FakePort: PropagationPort, @unchecked Sendable {
     private let state = Locked<(held: HeldLink?, resource: Bool, builds: [OwedEntry], sent: [Sent],
                                 gates: [Gate], failNext: Error?, cannotQueue: Bool, refused: Int)>((nil, false, [], [], [], nil, false, 0))
+    /// Transport's interface up-edge count (`UpEdgeMark`), and an up-edge to make during the next
+    /// refused upload (between the outbox's mark and its never-left record), after which the
+    /// interface can carry it or not.
+    private let edgeState = Locked<(edges: UInt64, edgeInNextRefusal: Bool?, marks: Int)>((0, nil, 0))
+
+    /// An interface came up: counted before anyone hears of it, as Transport counts it.
+    func interfaceUp() { edgeState.with { $0.edges += 1 } }
+    /// The next upload `cannotQueue` refuses brings an interface up while it is refused, and
+    /// from then on the interface carries uploads when `carries`.
+    func upEdgeDuringNextRefusal(thenCarries carries: Bool) { edgeState.with { $0.edgeInNextRefusal = carries } }
+    /// How many marks the outbox took (one before each upload).
+    var marks: Int { edgeState.with { $0.marks } }
 
     /// The link the stack holds for the propagation node now (what `held()` reads).
     var current: HeldLink? {
@@ -199,9 +214,22 @@ final class FakePort: PropagationPort, @unchecked Sendable {
         return Data("\(entry.id)|\(entry.msgHash)|\(entry.distroKey.prefix(4))".utf8)
     }
 
+    func upEdgeMark() -> UInt64 { edgeState.with { $0.marks += 1; return $0.edges } }
+
+    func cameUpSince(_ mark: UInt64) -> Bool { edgeState.with { $0.edges != mark } }
+
     func upload(_ upload: Data, sink: UploadSink) throws -> UploadLeft? {
         guard let link = current, link.active else { return nil }
-        if state.with({ s -> Bool in if s.cannotQueue { s.refused += 1 }; return s.cannotQueue }) { return nil }
+        if state.with({ s -> Bool in if s.cannotQueue { s.refused += 1 }; return s.cannotQueue }) {
+            if let carries = edgeState.with({ e -> Bool? in
+                let c = e.edgeInNextRefusal
+                if c != nil { e.edgeInNextRefusal = nil; e.edges += 1 }
+                return c
+            }) {
+                cannotQueue = !carries
+            }
+            return nil
+        }
         let parts = String(decoding: upload, as: UTF8.self).components(separatedBy: "|")
         state.with { $0.sent.append(Sent(linkId: link.id, entryId: parts[0], msgHash: parts[1], key: parts[2], sink: sink)) }
         return UploadLeft(linkId: link.id, resource: resource)
@@ -1684,6 +1712,270 @@ func theStacksStopSendsNothingAtAnInterfacesReturn() async {
     }
 }
 
+// MARK: - a Resource upload that never left the device (James, 2026-10-10; Stage 0)
+
+// DISTRO-SYNC-PROOF-DESIGN.md §5.3(a): a Resource upload whose first advertisement no
+// interface could carry never left the device, like a packet that could not be queued.
+// The stack (app-links send_on_held_link_owed, through retichat_propagation_upload's event
+// 3) cancels it, keeps the link and reports never-left instead of a loss, after the upload
+// was handed over. Every proven upload is a Resource (the claim alone is 170 B), so this
+// must hold before any claim is sent. `Sent.neverLeft` is the stack's report. The iOS twin
+// of Retichat-android DistroOutboxTest's short-drop case (DistroOutbox.kt:505-526).
+
+func theShortDropForAResourceUploadIsNeverLeftKeepsTheLinkAndGoesOnceAtTheUpEdge() async {
+    await withRig { rig in
+        rig.port.resource = true
+        rig.link("L1")
+        let copy = sentCopy("long")
+        let comingUps = await rig.outbox.propComingUps
+        await rig.outbox.owe(copy)
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "handed to the link as a Resource")
+        // The interface is down: its first advertisement went out on no interface.
+        nth(rig.port.sent, 0).neverLeft()
+        await rig.settle()
+        check(rig.lines.error.isEmpty && rig.lines.warn.isEmpty, "no failure, no warning")
+        check(rig.lines.info.contains { $0.contains("never left the device") && $0.contains("Resource's first advertisement") },
+              "said, as information, for what it is")
+        checkEqual(await rig.outbox.owed(), [copy], "still owed")
+        check(await rig.outbox.neverLeft(copy), "recorded as never left")
+        checkEqual(await rig.outbox.unprovedCount(), 0, "no failure record")
+        checkEqual(await rig.outbox.propComingUps, comingUps, "no coming-up counted")
+        checkEqual(rig.port.current, HeldLink(id: "L1", active: true), "the link is kept: nothing tore it down")
+
+        // A short drop: the interface comes back, and the link never went down, so no coming-up follows.
+        rig.port.interfaceUp()
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 2, "it goes at the up-edge")
+        checkEqual(nth(rig.port.sent, 1).msgHash, "long", "the same message")
+        checkEqual(nth(rig.port.sent, 1).linkId, "L1", "on the link that was kept")
+        check(!(await rig.outbox.neverLeft(copy)), "an upload of it began: the record has done its work")
+        // The first upload's late events (the stack reports one outcome, but a fake can lie) decide nothing.
+        nth(rig.port.sent, 0).lost()
+        nth(rig.port.sent, 0).proved()
+        await rig.settle()
+        check(rig.lines.error.isEmpty, "the never-left upload is decided: a loss after it says nothing")
+        checkEqual(await rig.outbox.owed(), [copy], "and a proof after it settles nothing")
+        // Mutation: a second up-edge while the upload is open sends it twice.
+        rig.port.interfaceUp()
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 2, "one upload in flight at a time")
+        nth(rig.port.sent, 1).proved()
+        await rig.settle()
+        check(await rig.outbox.owed().isEmpty, "proved: owed no more")
+        checkEqual(await rig.outbox.neverLeftCount(), 0, "no record")
+    }
+}
+
+func aResourceThatLeftAndLaterFailsIsStillLostAndWaitsForTheNextComingUpNotTheUpEdge() async {
+    await withRig { rig in
+        rig.port.resource = true
+        rig.link("L1")
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        // Its advertisement left; the Resource then failed: a loss (James, 2026-10-04), not never-left.
+        nth(rig.port.sent, 0).lost()
+        await rig.settle()
+        check(rig.lines.error.contains { $0.contains("was not proved") && $0.contains("its Resource failed") }, "a failure, said")
+        check(!(await rig.outbox.neverLeft(join)), "not never-left")
+        let comingUps = await rig.outbox.propComingUps
+        check(await rig.outbox.unprovedAt(join) == comingUps, "recorded at its coming-up")
+        // The stack tells never-left only instead of a loss; a fake telling it after the loss changes nothing.
+        nth(rig.port.sent, 0).neverLeft()
+        rig.port.interfaceUp()
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "an interface coming back does not retry a failure")
+        checkEqual(await rig.outbox.neverLeftCount(), 0, "and records no never-left")
+        rig.link("L2")
+        await rig.outbox.onLinkEstablished("L2")
+        await rig.settle()
+        checkEqual(links(rig.port.sent), ["L1", "L2"], "the next coming-up carries it")
+    }
+}
+
+// The UpEdgeMark contract (app-links send_on_held_link_owed): the up-edge a never-left upload
+// waits for can come while it is being sent, before it is recorded. It then reaches
+// onInterfaceUp with nothing to send, and the link stays up, so no coming-up follows: the
+// upload would wait for an up-edge that already came. The outbox takes the mark just before
+// each send and asks it once the record is made.
+
+func anUpEdgeThatCameBeforeAResourcesNeverLeftWasRecordedSendsItAtOnceAndOnce() async {
+    await withRig { rig in
+        rig.port.resource = true
+        rig.link("L1")
+        let copy = sentCopy("long")
+        await rig.outbox.owe(copy)
+        await rig.settle()
+        checkEqual(rig.port.marks, 1, "a mark was taken before the send")
+        // The interface comes back while the advertisement is still being found uncarried:
+        // the up-edge's pass runs first and finds nothing recorded (the upload is open).
+        rig.port.interfaceUp()
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "the up-edge found nothing never-left yet")
+        // Then the stack's never-left arrives: recorded, then the mark says an interface came up since.
+        nth(rig.port.sent, 0).neverLeft()
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 2, "it goes at once: that up-edge was this upload's")
+        checkEqual(nth(rig.port.sent, 1).msgHash, "long", "the same message")
+        check(rig.lines.info.contains { $0.contains("came online while") }, "said why it goes now")
+        checkEqual(rig.port.marks, 2, "with a new mark")
+        // The next up-edge's pass leaves the open upload alone.
+        rig.port.interfaceUp()
+        await rig.outbox.onInterfaceUp("tcp1")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 2, "once")
+        nth(rig.port.sent, 1).proved()
+        await rig.settle()
+        check(await rig.outbox.owed().isEmpty, "proved")
+        check(rig.lines.error.isEmpty && rig.lines.warn.isEmpty, "never a failure")
+    }
+}
+
+func withNoUpEdgeSinceItsMarkANeverLeftResourceWaitsForTheNextOne() async {
+    await withRig { rig in
+        rig.port.resource = true
+        rig.link("L1")
+        // An up-edge before the send is not this upload's: the mark is taken after it.
+        rig.port.interfaceUp()
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        nth(rig.port.sent, 0).neverLeft()
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "no up-edge since the mark: it waits")
+        check(await rig.outbox.neverLeft(join), "recorded")
+        rig.port.interfaceUp()
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 2, "the next up-edge sends it")
+    }
+}
+
+func anUpEdgeWhileAPacketWasRefusedSendsItAtOnceAndAnInterfaceStillDownWaitsWithNoLoop() async {
+    await withRig { rig in
+        rig.link("L1")
+        rig.port.cannotQueue = true
+        // The packet path's Err has the same race: an interface comes up while the packet is refused.
+        rig.port.upEdgeDuringNextRefusal(thenCarries: true)
+        let join = channel("join", "public.tea", "join")
+        await rig.outbox.owe(join)
+        await rig.settle()
+        checkEqual(rig.port.refused, 1, "refused once")
+        checkEqual(rig.port.sent.count, 1, "the up-edge that came meanwhile sends it at once")
+        checkEqual(nth(rig.port.sent, 0).msgHash, "join", "the same message")
+        nth(rig.port.sent, 0).proved()
+        await rig.settle()
+        check(await rig.outbox.owed().isEmpty, "proved")
+
+        // An interface comes up during the send and still cannot carry it (another interface came up):
+        // it goes once more at once, is refused again with no edge since, and waits: no loop.
+        rig.port.cannotQueue = true
+        rig.port.upEdgeDuringNextRefusal(thenCarries: false)
+        let leave = channel("leave", "public.tea", "leave")
+        await rig.outbox.owe(leave)
+        await rig.settle()
+        checkEqual(rig.port.refused, 3, "refused, sent again on that up-edge, refused again")
+        await rig.settle()
+        checkEqual(rig.port.refused, 3, "and no loop")
+        check(await rig.outbox.neverLeft(leave), "recorded never left")
+        check(rig.lines.error.isEmpty && rig.lines.warn.isEmpty, "never a failure")
+        rig.port.cannotQueue = false
+        rig.port.interfaceUp()
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.filter { $0.msgHash == "leave" }.count, 1, "the next up-edge sends it")
+    }
+}
+
+func aNeverLeftAfterTheStacksStopDecidesNothingAndTheUpEdgeSendsNothing() async {
+    await withRig { rig in
+        rig.port.resource = true
+        rig.link("L1")
+        let copy = sentCopy("long")
+        await rig.outbox.owe(copy)
+        await rig.settle()
+        await rig.outbox.onStop()
+        rig.port.interfaceUp()
+        nth(rig.port.sent, 0).neverLeft()
+        await rig.settle()
+        checkEqual(await rig.outbox.neverLeftCount(), 0, "the stop decided it first")
+        checkEqual(rig.port.sent.count, 1, "nothing is sent with the stack stopped")
+        await rig.outbox.onInterfaceUp("tcp0")
+        await rig.settle()
+        checkEqual(rig.port.sent.count, 1, "nor at the up-edge")
+        checkEqual(await rig.outbox.owed(), [copy], "still owed, for the next start")
+    }
+}
+
+// MARK: - the distro sync proof's build (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5.2, §5.4)
+
+let rfedNode = Data(repeating: 0xa7, count: 16)
+let overrideNode = Data(repeating: 0x0e, count: 16)
+
+func sealed(_ entry: OwedEntry) -> OwedEntry {
+    var e = entry
+    e.sealed = Data("sealed:\(entry.msgHash)".utf8)
+    e.syncSig = Data(repeating: 0x5e, count: 64)
+    return e
+}
+
+func theGateSendsTheProofOnlyToTheConfiguredRfedsOwnPropagationNode() {
+    let copy = sealed(sentCopy("c"))
+    let join = sealed(channel("join", "public.tea", "j"))
+    for entry in [copy, join] {
+        // Both kinds carry the proof (James, 2026-10-10, Q1).
+        checkEqual(UploadBuild.of(entry, node: rfedNode, rfedDerived: rfedNode), .sealed(withClaim: true),
+                   "\(entry.kind): the RFed's own lxmf.propagation gets three elements")
+        checkEqual(UploadBuild.of(entry, node: overrideNode, rfedDerived: rfedNode), .sealed(withClaim: false),
+                   "\(entry.kind): an override gets LXMF's two, the same sealed bytes")
+        checkEqual(UploadBuild.of(entry, node: rfedNode, rfedDerived: nil), .sealed(withClaim: false),
+                   "\(entry.kind): no RFed known, no proof")
+        checkEqual(UploadBuild.of(entry, node: rfedNode, rfedDerived: Data(rfedNode.prefix(15))), .sealed(withClaim: false),
+                   "\(entry.kind): a derived hash that is not one is no match")
+    }
+    // An entry owed before entries were sealed, or one that could not be sealed: the old builder, no proof.
+    checkEqual(UploadBuild.of(sentCopy("old"), node: rfedNode, rfedDerived: rfedNode), .legacy, "a legacy entry")
+    var half = sentCopy("half")
+    half.sealed = Data("s".utf8)
+    checkEqual(UploadBuild.of(half, node: rfedNode, rfedDerived: rfedNode), .legacy, "both fields or neither")
+    half.sealed = nil
+    half.syncSig = Data(repeating: 1, count: 64)
+    checkEqual(UploadBuild.of(half, node: rfedNode, rfedDerived: rfedNode), .legacy, "both fields or neither")
+}
+
+func aSealedEntryKeepsItsSealAndProofThroughTheOutboxAndASentCopyOwedToADistroGivenUpStillBuildsWithIt() async {
+    await withRig { rig in
+        let copy = sealed(sentCopy("copy"))
+        let join = sealed(channel("join", "public.tea", "join"))
+        await rig.outbox.owe(copy)
+        await rig.outbox.owe(join)
+        await rig.settle()
+        check(rig.store.held.contains { $0.id == copy.id && $0.sealed == copy.sealed && $0.syncSig == copy.syncSig },
+              "the seal and the proof are kept in the write that owes the entry")
+        // The device gives its distro up: the membership message goes, the sent copy stays owed to D1, sealed.
+        rig.setDistro(d2)
+        await rig.outbox.onDistroChanged()
+        rig.link("L1")
+        await rig.outbox.onLinkEstablished("L1")
+        await rig.settle()
+        checkEqual(ids(rig.port.sent), [copy.id], "only the sent copy goes")
+        guard let built = rig.port.builds.first(where: { $0.id == copy.id }) else {
+            check(false, "the sent copy was built")
+            return
+        }
+        checkEqual(built.sealed, copy.sealed, "built from its own sealed bytes")
+        checkEqual(built.syncSig, copy.syncSig, "with its own proof")
+        checkEqual(built.distroKey, d1.publicKey, "and its own distro's key")
+        checkEqual(UploadBuild.of(built, node: rfedNode, rfedDerived: rfedNode), .sealed(withClaim: true),
+                   "after forget a SENT entry still builds with its claim")
+    }
+}
+
 // MARK: - who may call what (DESIGN_PRINCIPLES §3, the distro exception)
 
 let outboxSource = source("Retichat/Services/DistroOutbox.swift")
@@ -1737,15 +2029,48 @@ func onlyTheLinkComingUpStartsAFlush() {
     checkEqual(callersOf("sendDistroOutbox"), ["onLinkEstablished", "onLinkRecovered"], "callers of the flush")
 }
 
-func anOwedUploadIsMadeByFourPathsAndNoOther() {
+func anOwedUploadIsMadeByFivePathsAndNoOther() {
     // The coming-up pass, which reads the failure record with its coming-up, uploadOwedAtOnce, which
     // reads none: the user's own action (owe) and the third ruling's send (inside uploadOwed's loss
-    // handler), and an interface's return, which sends only what never left (James, 2026-10-06).
+    // handler), and an interface's return, which sends only what never left (James, 2026-10-06), at
+    // the up-edge's pass or, when the up-edge came while the upload was being sent, once its
+    // never-left is recorded (the UpEdgeMark contract, 2026-10-10).
     // Anything else calling either would send an upload again on its own failure.
     checkEqual(callersOf("uploadOwed"), ["sendDistroOutbox", "sendDistroNeverLeft", "uploadOwedAtOnce"], "callers of uploadOwed")
-    checkEqual(callersOf("uploadOwedAtOnce"), ["owe", "uploadOwed"], "callers of uploadOwedAtOnce")
+    checkEqual(callersOf("uploadOwedAtOnce"), ["owe", "uploadOwed", "goesIfAnInterfaceCameUp"], "callers of uploadOwedAtOnce")
     // The upload it makes has one caller too.
     checkEqual(callersOf("uploadFor"), ["uploadOwed"], "callers of uploadFor")
+}
+
+func anUpEdgeThatCameDuringTheSendIsAskedOnlyOnceTheNeverLeftIsRecordedAndSendsNothingElse() {
+    // Called from the one never-left decision in uploadOwed (the packet's nil and the Resource's
+    // never-left both reach it), after the record.
+    checkEqual(callersOf("goesIfAnInterfaceCameUp"), ["uploadOwed"], "callers of the mark's send")
+    check(outboxCode.contains("            landed()\n            recordNeverLeft()") && outboxCode.contains("goesIfAnInterfaceCameUp(since: mark, entry)\n        }"),
+          "recorded first, the mark asked after")
+    guard let from = outboxCode.range(of: "private func goesIfAnInterfaceCameUp("), let to = outboxCode.range(of: "private func uploadFor(") else {
+        check(false, "the mark's send is in the source")
+        return
+    }
+    let send = String(outboxCode[from.lowerBound..<to.lowerBound])
+    for guardText in ["port.cameUpSince(mark)", "!stopped", "held.active", "unproved.neverLeft(entry)", "stillOwed(entry)", "!distroAttemptOpen(entry, linkId)"] {
+        check(send.contains(guardText), "the mark's send checks \(guardText)")
+    }
+    for text in ["propComingUps", "unprovedSince(", "recordUnproved", "unproved.at(", "unproved.since(", "unproved.record(", "sendDistroOutbox("] {
+        check(!send.contains(text), "the mark's send does not touch \(text)")
+    }
+    // The mark is taken just before the send, in the one place an upload is handed over.
+    guard let f = outboxCode.range(of: "private func uploadFor("), let t = outboxCode.range(of: "private func uploadProved(") else {
+        check(false, "uploadFor is in the source")
+        return
+    }
+    let handOver = String(outboxCode[f.lowerBound..<t.lowerBound])
+    if let mark = handOver.range(of: "let mark = port.upEdgeMark()"), let send = handOver.range(of: "try port.upload(bytes, sink: sink)") {
+        check(mark.lowerBound < send.lowerBound, "the mark comes before the send")
+    } else {
+        check(false, "the mark and the send are in uploadFor")
+    }
+    checkEqual(outboxCode.components(separatedBy: "port.upEdgeMark()").count - 1, 1, "one mark, before the one send")
 }
 
 func onlyAnInterfaceComingBackSendsWhatNeverLeftAndItSendsNothingElse() {
@@ -1772,7 +2097,10 @@ func onlyAnInterfaceComingBackSendsWhatNeverLeftAndItSendsNothingElse() {
 func theNeverLeftDecisionAndItsRecordAreMadeInOnePlaceEach() {
     // The port's nil with the link up is the one never-left decision, recorded in one place, and the
     // record ended where an upload of the message begins (and in forget, which ends both records).
-    checkEqual(outboxCode.components(separatedBy: "return .neverLeft").count - 1, 1, "one decision")
+    checkEqual(outboxCode.components(separatedBy: "return .neverLeft").count - 1, 1, "one decision for the packet")
+    // And the Resource's, told by the stack after the hand-over: decided in one place too, and recorded through the same path.
+    checkEqual(outboxCode.components(separatedBy: "upload.settled = .neverLeft").count - 1, 1, "one decision for a Resource")
+    checkEqual(outboxCode.components(separatedBy: "decideNeverLeft(").count - 1, 3, "declared once, reached from the two decisions")
     checkEqual(outboxCode.components(separatedBy: "unproved.recordNeverLeft(entry)").count - 1, 1, "one record")
     checkEqual(outboxCode.components(separatedBy: "recordNeverLeft()").count - 1, 2, "declared once, called once")
     checkEqual(outboxCode.components(separatedBy: "unproved.clearNeverLeft(entry)").count - 1, 1, "one place an upload begins")
@@ -1800,6 +2128,7 @@ func anUploadIsDecidedOnlyByItsProofItsLossOrTheStacksStop() {
     // The proof and the loss reach it from the sink the stack is handed, and the stop through cut.
     checkEqual(callersOf("uploadProved"), ["uploadFor"], "callers of uploadProved")
     checkEqual(callersOf("uploadLost"), ["uploadFor", "cut"], "callers of uploadLost")
+    checkEqual(callersOf("uploadNeverLeft"), ["uploadFor"], "callers of uploadNeverLeft: the stack's report alone")
     checkEqual(callersOf("cut"), ["onStop"], "callers of cut")
 }
 
@@ -1876,6 +2205,13 @@ let allTests: [(String, () async -> Void)] = [
     ("several never-left messages go oldest first and a sent copy goes the same way", severalNeverLeftMessagesGoOldestFirstAndASentCopyGoesTheSameWay),
     ("an interface that still cannot carry it refuses it again with no loop and the next return tries once", anInterfaceThatStillCannotCarryItRefusesItAgainWithNoLoopAndTheNextReturnTriesOnce),
     ("the stack's stop sends nothing at an interface's return", theStacksStopSendsNothingAtAnInterfacesReturn),
+    ("the short drop for a Resource upload is never-left, keeps the link and goes once at the up-edge", theShortDropForAResourceUploadIsNeverLeftKeepsTheLinkAndGoesOnceAtTheUpEdge),
+    ("a Resource that left and later fails is still lost and waits for the next coming-up, not the up-edge", aResourceThatLeftAndLaterFailsIsStillLostAndWaitsForTheNextComingUpNotTheUpEdge),
+    ("an up-edge that came before a Resource's never-left was recorded sends it at once, and once", anUpEdgeThatCameBeforeAResourcesNeverLeftWasRecordedSendsItAtOnceAndOnce),
+    ("with no up-edge since its mark a never-left Resource waits for the next one", withNoUpEdgeSinceItsMarkANeverLeftResourceWaitsForTheNextOne),
+    ("an up-edge while a packet was refused sends it at once; an interface still down waits with no loop", anUpEdgeWhileAPacketWasRefusedSendsItAtOnceAndAnInterfaceStillDownWaitsWithNoLoop),
+    ("a never-left after the stack's stop decides nothing and the up-edge sends nothing", aNeverLeftAfterTheStacksStopDecidesNothingAndTheUpEdgeSendsNothing),
+    ("a sealed entry keeps its seal and proof; a sent copy owed to a distro given up still builds with it", aSealedEntryKeepsItsSealAndProofThroughTheOutboxAndASentCopyOwedToADistroGivenUpStillBuildsWithIt),
 ]
 
 @main
@@ -1890,7 +2226,9 @@ enum DistroOutboxTests {
         }
         let pins: [(String, () -> Void)] = [
             ("only the link coming up starts a flush", onlyTheLinkComingUpStartsAFlush),
-            ("an owed upload is made by four paths and no other", anOwedUploadIsMadeByFourPathsAndNoOther),
+            ("an owed upload is made by five paths and no other", anOwedUploadIsMadeByFivePathsAndNoOther),
+            ("an up-edge that came during the send is asked only once the never-left is recorded, and sends nothing else", anUpEdgeThatCameDuringTheSendIsAskedOnlyOnceTheNeverLeftIsRecordedAndSendsNothingElse),
+            ("the gate sends the proof only to the configured RFed's own propagation node", theGateSendsTheProofOnlyToTheConfiguredRfedsOwnPropagationNode),
             ("only an interface coming back sends what never left, and it sends nothing else", onlyAnInterfaceComingBackSendsWhatNeverLeftAndItSendsNothingElse),
             ("the never-left decision and its record are made in one place each", theNeverLeftDecisionAndItsRecordAreMadeInOnePlaceEach),
             ("the third ruling's send is the loss of an upload on another link and nothing else", theThirdRulingsSendIsTheLossOfAnUploadOnAnotherLinkAndNothingElse),

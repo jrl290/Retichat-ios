@@ -85,6 +85,19 @@ enum RfedDerivedHashesTests {
         check(prefs.effectiveLxmfPropagationHash == "aabbccddeeff00112233445566778899",
               "whatever the node")
 
+        // The distro sync proof's gate (DISTRO-SYNC-PROOF-DESIGN.md §5.4): the RFed node's own
+        // lxmf.propagation, whatever the override, so an override never gets the claim.
+        check(prefs.rfedDerivedLxmfPropagationHash == stagingPropagation,
+              "the RFed's own propagation is derived past the override", prefs.rfedDerivedLxmfPropagationHash)
+        check(prefs.rfedDerivedLxmfPropagationHash != prefs.effectiveLxmfPropagationHash,
+              "an override is not the RFed's node")
+        prefs.rfedLxmfPropOverride = ""
+        check(prefs.rfedDerivedLxmfPropagationHash == prefs.effectiveLxmfPropagationHash,
+              "with no override the propagation node is the RFed's own")
+        prefs.rfedNodeIdentityHash = ""
+        check(prefs.rfedDerivedLxmfPropagationHash == productionPropagation,
+              "and it follows the node in use", prefs.rfedDerivedLxmfPropagationHash)
+
         keys.forEach { defaults.removeObject(forKey: $0) }
         if failures.isEmpty {
             print("all rfed derived-hash tests passed")

@@ -719,8 +719,9 @@ private func deliveryTrampoline(
 // MARK: - What a device owes its distro (RFed SPEC §17.12, §17.11)
 
 // Mirrors Retichat-android RetichatBridge.kt: messageSetDistroChannelSync,
-// messagePack, propagationBuildUpload, propagationLink, propagationUpload and
-// propagationLinkEventsRegister. The outbox itself is Services/DistroOutbox.swift;
+// messagePack, distroSeal, propagationBuildUpload, propagationBuildSealedUpload,
+// propagationLink, propagationUpload and propagationLinkEventsRegister. The
+// outbox itself is Services/DistroOutbox.swift;
 // these are what it cannot make from Swift (rust/retichat-ffi distro_outbox.rs
 // has the parts that need no stack). Nothing here sends on a timer or sends again.
 
@@ -734,13 +735,16 @@ nonisolated final class PropagationUploadSinkBox {
     init(_ sink: UploadSink) { self.sink = sink }
 }
 
-/// retichat_upload_event_t: 1 the node proved the upload, 2 it was lost. Runs on a stack thread.
+/// retichat_upload_event_t: 1 the node proved the upload, 2 it was lost, 3 it never left the
+/// device (a Resource whose first advertisement no interface could carry: DISTRO-SYNC-PROOF-DESIGN.md
+/// §5.3(a)). Runs on a stack thread.
 nonisolated func propagationUploadEvent(context: UnsafeMutableRawPointer?, event: Int32) {
     guard let context else { return }
     let box = Unmanaged<PropagationUploadSinkBox>.fromOpaque(context).takeUnretainedValue()
     switch event {
     case 1: box.sink.proved()
     case 2: box.sink.lost()
+    case 3: box.sink.neverLeft()
     default: break
     }
 }
@@ -865,10 +869,67 @@ extension RetichatBridge {
         return Data(bytes: ptr, count: Int(outLen))
     }
 
+    /// A message sealed for the distro sync proof (RFed SPEC §17.13): `sealed`
+    /// (`D_hash | D.encrypt(packed[16..])`) and `syncSig`, D's signature over it.
+    nonisolated struct DistroSealed: Equatable, Sendable {
+        let sealed: Data
+        let syncSig: Data
+    }
+
+    /// Seal the packed message `packed` (`messagePack`, from the distro to the distro)
+    /// once, when the outbox owes it (DISTRO-SYNC-PROOF-DESIGN.md §5.1): encrypted to the
+    /// distro whose identity `distroHandle` holds, and signed with its key. The outbox
+    /// stores both with the entry, and every upload of it carries the same sealed bytes.
+    /// Nil with the error slot set when it cannot be sealed (no private key, a message
+    /// not addressed to the distro): the entry is then owed without them and built the
+    /// legacy way. Local CPU work: never on the main thread.
+    nonisolated func distroSeal(distroHandle: UInt64, packed: Data) -> DistroSealed? {
+        var outLen: UInt32 = 0
+        let ptr = packed.withUnsafeBytes { buf in
+            retichat_distro_seal(distroHandle, buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(packed.count), &outLen)
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        let raw = Data(bytes: ptr, count: Int(outLen))
+        guard raw.count > 64 + 16 else { return nil }
+        return DistroSealed(sealed: Data(raw.dropFirst(64)), syncSig: Data(raw.prefix(64)))
+    }
+
+    /// The propagation upload of a sealed entry for the node `node`: `sealed` exactly as
+    /// stored, never encrypted again, stamped for the node's cost, with the distro sync
+    /// proof `[id, distroPublicKey, syncSig]` only when `withClaim` (the gate: `node` is
+    /// the configured RFed's own lxmf.propagation, `UploadBuild.of`). BLOCKS while the
+    /// stamp is mined: never on the main thread. Nil with the error slot set when it
+    /// cannot be built (the node's cost is not known: its path is requested); nothing
+    /// has left.
+    nonisolated func propagationBuildSealedUpload(distroPublicKey: Data, sealed: Data, syncSig: Data,
+                                                  withClaim: Bool, node: Data) -> Data? {
+        var outLen: UInt32 = 0
+        let ptr = distroPublicKey.withUnsafeBytes { key in
+            sealed.withUnsafeBytes { sealedBuf in
+                syncSig.withUnsafeBytes { sigBuf in
+                    node.withUnsafeBytes { nodeBuf in
+                        retichat_propagation_build_sealed_upload(
+                            key.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(distroPublicKey.count),
+                            sealedBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(sealed.count),
+                            sigBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(syncSig.count),
+                            withClaim ? 1 : 0,
+                            nodeBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(node.count),
+                            &outLen)
+                    }
+                }
+            }
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return Data(bytes: ptr, count: Int(outLen))
+    }
+
     /// The propagation upload of the packed message `packed` for the node `node`:
     /// encrypted to `distroPublicKey` and to no other key, stamped for the node's
     /// cost. BLOCKS while the stamp is mined: never on the main thread. Nil with
-    /// the error slot set when it cannot be built; nothing has left.
+    /// the error slot set when it cannot be built; nothing has left. The legacy
+    /// build, for an entry owed before entries were sealed.
     nonisolated func propagationBuildUpload(distroPublicKey: Data, packed: Data, node: Data) -> Data? {
         var outLen: UInt32 = 0
         let ptr = distroPublicKey.withUnsafeBytes { key in
@@ -900,13 +961,16 @@ extension RetichatBridge {
         return PropagationLink(id: raw.dropFirst().hexString, state: raw[raw.startIndex])
     }
 
-    /// Hand `upload` (`propagationBuildUpload`) to the ACTIVE link held for `node`.
-    /// Nil with the error slot set when it did not leave (no active link held, or
-    /// it could not be queued): `sink` is then never called. Once it has left,
-    /// `sink` hears the node's proof or the loss, each at most once and from a
-    /// stack thread, and on a loss the link the upload went on has already been
-    /// torn down (the receipt's timeout, as LXMF does). Nothing here resends or
-    /// times anything.
+    /// Hand `upload` (`propagationBuildUpload` or `propagationBuildSealedUpload`) to the
+    /// ACTIVE link held for `node`. Nil with the error slot set when it did not leave
+    /// (no active link held, or it could not be queued): `sink` is then never called.
+    /// Once handed over, `sink` hears the node's proof or the loss, each at most once
+    /// and from a stack thread, and on a loss the link the upload went on has already
+    /// been torn down (the receipt's timeout, as LXMF does). A Resource whose first
+    /// advertisement no interface could carry is heard as `neverLeft` instead, with no
+    /// teardown (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a)). Take `interfaceUpMark()` just
+    /// before this call. Nothing here resends or times anything; a Resource's progress
+    /// feeds the stack's §1 silence watch, which only logs.
     nonisolated func propagationUpload(node: Data, upload: Data, sink: UploadSink) -> PropagationUploadStart? {
         // The library owns this retain from the call on and releases it once.
         let context = Unmanaged.passRetained(PropagationUploadSinkBox(sink)).toOpaque()
@@ -961,6 +1025,19 @@ extension RetichatBridge {
     nonisolated func interfaceUpClear() {
         InterfaceUpEvents.set(nil)
         retichat_interface_up_clear()
+    }
+
+    /// AppLinks' `UpEdgeMark::now()`: how many Reticulum interface up-edges there have been.
+    /// The outbox takes it just before each upload (`PropagationPort.upEdgeMark`).
+    nonisolated func interfaceUpMark() -> UInt64 {
+        retichat_interface_up_mark()
+    }
+
+    /// AppLinks' `UpEdgeMark::came_up_since`: whether an interface has come up since
+    /// `mark`. Asked only once an upload that never left is recorded as owed: true means
+    /// the up-edge it waits for came meanwhile, and it goes at once.
+    nonisolated func interfaceCameUpSince(_ mark: UInt64) -> Bool {
+        retichat_interface_came_up_since(mark) == 1
     }
 
     // MARK: Member statuses and keys (RFed-spec Group.md, 2026-10-06)

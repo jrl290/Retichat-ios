@@ -71,16 +71,22 @@ nonisolated struct DistroOutboxFailure: Error, LocalizedError {
 nonisolated final class FFIPropagationPort: PropagationPort, @unchecked Sendable {
     private let lock = NSLock()
     private var current: Data?
+    private var rfedDerived: Data?
     private let bridge: RetichatBridge
 
     init(bridge: RetichatBridge) {
         self.bridge = bridge
     }
 
-    /// The propagation node this device uploads to, or nil when none is known.
-    func setNode(_ node: Data?) {
+    /// The propagation node this device uploads to, or nil when none is known, and the
+    /// configured RFed's own lxmf.propagation hash, derived from its identity whatever the
+    /// Settings override says (`UserPreferences.rfedDerivedLxmfPropagationHash`), or nil when
+    /// no RFed is configured. The distro sync proof goes only when the two are the same node
+    /// (DISTRO-SYNC-PROOF-DESIGN.md §5.4).
+    func setNode(_ node: Data?, rfedDerived: Data?) {
         lock.lock(); defer { lock.unlock() }
         current = node
+        self.rfedDerived = rfedDerived
     }
 
     func node() -> Data? {
@@ -88,26 +94,56 @@ nonisolated final class FFIPropagationPort: PropagationPort, @unchecked Sendable
         return current
     }
 
+    private func nodeAndRfed() -> (node: Data?, rfedDerived: Data?) {
+        lock.lock(); defer { lock.unlock() }
+        return (current, rfedDerived)
+    }
+
     func held() -> HeldLink? {
         guard let node = node(), let link = bridge.propagationLink(node: node) else { return nil }
         return HeldLink(id: link.id, active: link.active)
     }
 
+    /// The upload of `entry` for the node it goes to now. A sealed entry is built from its
+    /// own sealed bytes, with its distro sync proof only for the configured RFed's own
+    /// lxmf.propagation (three elements); any other node, a Settings override among them,
+    /// gets LXMF's two, since LXMF drops an envelope of any other length (RFed SPEC §17.13,
+    /// DISTRO-SYNC-PROOF-DESIGN.md §5.4). Both kinds carry it (James, 2026-10-10, Q1),
+    /// so a sent copy owed to a distro the device has since given up still goes with its
+    /// claim. An entry owed without a seal is built the legacy way.
     nonisolated(nonsending) func build(_ entry: OwedEntry) async throws -> Data {
-        guard let node = node() else { throw DistroOutboxFailure(message: "no propagation node is configured") }
+        let (node, rfedDerived) = nodeAndRfed()
+        guard let node else { throw DistroOutboxFailure(message: "no propagation node is configured") }
         guard let key = Data(hexString: entry.distroKey), key.count == 64 else {
             throw DistroOutboxFailure(message: "the distro's key is not 64 bytes of hex")
         }
+        let how = UploadBuild.of(entry, node: node, rfedDerived: rfedDerived)
         let packed = entry.packed
+        let sealed = entry.sealed
+        let syncSig = entry.syncSig
         let bridge = bridge
         // Mining the stamp blocks: it runs on its own thread, never the caller's.
         return try await Task.detached(priority: .utility) { () throws -> Data in
-            guard let upload = bridge.propagationBuildUpload(distroPublicKey: key, packed: packed, node: node) else {
-                throw DistroOutboxFailure(message: DistroMessageFFI.rnsLastError())
+            let upload: Data?
+            switch how {
+            case .sealed(let withClaim):
+                guard let sealed, let syncSig else { throw DistroOutboxFailure(message: "the sealed entry lost its seal") }
+                upload = bridge.propagationBuildSealedUpload(distroPublicKey: key, sealed: sealed, syncSig: syncSig,
+                                                             withClaim: withClaim, node: node)
+            case .legacy:
+                upload = bridge.propagationBuildUpload(distroPublicKey: key, packed: packed, node: node)
             }
+            guard let upload else { throw DistroOutboxFailure(message: DistroMessageFFI.rnsLastError()) }
             return upload
         }.value
     }
+
+    /// Transport's interface up-edge count, taken just before an upload is handed over
+    /// (app-links `UpEdgeMark`).
+    func upEdgeMark() -> UInt64 { bridge.interfaceUpMark() }
+
+    /// Whether an interface came up after `mark` was taken.
+    func cameUpSince(_ mark: UInt64) -> Bool { bridge.interfaceCameUpSince(mark) }
 
     func upload(_ upload: Data, sink: UploadSink) throws -> UploadLeft? {
         guard let node = node() else { return nil }
@@ -147,6 +183,8 @@ nonisolated private final class WatchedSink: UploadSink, @unchecked Sendable {
 
     func proved() { mark(); inner.proved() }
     func lost() { mark(); inner.lost() }
+    /// A Resource whose first advertisement no interface carried: decided, never sent.
+    func neverLeft() { mark(); inner.neverLeft() }
 }
 
 /// Where the stack's threads hand a link's coming-up: the one outbox and the node it watches.
@@ -252,11 +290,15 @@ final class DistroOutboxRuntime: ObservableObject {
     }
 
     /// The propagation node: the Settings override, else the RFed node's own
-    /// lxmf.propagation (UserPreferences.effectiveLxmfPropagationHash).
+    /// lxmf.propagation (UserPreferences.effectiveLxmfPropagationHash); and the RFed node's own
+    /// lxmf.propagation whatever the override says (UserPreferences.rfedDerivedLxmfPropagationHash),
+    /// the one node the distro sync proof goes to (DISTRO-SYNC-PROOF-DESIGN.md §5.4).
     private func refreshNode() {
-        let hex = UserPreferences.shared.effectiveLxmfPropagationHash
-        let node = Data(hexString: hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-        port.setNode(node.flatMap { $0.count == 16 ? $0 : nil })
+        func hash16(_ hex: String) -> Data? {
+            Data(hexString: hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()).flatMap { $0.count == 16 ? $0 : nil }
+        }
+        port.setNode(hash16(UserPreferences.shared.effectiveLxmfPropagationHash),
+                     rfedDerived: hash16(UserPreferences.shared.rfedDerivedLxmfPropagationHash))
     }
 
     /// The stack is up (called from its start, once the router has its propagation node): load
@@ -363,8 +405,9 @@ final class DistroOutboxRuntime: ObservableObject {
             return
         }
         let bridge = bridge
-        guard let (packed, hash) = await Self.pack(bridge: bridge, distro: distro, signer: signer, title: "", content: "",
-                                                   method: LxmfMethod.direct, fields: { handle in
+        let label = "the \(op) of #\(channelName) (§17.12)"
+        guard let (packed, hash, sealed) = await Self.pack(bridge: bridge, distro: distro, signer: signer, title: "", content: "",
+                                                           method: LxmfMethod.direct, label: label, fields: { handle in
             bridge.messageSetDistroChannelSync(handle: handle, op: op, name: channelName, atMs: atMs, deviceHex: deviceHex)
         }) else {
             fail("The \(op) of #\(channelName) was not sent to the distro: it could not be made")
@@ -373,8 +416,9 @@ final class DistroOutboxRuntime: ObservableObject {
         await outbox.owe(OwedEntry(
             id: DistroChannelSync.entryId(channelHashHex), kind: .channel,
             distro: distro.deliveryHashHex, distroKey: distro.publicKeyHex,
-            msgHash: hash, packed: packed, label: "the \(op) of #\(channelName) (§17.12)",
-            op: op, name: channelName, atMs: atMs))
+            msgHash: hash, packed: packed, label: label,
+            op: op, name: channelName, atMs: atMs,
+            sealed: sealed?.sealed, syncSig: sealed?.syncSig))
     }
 
     /// The §17.11 sent copy of a message this device just sent as the distro to
@@ -391,8 +435,9 @@ final class DistroOutboxRuntime: ObservableObject {
             return
         }
         let bridge = bridge
-        guard let (packed, hash) = await Self.pack(bridge: bridge, distro: distro, signer: signer, title: title, content: content,
-                                                   method: LxmfMethod.direct, fields: { handle in
+        let label = "the sent-copy for \(recipientHex.prefix(8)) (§17.11)"
+        guard let (packed, hash, sealed) = await Self.pack(bridge: bridge, distro: distro, signer: signer, title: title, content: content,
+                                                           method: LxmfMethod.direct, label: label, fields: { handle in
             DistroMessageFFI.addField(handle, key: LxmfFieldKey.customType, value: DistroSent.customType)
                 && DistroMessageFFI.addField(handle, key: LxmfFieldKey.customData, value: recipientHex)
                 && DistroMessageFFI.addField(handle, key: LxmfFieldKey.customMeta, value: deviceHex)
@@ -403,8 +448,9 @@ final class DistroOutboxRuntime: ObservableObject {
         await outbox.owe(OwedEntry(
             id: "sent:\(hash)", kind: .sent,
             distro: distro.deliveryHashHex, distroKey: distro.publicKeyHex,
-            msgHash: hash, packed: packed, label: "the sent-copy for \(recipientHex.prefix(8)) (§17.11)",
-            toHex: recipientHex))
+            msgHash: hash, packed: packed, label: label,
+            toHex: recipientHex,
+            sealed: sealed?.sealed, syncSig: sealed?.syncSig))
     }
 
     private func fail(_ message: String) {
@@ -414,14 +460,19 @@ final class DistroOutboxRuntime: ObservableObject {
 
     /// Make a message from the distro to the distro (its key, the identity `signer`, signs it),
     /// set its fields with `fields`, pack and sign it once, and return its LXMF bytes and message
-    /// hash (hex). Nil, said, when any step fails. The message is made DIRECT only so that
-    /// packing needs no destination: it is never sent from here; only the bytes it packs to are
-    /// kept. Runs on a detached task: signing is not the main actor's.
+    /// hash (hex), and the message sealed for the distro sync proof with D's signature over it
+    /// (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5.1), made once here so that every upload
+    /// of the entry carries the same sealed bytes. Nil, said, when making the message fails. A
+    /// seal that fails is said as an error and the message is owed without it: it then goes the
+    /// legacy way, without the proof, and RFed wakes the distro's devices for it as before (a
+    /// message lost for want of its proof would be worse). The message is made DIRECT only so
+    /// that packing needs no destination: it is never sent from here; only the bytes it packs to
+    /// are kept. Runs on a detached task: signing is not the main actor's.
     private static func pack(
         bridge: RetichatBridge, distro: DistroInfo, signer: UInt64, title: String, content: String,
-        method: UInt8, fields: @escaping @Sendable (UInt64) -> Bool
-    ) async -> (Data, String)? {
-        await Task.detached(priority: .userInitiated) { () -> (Data, String)? in
+        method: UInt8, label: String, fields: @escaping @Sendable (UInt64) -> Bool
+    ) async -> (Data, String, RetichatBridge.DistroSealed?)? {
+        await Task.detached(priority: .userInitiated) { () -> (Data, String, RetichatBridge.DistroSealed?)? in
             guard let distroHash = Data(hexString: distro.deliveryHashHex), distroHash.count == 16 else { return nil }
             let handle = bridge.messageCreate(destHash: distroHash, sourceHash: distroHash, content: content, title: title,
                                               method: method, identityHandle: signer)
@@ -435,7 +486,13 @@ final class DistroOutboxRuntime: ObservableObject {
                 print("[DistroOutbox] packing failed: \(DistroMessageFFI.rnsLastError())")
                 return nil
             }
-            return (packed, hash.hexString)
+            let sealed = bridge.distroSeal(distroHandle: signer, packed: packed)
+            if sealed == nil {
+                print("[DistroOutbox] ERROR: \(label) could not be sealed for the distro sync proof "
+                      + "(\(DistroMessageFFI.rnsLastError())): it is owed without the proof, and RFed wakes the "
+                      + "distro's devices for it as before (RFed SPEC §17.13)")
+            }
+            return (packed, hash.hexString, sealed)
         }.value
     }
 }

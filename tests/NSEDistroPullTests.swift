@@ -135,6 +135,38 @@ func testTheWiring() {
           "the app ingests the NSE's blobs with its NSE import")
 }
 
+/// DISTRO-SYNC-PROOF-DESIGN.md §7 and §13.1: a pull that stops at its round cap with
+/// more still in RFed is incomplete, and the NSE keeps the original alert. Until
+/// 2026-10-10 it left `failed` false, and a pull of only sync messages blanked the
+/// alert at the "nothing to show" branch while the message the push was for still
+/// waited behind them. The run loop needs the FFI and the branch UIKit, so both are
+/// asserted on the source, like the wiring above.
+func testMorePendingKeepsTheAlert() {
+    let pull = source("NotificationService/NSEDistroPull.swift")
+    check(pull.contains("var morePending = false"), "the pull's result says whether more was pending")
+    let decode = pull.range(of: "guard let (blobs, more) = NSEDistroPullDecoder.decode(response) else {")
+    let set = pull.range(of: "result.morePending = more\n            if !more { break }")
+    check(decode != nil && set != nil && decode!.lowerBound < set!.lowerBound,
+          "every decoded round sets it from that round's `more`, so the last round decides it")
+    check(pull.components(separatedBy: "result.morePending =").count == 2, "and nothing else sets it")
+
+    let nse = source("NotificationService/NotificationService.swift")
+    let failed = nse.range(of: "} else if distro.failed {")
+    let more = nse.range(of: "} else if distro.morePending {")
+    let suppress = nse.range(of: "} else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {")
+    check(failed != nil && more != nil && suppress != nil
+            && failed!.lowerBound < more!.lowerBound && more!.lowerBound < suppress!.lowerBound,
+          "more pending is decided with the incomplete pull, before any suppression")
+    if let more, let next = nse.range(of: "} else if", range: more.upperBound..<nse.endIndex) {
+        let branch = String(nse[more.lowerBound..<next.lowerBound])
+        check(!branch.contains("best.sound = nil") && !branch.contains("best.body  = \"\"")
+                && !branch.contains("best.title = \"\""),
+              "and keeps the original alert")
+    } else {
+        check(false, "the more-pending branch is followed by the others")
+    }
+}
+
 @main
 enum NSEDistroPullTests {
     static func main() {
@@ -143,6 +175,7 @@ enum NSEDistroPullTests {
         testSavedBlobsComeBackOnceInOrder()
         testThePullRouteRoundTrips()
         testTheWiring()
+        testMorePendingKeepsTheAlert()
         if failures.isEmpty {
             print("all NSE distro pull tests passed")
             exit(0)

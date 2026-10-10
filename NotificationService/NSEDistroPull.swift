@@ -39,6 +39,12 @@ enum NSEDistroPull {
         var failed = false
         /// This device has no distro (or the app has not shared it yet).
         var noDistro = false
+        /// The last round still reported more in RFed: the pull stopped at its
+        /// round cap, so the message this push is for may be behind the ones
+        /// pulled. Incomplete like `failed`, and the push must not be suppressed
+        /// (DISTRO-SYNC-PROOF-DESIGN.md §7: a woken sync backlog ahead of real
+        /// mail).
+        var morePending = false
     }
 
     /// At most this many rounds, as the app's pull (RfedDistroClient).
@@ -100,7 +106,12 @@ enum NSEDistroPull {
                 if let shown = unwrapToShow(blob, distroHandle: distroHandle) { result.shown.append(shown) }
             }
             NSLog("[NSE-Distro] pull round %d: %d blob(s), more=%d", round, blobs.count, more ? 1 : 0)
+            result.morePending = more
             if !more { break }
+        }
+        if result.morePending {
+            NSLog("[NSE-Distro] more pending after %d rounds (%d blobs): the rest waits for the next pull",
+                  roundsMax, result.pulled)
         }
         return result
     }

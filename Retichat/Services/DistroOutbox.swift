@@ -56,6 +56,22 @@
 //     OS saying the network is available: `onInterfaceUp`), as well as at the next
 //     coming-up. A loss after the packet left still waits for the next coming-up
 //     alone. What is recorded for it is `UnprovedUploads`' never-left record.
+//   - A Resource upload whose first advertisement no interface could carry never
+//     left the device either (James, 2026-10-10; DISTRO-SYNC-PROOF-DESIGN.md
+//     §5.3(a), Stage 0): the stack cancels it, keeps the link and reports it
+//     (`UploadSink.neverLeft`), later than the packet's nil, and it is recorded and
+//     sent the same way. Once its advertisement has left, its own completion or
+//     failure decides, as before. The up-edge such an upload waits for can come
+//     while it is being sent, before it is recorded, and find nothing to send; so
+//     the up-edge count is taken just before each send (`PropagationPort.upEdgeMark`)
+//     and asked once the record is made (app-links `UpEdgeMark`): an up-edge that
+//     came meanwhile sends it at once (`goesIfAnInterfaceCameUp`).
+//
+//  An entry may also carry the message sealed once, when it was owed, for the
+//  distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5): every
+//  upload of it carries the same sealed bytes, and the proof only to the
+//  configured RFed's own propagation node (`UploadBuild`, the gate). Nothing in
+//  when or how often an entry is uploaded depends on it.
 //
 //  At most one upload of an entry is in flight at a time: while one has left and
 //  is not decided, no flush uploads it, on its link or on a newer one.
@@ -81,7 +97,9 @@ nonisolated enum OwedKind: String, Sendable {
 /// one message from another under the same id. `distro` is D's `lxmf.delivery`
 /// hash and `distroKey` D's public key (hex), so a sent copy is still encrypted
 /// to its own distro after the device gives that distro up. A channel entry adds
-/// `op`, `name` and `atMs`; a sent entry `toHex`.
+/// `op`, `name` and `atMs`; a sent entry `toHex`. Both kinds may carry `sealed`
+/// and `syncSig` (RFed SPEC §17.13, James 2026-10-10 Q1: both kinds carry the
+/// proof).
 nonisolated struct OwedEntry: Equatable, Sendable, CustomStringConvertible {
     let id: String
     let kind: OwedKind
@@ -94,6 +112,15 @@ nonisolated struct OwedEntry: Equatable, Sendable, CustomStringConvertible {
     var name: String? = nil
     var atMs: Int64? = nil
     var toHex: String? = nil
+    /// The message sealed for the distro sync proof, once, in the write that owed it
+    /// (DISTRO-SYNC-PROOF-DESIGN.md §5.1): `D_hash | D.encrypt(packed[16..])`, and
+    /// `syncSig`, D's Ed25519 signature over `"rfed.distro.sync" | 0x01 | D_hash |
+    /// SHA-256(sealed)`. Every upload of the entry carries these same bytes, never
+    /// encrypted again, so the node and RFed hold a re-upload under the same id. Nil
+    /// for an entry owed before entries were sealed, or one that could not be sealed:
+    /// it is built the legacy way and carries no proof (`UploadBuild`).
+    var sealed: Data? = nil
+    var syncSig: Data? = nil
 
     /// The same message, as packed (not another action under the same id).
     func sameMessage(_ other: OwedEntry?) -> Bool {
@@ -104,6 +131,32 @@ nonisolated struct OwedEntry: Equatable, Sendable, CustomStringConvertible {
     static func == (a: OwedEntry, b: OwedEntry) -> Bool { a.sameMessage(b) && a.distro == b.distro }
 
     var description: String { "OwedEntry(\(id), \(label))" }
+}
+
+/// How the upload of an owed entry is built for the propagation node `node`
+/// (DISTRO-SYNC-PROOF-DESIGN.md §5.2, §5.4). Decided at each build, so a sent copy
+/// owed to a distro the device has since given up still goes sealed, with its proof.
+nonisolated enum UploadBuild: Equatable, Sendable {
+    /// Owed before entries were sealed, or not sealed: the packed message encrypted to
+    /// the entry's distro anew each time, in LXMF's two-element upload, with no proof
+    /// (RFed wakes the distro's devices for it, as before).
+    case legacy
+    /// The stored sealed bytes, stamped anew; with the distro sync proof only when
+    /// `withClaim`.
+    case sealed(withClaim: Bool)
+
+    /// The gate is mandatory (§5.4): the proof goes only to the configured RFed's own
+    /// `lxmf.propagation`, `rfedDerived` (`UserPreferences.rfedDerivedLxmfPropagationHash`).
+    /// Any other node, a Settings override (a Python or LXMF-rust lxmd, another RFed, a
+    /// hash typed in), gets LXMF's two-element upload: LXMF ignores a Resource whose
+    /// envelope is not exactly two elements (LXMRouter.py), so the message would be lost
+    /// there without a word. An RFed that predates the proof reads only the first two
+    /// elements and stores the message as it always did.
+    static func of(_ entry: OwedEntry, node: Data, rfedDerived: Data?) -> UploadBuild {
+        guard entry.sealed != nil, entry.syncSig != nil else { return .legacy }
+        guard let rfedDerived, rfedDerived.count == 16, node.count == 16 else { return .sealed(withClaim: false) }
+        return .sealed(withClaim: node == rfedDerived)
+    }
 }
 
 /// The distro this device holds: its `lxmf.delivery` hash and public key (hex).
@@ -135,6 +188,11 @@ nonisolated protocol UploadSink: AnyObject, Sendable {
 
     /// The packet's receipt timed out, or the Resource failed: it will not be proved.
     func lost()
+
+    /// A Resource whose first advertisement no interface could carry: the stack
+    /// cancelled it and kept the link, and nothing was sent (DISTRO-SYNC-PROOF-DESIGN.md
+    /// §5.3(a)). Told instead of `proved` or `lost`, never with them.
+    func neverLeft()
 }
 
 /// Where owed entries are kept across a restart (SwiftData).
@@ -157,16 +215,26 @@ nonisolated protocol PropagationPort: Sendable {
     func held() -> HeldLink?
 
     /// Build the propagation upload of `entry`: its packed message encrypted to
-    /// `OwedEntry.distroKey` and no other key, stamped for the node. Suspends
-    /// while the stamp is mined; throws when it cannot be built.
+    /// `OwedEntry.distroKey` and no other key, or its stored sealed bytes
+    /// (`UploadBuild`), stamped for the node. Suspends while the stamp is mined;
+    /// throws when it cannot be built.
     nonisolated(nonsending) func build(_ entry: OwedEntry) async throws -> Data
 
     /// Hand `upload` to the held ACTIVE link. Nil when it did not leave (no
     /// active link, or it could not be queued): `sink` is then never called.
     /// Otherwise `sink` hears its proof or its loss, each at most once, and a
-    /// proof can follow a loss. Synchronous: nothing may come between the
-    /// outbox's last check that the link is up and the upload leaving.
+    /// proof can follow a loss; or, for a Resource whose first advertisement no
+    /// interface could carry, `neverLeft` instead. Synchronous: nothing may come
+    /// between the outbox's last check that the link is up and the upload leaving.
     func upload(_ upload: Data, sink: UploadSink) throws -> UploadLeft?
+
+    /// The stack's count of interface up-edges now (app-links `UpEdgeMark::now`),
+    /// taken just before each `upload`.
+    func upEdgeMark() -> UInt64
+
+    /// Whether an interface has come up since `mark` (`UpEdgeMark::came_up_since`).
+    /// Asked only once an upload that never left is recorded.
+    func cameUpSince(_ mark: UInt64) -> Bool
 }
 
 nonisolated protocol OutboxLog: Sendable {
@@ -285,13 +353,14 @@ actor DistroOutbox {
     /// DESIGN_PRINCIPLES §1: the longest the propagation node may take to prove an upload packet.
     nonisolated static let proofLiveMs: Int64 = 5_000
 
-    private enum Settled { case proved, lost }
+    private enum Settled { case proved, lost, neverLeft }
 
     /// What handing an upload to the propagation link came to (`uploadFor`).
+    /// `neverLeft` carries the up-edge mark taken just before the send.
     private enum Handed {
         case left(Upload)
         case linkDown
-        case neverLeft
+        case neverLeft(UInt64)
     }
 
     /// One upload from its leaving until it is decided: the web's `DistroUploads.track`.
@@ -309,6 +378,9 @@ actor DistroOutbox {
         var onLost: (() -> Void)?
         var onOutcomeProved: (() -> Void)?
         var onOutcomeLost: ((String) -> Void)?
+        var onOutcomeNeverLeft: (() -> Void)?
+        /// The stack's up-edge count taken just before the send (`PropagationPort.upEdgeMark`).
+        var mark: UInt64 = 0
 
         init(label: String, linkId: String, how: String) {
             self.label = label
@@ -335,14 +407,18 @@ actor DistroOutbox {
     private final class ClosureSink: UploadSink, @unchecked Sendable {
         private let onProved: @Sendable () -> Void
         private let onLost: @Sendable () -> Void
+        private let onNeverLeft: @Sendable () -> Void
 
-        init(onProved: @escaping @Sendable () -> Void, onLost: @escaping @Sendable () -> Void) {
+        init(onProved: @escaping @Sendable () -> Void, onLost: @escaping @Sendable () -> Void,
+             onNeverLeft: @escaping @Sendable () -> Void) {
             self.onProved = onProved
             self.onLost = onLost
+            self.onNeverLeft = onNeverLeft
         }
 
         func proved() { onProved() }
         func lost() { onLost() }
+        func neverLeft() { onNeverLeft() }
     }
 
     private let store: OutboxStore
@@ -673,13 +749,24 @@ actor DistroOutbox {
             if entries[entry.id]?.msgHash == entry.msgHash { unproved.record(entry, at: propComingUps) }
         }
         // Never left the device (the port's nil with the link ACTIVE: the packet could
-        // not be queued, no interface could carry it): nothing was sent, so this is no
-        // failure and records no coming-up. An interface coming back online
+        // not be queued, no interface could carry it; or, for a Resource, the stack's
+        // never-left: its first advertisement went out on no interface, and the stack
+        // cancelled it and kept the link): nothing was sent, so this is no failure and
+        // records no coming-up, and no link is torn down. An interface coming back online
         // (`sendDistroNeverLeft`) or the next coming-up sends it, and the record only
         // says which message that is, while it is the one owed under its id, as a
-        // failure's does. James, 2026-10-06.
+        // failure's does. James, 2026-10-06; for a Resource 2026-10-10.
         func recordNeverLeft() {
             if entries[entry.id]?.msgHash == entry.msgHash { unproved.recordNeverLeft(entry) }
+        }
+        // Recorded first, and only then is the up-edge mark taken before the send asked:
+        // an up-edge that came meanwhile found nothing recorded (`goesIfAnInterfaceCameUp`).
+        func decideNeverLeft(_ how: String, mark: UInt64) {
+            landed()
+            recordNeverLeft()
+            let what = how == "resource" ? "its Resource's first advertisement" : "its packet"
+            log.info("\(entry.label) never left the device: no interface could carry \(what). Nothing was sent, so it is no failure; it goes when an interface comes back online, or at the propagation link's next coming-up (§17.11, §17.12, DESIGN_PRINCIPLES §3, the distro exception)")
+            goesIfAnInterfaceCameUp(since: mark, entry)
         }
         // Proved (late, too): owed no more, its record goes, and only its own.
         func forgetUnproved() { unproved.forget(entry) }
@@ -707,12 +794,10 @@ actor DistroOutbox {
                 upload = made
             case .linkDown:
                 upload = nil
-            case .neverLeft:
+            case .neverLeft(let mark):
                 // The link was up and the packet could not be queued: it is not a
                 // failure, and it is not "the link went down" either.
-                landed()
-                recordNeverLeft()
-                log.info("\(entry.label) never left the device: no interface could carry its packet. Nothing was sent, so it is no failure; it goes when an interface comes back online, or at the propagation link's next coming-up (§17.11, §17.12, DESIGN_PRINCIPLES §3, the distro exception)")
+                decideNeverLeft("packet", mark: mark)
                 return
             }
         } catch {
@@ -764,6 +849,11 @@ actor DistroOutbox {
                 self.distroOwedOutcome(entry, how: upload.how, error: why)
             }
         }
+        // A Resource whose first advertisement went out on no interface (the stack's
+        // never-left, told after the upload was handed over): as the packet's nil.
+        upload.onOutcomeNeverLeft = { [unowned upload] in
+            decideNeverLeft(upload.how, mark: upload.mark)
+        }
         // A proof after the upload was reported lost (the node had the packet
         // after all) is the truth all the same: the node has it, so it is owed
         // no more, and is not sent again.
@@ -780,9 +870,32 @@ actor DistroOutbox {
             upload.onOutcomeLost?(upload.lostWhy)
         case .proved:
             upload.onOutcomeProved?()
+        case .neverLeft:
+            upload.onOutcomeNeverLeft?()
         case nil:
             break
         }
+    }
+
+    /// The UpEdgeMark contract (app-links `send_on_held_link_owed`;
+    /// DISTRO-SYNC-PROOF-DESIGN.md §5.3(a)): `entry` was just recorded never left, and
+    /// the interface up-edge it waits for may have come while it was being sent,
+    /// between `mark` (the up-edge count taken just before the send) and the record.
+    /// That up-edge reached `onInterfaceUp` with nothing recorded, and the link stays
+    /// up, so no coming-up follows either. So the mark is asked now, after the record:
+    /// when an interface came up since, that up-edge was this upload's, and it goes
+    /// now, once, on the propagation link that is up, with a new mark. With the link
+    /// not up, its coming-up sends it. An ordering check at an event: no timer and no
+    /// retry. Each send answers one up-edge, so an interface that still cannot carry it
+    /// records it again, and it waits for the next. It reads and writes no failure
+    /// record and counts no coming-up, as `sendDistroNeverLeft`.
+    private func goesIfAnInterfaceCameUp(since mark: UInt64, _ entry: OwedEntry) {
+        guard port.cameUpSince(mark) else { return }
+        guard !stopped, let held = port.held(), held.active else { return }
+        let linkId = held.id
+        guard unproved.neverLeft(entry), stillOwed(entry), !distroAttemptOpen(entry, linkId) else { return }
+        log.info("An interface came online while \(entry.label) was being sent: it goes now, on that up-edge (§17.11, §17.12)")
+        uploadOwedAtOnce(linkId, entry)
     }
 
     /// Hand `bytes` to the propagation link `linkId`, never started here. `linkDown`
@@ -790,7 +903,8 @@ actor DistroOutbox {
     /// left, and its coming-up sends it. `neverLeft` when the link was up and the
     /// packet could not be queued on it (no interface could carry it): nothing left,
     /// and no failure (James, 2026-10-06). Otherwise the upload, decided by the
-    /// node's proof or by its loss. A
+    /// node's proof or by its loss, or, for a Resource whose first advertisement no
+    /// interface could carry, by the stack's never-left (James, 2026-10-10). A
     /// packet's proof has a §1 watch: a proof later than 5 s is logged as the
     /// violation it is, and it settles the entry all the same.
     private func uploadFor(_ linkId: String, _ bytes: Data, _ label: String) throws -> Handed {
@@ -798,8 +912,13 @@ actor DistroOutbox {
         let upload = Upload(label: label, linkId: linkId, how: "packet")
         let sink = ClosureSink(
             onProved: { self.spawn { await self.uploadProved(upload) } },
-            onLost: { self.spawn { await self.uploadLost(upload) } })
+            onLost: { self.spawn { await self.uploadLost(upload) } },
+            onNeverLeft: { self.spawn { await self.uploadNeverLeft(upload) } })
         open.append(upload)
+        // UpEdgeMark: the up-edge count just before the send, which a never-left upload
+        // asks once it is recorded (`goesIfAnInterfaceCameUp`).
+        let mark = port.upEdgeMark()
+        upload.mark = mark
         let left: UploadLeft?
         do {
             left = try port.upload(bytes, sink: sink)
@@ -812,7 +931,7 @@ actor DistroOutbox {
             // between that and this call), and the packet did not go: no interface
             // could carry it. Nothing was sent.
             open.removeAll { $0 === upload }
-            return .neverLeft
+            return .neverLeft(mark)
         }
         upload.linkId = left.linkId
         upload.how = left.resource ? "resource" : "packet"
@@ -859,6 +978,20 @@ actor DistroOutbox {
         open.removeAll { $0 === upload }
         upload.onLost?()
         upload.onOutcomeLost?(why)
+        return true
+    }
+
+    /// The stack found that `upload`, a Resource, never left the device: its first
+    /// advertisement went out on no interface, so the stack cancelled it and kept the
+    /// link (DISTRO-SYNC-PROOF-DESIGN.md §5.3(a); James, 2026-10-10). No loss: nothing
+    /// was sent. True when this decided it; a stop that decided it first (`cut`)
+    /// stands, and the stack tells nothing else of it after this.
+    @discardableResult
+    private func uploadNeverLeft(_ upload: Upload) -> Bool {
+        if upload.settled != nil { return false }
+        upload.settled = .neverLeft
+        open.removeAll { $0 === upload }
+        upload.onOutcomeNeverLeft?()
         return true
     }
 

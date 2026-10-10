@@ -862,6 +862,19 @@ uint8_t *retichat_distro_register_payload(uint64_t device_handle,
                                           uint64_t distro_handle,
                                           uint32_t *out_len);
 
+/// Seal a packed message for the distro sync proof (RFed SPEC §17.13), once,
+/// when the outbox owes it: encrypt it to the distro (distro_handle must hold
+/// D's private key) and sign the sealed bytes with D's key. `packed` is what
+/// retichat_message_pack returned, from D to D. Returns heap bytes
+/// sig(64) | sealed, where sealed = D_hash | D.encrypt(packed[16..]) and sig is
+/// D's Ed25519 over "rfed.distro.sync" | 0x01 | D_hash | SHA-256(sealed); the
+/// outbox stores both with the entry. NULL (rns_last_error) when D has no
+/// private key, packed is not addressed to D, or the encryption or signature
+/// fails: the entry is then owed without them and built the legacy way.
+uint8_t *retichat_distro_seal(uint64_t distro_handle,
+                              const uint8_t *packed, uint32_t packed_len,
+                              uint32_t *out_len);
+
 /// msgpack payload for /rfed/distro/list:
 ///   [ bin(16) distro_identity_hash, bin(64) distro_pubkey, bin(64) sig(hash) ]
 uint8_t *retichat_distro_list_payload(uint64_t distro_handle, uint32_t *out_len);
@@ -969,6 +982,24 @@ uint8_t *retichat_propagation_build_upload(const uint8_t *distro_public_key, uin
                                            const uint8_t *node, uint32_t node_len,
                                            uint32_t *out_len);
 
+/// The propagation upload of an entry sealed when it was owed
+/// (retichat_distro_seal) for the node `node` (16 bytes): `sealed` exactly as
+/// stored, never encrypted again, stamped anew for the node's cost (read from
+/// its announce; unknown is an error, and the node's path is requested), the
+/// timebase now. With with_claim non-zero it carries the distro sync proof
+/// [id, distro_public_key, sig], so RFed delivers it without waking the
+/// distro's devices: set it only when the node is the configured RFed's own
+/// lxmf.propagation (any other node gets LXMF's two-element upload). A stored
+/// proof that does not hold is not sent (the upload goes without it, logged as
+/// an error). BLOCKS while the stamp is mined: never on the main thread. Heap
+/// bytes, or NULL (rns_last_error) with nothing sent.
+uint8_t *retichat_propagation_build_sealed_upload(const uint8_t *distro_public_key, uint32_t key_len,
+                                                  const uint8_t *sealed, uint32_t sealed_len,
+                                                  const uint8_t *sig, uint32_t sig_len,
+                                                  int32_t with_claim,
+                                                  const uint8_t *node, uint32_t node_len,
+                                                  uint32_t *out_len);
+
 /// The outbound link AppLinks holds for the propagation node, as it is now:
 /// [state u8 | link id], state being the link's own (0 pending, 1 handshake,
 /// 2 ACTIVE, 3 STALE, 4 closed). Heap bytes, or NULL when none is held. A read
@@ -977,22 +1008,30 @@ uint8_t *retichat_propagation_link(const uint8_t *node, uint32_t node_len, uint3
 
 /// Told about an upload on the held propagation link: 1 the node proved it (or
 /// the Resource completed), 2 it was lost (the packet receipt timed out, or the
-/// Resource failed). Each at most once, from a stack thread; never blocks. A
-/// proof can follow a loss.
+/// Resource failed), 3 it never left the device (a Resource whose first
+/// advertisement no interface could carry: cancelled, the link kept, no
+/// teardown; told instead of 1 or 2). Each at most once, from a stack thread;
+/// never blocks. A proof can follow a loss.
 typedef void (*retichat_upload_event_t)(void *context, int32_t event);
 
 /// Called exactly once when the library is done with an upload's context.
 typedef void (*retichat_upload_release_t)(void *context);
 
-/// Hand an upload (retichat_propagation_build_upload) to the ACTIVE link held
-/// for the propagation node: one packet, or a Resource over the link MDU.
-/// Returns heap bytes [how u8 | link id] (how 1 a packet, 2 a Resource; the link
-/// id the upload went on), or NULL (rns_last_error) when it did not leave: then
-/// event is never called. On a loss the link the upload went on is torn down
-/// before event(context, 2). Nothing here times or resends anything: the
-/// stack's own receipt timeout is the clock. `context` is the library's from
-/// this call on, whether or not the upload leaves; release(context) is called
-/// once when the library is done with it.
+/// Hand an upload (retichat_propagation_build_upload or
+/// retichat_propagation_build_sealed_upload) to the ACTIVE link held for the
+/// propagation node: one packet, or a Resource over the link MDU. Returns heap
+/// bytes [how u8 | link id] (how 1 a packet, 2 a Resource; the link id the
+/// upload went on), or NULL (rns_last_error) when it did not leave (no active
+/// link, or no interface could carry the packet): then event is never called.
+/// On a loss the link the upload went on is torn down before event(context, 2).
+/// A Resource that never left is event(context, 3), with no teardown. Take
+/// retichat_interface_up_mark() just before this call and, once an upload that
+/// never left is recorded as owed, ask retichat_interface_came_up_since(mark).
+/// A Resource's progress feeds the §1 silence watch, which only logs. Nothing
+/// here times or resends anything: the stack's own receipt timeout is the
+/// clock. `context` is the library's from this call on, whether or not the
+/// upload leaves; release(context) is called once when the library is done
+/// with it.
 uint8_t *retichat_propagation_upload(const uint8_t *node, uint32_t node_len,
                                      const uint8_t *upload, uint32_t upload_len,
                                      retichat_upload_event_t event,
@@ -1034,6 +1073,15 @@ int32_t retichat_interface_up_register(retichat_interface_up_t callback, void *c
 
 /// Stop telling the host (the stack is stopping).
 void retichat_interface_up_clear(void);
+
+/// AppLinks' UpEdgeMark::now(): the number of Reticulum interface up-edges so
+/// far. Taken just before each retichat_propagation_upload.
+uint64_t retichat_interface_up_mark(void);
+
+/// AppLinks' UpEdgeMark::came_up_since(): 1 when an interface has come up since
+/// `mark`, else 0. Asked only once an upload that never left is recorded as
+/// owed; 1 means the up-edge it waits for came meanwhile, and it goes at once.
+int32_t retichat_interface_came_up_since(uint64_t mark);
 
 #pragma mark - Member statuses and keys (RFed-spec Group.md, 2026-10-06)
 

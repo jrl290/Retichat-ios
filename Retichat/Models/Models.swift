@@ -432,7 +432,13 @@ final class ChannelMembershipEntity {
 /// `distro` is the distro's `lxmf.delivery` hash and `distroKey` its public key
 /// (hex), so a sent copy is still encrypted to its own distro after the device
 /// gives that distro up. A channel entry adds `op`, `name` and `atMs`; a sent
-/// entry adds `toHex`. `seq` orders what is owed, oldest first. Retichat-android's
+/// entry adds `toHex`. `seq` orders what is owed, oldest first. `sealed` and
+/// `syncSig` are the message sealed for the distro sync proof and D's signature
+/// over it (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5.1), made once in the
+/// write that owes it, for both kinds; nil on a row owed before they existed, which
+/// is built the legacy way. Optional attributes with no default store value: a
+/// store written before them opens by SwiftData's lightweight migration, its rows
+/// with both nil (tests/DistroSyncMigrationTests.swift). Retichat-android's
 /// `distro_outbox` table, field for field.
 @Model
 final class DistroOutboxEntity {
@@ -448,10 +454,12 @@ final class DistroOutboxEntity {
     var atMs: Int?
     var toHex: String?
     var seq: Int
+    var sealed: Data?
+    var syncSig: Data?
 
     init(id: String, kind: String, distro: String, distroKey: String, msgHash: String, packed: Data,
          label: String, op: String? = nil, name: String? = nil, atMs: Int? = nil, toHex: String? = nil,
-         seq: Int) {
+         seq: Int, sealed: Data? = nil, syncSig: Data? = nil) {
         self.id = id
         self.kind = kind
         self.distro = distro
@@ -464,6 +472,8 @@ final class DistroOutboxEntity {
         self.atMs = atMs
         self.toHex = toHex
         self.seq = seq
+        self.sealed = sealed
+        self.syncSig = syncSig
     }
 }
 

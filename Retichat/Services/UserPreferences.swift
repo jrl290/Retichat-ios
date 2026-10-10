@@ -177,8 +177,17 @@ final class UserPreferences {
     var effectiveLxmfPropagationHash: String {
         let override = Self.normalizedHex(rfedLxmfPropOverride)
         if !override.isEmpty { return override }
-        return Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
-                                app: "lxmf", aspects: ["propagation"]) ?? ""
+        return rfedDerivedLxmfPropagationHash
+    }
+
+    /// The RFed node's own lxmf.propagation, derived from the RFed identity in use whatever
+    /// the Settings override says, or "" when it cannot be derived. The one node the distro
+    /// sync proof goes to: its three-element upload is for RFed alone, and any other node, an
+    /// override among them, gets LXMF's two (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md
+    /// §5.4).
+    var rfedDerivedLxmfPropagationHash: String {
+        Self.rnsDestHash(identityHashHex: effectiveRfedNodeIdentityHash,
+                         app: "lxmf", aspects: ["propagation"]) ?? ""
     }
 
     /// 32-char hex public identity hash of the RFed node.
