@@ -72,8 +72,9 @@ final class Device {
         return .init(blobs: 1, unfinished: nil, morePending: false)
     }
 
-    func start(hasDistro: Bool, pull: () async -> DistroFirst.PullOutcome) async {
-        await DistroFirst.thenResubscribe(hasDistro: hasDistro, pull: pull,
+    @discardableResult
+    func start(hasDistro: Bool, stopped: () -> Bool = { false }, pull: () async -> DistroFirst.PullOutcome) async -> Bool {
+        await DistroFirst.thenResubscribe(hasDistro: hasDistro, pull: pull, stopped: stopped,
                                           say: { line, warning in self.said.append((line, warning)) }) {
             for c in self.channels { self.wire.append("/rfed/subscribe #\(c)") }
         }
@@ -92,7 +93,7 @@ enum DistroFirstTests {
             await d.start(hasDistro: true) { await d.pullApplyingLeaveOfB() }
             check(d.wire == ["/rfed/pull", "/rfed/unsubscribe #b", "/rfed/subscribe #a"],
                   "the leave is applied before any channel is subscribed again, and the left one is not: \(d.wire)")
-            check(d.said.count == 1 && d.said[0].0 == "Distro queue pulled and applied first (1 blob(s)): re-subscribing persisted channels"
+            check(d.said.count == 1 && d.said[0].0 == "Distro queue pulled and applied first (1 blob(s)): persisted channels may be re-subscribed now"
                   && d.said[0].1 == false, "the applied pull is said: \(d.said)")
         }
         // No distro: at once, no pull.
@@ -111,23 +112,44 @@ enum DistroFirstTests {
             check(d.wire == ["/rfed/subscribe #a"], "a pull with no answer still lets the re-subscription go")
             check(d.said.count == 1 && d.said[0].1 && d.said[0].0 ==
                   "Distro pull before re-subscribing stopped after 0 blob(s): no answer from RFed (no link inside 5 s, or the request went unanswered); "
-                  + "re-subscribing persisted channels now; \(later)", "said, as a warning: \(d.said)")
+                  + "persisted channels may be re-subscribed now; \(later)", "said, as a warning: \(d.said)")
         }
-        // The stack stopped under it: cancelled, and the re-subscription still is not dropped silently.
+        // A forget or an adopt under it (the stack still running): cancelled, and the
+        // re-subscription still is not dropped silently.
         do {
             let d = Device(["a"])
             await d.start(hasDistro: true) {
                 .init(blobs: 2, unfinished: "cancelled: the stack stopped or the distro changed while round 1 waited for RFed", morePending: false)
             }
-            check(d.wire == ["/rfed/subscribe #a"], "a cancelled pull still lets the re-subscription go")
+            check(d.wire == ["/rfed/subscribe #a"], "a pull a distro change cancelled still lets the re-subscription go")
             check(d.said.first?.0.hasPrefix("Distro pull before re-subscribing stopped after 2 blob(s): cancelled: the stack stopped") == true,
                   "said as cancelled, never failed")
+        }
+        // The stack stopped under it (Settings → Apply), review of 67b8a38: this start ends and
+        // subscribes nothing on the restarted stack; that stack's start pulls first, then subscribes.
+        do {
+            var stops: UInt64 = 0
+            let d = Device(["a", "b"])
+            let first = stops
+            let went = await d.start(hasDistro: true, stopped: { stops != first }) {
+                stops += 1 // onStackStopped; the round then comes back cancelled
+                return .init(blobs: 0, unfinished: "cancelled: the stack stopped or the distro changed while round 1 waited for RFed", morePending: false)
+            }
+            check(!went && d.wire.isEmpty, "a start whose stack stopped under its pull subscribes nothing: \(d.wire)")
+            check(d.said.count == 1 && d.said[0].1 == false && d.said[0].0 ==
+                  "Distro pull before re-subscribing ended with the stack stopped under it after 0 blob(s): "
+                  + "this start re-subscribes nothing; the restarted stack's start runs its own distro pull before its re-subscription",
+                  "said: \(d.said)")
+            let second = stops
+            let again = await d.start(hasDistro: true, stopped: { stops != second }) { await d.pullApplyingLeaveOfB() }
+            check(again && d.wire == ["/rfed/pull", "/rfed/unsubscribe #b", "/rfed/subscribe #a"],
+                  "the restarted stack's start applies the leave, then subscribes the rest: \(d.wire)")
         }
         // The round cap.
         do {
             let s = DistroFirst.said(.init(blobs: 24, unfinished: nil, morePending: true))
             check(s.warning && s.line == "Distro pull before re-subscribing applied 24 blob(s) and stopped at its round cap with more pending: "
-                  + "re-subscribing persisted channels now; the rest is applied when a later pull brings it", "the round cap is said")
+                  + "persisted channels may be re-subscribed now; the rest is applied when a later pull brings it", "the round cap is said")
         }
 
         // No answer is never a refusal (the truth rule).
@@ -148,11 +170,37 @@ enum DistroFirstTests {
               "the pull comes before the reachability wait and the re-subscription (and with it the push re-registration)")
         check(schedule.contains("print(\"[RfedChannel] RFed not reachable within 5 s: \\(n) persisted channel(s) not re-subscribed at this start\")"),
               "an unreachable node is said, not dropped silently")
-        check(channel.components(separatedBy: "scheduleResubscribeOnRfedChannelActive()").count - 1 == 2, "one definition, one call (start)")
+        check(channel.components(separatedBy: "scheduleResubscribeOnRfedChannelActive()").count - 1 == 3,
+              "one definition, two calls (start, and startEnded for a restarted stack's start that came first)")
         let resub = body(channel, "private func resubscribePersistedChannels()", "await MainActor.run")
         check(resub.contains("RfedNotifyRegistrar.shared.registerForChannel("), "push re-registration is inside the gated re-subscription")
 
+        // A stop under the start ends it (review of 67b8a38), and the restarted stack's start runs the gate.
+        check(before(schedule, "let stopsAtStart = RfedDistroClient.shared.stackStops", "Task { [weak self] in")
+              && schedule.contains("let stopped = { RfedDistroClient.shared.stackStops != stopsAtStart }")
+              && schedule.contains("stopped: stopped,") && schedule.contains("if !went { self.startEnded() }"),
+              "the gate reads the stop count when it is scheduled and ends on a stop")
+        check(before(schedule, "waitForRfedReachable(timeoutSecs: 5.0)", "guard !stopped() else {")
+              && before(schedule, "guard !stopped() else {", "self.didResubscribeOnActive = true"),
+              "a stop while it waited for RFed ends it too")
+        let ended = body(channel, "private func startEnded() {", "/// Re-subscribe to all channels")
+        check(ended.contains("if stopsAtLastStart == RfedDistroClient.shared.stackStops {") && ended.contains("scheduleResubscribeOnRfedChannelActive()")
+              && ended.contains("didStartNetworkFlows = false"), "the restarted stack's start runs the gate: now, or at its start()")
+        let startBody = body(channel, "func start() {", "func stop() {")
+        check(before(startBody, "stopsAtLastStart = RfedDistroClient.shared.stackStops", "if !didStartNetworkFlows {"), "each start with an identity records the stop count")
+        // Every return of the re-subscription is said: the gate's line only lets it run.
+        check(!schedule.contains("guard !self.didResubscribeOnActive else { return }")
+              && schedule.contains("print(\"[RfedChannel] The persisted channels' re-subscription ran already in this process: it does not run again at this start\")")
+              && schedule.contains("print(\"[RfedChannel] The stack stopped while this start waited for RFed: \\(n) persisted channel(s) not re-subscribed by it\")"),
+              "the once-per-process return and the stop are said")
+        check(!resub.contains("guard !toResub.isEmpty else { return }") && resub.contains("print(\"[RfedChannel] No persisted channels to re-subscribe at this start\")")
+              && !resub.contains("guard let channelHashData = Data(hexString: channel.id) else { continue }")
+              && resub.contains("Re-subscribe failed for \\(channel.channelName): its stored channel hash is not hex"),
+              "no persisted channels, and a hash that cannot be used, are said")
+
         let distro = read("Retichat/Services/RfedDistroClient.swift")
+        let stopped = body(distro, "func onStackStopped() {", "// MARK: - Registration")
+        check(before(stopped, "stackStops &+= 1", "epoch &+= 1"), "the stack's stop is counted first")
         let start = body(distro, "func pullForStart() async -> DistroFirst.PullOutcome {", "nonisolated static func ingested() async {")
         check(before(start, "Self.importNSEBlobs()", "await pullOutcome()") && before(start, "await pullOutcome()", "await Self.ingested()"),
               "what the NSE pulled, then RFed's queue, then every blob of both applied")

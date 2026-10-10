@@ -111,6 +111,10 @@ final class RfedChannelClient: ObservableObject {
     private var didResubscribeOnActive = false
     private var didLoadPersistedState = false
     private var didStartNetworkFlows = false
+    /// RfedDistroClient.stackStops as the latest start() with an identity saw it:
+    /// equal to the current count, that start came after the latest stop, so the
+    /// restarted stack is running (startEnded).
+    private var stopsAtLastStart: UInt64 = 0
     /// ChannelEntity's own name state is adopted by the device once per process
     /// (adoptLegacyNameState).
     private var legacyNameStateAdopted = false
@@ -171,6 +175,7 @@ final class RfedChannelClient: ObservableObject {
         drainPendingChannelSync()
 
         guard identityHandle != 0 else { return }
+        stopsAtLastStart = RfedDistroClient.shared.stackStops
         if !didStartNetworkFlows {
             didStartNetworkFlows = true
 
@@ -1409,26 +1414,58 @@ final class RfedChannelClient: ObservableObject {
     /// RfedDistroClient's pull after its registration, unsynchronised, so a
     /// channel left on another device could be subscribed here and only then
     /// left. The pull's outcome, whatever it is, is the event: said, and the
-    /// re-subscription goes on.
+    /// re-subscription may run.
+    ///
+    /// A stop under it (Settings → Apply: stopService, then startService) ends
+    /// this start instead (review of 67b8a38): its stack is gone, and on the
+    /// restarted one it would race that stack's own pull. startEnded hands the
+    /// re-subscription to the restarted stack's start, with its own pull first.
     private func scheduleResubscribeOnRfedChannelActive() {
+        let stopsAtStart = RfedDistroClient.shared.stackStops
         Task { [weak self] in
             guard let self else { return }
-            await DistroFirst.thenResubscribe(
+            let stopped = { RfedDistroClient.shared.stackStops != stopsAtStart }
+            let went = await DistroFirst.thenResubscribe(
                 hasDistro: DistroManager.shared.has,
                 pull: { await RfedDistroClient.shared.pullForStart() },
+                stopped: stopped,
                 say: { line, _ in print("[RfedChannel] \(line)") }
             ) {
+                // Every return is said (the truth rule): the gate only lets this run.
                 guard await ConnectionStateManager.shared.waitForRfedReachable(timeoutSecs: 5.0) else {
                     // Said, never silent: until 2026-10-10 this returned without a word.
                     let n = self.channels.filter { $0.isSubscribed }.count
                     print("[RfedChannel] RFed not reachable within 5 s: \(n) persisted channel(s) not re-subscribed at this start")
                     return
                 }
-                guard !self.didResubscribeOnActive else { return }
+                guard !stopped() else {
+                    let n = self.channels.filter { $0.isSubscribed }.count
+                    print("[RfedChannel] The stack stopped while this start waited for RFed: \(n) persisted channel(s) not re-subscribed by it")
+                    self.startEnded()
+                    return
+                }
+                guard !self.didResubscribeOnActive else {
+                    print("[RfedChannel] The persisted channels' re-subscription ran already in this process: it does not run again at this start")
+                    return
+                }
                 self.didResubscribeOnActive = true
                 print("[RfedChannel] rfed.channel reachable → re-subscribing persisted channels")
                 self.resubscribePersistedChannels()
             }
+            if !went { self.startEnded() }
+        }
+    }
+
+    /// This start's stack was stopped under it, and it re-subscribed nothing.
+    /// The restarted stack's start runs the gate, its own pull first: now, when
+    /// that start has come already (it found the network flows started and ran
+    /// nothing), else at that start(). Each is an event, never a timer.
+    private func startEnded() {
+        if stopsAtLastStart == RfedDistroClient.shared.stackStops {
+            print("[RfedChannel] The restarted stack's start came during this one: its distro pull runs now, then its re-subscription")
+            scheduleResubscribeOnRfedChannelActive()
+        } else {
+            didStartNetworkFlows = false
         }
     }
 
@@ -1436,11 +1473,18 @@ final class RfedChannelClient: ObservableObject {
     /// Called on start() so the rfed node delivers real-time blobs after a restart.
     private func resubscribePersistedChannels() {
         let toResub = channels.filter { $0.isSubscribed }
-        guard !toResub.isEmpty else { return }
+        guard !toResub.isEmpty else {
+            // Said, never silent (2026-10-10): the gate's line only let this run.
+            print("[RfedChannel] No persisted channels to re-subscribe at this start")
+            return
+        }
         print("[RfedChannel] Re-subscribing to \(toResub.count) persisted channel(s) after restart")
         Task {
             for channel in toResub {
-                guard let channelHashData = Data(hexString: channel.id) else { continue }
+                guard let channelHashData = Data(hexString: channel.id) else {
+                    print("[RfedChannel] Re-subscribe failed for \(channel.channelName): its stored channel hash is not hex")
+                    continue
+                }
                 do {
                     let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
                                                                rfedNodeIdentityHashHex: channel.rfedNodeHash)

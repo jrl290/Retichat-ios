@@ -229,6 +229,11 @@ final class RfedDistroClient: ObservableObject {
     /// register or pull that finishes after the world changed drops its result.
     private var epoch: UInt64 = 0
 
+    /// How many times the stack has been stopped in this process (onStackStopped).
+    /// The start's re-subscription reads it to know its stack was stopped under
+    /// its distro pull (DistroFirst, RfedChannelClient); Android StackRuntime.stops.
+    private(set) var stackStops: UInt64 = 0
+
     /// The (distro handle, epoch) an operation was started for.
     private struct RegKey: Equatable {
         let handle: UInt64
@@ -344,6 +349,7 @@ final class RfedDistroClient: ObservableObject {
     /// In-flight register/pull tasks are NOT cancelled: they finish, see
     /// isCurrent == false and drop their results.
     func onStackStopped() {
+        stackStops &+= 1
         epoch &+= 1
         client = nil
         registeredKey = nil

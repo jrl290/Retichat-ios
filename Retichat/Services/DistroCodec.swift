@@ -252,9 +252,16 @@ nonisolated enum DistroCodec {
 /// RfedDistroClient pulled after its registration, the two unsynchronised.
 ///
 /// The pull's outcome, whatever it is, is the event the re-subscription waits
-/// for: drained, stopped at its round cap, no answer, refused, malformed, the
-/// stack stopped under it. Each is said, and the re-subscription goes on: no
-/// timer, never forever, never silent. No distro: re-subscribed at once.
+/// for: drained, stopped at its round cap, no answer, refused, malformed, a
+/// forget or an adopt under it. Each is said, and the re-subscription may run:
+/// no timer, never forever, never silent. No distro: re-subscribed at once.
+///
+/// One outcome ends the start instead: the stack stopped under its pull (a
+/// Settings restart, `stopped`). The restarted stack's start runs its own pull
+/// before its own re-subscription (RfedChannelClient.startEnded); this one
+/// re-subscribing on the new stack would race that pull and could subscribe a
+/// channel the distro left before the leave is applied (review of 67b8a38,
+/// 2026-10-10). It is said, and nothing is re-subscribed by it.
 @MainActor
 enum DistroFirst {
     /// How one distro pull ended (RfedDistroClient.pullOutcome).
@@ -267,27 +274,43 @@ enum DistroFirst {
         let morePending: Bool
     }
 
+    /// Returns false when the start ended under its pull (the stack stopped)
+    /// and `resubscribe` was not run.
+    @discardableResult
     static func thenResubscribe(hasDistro: Bool,
                                 pull: () async -> PullOutcome,
+                                stopped: () -> Bool,
                                 say: (_ line: String, _ warning: Bool) -> Void,
-                                resubscribe: () async -> Void) async {
+                                resubscribe: () async -> Void) async -> Bool {
         if hasDistro {
-            let s = said(await pull())
+            let o = await pull()
+            if stopped() {
+                say(superseded(o.blobs), false)
+                return false
+            }
+            let s = said(o)
             say(s.line, s.warning)
         }
         await resubscribe()
+        return true
+    }
+
+    /// The stack stopped under the start's pull: this start ends, and re-subscribes nothing.
+    nonisolated static func superseded(_ blobs: Int) -> String {
+        "Distro pull before re-subscribing ended with the stack stopped under it after \(blobs) blob(s): "
+            + "this start re-subscribes nothing; the restarted stack's start runs its own distro pull before its re-subscription"
     }
 
     nonisolated static func said(_ o: PullOutcome) -> (line: String, warning: Bool) {
         let later = "a sibling's leave still queued at RFed, if any, is applied when a later pull brings it"
         if let why = o.unfinished {
             return ("Distro pull before re-subscribing stopped after \(o.blobs) blob(s): \(why); "
-                    + "re-subscribing persisted channels now; \(later)", true)
+                    + "persisted channels may be re-subscribed now; \(later)", true)
         }
         if o.morePending {
             return ("Distro pull before re-subscribing applied \(o.blobs) blob(s) and stopped at its round cap "
-                    + "with more pending: re-subscribing persisted channels now; the rest is applied when a later pull brings it", true)
+                    + "with more pending: persisted channels may be re-subscribed now; the rest is applied when a later pull brings it", true)
         }
-        return ("Distro queue pulled and applied first (\(o.blobs) blob(s)): re-subscribing persisted channels", false)
+        return ("Distro queue pulled and applied first (\(o.blobs) blob(s)): persisted channels may be re-subscribed now", false)
     }
 }
