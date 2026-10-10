@@ -175,6 +175,13 @@ enum DistroFirstTests {
         check(register.contains("fail(k, DistroCodec.notAYes(\"registration\", nil))") && register.contains("fail(k, DistroCodec.notAYes(\"registration\", resp))")
               && !register.contains("fail(k, \"RFed link not reachable\")"), "the registration too")
 
+        // An unset hash is the default node: the destinations are unusable only for a set
+        // one that is not 32 hex characters, never "no RFed node configured".
+        check(distro.contains("private static let noNode = \"the RFed node identity hash set here is not 32 hex characters\"")
+              && distro.contains("print(\"[Distro] pull: \\(Self.noNode)\")") && distro.contains("fail(k, Self.noNode)")
+              && distro.contains("print(\"[Distro] unregister: \\(Self.noNode)\")") && !distro.contains("no RFed node configured"),
+              "an unusable node hash is said as what it is")
+
         // The NSE's twin: a round with no answer, after its path was found, is not "RFed not reachable".
         let nse = read("NotificationService/NSEDistroPull.swift")
         check(nse.contains("NSLog(\"[NSE-Distro] pull round %d: no answer from RFed (the link did not come up, or the request went unanswered)\", round)")

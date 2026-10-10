@@ -175,6 +175,10 @@ final class RfedDistroClient: ObservableObject {
 
     static let shared = RfedDistroClient()
 
+    /// The destinations are unusable only for a set RFed node identity hash that is not
+    /// 32 hex characters (an unset one is the default).
+    private static let noNode = "the RFed node identity hash set here is not 32 hex characters"
+
     /// nil = no distro loaded.
     @Published private(set) var distro: DistroInfo?
     @Published private(set) var status = DistroRegistrationStatus()
@@ -385,7 +389,7 @@ final class RfedDistroClient: ObservableObject {
     /// learns the distro PUBLIC key, so it cannot mint that announce itself.
     private func register(_ k: RegKey) async {
         guard let dest = Data(hexString: registerDestHex), dest.count == 16 else {
-            fail(k, "no RFed node configured")
+            fail(k, Self.noNode)
             return
         }
         guard let client else { return }
@@ -521,7 +525,7 @@ final class RfedDistroClient: ObservableObject {
     private func unregister(handle: UInt64) async -> Bool {
         guard let client else { return false }
         guard let dest = Data(hexString: unregisterDestHex), dest.count == 16 else {
-            print("[Distro] unregister: no RFed node configured")
+            print("[Distro] unregister: \(Self.noNode)")
             return false
         }
         guard let payload = Self.registerPayload(device: client.identityHandle, distro: handle) else {
@@ -558,8 +562,8 @@ final class RfedDistroClient: ObservableObject {
         guard client != nil else { return .init(blobs: 0, unfinished: "the stack is not started", morePending: false) }
         guard let k = currentKey() else { return .init(blobs: 0, unfinished: "no distro held", morePending: false) }
         guard let dest = Data(hexString: registerDestHex), dest.count == 16 else {
-            print("[Distro] pull: no RFed node configured")
-            return .init(blobs: 0, unfinished: "no RFed node configured", morePending: false)
+            print("[Distro] pull: \(Self.noNode)")
+            return .init(blobs: 0, unfinished: Self.noNode, morePending: false)
         }
         let task = Task { [weak self] () -> DistroFirst.PullOutcome in
             guard let self else { return .init(blobs: 0, unfinished: "the distro client is gone", morePending: false) }
