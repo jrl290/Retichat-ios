@@ -85,11 +85,13 @@ func newIdentity() -> (handle: UInt64, delivery: Data, publicKey: Data) {
 /// What the bridge calls back, counted.
 final class CountingSink: UploadSink, @unchecked Sendable {
     private let lock = NSLock()
-    private var counts = (proved: 0, lost: 0)
+    private var counts = (proved: 0, lost: 0, neverLeft: 0)
     var provedCount: Int { lock.lock(); defer { lock.unlock() }; return counts.proved }
     var lostCount: Int { lock.lock(); defer { lock.unlock() }; return counts.lost }
+    var neverLeftCount: Int { lock.lock(); defer { lock.unlock() }; return counts.neverLeft }
     func proved() { lock.lock(); counts.proved += 1; lock.unlock() }
     func lost() { lock.lock(); counts.lost += 1; lock.unlock() }
+    func neverLeft() { lock.lock(); counts.neverLeft += 1; lock.unlock() }
 }
 
 /// The message's hash (32 bytes) once it is packed.
@@ -218,8 +220,12 @@ func theUploadTrampolinesReportEachEventAndTheReleaseFreesTheSink() {
         propagationUploadEvent(context: context, event: 1)   // a late proof
         checkEqual(sink.provedCount, 1, "event 1 is the proof, after it")
         checkEqual(sink.lostCount, 1, "and not another loss")
+        // A Resource whose first advertisement no interface carried (2026-10-10, Stage 0).
+        propagationUploadEvent(context: context, event: 3)
+        checkEqual(sink.neverLeftCount, 1, "event 3 is never-left")
+        check(sink.provedCount == 1 && sink.lostCount == 1, "and neither a proof nor a loss")
         propagationUploadEvent(context: context, event: 9)   // no such event
-        check(sink.provedCount == 1 && sink.lostCount == 1, "no other event is told")
+        check(sink.provedCount == 1 && sink.lostCount == 1 && sink.neverLeftCount == 1, "no other event is told")
         check(weakSink != nil, "the sink lives until the library releases it")
         propagationUploadRelease(context: context)
     }
@@ -457,6 +463,86 @@ func theUnwrapsFieldsAreTheBytesTheReaderTakes() {
           "C passes for a delivery notification, which is why it is read before that test")
 }
 
+
+// MARK: - The distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5.1, §12.16)
+
+/// A message from `distro` to `to`, packed once.
+func packedMessage(from distro: (handle: UInt64, delivery: Data, publicKey: Data), to: Data, op: String = "join") -> Data? {
+    let msg = bridge.messageCreate(destHash: to, sourceHash: distro.delivery, content: "", title: "",
+                                   method: LxmfMethod.direct, identityHandle: distro.handle)
+    defer { _ = lxmf_message_destroy(msg) }
+    guard msg != 0, bridge.messageSetDistroChannelSync(handle: msg, op: op, name: "public.general", atMs: atMs, deviceHex: pinnedDevice)
+    else { return nil }
+    return bridge.messagePack(handle: msg)
+}
+
+func aMessageIsSealedThroughTheBridgeForItsDistroAndTheProofIsDsSignatureOverTheSealedBytes() {
+    let distro = newIdentity()
+    guard let packed = packedMessage(from: distro, to: distro.delivery) else { check(false, "packed"); return }
+    guard let sealed = bridge.distroSeal(distroHandle: distro.handle, packed: packed) else {
+        check(false, "sealed: \(bridge.rnsLastError() ?? "nil")")
+        return
+    }
+    // sealed = D_hash | D.encrypt(packed[16..]): LXMF's lxmf_data before the stamp.
+    checkEqual(sealed.sealed.prefix(16), distro.delivery, "the sealed bytes start with D's hash")
+    check(sealed.sealed.count > packed.count, "and carry the encrypted rest (token overhead)")
+    check(sealed.sealed.range(of: packed.dropFirst(32)) == nil, "encrypted: the signed payload is not in the clear")
+    checkEqual(sealed.syncSig.count, 64, "an Ed25519 signature")
+
+    // An independent verifier: SIGNED = "rfed.distro.sync" | 0x01 | D_hash | SHA-256(sealed), under D's Ed25519 key.
+    let signed = Data("rfed.distro.sync".utf8) + Data([0x01]) + distro.delivery + Data(SHA256.hash(data: sealed.sealed))
+    let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: distro.publicKey.suffix(32))
+    check(publicKey?.isValidSignature(sealed.syncSig, for: signed) == true, "the proof is D's signature over SIGNED")
+    check(publicKey?.isValidSignature(sealed.syncSig, for: signed.dropLast() + [0]) == false, "and the verifier is not vacuous")
+    let otherBytes = Data("rfed.distro.sync".utf8) + Data([0x01]) + distro.delivery + Data(SHA256.hash(data: sealed.sealed + [0]))
+    check(publicKey?.isValidSignature(sealed.syncSig, for: otherBytes) == false, "it binds these sealed bytes only")
+
+    // Sealed once per owed message: a second seal is new bytes (a fresh ephemeral key), so the
+    // outbox keeps the first and never seals again.
+    if let again = bridge.distroSeal(distroHandle: distro.handle, packed: packed) {
+        check(again.sealed != sealed.sealed, "a second seal differs, which is why the entry keeps its first")
+    } else {
+        check(false, "sealed again")
+    }
+}
+
+func aSealIsRefusedForAMessageNotToItsDistroOrWithNoDistro() {
+    let distro = newIdentity()
+    let other = newIdentity()
+    guard let toOther = packedMessage(from: distro, to: other.delivery) else { check(false, "packed"); return }
+    check(bridge.distroSeal(distroHandle: distro.handle, packed: toOther) == nil, "a message to someone else is not sealed")
+    check(bridge.rnsLastError()?.contains("not addressed to the distro") == true, "and it says so: \(bridge.rnsLastError() ?? "nil")")
+    guard let toSelf = packedMessage(from: distro, to: distro.delivery) else { check(false, "packed"); return }
+    check(bridge.distroSeal(distroHandle: other.handle, packed: toSelf) == nil, "nor by another distro")
+    check(bridge.distroSeal(distroHandle: 0, packed: toSelf) == nil, "nor with no handle")
+    check(bridge.distroSeal(distroHandle: distro.handle, packed: Data([1, 2, 3])) == nil, "nor what is no message")
+}
+
+func aSealedUploadIsNotBuiltForANodeWhoseAnnounceWasNotHeardWithOrWithoutTheClaim() {
+    let distro = newIdentity()
+    guard let packed = packedMessage(from: distro, to: distro.delivery),
+          let sealed = bridge.distroSeal(distroHandle: distro.handle, packed: packed) else { check(false, "sealed"); return }
+    let node = Data(repeating: 0x44, count: 16)
+    for withClaim in [true, false] {
+        check(bridge.propagationBuildSealedUpload(distroPublicKey: distro.publicKey, sealed: sealed.sealed, syncSig: sealed.syncSig,
+                                                  withClaim: withClaim, node: node) == nil,
+              "no stamp cost is known for a node that was not heard (claim \(withClaim))")
+        check(bridge.rnsLastError()?.contains("not known") == true, "and it says so: \(bridge.rnsLastError() ?? "nil")")
+    }
+    check(bridge.propagationBuildSealedUpload(distroPublicKey: distro.publicKey, sealed: sealed.sealed, syncSig: sealed.syncSig,
+                                              withClaim: true, node: Data([1, 2, 3])) == nil,
+          "a node that is not 16 bytes is refused")
+}
+
+func theUpEdgeMarkIsTransportsCountAndNothingCameUpSinceItWithNoStack() {
+    // No stack is started here, so no interface comes up: the mark holds. The count moving is the
+    // glue crate's cargo test (an interface set online between the mark and the question).
+    let mark = bridge.interfaceUpMark()
+    check(!bridge.interfaceCameUpSince(mark), "nothing came up since the mark")
+    checkEqual(bridge.interfaceUpMark(), mark, "the mark is the same count asked again")
+    check(bridge.interfaceCameUpSince(mark &+ 1), "a mark that is not the count says an interface came up")
+}
+
 let allTests: [(String, () -> Void)] = [
     ("the wrapper writes C exactly as pinned, and the Swift reader and an independent verifier take it", theWrapperWritesCExactlyAsPinnedAndTheSwiftReaderAndAnIndependentVerifierTakeIt),
     ("the wrapper refuses a malformed message and writes nothing", theWrapperRefusesAMalformedMessageAndWritesNothing),
@@ -471,6 +557,10 @@ let allTests: [(String, () -> Void)] = [
     ("the shared vectors' messages are unpacked by the real library as the file says", theSharedVectorsPackedMessagesAreUnpackedByTheRealLibraryAsTheFileSaysForAReceiverHoldingNoKeys),
     ("a member key that does not produce the member's address is not remembered", aMemberKeyThatDoesNotProduceTheMembersAddressIsNotRememberedByTheRealLibrary),
     ("the unwrap's fields are the bytes the reader takes", theUnwrapsFieldsAreTheBytesTheReaderTakes),
+    ("a message is sealed through the bridge for its distro, and the proof is D's signature over the sealed bytes", aMessageIsSealedThroughTheBridgeForItsDistroAndTheProofIsDsSignatureOverTheSealedBytes),
+    ("a seal is refused for a message not to its distro, or with no distro", aSealIsRefusedForAMessageNotToItsDistroOrWithNoDistro),
+    ("a sealed upload is not built for a node whose announce was not heard, with or without the claim", aSealedUploadIsNotBuiltForANodeWhoseAnnounceWasNotHeardWithOrWithoutTheClaim),
+    ("the up-edge mark is Transport's count, and nothing came up since it with no stack", theUpEdgeMarkIsTransportsCountAndNothingCameUpSinceItWithNoStack),
 ]
 
 @main
