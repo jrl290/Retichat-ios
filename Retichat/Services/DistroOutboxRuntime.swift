@@ -453,6 +453,41 @@ final class DistroOutboxRuntime: ObservableObject {
             sealed: sealed?.sealed, syncSig: sealed?.syncSig))
     }
 
+    /// GROUPS-DISTRO-DESIGN.md §10.5-§10.6: the group sync G of an action the user made as D in
+    /// a D-group whose own address is `groupD`: from D to D, signed by D, its fields set by the
+    /// writer from `syncJson` (the unwrap's `group_sync` object without `by` and `problem`) with
+    /// this device's address in 0xFD, packed and sealed once, here, and owed on its own under
+    /// `group:<hash>` until the node proves it. Kept when the device gives D up. Nothing when this
+    /// device does not hold `groupD` now: the caller's groupSigner refused then already (§8.7).
+    /// Never throws.
+    func oweGroupSync(groupD: String, syncJson: String, deviceHex: String, label: String) async {
+        guard let (distro, signer) = DistroManager.shared.signing(), distro.deliveryHashHex == groupD else {
+            print("[DistroOutbox] \(label) not owed: this device does not hold the distro \(groupD.prefix(8)) (GROUPS-DISTRO-DESIGN.md §8.7)")
+            return
+        }
+        guard let outbox = ensureOutbox() else { return }
+        refreshNode()
+        let device = DistroCodec.isAddressHex(deviceHex) ? deviceHex : (client?.destHashHex ?? "")
+        guard DistroCodec.isAddressHex(device) else {
+            print("[DistroOutbox] \(label) not owed: this device's address is not known (§17.14)")
+            return
+        }
+        let bridge = bridge
+        guard let (packed, hash, sealed) = await Self.pack(bridge: bridge, distro: distro, signer: signer, title: "", content: "",
+                                                           method: LxmfMethod.direct, label: label, fields: { handle in
+            bridge.messageSetDistroGroupSync(handle: handle, syncJson: syncJson, dHex: distro.deliveryHashHex,
+                                             deviceHex: device)
+        }) else {
+            fail("\(label) was not sent to the distro: it could not be made")
+            return
+        }
+        await outbox.owe(OwedEntry(
+            id: DistroGroupSync.entryId(hashHex: hash), kind: .group,
+            distro: distro.deliveryHashHex, distroKey: distro.publicKeyHex,
+            msgHash: hash, packed: packed, label: label,
+            sealed: sealed?.sealed, syncSig: sealed?.syncSig))
+    }
+
     private func fail(_ message: String) {
         print("[DistroOutbox] \(message)")
         lastError = message

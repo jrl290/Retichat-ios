@@ -373,9 +373,16 @@ class NotificationService: UNNotificationServiceExtension {
                                contactTitle(m.senderHash, LxmfClient.decodeDisplayName(fieldsRaw: fields), reason,
                                             m.timestamp)))
         }
+        // A group message from the distro pull (GROUPS-DISTRO-DESIGN.md §6.7) opens its group:
+        // its thread and chatId are the group id; a post is titled "<sender> (<group name>)" as
+        // the app's group notification, an invitation by its inviter.
         candidates += distro.shown.map {
-            ($0.senderHash, $0.content, $0.timestamp, "distro", $0.senderHash,
-             contactTitle($0.senderHash, $0.displayName, $0.unverifiedReason, $0.timestamp))
+            let title = contactTitle($0.senderHash, $0.displayName, $0.unverifiedReason, $0.timestamp)
+            guard let group = $0.group else {
+                return ($0.senderHash, $0.content, $0.timestamp, "distro", $0.senderHash, title)
+            }
+            return ($0.senderHash, $0.content, $0.timestamp, group.hash.isEmpty ? "distro" : group.hash,
+                    group.groupId, group.isInvite ? title : "\(title) (\(group.groupName))")
         }
         let channelNames = PendingNotification.readChannelSenderNames()[channelPull.channelHex] ?? [:]
         for shown in channelPull.shown {
@@ -389,6 +396,9 @@ class NotificationService: UNNotificationServiceExtension {
         }
         if let msg = candidates.max(by: { $0.timestamp < $1.timestamp }) {
             let others = stored + distro.shown.count + channelPull.shown.count - 1
+            // §6.7: the group messages this notification counts (the newest and the "+N more"),
+            // so the app's group branch does not notify again for them.
+            PendingNotification.recordNSECountedGroupHashes(distro.shown.compactMap { $0.group?.hash }.filter { !$0.isEmpty })
             let body = others == 0 ? msg.content
                 : (msg.content.isEmpty ? "+\(others) more" : msg.content + "\n+\(others) more")
             NSLog("[NSE] delivered after %ds: %d stored, %d from the distro, %d from the channel, %d not stored, showing the newest",

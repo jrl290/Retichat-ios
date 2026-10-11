@@ -90,10 +90,14 @@ import Foundation
 nonisolated enum OwedKind: String, Sendable {
     case channel
     case sent
+    /// A group sync G (RFed SPEC §17.14, GROUPS-DISTRO-DESIGN.md §10.5): owed on its own,
+    /// never replaced by a later one, and kept when the device gives the distro up, as a sent
+    /// copy is.
+    case group
 }
 
-/// One thing owed. `id` is `channel:<channel hash>` or `sent:<LXMF message
-/// hash>`; `msgHash` is the LXMF message hash of `packed`, which is what tells
+/// One thing owed. `id` is `channel:<channel hash>`, `sent:<LXMF message
+/// hash>` or `group:<LXMF message hash>`; `msgHash` is the LXMF message hash of `packed`, which is what tells
 /// one message from another under the same id. `distro` is D's `lxmf.delivery`
 /// hash and `distroKey` D's public key (hex), so a sent copy is still encrypted
 /// to its own distro after the device gives that distro up. A channel entry adds
@@ -1095,6 +1099,8 @@ actor DistroOutbox {
         let how = how ?? "packet"
         if entry.kind == .channel {
             log.info("The \(entry.op ?? "?") of #\(entry.name ?? "?") (at \(entry.atMs.map(String.init) ?? "?")) propagated to the distro as a \(how): the propagation node proved it (§17.12)")
+        } else if entry.kind == .group {
+            log.info("\(entry.label) propagated to the distro as a \(how): the propagation node proved it (§17.14)")
         } else {
             log.info("Sent-copy for \((entry.toHex ?? "").prefix(8)) propagated to the distro as a \(how): the propagation node proved it (§17.11)")
         }

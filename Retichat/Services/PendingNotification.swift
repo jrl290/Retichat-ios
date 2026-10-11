@@ -814,4 +814,150 @@ nonisolated enum PendingNotification {
             return (Data(record.prefix(16)), Data(record.dropFirst(16)))
         }
     }
+
+    // MARK: - Groups, for the NSE (GROUPS-DISTRO-DESIGN.md §6.7)
+
+    private static let nseGroupsFile = "nse_groups.json"
+    private static let nseGroupCountedFile = "nse_group_counted.json"
+    /// At most this many counted hashes are kept: the app takes each one as it imports it.
+    static let nseGroupCountedLimit = 256
+
+    /// App side: the groups the NSE decides group notifications from, written on every change
+    /// (ChatRepository.refreshChats).
+    @discardableResult
+    static func writeNSEGroups(_ groups: NSEGroups, in dir: URL? = nil) -> Bool {
+        guard let dir = dir ?? containerURL, let data = try? JSONEncoder().encode(groups) else { return false }
+        do {
+            try data.write(to: dir.appendingPathComponent(nseGroupsFile), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// NSE side: nil when the app has not written it (an older build): the NSE then shows no
+    /// group message, and the app decides when it runs.
+    static func readNSEGroups(in dir: URL? = nil) -> NSEGroups? {
+        guard let dir = dir ?? containerURL,
+              let data = try? Data(contentsOf: dir.appendingPathComponent(nseGroupsFile)) else { return nil }
+        return try? JSONDecoder().decode(NSEGroups.self, from: data)
+    }
+
+    /// NSE side: the LXMF hashes of the group messages its notification counted (the newest and
+    /// the "+N more"), kept with the blobs it saved for the app, so the app does not notify
+    /// again for them.
+    static func recordNSECountedGroupHashes(_ hashes: [String], in dir: URL? = nil) {
+        guard !hashes.isEmpty, let dir = dir ?? containerURL else { return }
+        let file = dir.appendingPathComponent(nseGroupCountedFile)
+        let old = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
+        let merged = Array((old.filter { !hashes.contains($0) } + hashes).suffix(nseGroupCountedLimit))
+        if let data = try? JSONEncoder().encode(merged) {
+            try? data.write(to: file, options: .atomic)
+        }
+    }
+
+    /// App side: whether the NSE counted the group message `hash` in a notification; taken
+    /// (forgotten) when it did, so each is asked once.
+    static func takeNSECountedGroupHash(_ hash: String, in dir: URL? = nil) -> Bool {
+        guard !hash.isEmpty, let dir = dir ?? containerURL else { return false }
+        let file = dir.appendingPathComponent(nseGroupCountedFile)
+        guard let data = try? Data(contentsOf: file),
+              let hashes = try? JSONDecoder().decode([String].self, from: data),
+              hashes.contains(hash) else { return false }
+        if let out = try? JSONEncoder().encode(hashes.filter { $0 != hash }) {
+            try? out.write(to: file, options: .atomic)
+        }
+        return true
+    }
+}
+
+/// `nse_groups.json` (GROUPS-DISTRO-DESIGN.md §6.7): what the app tells the NSE about its groups,
+/// beside chat_names.json, which cannot say that a group is joined. Client-local, never on the
+/// wire. `self` (the device, the distro and its known siblings) is this client's addition: the
+/// NSE shows nothing from, or naming, a self address.
+nonisolated struct NSEGroups: Codable, Equatable, Sendable {
+    struct Group: Codable, Equatable, Sendable {
+        var name: String
+        /// "pending" or "joined".
+        var state: String
+        /// The members that accepted: a plain post shows only from one of them.
+        var accepted: [String]
+    }
+
+    /// The privacy filter is on: an invite shows only from an inviter in `inviters`.
+    var filterOn: Bool
+    /// The allowlisted contacts: the inviters the filter lets an invite through from.
+    var inviters: [String]
+    var groups: [String: Group]
+    /// The closed group ids and the filtered-invite set.
+    var closed: [String]
+    var selfAddresses: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case filterOn = "filter_on", inviters, groups, closed, selfAddresses = "self"
+    }
+
+    init(filterOn: Bool, inviters: [String], groups: [String: Group], closed: [String], selfAddresses: [String]) {
+        self.filterOn = filterOn
+        self.inviters = inviters
+        self.groups = groups
+        self.closed = closed
+        self.selfAddresses = selfAddresses
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        filterOn = try c.decode(Bool.self, forKey: .filterOn)
+        inviters = try c.decode([String].self, forKey: .inviters)
+        groups = try c.decode([String: Group].self, forKey: .groups)
+        closed = try c.decode([String].self, forKey: .closed)
+        selfAddresses = (try? c.decodeIfPresent([String].self, forKey: .selfAddresses)) ?? []
+    }
+}
+
+/// What the NSE shows for group traffic it pulled for the distro D (GROUPS-DISTRO-DESIGN.md
+/// §6.7). It applies nothing: the app does when it runs, and does not notify again for what the
+/// NSE counted.
+nonisolated enum NSEGroupShow {
+    enum Outcome: Equatable, Sendable {
+        case nothing
+        /// "Group invitation: <name>" from the inviter.
+        case invite(groupId: String, groupName: String)
+        /// A post in a joined group, titled "<sender> (<group name>)", opening the group.
+        case post(groupId: String, groupName: String)
+    }
+
+    /// For a message whose unwrap has `group_sync` non-null (`isGroupSync`) or `has_group_id`:
+    /// a group sync shows nothing; a group message with an invalid signature, from a self
+    /// address, or naming a self address as its sender while its source is not one, nothing;
+    /// an invite to D from an inviter the shared filter admits, for a group not closed, not
+    /// filtered and not held, the invitation; a plain post in a joined group from an accepted
+    /// member, validated, the post; anything else nothing. `members`: GROUP_MEMBERS as listed;
+    /// `file` nil (no nse_groups.json yet): nothing.
+    static func decide(isGroupSync: Bool, groupId: String?, action: String?, groupName: String?,
+                       members: [String], source: String, groupSender: String?, signatureValidated: Bool,
+                       unverifiedReason: Int?, distro: String, file: NSEGroups?) -> Outcome {
+        if isGroupSync { return .nothing }
+        guard let file, let groupId else { return .nothing }
+        if unverifiedReason == 2 { return .nothing }
+        let me = Set(file.selfAddresses + [distro])
+        let src = source.lowercased()
+        if me.contains(src) { return .nothing }
+        if let named = groupSender?.trimmingCharacters(in: .whitespaces).lowercased(), me.contains(named) {
+            return .nothing
+        }
+        switch action {
+        case GroupAction.invite?:
+            guard members.map({ $0.lowercased() }).contains(distro),
+                  !file.filterOn || file.inviters.contains(src),
+                  !file.closed.contains(groupId), file.groups[groupId] == nil else { return .nothing }
+            return .invite(groupId: groupId, groupName: groupName ?? "Group")
+        case nil:
+            guard let group = file.groups[groupId], group.state == "joined", group.accepted.contains(src),
+                  signatureValidated else { return .nothing }
+            return .post(groupId: groupId, groupName: group.name)
+        default:
+            return .nothing
+        }
+    }
 }

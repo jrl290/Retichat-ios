@@ -26,6 +26,17 @@ enum NSEDistroPull {
         /// the title may use it (DISPLAY_NAMES.md §5.2).
         let displayName: DisplayNames.NameField
         let unverifiedReason: Int
+        /// GROUPS-DISTRO-DESIGN.md §6.7: a group message shown (an invitation, or a post in a
+        /// joined group): its group, which the notification's thread and chatId are, and its
+        /// LXMF hash, which the NSE records as counted so the app does not notify again.
+        var group: ShownGroup? = nil
+    }
+
+    struct ShownGroup {
+        let groupId: String
+        let groupName: String
+        let isInvite: Bool
+        let hash: String
     }
 
     struct Result {
@@ -80,6 +91,10 @@ enum NSEDistroPull {
             return result
         }
 
+        // GROUPS-DISTRO-DESIGN.md §6.7: what the app last said about its groups.
+        let groups = PendingNotification.readNSEGroups()
+        var invitesShown = Set<String>()
+
         // The rounds that completed: a round that fails ends the pull without
         // completing, so the line below counts only what ran.
         var completed = 0
@@ -109,7 +124,10 @@ enum NSEDistroPull {
             }
             result.pulled += blobs.count
             for blob in blobs {
-                if let shown = unwrapToShow(blob, distroHandle: distroHandle) { result.shown.append(shown) }
+                guard let shown = unwrapToShow(blob, distroHandle: distroHandle, groups: groups) else { continue }
+                // An invitation once per group id in a run (§6.7).
+                if let g = shown.group, g.isInvite, !invitesShown.insert(g.groupId).inserted { continue }
+                result.shown.append(shown)
             }
             NSLog("[NSE-Distro] pull round %d: %d blob(s), more=%d", round, blobs.count, more ? 1 : 0)
             completed = round
@@ -256,9 +274,24 @@ enum NSEDistroPull {
         let display_name: String?
         let signature_validated: Bool?
         let unverified_reason: Int?
+        /// GROUPS-DISTRO-DESIGN.md §7, for §6.7: the LXMF hash, the group fields the unwrap
+        /// reads, and whether it is a group sync (its object is not read here). `fields`, for a
+        /// group message only: its GROUP_SENDER and GROUP_MEMBERS.
+        let hash: String?
+        let has_group_id: Bool?
+        let group_id: String?
+        let group_action: String?
+        let group_name: String?
+        let group_sync: Present?
+        let fields: String?
     }
 
-    private static func unwrapToShow(_ blob: Data, distroHandle: UInt64) -> Shown? {
+    /// Any JSON value: the key is there and not null.
+    private struct Present: Decodable {
+        init(from decoder: Decoder) throws {}
+    }
+
+    private static func unwrapToShow(_ blob: Data, distroHandle: UInt64, groups: NSEGroups?) -> Shown? {
         var outLen: UInt32 = 0
         let ptr = blob.withUnsafeBytes { raw in
             retichat_distro_unwrap(distroHandle, raw.baseAddress?.assumingMemoryBound(to: UInt8.self),
@@ -268,6 +301,35 @@ enum NSEDistroPull {
         let json = Data(bytes: ptr, count: Int(outLen))
         rns_free_bytes(ptr, outLen)
         guard !json.isEmpty, let m = try? JSONDecoder().decode(Unwrapped.self, from: json) else { return nil }
+        // GROUPS-DISTRO-DESIGN.md §6.7: group traffic is never shown as a DM. A group sync shows
+        // nothing; a group message shows only as NSEGroupShow decides, titled and threaded as the
+        // app's group notification.
+        if m.group_sync != nil || m.has_group_id == true {
+            let fields = LxmfFieldsDecoder.decode(m.fields.flatMap { Data(base64Encoded: $0) } ?? Data())
+            let distro = blob.prefix(16).map { String(format: "%02x", $0) }.joined()
+            let outcome = NSEGroupShow.decide(
+                isGroupSync: m.group_sync != nil, groupId: m.group_id, action: m.group_action,
+                groupName: m.group_name, members: fields.groupMembers ?? [], source: m.source_hash,
+                groupSender: fields.groupSender, signatureValidated: m.signature_validated ?? false,
+                unverifiedReason: m.unverified_reason, distro: distro, file: groups)
+            let shownGroup: ShownGroup
+            let content: String
+            switch outcome {
+            case .nothing:
+                return nil
+            case .invite(let groupId, let groupName):
+                shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: true, hash: m.hash ?? "")
+                content = "Group invitation: \(groupName)"
+            case .post(let groupId, let groupName):
+                shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: false, hash: m.hash ?? "")
+                content = m.content ?? ""
+            }
+            return Shown(senderHash: m.source_hash.lowercased(), title: "", content: content, timestamp: m.timestamp,
+                         displayName: DisplayNames.distroNameField(state: m.display_name_state, name: m.display_name),
+                         unverifiedReason: DisplayNames.distroReason(validated: m.signature_validated,
+                                                                     unverifiedReason: m.unverified_reason),
+                         group: shownGroup)
+        }
         // Sent copies are the user's own messages (SPEC §17.11), a transfer
         // is an offer the app acts on, a delivery notification has no text.
         if m.sent_by != nil || !(m.distro_transfer_key ?? "").isEmpty || m.is_delivery_notification {

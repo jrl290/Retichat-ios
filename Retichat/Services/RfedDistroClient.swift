@@ -27,8 +27,10 @@ nonisolated struct DistroTransferOffer: Equatable, Identifiable, Sendable {
 }
 
 // BEGIN DistroInbound
-// Foundation only, with Retichat/Bridge/LxmfFields.swift:
-// tests/DistroAttachmentsTests.swift compiles this block on its own.
+// Foundation only, with Retichat/Bridge/LxmfFields.swift,
+// Retichat/Services/DeliveryPolicy.swift and Retichat/Services/DistroGroupSync.swift:
+// tests/DistroAttachmentsTests.swift and tests/DistroGroupsTests.swift compile this
+// block on their own.
 
 /// A decrypted distro message, ready to be stored as an inbound DM from
 /// whoever sent it (Android ChatRepository.onDistroMessageReceived).
@@ -94,6 +96,26 @@ nonisolated struct DistroUnwrapped: Decodable, Sendable {
     /// an empty one). Optional so an older FFI build, which has no such
     /// key, still decodes.
     let fields: String?
+    /// GROUPS-DISTRO-DESIGN.md §7 (LXMF-rust to_json_with_receipt). Optional so an
+    /// older FFI build still decodes; without them every message takes the path it
+    /// took before. `hash`: the LXMF message hash, 64 lowercase hex (LXMF.py's, as
+    /// received).
+    var hash: String? = nil
+    /// A GROUP_ID entry in either form, of any type, and no distro marker: routes the
+    /// message to the group branch (§6.1), so a malformed id is dropped there.
+    var has_group_id: Bool? = nil
+    /// GROUP_ID when it is 32 hex characters (lowercased), else null.
+    var group_id: String? = nil
+    var group_action: String? = nil
+    var group_name: String? = nil
+    /// Non-null exactly when fields[0xFB] is "rfed.distro.group" (§10).
+    var group_sync: DistroGroupSync.Reading? = nil
+    /// The receipt's key: an accept's or leave's own 64-byte key when it binds to the
+    /// source, 128 lowercase hex.
+    var sender_key: String? = nil
+    /// The receipt's packed message for an accept or leave of at most 2144 bytes
+    /// (`blob[0:16] | plaintext`), standard base64: the creator's kept copy (§12.2).
+    var packed: String? = nil
 
     /// `fields` as the msgpack bytes; nil when null, absent or not base64.
     var fieldsRaw: Data? {
@@ -105,6 +127,49 @@ nonisolated struct DistroUnwrapped: Decodable, Sendable {
     var reason: Int {
         DisplayNames.distroReason(validated: signature_validated, unverifiedReason: unverified_reason)
     }
+    var senderKeyData: Data? {
+        guard let hex = sender_key, hex.count == 128 else { return nil }
+        var out = Data(capacity: 64)
+        var i = hex.startIndex
+        while i < hex.endIndex {
+            let j = hex.index(i, offsetBy: 2)
+            guard let byte = UInt8(hex[i..<j], radix: 16) else { return nil }
+            out.append(byte)
+            i = j
+        }
+        return out
+    }
+    var packedData: Data? { packed.flatMap { Data(base64Encoded: $0) } }
+
+    /// Where the message goes after the unwrap and the §17.12 branch
+    /// (GROUPS-DISTRO-DESIGN.md §6.1).
+    var groupRoute: DistroGroupRoute {
+        if group_sync != nil {
+            guard let h = DistroGroupSync.messageHash(hash) else { return .dropped("a group sync without its LXMF hash") }
+            return .groupSync(hash: h)
+        }
+        guard has_group_id == true else { return .other }
+        guard let h = DistroGroupSync.messageHash(hash) else { return .dropped("a group message without its LXMF hash") }
+        guard let id = DeliveryPolicy.hash(group_id?.lowercased()) else {
+            return .dropped("its GROUP_ID is not 32 hex characters")
+        }
+        return .group(hash: h, groupId: id)
+    }
+}
+
+/// GROUPS-DISTRO-DESIGN.md §6.1, steps 1 and 2, after the §17.12 branch: the
+/// group sync and group messages are judged on their LXMF hash (`gsync:`/`grp:`),
+/// ahead of the generic `src:ts` seen key, and a group message is never a DM.
+nonisolated enum DistroGroupRoute: Equatable, Sendable {
+    /// fields[0xFB] is "rfed.distro.group".
+    case groupSync(hash: String)
+    /// A GROUP_ID in either form and no distro marker.
+    case group(hash: String, groupId: String)
+    /// A group message or sync the branch cannot key or name: dropped there, with a
+    /// log line, never a DM.
+    case dropped(String)
+    /// Neither: the generic seen key, then today's order.
+    case other
 }
 
 /// What ChatRepository.handleDistroMessage stores for a distro message: its
@@ -213,6 +278,22 @@ final class RfedDistroClient: ObservableObject {
     /// seen. False when it is dropped (rules 1, 2 and 4): not recorded, so a later
     /// copy is judged again.
     var onChannelSync: ((DistroChannelSync.Marker, _ fromDistro: Bool, _ signedByDistro: Bool) -> Bool)?
+
+    /// Sink for a group sync G (SPEC §17.14; ChatRepository.handleDistroGroupSync): true
+    /// when it is kept (applied, or the device's own echo), so its `gsync:` key is recorded;
+    /// false when it is dropped or held until its group is joined here
+    /// (GROUPS-DISTRO-DESIGN.md §6.2, §11.1).
+    var onGroupSync: ((DistroGroupSyncArrival) -> Bool)?
+
+    /// Sink for a group message to the distro (ChatRepository.handleDistroGroupArrival): true
+    /// when it is kept (applied or stored), so its `grp:` key is recorded; false when it is
+    /// dropped or held (§6.2).
+    var onGroup: ((DistroGroupArrival) -> Bool)?
+
+    /// The 0xFD of a sync the distro signed that this device accepted (a §17.11 copy, a
+    /// §17.12 message): another device of the user's distro, a known sibling
+    /// (GROUPS-DISTRO-DESIGN.md §9.1). The group sync's are learned by its own sink.
+    var onSiblingSeen: ((_ byHex: String, _ distroHex: String) -> Void)?
 
     /// Up to this many `/rfed/pull` rounds per pull (Android PULL_ROUNDS_MAX).
     private static let pullRoundsMax = 8
@@ -678,6 +759,12 @@ final class RfedDistroClient: ObservableObject {
         /// Carries the membership marker (SPEC §17.12); rules 1-6 are judged on the
         /// main actor, where the channel list is.
         case channelSync(ChannelSyncCandidate)
+        /// A group sync G (SPEC §17.14, GROUPS-DISTRO-DESIGN.md §11): judged on the main
+        /// actor, where the groups are.
+        case groupSync(DistroGroupSyncArrival)
+        /// A group message to the distro (§6.1 step 2): admitted, handed to the group
+        /// handler, or held (§6.5), on the main actor.
+        case group(DistroGroupArrival)
     }
 
     private nonisolated struct ChannelSyncCandidate: Sendable {
@@ -690,6 +777,8 @@ final class RfedDistroClient: ObservableObject {
 
     private nonisolated struct SentCopyCandidate: Sendable {
         let source: Data
+        /// Its LXMF signature validated (under the distro's key, for a copy from the distro).
+        var signedByDistro = false
         /// Our distro's delivery hash, read with the handle that unwrapped it.
         let distroHex: String
         let sentTo: String?
@@ -778,6 +867,50 @@ final class RfedDistroClient: ObservableObject {
             return
         }
 
+        // GROUPS-DISTRO-DESIGN.md §6.1-§6.2: the group sync (SPEC §17.14) and group
+        // messages, each judged on its LXMF hash, here, before the generic `src:ts` key:
+        // web invite chunks share one `src:ts`, and every group sync has source D and
+        // no content. A key is recorded only when `deliver` reports the message kept
+        // (applied or stored), never for one dropped (judged again on its next copy) or
+        // held until its group is joined here (judged as a new arrival when replayed).
+        switch parsed.groupRoute {
+        case .groupSync(let hash):
+            let key = DistroGroupSync.syncSeenKey(hashHex: hash)
+            // §11.1 rule 0: a repeat is dropped silently.
+            guard !seen.contains(key) else { return }
+            let arrival = DistroGroupSyncArrival(
+                blob: blob, hash: hash, sourceHex: srcHex, distroHex: distroHex,
+                signatureValidated: parsed.signature_validated ?? false,
+                reading: parsed.group_sync ?? DistroGroupSync.Reading())
+            Task { @MainActor in
+                let kept = RfedDistroClient.shared.deliver(.groupSync(arrival))
+                if kept { blobQueue.async { seen.record(key) } }
+            }
+            return
+        case .group(let hash, let groupId):
+            let key = DistroGroupSync.groupSeenKey(hashHex: hash)
+            guard !seen.contains(key) else {
+                print("[Distro] duplicate group message \(hash.prefix(8)) from \(srcHex.prefix(8)) — skipped")
+                return
+            }
+            let arrival = DistroGroupArrival(
+                blob: blob, hash: hash, sourceHex: srcHex, groupId: groupId,
+                title: parsed.title ?? "", content: parsed.content ?? "", timestamp: parsed.timestamp,
+                fieldsRaw: parsed.fieldsRaw, displayName: parsed.nameField,
+                unverifiedReason: parsed.reason, signatureValidated: parsed.signature_validated ?? false,
+                senderKey: parsed.senderKeyData, packed: parsed.packedData)
+            Task { @MainActor in
+                let kept = RfedDistroClient.shared.deliver(.group(arrival))
+                if kept { blobQueue.async { seen.record(key) } }
+            }
+            return
+        case .dropped(let why):
+            print("[Distro] group message from \(srcHex.prefix(8)) dropped: \(why) (never a direct message)")
+            return
+        case .other:
+            break
+        }
+
         let key = DistroCodec.seenKey(sourceHex: srcHex, timestamp: parsed.timestamp)
         guard !seen.contains(key) else { return }
 
@@ -791,7 +924,8 @@ final class RfedDistroClient: ObservableObject {
             // with a bad recipient is still recognised here and dropped,
             // never shown as a message from the distro.
             inbound = .sentCopy(SentCopyCandidate(
-                source: src, distroHex: distroHex, sentTo: parsed.sent_to, sentBy: sentBy,
+                source: src, signedByDistro: srcHex == distroHex && (parsed.signature_validated ?? false),
+                distroHex: distroHex, sentTo: parsed.sent_to, sentBy: sentBy,
                 title: parsed.title ?? "", content: parsed.content ?? "",
                 timestamp: parsed.timestamp))
         } else if parsed.is_delivery_notification {
@@ -830,7 +964,23 @@ final class RfedDistroClient: ObservableObject {
                 print("[Distro] no channel-sync sink; not recorded")
                 return false
             }
-            return onChannelSync(c.marker, c.fromDistro, c.signedByDistro)
+            let held = onChannelSync(c.marker, c.fromDistro, c.signedByDistro)
+            if held, c.fromDistro, c.signedByDistro, let d = DistroManager.shared.deliveryHashHex {
+                onSiblingSeen?(c.marker.byHex, d)
+            }
+            return held
+        case .groupSync(let g):
+            guard let onGroupSync else {
+                print("[Distro] no group-sync sink; not recorded")
+                return false
+            }
+            return onGroupSync(g)
+        case .group(let g):
+            guard let onGroup else {
+                print("[Distro] no group sink; not recorded")
+                return false
+            }
+            return onGroup(g)
         }
     }
 
@@ -862,6 +1012,7 @@ final class RfedDistroClient: ObservableObject {
                 print("[Distro] no sent-copy sink; not recorded")
                 return false
             }
+            if c.signedByDistro { onSiblingSeen?(c.sentBy, c.distroHex) }
             onSentCopy(DistroSentCopy(distroHash: c.source, recipientHex: recipientHex,
                                       title: c.title, content: c.content, timestamp: c.timestamp))
             return true
