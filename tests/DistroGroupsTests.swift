@@ -637,6 +637,14 @@ func strangersCannotEvictAHeldCreatorStatusAndForgedSelfOrFilteredTrafficIsNever
     }
     check(items.contains { $0.seq == 1 }, "the creator's status survives")
     check(items.filter { $0.groupId != pendingGroup }.count <= HeldArrivals.notHeldMax, "groups not held get 16 at most")
+    // Strangers' large blobs reach the byte bound before the 16: what it evicts is still never a
+    // pending group's (mutation: any blob evictable takes the creator's status, the oldest).
+    var heavy = apply(item(1, group: pendingGroup, source: C, size: 60 * 1024), to: []) { isPending($0) }
+    for n in 0..<16 {
+        heavy = apply(item(700 + n, group: id32(2000 + n), source: id32(7000 + n), size: 60 * 1024), to: heavy) { isPending($0) }
+    }
+    check(heavy.contains { $0.seq == 1 }, "the byte bound evicts strangers' blobs, never the pending group's")
+    check(heavy.reduce(0) { $0 + $1.size } <= HeldArrivals.maxBytes, "within 256 KiB")
     // A flood from one source for the pending group: 8 per source.
     var flood = [item(1, group: pendingGroup, source: C)]
     for n in 0..<20 { flood = apply(item(100 + n, group: pendingGroup, source: M), to: flood) { isPending($0) } }
