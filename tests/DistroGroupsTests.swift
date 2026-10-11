@@ -8,7 +8,7 @@
 // their bounds), the group rule (DeliveryPolicy), the group engine (GroupStatuses.swift) with a
 // creator that is the distro on two devices, and the NSE's decision (PendingNotification.swift,
 // NSEGroupShow). The group sync readings are the shared vectors
-// (rust/retichat-ffi/tests/data/distro_group_sync_vectors.json, LXMF-rust 1a1ed8b); the engine's
+// (rust/retichat-ffi/tests/data/distro_group_sync_vectors.json, LXMF-rust 5f9edff); the engine's
 // messages are the member-status vectors' (tests/GroupStatusFixtures.swift, real Ed25519).
 // ChatRepository, GroupChatManager, the NSE and the views need SwiftData, UIKit and the FFI, so
 // their wiring is asserted on the source, in the same tests. The bridge itself (the unwrap of a
@@ -1179,6 +1179,63 @@ func aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice() {
           "the chat list's preview")
 }
 
+// MARK: - The shared vectors (LXMF-rust 5f9edff; RFed SPEC §17.14 "Repeated keys")
+
+/// The copy is LXMF-rust 5f9edff's: an older one lacks the repeated-key, ext, bin GROUP_ID and
+/// comma-split vectors.
+func theGroupSyncVectorsAreLXMFRust5f9edffsCopy() {
+    checkEqual(gvList("variants").count, 14, "variants")
+    checkEqual(gvList("rejects").count, 53, "rejects")
+    checkEqual(gvList("group_entries").count, 28, "group_entries")
+    checkEqual((GV["invite_members"] as? [[String: Any]])?.count, 2, "invite_members")
+}
+
+/// invite_members: the csv split on the code point ',', never on grapheme clusters.
+func theInviteParserListsEachInviteMembersVector() {
+    for v in (GV["invite_members"] as? [[String: Any]]) ?? [] {
+        checkEqual(DeliveryPolicy.members(LxmfFieldsDecoder.groupCsv(v["csv"] as! String)), v["members"] as! [String],
+                   "\(v["name"]!): the members listed")
+    }
+    // The same csv in an accept G (variants accept_members_combining_mark_after_a_comma).
+    let variant = gvList("variants").first { $0["name"] as? String == "accept_members_combining_mark_after_a_comma" }
+    let csv = (GV["invite_members"] as? [[String: Any]])?.first { $0["name"] as? String == "combining_mark_after_a_comma" }
+    if let variant, let csv, case .success(let f) = DistroGroupSync.form(reading(variant["expected"]!), distroHex: D) {
+        checkEqual(f.members, csv["members"] as! [String], "the accept G lists D and its creator")
+    } else {
+        check(false, "the accept G whose csv has a combining mark after the last comma passes rule 4")
+    }
+}
+
+/// Every group_entries vector through the direct path's reader (LxmfFieldsDecoder.decode on the
+/// fields the router hands over): a group entry from the first entry with its key, even one of
+/// the wrong type; 0xFB from the last; an ext of an unknown type skipped and the rest of the map
+/// read; a bin GROUP_ID no id. The id compared is what the group branch takes (32 hex, lowercase);
+/// the action and the name only of a message it takes (the shared layer reports none without an
+/// id). A message whose last 0xFB is a distro marker is classified on the distro path, by the
+/// shared unwrap (tests/DistroGroupsFFITests.swift): here only its 0xFB is compared.
+func theDirectPathReaderReadsEachGroupEntriesVectorAsLXMFRustDoes() {
+    let markers: Set<String> = [DistroGroupSync.marker, "rfed.distro.channel", DistroTransfer.customType, DistroSent.customType]
+    var compared = 0
+    for v in gvList("group_entries") {
+        let name = v["name"] as! String
+        let e = v["expected"] as! [String: Any]
+        let f = LxmfFieldsDecoder.decode(unhex(v["fields_hex"] as! String))
+        checkEqual(f.customType == DistroGroupSync.marker, e["group_sync"] as! Bool, "\(name): a G by its last 0xFB")
+        if let type = f.customType, markers.contains(type) { continue }
+        let id = DeliveryPolicy.hash(f.groupId?.lowercased())
+        checkEqual(id, e["group_id"] as? String, "\(name): GROUP_ID")
+        guard id != nil else { continue }
+        compared += 1
+        checkEqual(f.groupAction, e["group_action"] as? String, "\(name): GROUP_ACTION")
+        checkEqual(f.groupName, e["group_name"] as? String, "\(name): GROUP_NAME")
+    }
+    for name in ["group_id_twice_the_first_read", "retichat_field_twice", "group_action_and_name_twice", "ext_beside_group_id",
+                 "ext_beside_group_id_in_retichat_field", "custom_type_twice_the_last_not_a_marker", "group_id_bin_in_0xd1_str_in_0xa0"] {
+        check(gvList("group_entries").contains { $0["name"] as? String == name }, "\(name) is in the vectors")
+    }
+    check(compared >= 12, "the entries of every vector the group branch takes are compared (\(compared))")
+}
+
 // MARK: - Run
 
 let allTests: [(String, @MainActor () -> Void)] = [
@@ -1219,6 +1276,9 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("the member csv is split on code points as the shared parser splits it", theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt),
     ("the group texts are the ones the three clients share", theGroupTextsAreTheOnesTheThreeClientsShare),
     ("a known sibling's own accept or leave is \"Your other device\"", aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice),
+    ("the group sync vectors are LXMF-rust 5f9edff's copy", theGroupSyncVectorsAreLXMFRust5f9edffsCopy),
+    ("the invite parser lists each invite_members vector", theInviteParserListsEachInviteMembersVector),
+    ("the direct path's reader reads each group_entries vector as LXMF-rust does", theDirectPathReaderReadsEachGroupEntriesVectorAsLXMFRustDoes),
 ]
 
 @main

@@ -234,6 +234,123 @@ func theWriterRefusesWhatAReceiverWouldDropAndAMessageNotFromDToD() {
     check(!attempt(good, dest: unhexData(M)), "a message not to D is refused")
 }
 
+// MARK: - The vectors given as fields bytes (LXMF-rust 5f9edff; RFed SPEC §17.14 "Repeated keys")
+
+/// D's Ed25519 key, from the vectors' private key (X25519 private | Ed25519 seed).
+let dSigningKey: Curve25519.Signing.PrivateKey = {
+    let bytes = unhexData(gv("distro")["private_key_hex"] as! String)
+    return try! Curve25519.Signing.PrivateKey(rawRepresentation: bytes.suffix(32))
+}()
+
+/// A message from D to D whose fields map is `fieldsHex` exactly as given (a repeated key, an ext
+/// of an unknown type, a bin GROUP_ID), packed as LXMF packs it, [1790000000.5, "", "x", fields],
+/// and signed by D as LXMF signs: dest | src | payload | SHA-256(dest | src | payload).
+func packedFromD(fieldsHex: String) -> Data {
+    let dHash = unhexData(D)
+    var payload = unhexData("94cb41daac4ee0200000c400c40178")
+    payload.append(unhexData(fieldsHex))
+    let signed = dHash + dHash + payload
+    let hash = Data(SHA256.hash(data: signed))
+    let signature = try! dSigningKey.signature(for: signed + hash)
+    return dHash + dHash + signature + payload
+}
+
+/// `packed` sealed for D (retichat_distro_seal) and unwrapped with D's key, as a sibling gets it.
+func throughTheDistro(_ d: UInt64, _ packed: Data) -> (json: [String: Any], parsed: DistroUnwrapped)? {
+    guard let sealed = bridge.distroSeal(distroHandle: d, packed: packed) else { return nil }
+    return unwrap(d, sealed.sealed)
+}
+
+/// variants: each G of the reference (the web's int-64 at_ms, a 0xFB given twice with the marker
+/// last, a members csv with a combining mark after its last comma, ...) reaches a sibling, is read
+/// as the shared layer reads it, and passes the app's own rules.
+func everyVariantReachesASiblingAndPassesTheAppsRulesAsTheSharedLayerReadsIt() {
+    let d = identity("distro")
+    checkEqual(gvList("variants").count, 14, "the variants of 5f9edff")
+    for v in gvList("variants") {
+        let name = v["name"] as! String
+        guard let (_, u) = throughTheDistro(d, unhexData(v["packed_hex"] as! String)) else {
+            check(false, "\(name): sealed and unwrapped")
+            continue
+        }
+        checkEqual(u.hash, v["hash_hex"] as? String, "\(name): its LXMF hash")
+        checkEqual(u.groupRoute, .groupSync(hash: v["hash_hex"] as! String), "\(name): a group sync, on its hash")
+        checkEqual(u.group_sync, reading(v["expected"]!), "\(name): the reading the shared layer gives")
+        if case .apply(let form, let sibling) = DistroGroupSync.disposition(
+            sourceHex: u.source_hash, distroHex: D, signatureValidated: u.signature_validated ?? false,
+            reading: u.group_sync ?? DistroGroupSync.Reading(), deviceHex: THIS) {
+            checkEqual(sibling, DeliveryPolicy.hash(u.group_sync?.by), "\(name): its 0xFD, when it has one, is a sibling")
+            checkEqual(form.groupId, GID, "\(name): its group")
+            if form.op == .create || form.op == .accept {
+                checkEqual(form.members, DeliveryPolicy.members(LxmfFieldsDecoder.groupCsv(form.membersCsv)), "\(name): the members")
+                check(form.members.contains(D), "\(name): the members name D")
+            }
+        } else {
+            check(false, "\(name): applied on a sibling")
+        }
+    }
+}
+
+/// rejects: each is a G the shared layer reads with its problem named, and the app's rules
+/// never apply it. A members csv whose combining mark comes before D's entry names no D, by the
+/// app's own rule 4 too.
+func everyRejectReachesASiblingAsAGroupSyncTheAppNeverApplies() {
+    let d = identity("distro")
+    checkEqual(gvList("rejects").count, 53, "the rejects of 5f9edff")
+    for v in gvList("rejects") {
+        let name = v["name"] as! String
+        guard let (_, u) = throughTheDistro(d, packedFromD(fieldsHex: v["fields_hex"] as! String)) else {
+            check(false, "\(name): sealed and unwrapped")
+            continue
+        }
+        checkEqual(u.signature_validated, true, "\(name): signed by D")
+        guard let r = u.group_sync, case .groupSync = u.groupRoute else {
+            check(false, "\(name): a group sync")
+            continue
+        }
+        check(r.problem != nil, "\(name): the shared layer names its problem")
+        switch DistroGroupSync.disposition(sourceHex: u.source_hash, distroHex: D, signatureValidated: u.signature_validated ?? false,
+                                           reading: r, deviceHex: THIS) {
+        case .malformed: break
+        case let other: check(false, "\(name): dropped by rule 4, got \(other)")
+        }
+    }
+    var r = reading(gvList("ops").first { $0["name"] as? String == "accept_empty_left" }!["expected"]!)!
+    r.members = "\(M),\u{301}\(D)"
+    if case .success = DistroGroupSync.form(r, distroHex: D) {
+        check(false, "members naming D only after a combining mark do not name D")
+    }
+}
+
+/// group_entries: each fields map, the first of a repeated group key, the last 0xFB, an unknown
+/// ext skipped and a bin GROUP_ID, through the distro unwrap the app calls, decoded into the
+/// app's DistroUnwrapped and routed as the distro path routes it.
+func everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerReadsIt() {
+    let d = identity("distro")
+    checkEqual(gvList("group_entries").count, 28, "the group_entries of 5f9edff")
+    for v in gvList("group_entries") {
+        let name = v["name"] as! String
+        let e = v["expected"] as! [String: Any]
+        guard let (_, u) = throughTheDistro(d, packedFromD(fieldsHex: v["fields_hex"] as! String)) else {
+            check(false, "\(name): sealed and unwrapped")
+            continue
+        }
+        let isG = e["group_sync"] as! Bool
+        let hasId = e["has_group_id"] as! Bool
+        let id = e["group_id"] as? String
+        checkEqual(u.has_group_id ?? false, hasId, "\(name): has_group_id")
+        checkEqual(u.group_id, id, "\(name): group_id")
+        checkEqual(u.group_action, e["group_action"] as? String, "\(name): group_action")
+        checkEqual(u.group_name, e["group_name"] as? String, "\(name): group_name")
+        checkEqual(u.group_sync != nil, isG, "\(name): a G")
+        guard let hash = u.hash else { check(false, "\(name): its hash"); continue }
+        let route: DistroGroupRoute = isG ? .groupSync(hash: hash)
+            : !hasId ? .other
+            : id.map { .group(hash: hash, groupId: $0) } ?? .dropped("its GROUP_ID is not 32 hex characters")
+        checkEqual(u.groupRoute, route, "\(name): the route")
+    }
+}
+
 let allTests: [(String, () -> Void)] = [
     ("a sealed group sync and a member's group messages unwrap, route and pass the app's rules as the shared layer read them",
      aSealedGroupSyncAndAMembersGroupMessagesUnwrapRouteAndPassTheAppsRulesAsTheSharedLayerReadThem),
@@ -241,6 +358,12 @@ let allTests: [(String, () -> Void)] = [
      theAppsWriterJSONThroughTheBridgeWritesTheReferenceFieldsSignedByDAndASiblingReadsTheSameSync),
     ("the writer refuses what a receiver would drop, and a message not from D to D",
      theWriterRefusesWhatAReceiverWouldDropAndAMessageNotFromDToD),
+    ("every variant reaches a sibling and passes the app's rules as the shared layer reads it",
+     everyVariantReachesASiblingAndPassesTheAppsRulesAsTheSharedLayerReadsIt),
+    ("every reject reaches a sibling as a group sync the app never applies",
+     everyRejectReachesASiblingAsAGroupSyncTheAppNeverApplies),
+    ("every group_entries vector through the distro is decoded and routed as the shared layer reads it",
+     everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerReadsIt),
 ]
 
 @main
