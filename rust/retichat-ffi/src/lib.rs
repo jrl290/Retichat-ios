@@ -2995,10 +2995,11 @@ mod distro_outbox_bridge_tests {
     }
 }
 
-/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity), at the C API the app calls: a
-/// message whose payload repeats a key is refused whole by the distro unwrap and by the group
-/// receipt's unpack, with an error the Swift callers know as a refusal (already logged once, by
-/// LXMF-rust), so they say nothing more.
+/// RFed SPEC §17.14 "Repeated keys", "Unhashable keys" and "Nesting" (James, 2026-10-11, and
+/// decided 2026-10-11: parity), at the C API the app calls: a message whose payload repeats a key,
+/// has a key Python cannot hash or nests past depth 493 is refused whole by the distro unwrap and
+/// by the group receipt's unpack, with an error the Swift callers know as a refusal (already
+/// logged once, by LXMF-rust), so they say nothing more.
 #[cfg(test)]
 mod repeated_keys_bridge_tests {
     use super::*;
@@ -3017,22 +3018,36 @@ mod repeated_keys_bridge_tests {
         assert!(swift.contains(&line), "LxmfFields.swift lacks: {line}");
     }
 
-    /// Every `refused` vector and every refused `key_equality` pair, sealed for D: the C unwrap
-    /// returns NULL with an error that starts with the refusal prefix, and the C group unpack
-    /// returns NULL too; every pair the reference reads is unwrapped and unpacked.
+    /// Every `refused` vector and every refused `key_equality` pair and `nesting` vector, sealed
+    /// for D: the C unwrap returns NULL with an error that starts with the refusal prefix and names
+    /// the reference's reason, and the C group unpack returns NULL too; every pair and nesting
+    /// vector the reference reads is unwrapped and unpacked. On a 64 MiB stack: a debug build's
+    /// rmpv reader spends about 4.9 KB a level (about 260 B in release), and the nesting vectors
+    /// are read to depth 493.
     #[test]
-    fn the_c_unwrap_and_the_c_group_unpack_refuse_a_message_that_repeats_a_key() {
+    fn the_c_unwrap_and_the_c_group_unpack_refuse_what_python_refuses() {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(c_refusals).unwrap().join().unwrap();
+    }
+
+    fn c_refusals() {
         let v: serde_json::Value = serde_json::from_str(GROUP_SYNC_VECTORS).unwrap();
         let key = unhex(v["distro"]["private_key_hex"].as_str().unwrap());
         let d = Identity::from_bytes(&key).unwrap();
         let handle = rns::store_handle(Identity::from_bytes(&key).unwrap());
         let refused = v["refused"].as_array().unwrap();
         let pairs = v["key_equality"].as_array().unwrap();
-        assert_eq!((refused.len(), pairs.len()), (11, 22));
+        let nesting = v["nesting"].as_array().unwrap();
+        assert_eq!((refused.len(), pairs.len(), nesting.len()), (22, 24, 11));
         let mut refusals = 0;
-        for vector in refused.iter().chain(pairs) {
+        for vector in refused.iter().chain(pairs).chain(nesting) {
             let name = vector["name"].as_str().unwrap();
             let refuse = vector.get("refused").map_or(true, |r| r.as_bool().unwrap());
+            let why = match vector["reason"].as_str().unwrap_or("repeated_key") {
+                "repeated_key" => "repeats a key",
+                "unhashable_key" => "cannot hash",
+                "too_deep" => "nested past depth",
+                other => panic!("{name}: unknown reason {other}"),
+            };
             let packed = unhex(vector["packed_hex"].as_str().unwrap());
             let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
             let mut len = 0u32;
@@ -3045,9 +3060,9 @@ mod repeated_keys_bridge_tests {
                 refusals += 1;
                 assert!(unwrapped.is_null(), "{name}: the unwrap must refuse it");
                 let error = unwrap_error.unwrap_or_default();
-                assert!(lxmf_rust::msgpack_keys::is_refusal(&error) && error.contains("repeats a key"), "{name}: {error}");
+                assert!(lxmf_rust::msgpack_keys::is_refusal(&error) && error.contains(why), "{name}: {error}");
                 assert!(element.is_null(), "{name}: the group unpack must refuse it");
-                assert!(element_error.unwrap_or_default().contains("repeats a key"), "{name}: the group unpack's error");
+                assert!(element_error.unwrap_or_default().contains(why), "{name}: the group unpack's error");
             } else {
                 assert!(!unwrapped.is_null() && len > 0, "{name}: unwrapped ({unwrap_error:?})");
                 rns_free_bytes(unwrapped, len);
@@ -3055,6 +3070,6 @@ mod repeated_keys_bridge_tests {
                 rns_free_bytes(element, element_len);
             }
         }
-        assert_eq!(refusals, 11 + 15);
+        assert_eq!(refusals, 22 + 15 + 6);
     }
 }

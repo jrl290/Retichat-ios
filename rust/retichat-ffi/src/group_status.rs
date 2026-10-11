@@ -1071,21 +1071,32 @@ mod distro_unwrap_tests {
         }
     }
 
-    /// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity with Python LXMF): a message
-    /// whose payload holds a map, at any depth, that repeats a key is refused whole by the distro
-    /// unwrap the app calls and by the group receipt of a message that arrived directly (the
-    /// router's own unpack), so the app never shows, stores or applies it. Each `refused` vector is
-    /// signed by its source; each `key_equality` pair is refused exactly when the reference
-    /// refuses it, and read otherwise.
+    /// RFed SPEC §17.14 "Repeated keys", "Unhashable keys" and "Nesting" (James, 2026-10-11, and
+    /// decided 2026-10-11: parity with Python LXMF): a message whose payload holds a map, at any
+    /// depth, that repeats a key or has a key Python cannot hash (a map, or an array holding one),
+    /// or that nests past depth 493, is refused whole by the distro unwrap the app calls and by the
+    /// group receipt of a message that arrived directly (the router's own unpack), so the app
+    /// never shows, stores or applies it; the error names the reason the reference gives. Each
+    /// `refused` vector is signed by its source; each `key_equality` pair and each `nesting`
+    /// vector is refused exactly when the reference refuses it, and read otherwise.
     #[test]
-    fn the_unwrap_and_the_receipt_refuse_a_message_that_repeats_a_key() {
+    fn the_unwrap_and_the_receipt_refuse_what_python_refuses() {
+        // A debug build's rmpv reader spends about 4.9 KB of stack a level (about 260 B in
+        // release), and the nesting vectors are read to depth 493: more than a test thread holds.
+        std::thread::Builder::new().stack_size(64 << 20).spawn(unwrap_and_receipt_refusals).unwrap().join().unwrap();
+    }
+
+    fn unwrap_and_receipt_refusals() {
         let v = vectors();
         let mut d = distro(&v);
         let refused = v["refused"].as_array().unwrap();
-        assert_eq!(refused.len(), 11);
+        assert_eq!(refused.len(), 22);
         let pairs = v["key_equality"].as_array().unwrap();
-        assert_eq!(pairs.len(), 22);
-        for vector in refused.iter().chain(pairs) {
+        assert_eq!(pairs.len(), 24);
+        let nesting = v["nesting"].as_array().unwrap();
+        assert_eq!(nesting.len(), 11);
+        assert_eq!(v["nesting_max_depth"], lxmf_rust::msgpack_keys::NESTING_MAX_DEPTH);
+        for vector in refused.iter().chain(pairs).chain(nesting) {
             let name = vector["name"].as_str().unwrap();
             let refuse = vector.get("refused").map_or(true, |r| r.as_bool().unwrap());
             let packed = unhex(vector["packed_hex"].as_str().unwrap());
@@ -1093,10 +1104,16 @@ mod distro_unwrap_tests {
             let unwrapped = distro_unwrap_json(&mut d, &blob);
             let received = unpack_element_with(&packed, &|_| None);
             if refuse {
+                let why = match vector["reason"].as_str().unwrap_or("repeated_key") {
+                    "repeated_key" => "repeats a key",
+                    "unhashable_key" => "cannot hash",
+                    "too_deep" => "nested past depth",
+                    other => panic!("{name}: unknown reason {other}"),
+                };
                 let err = unwrapped.err().unwrap_or_else(|| panic!("{name}: the distro unwrap must refuse it"));
-                assert!(err.contains("repeats a key"), "{name}: {err}");
+                assert!(lxmf_rust::msgpack_keys::is_refusal(&err) && err.contains(why), "{name}: {err}");
                 let err = received.err().unwrap_or_else(|| panic!("{name}: the group receipt must refuse it"));
-                assert!(err.contains("repeats a key"), "{name}: {err}");
+                assert!(err.contains(lxmf_rust::msgpack_keys::REFUSED_WHOLE) && err.contains(why), "{name}: {err}");
             } else {
                 assert!(unwrapped.unwrap_or_else(|e| panic!("{name}: {e}")).is_some(), "{name}: a blob for D");
                 assert!(received.is_ok(), "{name}: read on the direct path");
