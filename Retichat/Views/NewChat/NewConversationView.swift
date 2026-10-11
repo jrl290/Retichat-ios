@@ -319,6 +319,9 @@ private struct GroupForm: View {
         }
         guard !selectedMembers.isEmpty else { errorMessage = "Select at least one member"; return }
         let chatId = repository.createGroupChat(name: name, memberHashes: Array(selectedMembers))
+        // "" when the distro this device holds has not loaded yet (GROUPS-DISTRO-DESIGN.md
+        // §8.7): nothing was created, and nothing is queued.
+        guard !chatId.isEmpty else { errorMessage = GroupSelf.createNotReadyText; return }
         selectedChatId = chatId
         dismiss()
     }

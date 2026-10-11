@@ -60,6 +60,9 @@ struct ChatListView: View {
     /// The group whose Delete was swiped: it asks first, since deleting a
     /// group conversation leaves the group, for good (ChatSwipe.leaveGroup).
     @State private var leaving: Chat?
+    /// The group whose Delete was swiped where this device cannot act in it
+    /// (ChatSwipe.deleteFromThisDevice): it asks first, then removes it here only.
+    @State private var deletingHere: Chat?
 
     private var showsStatusLine: Bool {
         repository.serviceRunning || repository.serviceStartFailed
@@ -183,7 +186,8 @@ struct ChatListView: View {
                                     }
                                     .swipeActions(edge: .trailing) {
                                         switch ChatSwipe.of(isGroup: chat.isGroup,
-                                                            isPendingInvite: chat.isPendingInvite) {
+                                                            isPendingInvite: chat.isPendingInvite,
+                                                            cannotAct: chat.cannotActText != nil) {
                                         case .invite:
                                             Button(role: .destructive) {
                                                 declining = chat
@@ -205,6 +209,12 @@ struct ChatListView: View {
                                         case .archive:
                                             Button(role: .destructive) {
                                                 repository.archiveChat(chatId: chat.id)
+                                            } label: {
+                                                Label("Delete", systemImage: "trash")
+                                            }
+                                        case .deleteFromThisDevice:
+                                            Button(role: .destructive) {
+                                                deletingHere = chat
                                             } label: {
                                                 Label("Delete", systemImage: "trash")
                                             }
@@ -238,7 +248,9 @@ struct ChatListView: View {
                     .scrollContentBackground(.hidden)
                     // A group's swiped Delete, worded as Delete in the chat
                     // info (GroupDeleteText): leaves the group, then deletes it.
-                    .confirmationDialog(GroupDeleteText.title,
+                    // In a D-group it is final on all the user's devices
+                    // (GROUPS-DISTRO-DESIGN.md §13).
+                    .confirmationDialog(GroupDeleteText.title(distro: leaving?.isDistroGroup ?? false),
                                         isPresented: Binding(get: { leaving != nil },
                                                              set: { if !$0 { leaving = nil } }),
                                         titleVisibility: .visible,
@@ -249,8 +261,23 @@ struct ChatListView: View {
                             leaving = nil
                         }
                         Button("Cancel", role: .cancel) { leaving = nil }
+                    } message: { chat in
+                        Text(GroupDeleteText.message(distro: chat.isDistroGroup))
+                    }
+                    // §8.7: "Delete from this device": no leave, no group sync.
+                    .confirmationDialog(GroupSelf.deleteLocalTitle + "?",
+                                        isPresented: Binding(get: { deletingHere != nil },
+                                                             set: { if !$0 { deletingHere = nil } }),
+                                        titleVisibility: .visible,
+                                        presenting: deletingHere) { chat in
+                        Button(GroupSelf.deleteLocalTitle, role: .destructive) {
+                            if selectedChatId == chat.id { selectedChatId = nil }
+                            repository.deleteGroupFromThisDevice(chatId: chat.id)
+                            deletingHere = nil
+                        }
+                        Button("Cancel", role: .cancel) { deletingHere = nil }
                     } message: { _ in
-                        Text(GroupDeleteText.message)
+                        Text(GroupSelf.deleteLocalMessage)
                     }
                 }
             }
@@ -278,7 +305,8 @@ struct ChatListView: View {
             repository.refreshChats()
         }
         // As the conversation's Decline asks (GroupInviteText).
-        .confirmationDialog(GroupInviteText.declineTitle,
+        // In a D-group the decline is final on all the user's devices (§13).
+        .confirmationDialog(GroupInviteText.title(distro: declining?.isDistroGroup ?? false),
                             isPresented: Binding(get: { declining != nil },
                                                  set: { if !$0 { declining = nil } }),
                             titleVisibility: .visible,
@@ -289,8 +317,8 @@ struct ChatListView: View {
                 declining = nil
             }
             Button("Cancel", role: .cancel) { declining = nil }
-        } message: { _ in
-            Text(GroupInviteText.declineMessage)
+        } message: { chat in
+            Text(GroupInviteText.message(distro: chat.isDistroGroup))
         }
     }
 }

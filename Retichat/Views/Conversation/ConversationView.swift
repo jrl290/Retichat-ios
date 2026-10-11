@@ -89,6 +89,20 @@ struct ConversationView: View {
         return repository.chats.first(where: { $0.id == chatId })?.isPendingInvite ?? false
     }
 
+    /// GROUPS-DISTRO-DESIGN.md §8.7: why this device cannot post, accept, decline or leave in
+    /// this group (its own address is a distro this device does not hold, or not yet); nil
+    /// when it can.
+    private var cannotActText: String? {
+        guard !isChannelMode else { return nil }
+        return repository.chats.first(where: { $0.id == chatId })?.cannotActText
+    }
+
+    /// §13: a D-group's decline, leave and delete are final on all the user's devices.
+    private var isDistroGroup: Bool {
+        guard !isChannelMode else { return false }
+        return repository.chats.first(where: { $0.id == chatId })?.isDistroGroup ?? false
+    }
+
     /// Live: the chat list's resolved name, which follows every name change
     /// (DISPLAY_NAMES.md §5.3), not a copy taken when the screen appeared.
     private var navigationTitle: String {
@@ -239,7 +253,10 @@ struct ConversationView: View {
                     attachmentPreview
                 }
 
-                if viewModel.isGroup && isGroupPending {
+                if viewModel.isGroup, let why = cannotActText {
+                    // §8.7: the composer, accept and decline are disabled, with the reason.
+                    cannotActBar(why)
+                } else if viewModel.isGroup && isGroupPending {
                     inviteOverlay
                 } else {
                     inputBar
@@ -275,7 +292,7 @@ struct ConversationView: View {
                         Image(systemName: "info.circle")
                             .foregroundColor(.retichatPrimary)
                     }
-                } else if isGroupPending {
+                } else if isGroupPending && cannotActText == nil {
                     Menu {
                         Button("Accept Invite") {
                             repository.acceptGroupInvite(groupId: chatId)
@@ -300,7 +317,9 @@ struct ConversationView: View {
         // A decline is the user's leave (James, 2026-10-02: "Make the decline
         // message the same as the leave message"), told to the members and
         // final (ChatRepository.declineGroupInvite).
-        .confirmationDialog(GroupInviteText.declineTitle, isPresented: $showDeclineConfirm,
+        // In a D-group the decline is final on all the user's devices
+        // (GROUPS-DISTRO-DESIGN.md §13).
+        .confirmationDialog(GroupInviteText.title(distro: isDistroGroup), isPresented: $showDeclineConfirm,
                             titleVisibility: .visible) {
             Button("Decline", role: .destructive) {
                 repository.declineGroupInvite(groupId: chatId)
@@ -308,7 +327,7 @@ struct ConversationView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(GroupInviteText.declineMessage)
+            Text(GroupInviteText.message(distro: isDistroGroup))
         }
         .photosPicker(isPresented: $showAttachmentPicker, selection: $selectedPhotos,
                       maxSelectionCount: 5, matching: .any(of: [.images, .videos]))
@@ -347,6 +366,10 @@ struct ConversationView: View {
                     },
                     onLeave: {
                         repository.leaveGroup(chatId: chatId)
+                        dismiss()
+                    },
+                    onDeleteFromThisDevice: {
+                        repository.deleteGroupFromThisDevice(chatId: chatId)
                         dismiss()
                     }
                 )
@@ -676,6 +699,22 @@ struct ConversationView: View {
 
     // MARK: - Group invite overlay (DM only)
 
+    /// §8.7: in a group this device cannot sign for, the text in place of the composer and
+    /// the invite's Accept and Decline. "Delete from this device" is in the chat info.
+    private func cannotActBar(_ why: String) -> some View {
+        VStack(spacing: 0) {
+            Divider()
+            Text(why)
+                .font(.caption)
+                .foregroundColor(.retichatOnSurfaceVariant)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity)
+                .background(Color.retichatSurface)
+        }
+    }
+
     private var inviteOverlay: some View {
         VStack(spacing: 0) {
             Divider()
@@ -808,13 +847,20 @@ struct ChatInfoSheet: View {
     let onArchive: () -> Void
     let onDelete: () -> Void
     let onLeave: () -> Void
+    /// GROUPS-DISTRO-DESIGN.md §8.7: removes the group from this device only.
+    var onDeleteFromThisDevice: () -> Void = {}
 
     @State private var renameText: String = ""
     @State private var notificationsEnabled: Bool = true
     @State private var showDeleteConfirm = false
     @State private var showLeaveConfirm = false
+    @State private var showDeleteLocalConfirm = false
 
     private var chat: Chat? { repository.chats.first(where: { $0.id == chatId }) }
+    /// §13: a D-group's leave and delete are final on all the user's devices.
+    private var isDistroGroup: Bool { chat?.isDistroGroup ?? false }
+    /// §8.7: set when this device cannot act in the group.
+    private var cannotActText: String? { isGroup ? chat?.cannotActText : nil }
     private var title: String { chat?.displayName ?? repository.contactDisplayName(for: chatId) }
     private var peerHash: String { chat?.peerHash ?? chatId }
     /// The contact's three name slots (DISPLAY_NAMES.md §5.1); nil for a group.
@@ -926,12 +972,14 @@ struct ChatInfoSheet: View {
                                         .foregroundColor(.retichatOnSurface)
                                     ForEach(members, id: \.memberHash) { member in
                                         HStack {
+                                            // "You" for every address of the user in this group:
+                                            // the device, the distro and its devices (§9.1).
                                             AvatarView(
-                                                name: repository.contactDisplayName(for: member.memberHash),
+                                                name: repository.groupMemberDisplayName(for: member.memberHash, groupId: chatId),
                                                 size: 36
                                             )
                                             VStack(alignment: .leading, spacing: 2) {
-                                                Text(repository.contactDisplayName(for: member.memberHash))
+                                                Text(repository.groupMemberDisplayName(for: member.memberHash, groupId: chatId))
                                                     .foregroundColor(.retichatOnSurface)
                                                 Text(member.memberHash)
                                                     .font(.caption2)
@@ -952,7 +1000,21 @@ struct ChatInfoSheet: View {
                         // Archive / Delete / Leave
                         GlassCard {
                             VStack(spacing: 0) {
-                                if isGroup {
+                                if isGroup, let why = cannotActText {
+                                    // §8.7: no leave from here; only the local delete.
+                                    Text(why)
+                                        .font(.caption)
+                                        .foregroundColor(.retichatOnSurfaceVariant)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    Divider().background(Color.glassBorder).padding(.vertical, 8)
+                                    Button {
+                                        showDeleteLocalConfirm = true
+                                    } label: {
+                                        Label(GroupSelf.deleteLocalTitle, systemImage: "trash")
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .foregroundColor(.retichatError)
+                                    }
+                                } else if isGroup {
                                     Button {
                                         showLeaveConfirm = true
                                     } label: {
@@ -993,7 +1055,7 @@ struct ChatInfoSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .confirmationDialog(isGroup ? GroupDeleteText.title : "Delete this conversation?",
+            .confirmationDialog(isGroup ? GroupDeleteText.title(distro: isDistroGroup) : "Delete this conversation?",
                                  isPresented: $showDeleteConfirm,
                                  titleVisibility: .visible) {
                 Button("Delete", role: .destructive) {
@@ -1004,10 +1066,10 @@ struct ChatInfoSheet: View {
             } message: {
                 // Deleting a group conversation is leaving it (James,
                 // 2026-10-05; ChatRepository.deleteChat).
-                Text(isGroup ? GroupDeleteText.message
+                Text(isGroup ? GroupDeleteText.message(distro: isDistroGroup)
                              : "All messages will be permanently deleted. This cannot be undone.")
             }
-            .confirmationDialog("Leave this group?", isPresented: $showLeaveConfirm,
+            .confirmationDialog(GroupLeaveText.title(distro: isDistroGroup), isPresented: $showLeaveConfirm,
                                  titleVisibility: .visible) {
                 Button("Leave Group", role: .destructive) {
                     dismiss()
@@ -1015,8 +1077,20 @@ struct ChatInfoSheet: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                // A leave is final (James, 2026-10-01; ChatRepository.quitGroup).
-                Text("The members are told you left, and this conversation is deleted. You won't receive future messages, and you won't be able to rejoin this group.")
+                // A leave is final (James, 2026-10-01; ChatRepository.quitGroup), and in a
+                // D-group on all the user's devices (GROUPS-DISTRO-DESIGN.md §13).
+                Text(GroupLeaveText.message(distro: isDistroGroup))
+            }
+            // §8.7: removes the group here only: no leave, no group sync.
+            .confirmationDialog(GroupSelf.deleteLocalTitle + "?", isPresented: $showDeleteLocalConfirm,
+                                 titleVisibility: .visible) {
+                Button(GroupSelf.deleteLocalTitle, role: .destructive) {
+                    dismiss()
+                    onDeleteFromThisDevice()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(GroupSelf.deleteLocalMessage)
             }
             .onAppear {
                 // A contact's field holds only the user's own name, so saving
@@ -1067,6 +1141,25 @@ struct ChatInfoSheet: View {
 enum GroupInviteText {
     static let declineTitle = "Decline this group invite?"
     static let declineMessage = "The group's members are told you declined, and you won't be able to join this group later."
+    /// GROUPS-DISTRO-DESIGN.md §13: in a D-group the decline is signed as the distro, so it is
+    /// final on all the user's devices.
+    static let distroDeclineTitle = "Decline this invitation?"
+    static let distroDeclineMessage = "This declines it on all your devices, and you cannot join this group later."
+
+    static func title(distro: Bool) -> String { distro ? distroDeclineTitle : declineTitle }
+    static func message(distro: Bool) -> String { distro ? distroDeclineMessage : declineMessage }
+}
+
+/// What the chat info's Leave confirmation says: a leave is final (James, 2026-10-01), and in
+/// a D-group on all the user's devices (GROUPS-DISTRO-DESIGN.md §13).
+enum GroupLeaveText {
+    static let title = "Leave this group?"
+    static let message = "The members are told you left, and this conversation is deleted. You won't receive future messages, and you won't be able to rejoin this group."
+    static let distroTitle = "Leave this group?"
+    static let distroMessage = "You will leave it on all your devices, its messages are deleted from all of them, and you cannot rejoin."
+
+    static func title(distro: Bool) -> String { distro ? distroTitle : title }
+    static func message(distro: Bool) -> String { distro ? distroMessage : message }
 }
 
 /// What a group's Delete confirmations say (the chat info's and the chat
@@ -1075,4 +1168,11 @@ enum GroupInviteText {
 enum GroupDeleteText {
     static let title = "Delete and leave this group?"
     static let message = "Deleting a group conversation leaves the group: the members are told you left, and you won't be able to rejoin it. All messages will be permanently deleted."
+    /// GROUPS-DISTRO-DESIGN.md §13: in a D-group the delete leaves it as the distro, on all
+    /// the user's devices.
+    static let distroTitle = "Delete this group?"
+    static let distroMessage = "This leaves it and deletes its messages on all your devices, and you cannot rejoin."
+
+    static func title(distro: Bool) -> String { distro ? distroTitle : title }
+    static func message(distro: Bool) -> String { distro ? distroMessage : message }
 }

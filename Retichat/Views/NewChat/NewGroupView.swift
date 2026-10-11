@@ -132,6 +132,12 @@ struct NewGroupView: View {
             name: trimmedName,
             memberHashes: Array(selectedMembers)
         )
+        // "" when the distro this device holds has not loaded yet (GROUPS-DISTRO-DESIGN.md
+        // §8.7): nothing was created, and nothing is queued.
+        guard !chatId.isEmpty else {
+            errorMessage = GroupSelf.createNotReadyText
+            return
+        }
         selectedChatId = chatId
         dismiss()
         onDismissParent?()
