@@ -1221,6 +1221,15 @@ pub extern "C" fn retichat_distro_delivery_hash(
 /// cleaned name, null unless 2); signature_validated / unverified_reason
 /// (0 ok, 1 source unknown, 2 signature invalid) decide whether to accept it
 /// (DISPLAY_NAMES.md §5.2).
+///
+/// RFed SPEC §17.14 (GROUPS-DISTRO-DESIGN.md §7): also hash (64 hex), has_group_id,
+/// group_id, group_action, group_name, group_sync (null or an object), sender_key
+/// (128 hex or null) and packed (base64 or null). This crate's group receipt
+/// (`group_status::receipt_parts`) runs on the rebuilt message, so
+/// signature_validated / unverified_reason are its verdict: an accept or leave
+/// from a source whose key is not held is decided under the key it carries.
+/// The JSON is `lxmf_rust::distro::DistroMessage::to_json_with_receipt`, the one
+/// definition both bridges use.
 #[no_mangle]
 pub extern "C" fn retichat_distro_unwrap(
     distro_handle: u64,
@@ -1234,9 +1243,9 @@ pub extern "C" fn retichat_distro_unwrap(
     };
     let data = slice_from_raw(blob, blob_len);
 
-    match lxmf_rust::distro::unwrap_blob(&mut distro, &data) {
+    match group_status::distro_unwrap_json(&mut distro, &data) {
         Ok(None) => emit_buffer(Vec::new(), out_len),
-        Ok(Some(msg)) => emit_buffer(msg.to_json().into_bytes(), out_len),
+        Ok(Some(json)) => emit_buffer(json.into_bytes(), out_len),
         Err(e) => emit_error(out_len, e),
     }
 }
@@ -1390,6 +1399,44 @@ pub extern "C" fn retichat_message_set_distro_channel_sync(
     };
     let result = match message.lock() {
         Ok(mut m) => distro_outbox::set_channel_sync_fields(&mut m, &op, &name, at_ms as u64, &device),
+        Err(e) => Err(e.to_string()),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// Write the group sync G's fields on the outbound message `msg` (a
+/// `retichat_message_create` handle from D to D; RFed SPEC §17.14): 0x0C an
+/// empty bin, 0xFB `"rfed.distro.group"`, 0xFC the native array of the op, 0xFD
+/// the sending device's own address. `sync_json` is the `group_sync` object of
+/// the unwrap JSON without `by` and `problem` (`lxmf_rust::distro::GroupSync::from_json`):
+/// `op`, `group_id`, `at_ms`, `left`, and `name`, `members`, `keys` (create,
+/// accept), `creator` (accept), `text` (post). `d_hex` is D's `lxmf.delivery`
+/// address. 0 on success; -1 with `rns_last_error` set and the message unchanged
+/// when the JSON does not parse or what it describes would fail a receiver's
+/// form check (§11.1 rule 4), or the message is not one G can be written on
+/// (`lxmf_rust::distro::set_group_sync_fields`).
+#[no_mangle]
+pub extern "C" fn retichat_message_set_distro_group_sync(
+    msg: u64,
+    sync_json: *const c_char,
+    d_hex: *const c_char,
+    device_hex: *const c_char,
+) -> i32 {
+    let sync_json = unsafe { cstr_to_string(sync_json) };
+    let d_hex = unsafe { cstr_to_string(d_hex) };
+    let device = unsafe { cstr_to_string(device_hex) };
+    let Some(message) = rns::get_handle::<Arc<Mutex<lxmf_rust::lx_message::LXMessage>>>(msg) else {
+        rns::set_error("invalid message handle".to_string());
+        return -1;
+    };
+    let result = match message.lock() {
+        Ok(mut m) => distro_outbox::set_group_sync_json(&mut m, &sync_json, &d_hex, &device),
         Err(e) => Err(e.to_string()),
     };
     match result {
@@ -2771,6 +2818,7 @@ mod distro_outbox_bridge_tests {
             "uint8_t *retichat_propagation_build_sealed_upload(const uint8_t *distro_public_key, uint32_t key_len, const uint8_t *sealed, uint32_t sealed_len, const uint8_t *sig, uint32_t sig_len, int32_t with_claim, const uint8_t *node, uint32_t node_len, uint32_t *out_len);",
             "uint64_t retichat_interface_up_mark(void);",
             "int32_t retichat_interface_came_up_since(uint64_t mark);",
+            "int32_t retichat_message_set_distro_group_sync(uint64_t msg, const char *sync_json, const char *d_hex, const char *device_hex);",
         ] {
             assert!(flat.contains(declaration), "the header lacks: {declaration}");
         }
@@ -2780,6 +2828,7 @@ mod distro_outbox_bridge_tests {
         let _: extern "C" fn() -> u64 = retichat_interface_up_mark;
         let _: extern "C" fn(u64) -> i32 = retichat_interface_came_up_since;
         let _: extern "C" fn(u64, *const c_char, *const c_char, i64, *const c_char) -> i32 = retichat_message_set_distro_channel_sync;
+        let _: extern "C" fn(u64, *const c_char, *const c_char, *const c_char) -> i32 = retichat_message_set_distro_group_sync;
         let _: extern "C" fn(u64, *mut u32) -> *mut u8 = retichat_message_pack;
         let _: extern "C" fn(*const u8, u32, *const u8, u32, *const u8, u32, *mut u32) -> *mut u8 = retichat_propagation_build_upload;
         let _: extern "C" fn(*const u8, u32, *mut u32) -> *mut u8 = retichat_propagation_link;
@@ -2795,6 +2844,123 @@ mod distro_outbox_bridge_tests {
         let _: extern "C" fn(*const u8, u32, *mut u32) -> *mut u8 = retichat_group_unpack_packed;
         let _: extern "C" fn(u64, *const u8, u32) -> i32 = retichat_message_set_retichat_statuses;
         let _: extern "C" fn(u64, GroupDeliveryCallback, *mut c_void) -> i32 = retichat_client_set_delivery_callback_receipt;
+    }
+
+    /// LXMF-rust's group sync vectors (GROUPS-DISTRO-DESIGN.md §17.1), the copy `group_status.rs`
+    /// checks against LXMF-rust's own.
+    const GROUP_SYNC_VECTORS: &str = include_str!("../tests/data/distro_group_sync_vectors.json");
+
+    fn group_vectors() -> serde_json::Value {
+        serde_json::from_str(GROUP_SYNC_VECTORS).expect("the group sync vectors are JSON")
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// The vectors' distro D as a handle, its `lxmf.delivery` hash and that hash in hex.
+    fn vector_distro(v: &serde_json::Value) -> (u64, [u8; 16], String) {
+        let identity = Identity::from_bytes(&unhex(v["distro"]["private_key_hex"].as_str().unwrap())).unwrap();
+        let handle = rns::store_handle(identity);
+        let mut delivery = [0u8; 16];
+        assert_eq!(retichat_distro_delivery_hash(handle, delivery.as_mut_ptr(), 16), 16);
+        assert_eq!(hex(&delivery), v["distro"]["lxmf_delivery_hash_hex"].as_str().unwrap());
+        (handle, delivery, hex(&delivery))
+    }
+
+    fn unwrap_json(handle: u64, blob: &[u8]) -> serde_json::Value {
+        let mut len = 0u32;
+        let ptr = retichat_distro_unwrap(handle, blob.as_ptr(), blob.len() as u32, &mut len);
+        serde_json::from_slice(&take(ptr, len)).expect("the unwrap JSON")
+    }
+
+    /// GROUPS-DISTRO-DESIGN.md §7, §17.2, §19.1: the C unwrap runs this crate's group receipt. M's
+    /// accept to D, M unknown here, carrying M's key, is validated under it, with M's key and the
+    /// packed copy; the same accept signed by another key is invalid (2); a plain post has neither.
+    #[test]
+    fn the_distro_unwrap_through_the_c_api_runs_the_group_receipt() {
+        let v = group_vectors();
+        let (handle, _, _) = vector_distro(&v);
+        let member_key = v["member"]["public_key_hex"].as_str().unwrap();
+        for (name, key, packed, verdict) in [
+            ("member_accept_legacy", Some(member_key), true, (true, 0)),
+            ("member_accept_forged", Some(member_key), true, (false, 2)),
+            ("member_post_legacy", None, false, (false, 1)),
+            ("member_invite_retichat_field", None, false, (false, 1)),
+        ] {
+            let vector = v["sealed"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap();
+            let out = unwrap_json(handle, &unhex(vector["blob_hex"].as_str().unwrap()));
+            assert_eq!(out["sender_key"].as_str(), key, "{name}: sender_key");
+            if packed {
+                let b64 = out["packed"].as_str().unwrap_or_else(|| panic!("{name}: packed is null"));
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+                assert_eq!(hex(&bytes), vector["packed_hex"].as_str().unwrap(), "{name}: packed");
+            } else {
+                assert!(out["packed"].is_null(), "{name}: packed");
+            }
+            assert_eq!(
+                (out["signature_validated"].as_bool().unwrap(), out["unverified_reason"].as_u64().unwrap()),
+                verdict,
+                "{name}: the receipt's verdict"
+            );
+            assert_eq!(out["hash"], vector["hash_hex"], "{name}");
+            assert_eq!(out["group_id"], vector["expected"]["group_id"], "{name}");
+        }
+    }
+
+    fn set_g(msg: u64, sync_json: &str, d_hex: &str, device: &str) -> i32 {
+        let (json, d, device) = (CString::new(sync_json).unwrap(), CString::new(d_hex).unwrap(), CString::new(device).unwrap());
+        retichat_message_set_distro_group_sync(msg, json.as_ptr(), d.as_ptr(), device.as_ptr())
+    }
+
+    /// RFed SPEC §17.14: each op of the vectors, written through the C function on a message from
+    /// D to D, packs to the fields Python packed (the timestamp is the clock's, so only the fields
+    /// are compared; LXMF-rust compares whole messages).
+    #[test]
+    fn g_goes_through_the_c_api_as_the_vectors_give_it() {
+        let v = group_vectors();
+        let (identity, delivery, d_hex) = vector_distro(&v);
+        let device = v["device_hex"].as_str().unwrap();
+        for op in v["ops"].as_array().unwrap() {
+            let msg = message_from(identity, &delivery);
+            assert_eq!(set_g(msg, &op["sync"].to_string(), &d_hex, device), 0, "{}: {:?}", op["name"], rns::take_error());
+            let packed = pack(msg);
+            assert!(hex(&packed).ends_with(op["fields_hex"].as_str().unwrap()), "{}: the fields Python packed", op["name"]);
+            assert_eq!(lxmf_message_destroy(msg), 0);
+        }
+    }
+
+    #[test]
+    fn g_is_refused_at_the_c_boundary_and_the_message_is_unchanged() {
+        let v = group_vectors();
+        let (identity, delivery, d_hex) = vector_distro(&v);
+        let leave = r#"{"op":"leave","group_id":"9f8e7d6c5b4a39281706f5e4d3c2b1a0","at_ms":5,"left":[]}"#;
+        let stranger = r#"{"op":"create","group_id":"9f8e7d6c5b4a39281706f5e4d3c2b1a0","at_ms":5,"name":"n","members":"abababababababababababababababab","keys":[],"left":[]}"#;
+        let msg = message_from(identity, &delivery);
+        for (json, d, device, why) in [
+            ("{", d_hex.as_str(), DEVICE, "not JSON"),
+            (r#"{"op":"leave","group_id":"9f8e7d6c5b4a39281706f5e4d3c2b1a0","at_ms":5}"#, d_hex.as_str(), DEVICE, "left is missing"),
+            (stranger, d_hex.as_str(), DEVICE, "does not name D"),
+            (leave, "xyz", DEVICE, "d_hex"),
+            (leave, d_hex.as_str(), "xyz", "0xFD"),
+        ] {
+            assert_eq!(set_g(msg, json, d, device), -1, "{why}");
+            let error = rns::take_error().unwrap_or_default();
+            assert!(error.contains(why), "{why}: {error}");
+        }
+        assert_eq!(set_g(0, leave, &d_hex, DEVICE), -1);
+        assert!(rns::take_error().unwrap_or_default().contains("invalid message handle"));
+        assert_eq!(retichat_message_set_distro_group_sync(msg, std::ptr::null(), std::ptr::null(), std::ptr::null()), -1);
+        // A refused call wrote nothing. (Not packed here: an empty message with no fields cannot be,
+        // see message_with.)
+        let message = rns::get_handle::<Arc<Mutex<lxmf_rust::lx_message::LXMessage>>>(msg).unwrap();
+        assert_eq!(message.lock().unwrap().fields, rmpv::Value::Map(Vec::new()));
+        // A message that is not from D to D is refused too.
+        let (other, other_delivery, _) = distro();
+        let not_d = message_from(other, &other_delivery);
+        assert_eq!(set_g(not_d, leave, &d_hex, DEVICE), -1);
+        assert!(rns::take_error().unwrap_or_default().contains("from D to D"));
     }
 
     /// The statuses reach a real outbound message through the C function: key 10 in the Retichat field,

@@ -6,7 +6,9 @@
 //! The same code as Retichat-android's `rust/retichat-jni/src/group_status.rs`
 //! (the two glue crates are separate, and the messages they check must not be).
 //!
-//! * [`receipt`]: what a message the router has just delivered is worth. An
+//! * [`receipt`] (and [`receipt_parts`], the same on a message's parts, which
+//!   [`distro_unwrap_json`] runs on what the distro unwrap rebuilt, RFed SPEC
+//!   §17.14): what a message the router has just delivered is worth. An
 //!   accept or leave carries its sender's own key (`GROUP_MEMBER_KEYS`, one
 //!   `hash:base64-public-key` entry). It is bound as an invite chunk's key is:
 //!   the key's `lxmf.delivery` destination must be the entry's hash, and the
@@ -198,15 +200,26 @@ fn valid_under(packed: &[u8], destination: &Destination) -> Option<bool> {
 /// * the packed message is reported when it is no longer than
 ///   [`STATUS_PACKED_LIMIT`].
 pub fn receipt(msg: &LXMessage, validated: bool, reason: u8) -> Receipt {
+    receipt_of(&msg.fields, &msg.source_hash, msg.packed.as_deref(), validated, reason)
+}
+
+/// [`receipt`] on a message's parts: its fields, its LXMF source and the packed message as received
+/// (`destination | source | signature | payload`). For a message no router unpacked: the distro
+/// unwrap (GROUPS-DISTRO-DESIGN.md §7, §17.2) has these, not an `LXMessage`.
+pub fn receipt_parts(fields: &Value, source_hash: &[u8], packed: &[u8], validated: bool, reason: u8) -> Receipt {
+    receipt_of(fields, source_hash, Some(packed), validated, reason)
+}
+
+fn receipt_of(fields: &Value, source_hash: &[u8], whole: Option<&[u8]>, validated: bool, reason: u8) -> Receipt {
     let plain = Receipt { validated, unverified_reason: reason, sender_key: None, packed: None };
-    if !is_accept_or_leave(&msg.fields) {
+    if !is_accept_or_leave(fields) {
         return plain;
     }
-    let packed = msg.packed.as_ref().filter(|packed| packed.len() <= STATUS_PACKED_LIMIT).cloned();
-    let Some((key, destination)) = carried_key(&msg.fields, &msg.source_hash) else {
+    let packed = whole.filter(|packed| packed.len() <= STATUS_PACKED_LIMIT).map(<[u8]>::to_vec);
+    let Some((key, destination)) = carried_key(fields, source_hash) else {
         return Receipt { packed, ..plain };
     };
-    let (validated, reason) = match (validated, reason, msg.packed.as_deref()) {
+    let (validated, reason) = match (validated, reason, whole) {
         (false, SOURCE_UNKNOWN, Some(whole)) => match valid_under(whole, &destination) {
             Some(true) => (true, VALIDATED),
             Some(false) => (false, SIGNATURE_INVALID),
@@ -216,6 +229,37 @@ pub fn receipt(msg: &LXMessage, validated: bool, reason: u8) -> Receipt {
         other => (other.0, other.1),
     };
     Receipt { validated, unverified_reason: reason, sender_key: Some(key), packed }
+}
+
+/// The JSON of the distro unwrap (`retichat_distro_unwrap`; RFed SPEC §17.14, GROUPS-DISTRO-DESIGN.md
+/// §7, §17.2): `lxmf_rust::distro::unwrap_blob`, then [`receipt_parts`] on the message it rebuilt
+/// (its fields map, an empty one when it has none; its source; its packed bytes; its own verdict),
+/// reported by `DistroMessage::to_json_with_receipt`, the one definition of the keys. So an accept
+/// or leave from a member whose key this device does not hold is decided under the key it carries,
+/// as on the direct path, and a creator gets the packed copy it keeps. Nothing is remembered here.
+/// `Ok(None)` for a blob addressed to another distro.
+pub fn distro_unwrap_json(distro: &mut Identity, blob: &[u8]) -> Result<Option<String>, String> {
+    let Some(message) = lxmf_rust::distro::unwrap_blob(distro, blob)? else {
+        return Ok(None);
+    };
+    let fields = match message.fields.as_deref() {
+        // unwrap_blob has read these bytes as a map already, so they decode.
+        Some(bytes) => rmpv::decode::read_value(&mut Cursor::new(bytes)).unwrap_or_else(|_| Value::Map(Vec::new())),
+        None => Value::Map(Vec::new()),
+    };
+    let r = receipt_parts(
+        &fields,
+        &message.source_hash,
+        &message.packed,
+        message.signature_validated,
+        message.unverified_reason.unwrap_or(VALIDATED),
+    );
+    Ok(Some(message.to_json_with_receipt(&lxmf_rust::distro::DistroReceipt {
+        validated: r.validated,
+        unverified_reason: r.unverified_reason,
+        sender_key: r.sender_key,
+        packed: r.packed,
+    })))
 }
 
 /// An element of a `status`, unpacked and checked as if it had arrived
@@ -879,5 +923,103 @@ mod tests {
         let mut short = flat.clone();
         short.pop();
         assert!(decode_elements(&short).is_err(), "a last element that stops short");
+    }
+}
+
+/// GROUPS-DISTRO-DESIGN.md §7, §17.2, §19.1: the distro unwrap runs this crate's group receipt,
+/// checked against LXMF-rust's group sync vectors (`tests/data/distro_group_sync_vectors.json`,
+/// made with the Python reference by LXMF-rust `tests/distro_group_sync_vectors.py`).
+#[cfg(test)]
+mod distro_unwrap_tests {
+    use super::*;
+    use serde_json::Value as Json;
+
+    const VECTORS: &str = include_str!("../tests/data/distro_group_sync_vectors.json");
+
+    fn vectors() -> Json {
+        serde_json::from_str(VECTORS).expect("the vectors are JSON")
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    fn distro(v: &Json) -> Identity {
+        Identity::from_bytes(&unhex(v["distro"]["private_key_hex"].as_str().unwrap())).unwrap()
+    }
+
+    /// The copy here is LXMF-rust's own file: its working tree's once the vectors are merged there,
+    /// else the one committed on its `group-distro` branch. Neither found fails the test rather
+    /// than skipping it: a skipped contract check reads as a pass.
+    #[test]
+    fn the_copy_of_the_group_sync_vectors_here_is_the_one_lxmf_rust_has() {
+        let lxmf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../LXMF-rust");
+        let tree = lxmf.join("tests/distro_group_sync_vectors.json");
+        let theirs = if tree.exists() {
+            std::fs::read_to_string(&tree).expect("LXMF-rust's vectors are readable")
+        } else {
+            let shown = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&lxmf)
+                .args(["show", "group-distro:tests/distro_group_sync_vectors.json"])
+                .output()
+                .expect("git runs");
+            assert!(shown.status.success(), "the vectors are in neither {} nor LXMF-rust's group-distro branch", tree.display());
+            String::from_utf8(shown.stdout).expect("the vectors are UTF-8")
+        };
+        assert_eq!(theirs, VECTORS, "tests/data/distro_group_sync_vectors.json is not LXMF-rust's: copy it again");
+    }
+
+    /// Every sealed vector: the unwrap's hash and group keys, and the receipt's key, packed copy
+    /// and verdict. M is not known here; nothing is remembered.
+    #[test]
+    fn the_distro_unwrap_reports_the_group_receipts_key_packed_copy_and_verdict() {
+        let v = vectors();
+        let mut d = distro(&v);
+        let member = unhex(v["member"]["lxmf_delivery_hash_hex"].as_str().unwrap());
+        assert!(Identity::recall(&member).is_none(), "M is unknown here");
+        let sealed = v["sealed"].as_array().unwrap();
+        assert_eq!(sealed.len(), 5);
+        for vector in sealed {
+            let name = vector["name"].as_str().unwrap();
+            let expected = &vector["expected"];
+            let json = distro_unwrap_json(&mut d, &unhex(vector["blob_hex"].as_str().unwrap())).unwrap().expect("a blob for D");
+            let out: Json = serde_json::from_str(&json).unwrap();
+            assert_eq!(out["hash"], vector["hash_hex"], "{name}: hash");
+            assert_eq!(out["sender_key"], expected["sender_key_hex"], "{name}: sender_key");
+            if expected["packed"].as_bool().unwrap() {
+                let packed = base64::engine::general_purpose::STANDARD.decode(out["packed"].as_str().unwrap()).unwrap();
+                assert_eq!(packed, unhex(vector["packed_hex"].as_str().unwrap()), "{name}: packed");
+            } else {
+                assert!(out["packed"].is_null(), "{name}: packed");
+            }
+            assert_eq!(out["signature_validated"], expected["signature_validated"], "{name}");
+            assert_eq!(out["unverified_reason"], expected["unverified_reason"], "{name}");
+            for key in ["has_group_id", "group_id", "group_action", "group_name", "group_sync"] {
+                assert_eq!(out[key], expected[key], "{name}: {key}");
+            }
+        }
+        assert!(Identity::recall(&member).is_none(), "the app remembers M's key, after its group rule passes");
+        // A blob for another distro is no message.
+        let blob = unhex(sealed[1]["blob_hex"].as_str().unwrap());
+        assert_eq!(distro_unwrap_json(&mut Identity::new(true), &blob).unwrap(), None);
+    }
+
+    /// `receipt_parts` is `receipt` on the parts of the message the router would have unpacked.
+    #[test]
+    fn receipt_parts_is_receipt_on_the_parts() {
+        let v = vectors();
+        for vector in v["sealed"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let packed = unhex(vector["packed_hex"].as_str().unwrap());
+            let msg = LXMessage::unpack_from_bytes(&packed, None).unwrap();
+            for (validated, reason) in [(false, SOURCE_UNKNOWN), (true, VALIDATED), (false, SIGNATURE_INVALID)] {
+                assert_eq!(
+                    receipt_parts(&msg.fields, &msg.source_hash, &packed, validated, reason),
+                    receipt(&msg, validated, reason),
+                    "{name} {reason}"
+                );
+            }
+        }
     }
 }

@@ -912,6 +912,15 @@ int32_t retichat_distro_delivery_hash(uint64_t distro_handle,
 /// signature_validated + unverified_reason (0 ok, 1 source unknown, 2 invalid)
 /// decide whether to accept the name (DISPLAY_NAMES.md §5.2).
 ///
+/// Also (RFed SPEC §17.14, GROUPS-DISTRO-DESIGN.md §7): fields (base64 or null),
+/// hash (64 hex, the LXMF message hash), has_group_id (bool), group_id,
+/// group_action, group_name (string or null), group_sync (null, or
+///   { by, problem, op, group_id, at_ms, name, members, keys, creator, text, left }),
+/// sender_key (128 hex or null) and packed (base64 or null). The bridge's group
+/// receipt runs on the rebuilt message, so signature_validated/unverified_reason
+/// are its verdict: an accept or leave from a source whose key is not held is
+/// decided under the key it carries.
+///
 /// A ZERO-LENGTH result is not an error: it means the blob is addressed to a
 /// different distro, which a node may legitimately hand over.
 ///
@@ -964,6 +973,23 @@ int32_t retichat_message_set_distro_channel_sync(uint64_t msg,
                                                  const char *name,
                                                  int64_t at_ms,
                                                  const char *device_hex);
+
+/// Write the group sync G's fields on an outbound message from D to D made by
+/// retichat_message_create (RFed SPEC §17.14): 0x0C an empty bin, 0xFB
+/// "rfed.distro.group", 0xFC the native array of the op, 0xFD the sending
+/// device's own address. sync_json is the unwrap's group_sync object without
+/// by and problem: {"op", "group_id", "at_ms", "name", "members", "keys",
+/// "creator", "text", "left"}, absent or null where the op has none. d_hex is
+/// D's lxmf.delivery address (32 hex). Returns 0, or -1 (rns_last_error) with
+/// the message unchanged when the JSON does not parse, what it describes would
+/// fail a receiver's form check (members must name D, creator be listed and not
+/// D, at_ms 0..2^53-1, left at most 32 ids of 32 hex), d_hex or device_hex is
+/// not 32 hex characters, or the message is not from D to D, has a title or
+/// content, a group field (0xD1, 0xA0-0xA8) or an attachment.
+int32_t retichat_message_set_distro_group_sync(uint64_t msg,
+                                               const char *sync_json,
+                                               const char *d_hex,
+                                               const char *device_hex);
 
 /// Pack and sign an outbound message once and return its LXMF bytes
 /// (dest | src | signature | payload); lxmf_message_hash is then its hash. A

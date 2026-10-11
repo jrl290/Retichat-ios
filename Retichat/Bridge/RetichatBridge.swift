@@ -859,6 +859,26 @@ extension RetichatBridge {
         }
     }
 
+    /// Write the group sync G's fields on an outbound message from D to D
+    /// (`messageCreate`; RFed SPEC §17.14): 0x0C an empty bin, 0xFB
+    /// `rfed.distro.group`, 0xFC the op's native array, 0xFD `deviceHex`.
+    /// `syncJson` is the unwrap's `group_sync` object without `by` and
+    /// `problem` (`op`, `group_id`, `at_ms`, `left`; `name`, `members`, `keys`
+    /// for create and accept; `creator` for accept; `text` for post). `dHex` is
+    /// D's `lxmf.delivery` address. False with the error slot set, and the
+    /// message unchanged, when the JSON does not parse or a receiver's form
+    /// check would drop it (LXMF-rust `distro::set_group_sync_fields`).
+    nonisolated func messageSetDistroGroupSync(handle: UInt64, syncJson: String, dHex: String,
+                                               deviceHex: String) -> Bool {
+        syncJson.withCString { cJson in
+            dHex.withCString { cD in
+                deviceHex.withCString { cDevice in
+                    retichat_message_set_distro_group_sync(handle, cJson, cD, cDevice) == 0
+                }
+            }
+        }
+    }
+
     /// Pack and sign an outbound message once and return its LXMF bytes
     /// (`dest | src | signature | payload`); `DistroMessageFFI.hash` is then its
     /// hash. What the outbox keeps: never packed again, so every upload is one message.

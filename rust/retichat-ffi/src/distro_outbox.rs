@@ -9,6 +9,8 @@
 //!
 //! * [`set_channel_sync_fields`]: C's fields, the membership message of §17.12.
 //!   The generic field setters write str and bool only, and 0xFC is an array.
+//! * [`set_group_sync_json`]: G's fields, the group sync of §17.14, from the
+//!   bridge's JSON, by `lxmf_rust::distro` (the format is LXMF-rust's).
 //! * [`pack_message`]: pack and sign a message once. What Swift keeps is that
 //!   message, never packed again.
 //! * [`build_propagation_upload`]: the upload of a packed message, encrypted to
@@ -95,6 +97,17 @@ pub fn set_channel_sync_fields(
     );
     msg.set_field(FIELD_CUSTOM_META, Value::String(device_hex.to_ascii_lowercase().into()));
     Ok(())
+}
+
+/// Write the group sync G's fields on `msg` from the bridge's JSON (RFed SPEC §17.14,
+/// GROUPS-DISTRO-DESIGN.md §17.2): `lxmf_rust::distro::GroupSync::from_json`, then
+/// `lxmf_rust::distro::set_group_sync_fields`, which writes 0x0C an empty bin, 0xFB
+/// `"rfed.distro.group"`, 0xFC the op's native array and 0xFD `device_hex`, and refuses (the
+/// message unchanged) what a receiver's form check would drop. The format lives in LXMF-rust
+/// once, with its golden vectors; nothing of it is written here.
+pub fn set_group_sync_json(msg: &mut LXMessage, sync_json: &str, d_hex: &str, device_hex: &str) -> Result<(), String> {
+    let sync = lxmf_rust::distro::GroupSync::from_json(sync_json)?;
+    lxmf_rust::distro::set_group_sync_fields(msg, &sync, d_hex, device_hex)
 }
 
 /// Pack and sign the message behind `msg` once, and return its packed bytes:
