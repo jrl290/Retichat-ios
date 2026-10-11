@@ -683,7 +683,7 @@ func testTheReceivePaths() {
     let incoming = body(repo, "private func handleIncomingMessage(")
     check(before(incoming, "if let key = fields.distroTransferKey", "LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw)"),
           "transfers and sent copies are dropped before any name is read")
-    check(before(incoming, "guard let standing = admitGroupMessage(", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                             messageTime: timestamp)\n            handleGroupMessage("),
+    check(before(incoming, "guard case .kept(let standing, let ownAct) = admitGroupMessage(", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                             messageTime: timestamp)\n            handleGroupMessage("),
           "a group message's 0xD1 names its LXMF source, only when the group policy accepts it (audit H11), ordered by its timestamp")
     check(before(incoming, "guard allowlist.isAllowed else", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                         messageTime: timestamp)\n        storeIncomingDirect("),
           "a DM's 0xD1 is applied after the allowlist and before the bubble and notification, ordered by its timestamp")
@@ -699,8 +699,12 @@ func testTheReceivePaths() {
     check(distro.contains("applyMessageName(m.displayName, unverifiedReason: m.unverifiedReason, sourceHex: srcHex,\n                         messageTime: m.timestamp)")
             && distro.contains("signatureValid: m.unverifiedReason == 0"),
           "distro messages carry their name, signature result (audit H7) and timestamp")
-    check(repo.components(separatedBy: "applyMessageName(").count == 7,
-          "those five calls are every accept path (and the definition)")
+    // GROUPS-DISTRO-DESIGN.md §6.4: the sixth is a group message to the distro, after the same admission.
+    check(repo.components(separatedBy: "applyMessageName(").count == 8,
+          "those six calls are every accept path (and the definition)")
+    let distroGroup = body(repo, "private func handleDistroGroupArrival(")
+    check(before(distroGroup, "case .kept(let standing, let ownAct):", "applyMessageName(a.displayName, unverifiedReason: a.unverifiedReason, sourceHex: srcHex,"),
+          "a group message to the distro names its LXMF source only once the group policy keeps it")
     let apply = body(repo, "private func applyMessageName(")
     check(apply.contains("DisplayNames.acceptMessageName(field, unverifiedReason: unverifiedReason")
             && apply.contains("contact.messageName = name") && !apply.contains("localName"),
@@ -765,8 +769,8 @@ func testTheSurfaces() {
           "the pickers never list a group id or this device (audit L4)")
     let create = body(repo, "func createGroupChat(")
     check(!create.contains("ensureAllowlistedContact(destHash: groupId)")
-            && create.contains("guard memberHash != ownHashHex else { continue }"),
-          "creating a group makes no contact for its id or for this device")
+            && create.contains("guard memberHash != own else { continue }"),
+          "creating a group makes no contact for its id or for the user's own entry (the device, or the distro, §8.5)")
     check(!body(repo, "func acceptGroupInvite(").contains("ensureAllowlistedContact(destHash: groupId)"),
           "nor does accepting one")
     check(body(repo, "func createDirectChat(").contains("refreshAnnounceNameFromCache(destHash: normalizedHash)"),
@@ -817,7 +821,7 @@ func testTheSurfaces() {
     check(service.contains("DisplayNames.notificationName(") && !service.contains("senderName = msg.title"),
           "NSE titles use the resolver order and never the LXMF title (audit M3)")
     check(service.contains("messageTime: timestamp,") && service.contains("reason,\n                                            m.timestamp)))")
-            && service.contains("$0.unverifiedReason, $0.timestamp))"),
+            && service.contains("let title = contactTitle($0.senderHash, $0.displayName, $0.unverifiedReason, $0.timestamp)"),
           "each NSE title is decided with its message's timestamp, from the sync and the distro pull")
     check(service.contains("PendingNotification.readChannelSenderNames()[channelPull.channelHex]"),
           "NSE channel titles know the stored channel names")

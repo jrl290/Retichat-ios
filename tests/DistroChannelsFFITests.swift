@@ -27,6 +27,7 @@
 //     /private/tmp/claude-501/DistroInbound.swift \
 //     Retichat-ios/Retichat/Bridge/RetichatBridge.swift \
 //     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
+//     Retichat-ios/Retichat/Services/DistroGroupSync.swift \
 //     Retichat-ios/Retichat/Services/LxmfClient.swift \
 //     Retichat-ios/Retichat/Services/PendingNotification.swift \
 //     Retichat-ios/Retichat/Services/PropagationNodeManager.swift \

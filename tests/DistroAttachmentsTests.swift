@@ -17,6 +17,8 @@
 //   swiftc -o /private/tmp/claude-501/distro-attachments \
 //     /private/tmp/claude-501/DistroInbound.swift \
 //     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
+//     Retichat-ios/Retichat/Services/DeliveryPolicy.swift \
+//     Retichat-ios/Retichat/Services/DistroGroupSync.swift \
 //     Retichat-ios/tests/DistroAttachmentsTests.swift && \
 //     /private/tmp/claude-501/distro-attachments
 //

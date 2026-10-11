@@ -210,8 +210,12 @@ func anOwedMessageIsSignedByTheKeyItsSourceNames() {
     // The distro and the handle that signs as it are read together (DistroManager.signing), so a
     // generate, import or forget between two reads cannot give a source that the key does not match.
     let channel = body(runtime, "func oweChannelSync(", "func oweSentCopy(")
-    let sent = body(runtime, "func oweSentCopy(", "private func fail(")
-    for (name, text) in [("C", channel), ("sent copy", sent)] {
+    let sent = body(runtime, "func oweSentCopy(", "func oweGroupSync(")
+    // GROUPS-DISTRO-DESIGN.md §10.5: the group sync G too, and only for the D it names.
+    let group = body(runtime, "func oweGroupSync(", "private func fail(")
+    check(group.contains("guard let (distro, signer) = DistroManager.shared.signing(), distro.deliveryHashHex == groupD else {"),
+          "G: owed only while this device holds the group's own D")
+    for (name, text) in [("C", channel), ("sent copy", sent), ("G", group)] {
         check(count(text, "DistroManager.shared.signing()") == 1, "\(name): one atomic read of the distro and its handle")
         check(!text.contains("DistroManager.shared.handle") && !text.contains("DistroManager.shared.info()")
                 && !text.contains("DistroManager.shared.sendingIdentity"), "\(name): no second read")

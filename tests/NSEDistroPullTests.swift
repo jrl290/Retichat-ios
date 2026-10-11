@@ -107,7 +107,7 @@ func testTheWiring() {
     check(pull.contains("retichat_transport_wait_for_path_verified("),
           "the wait is the stack's event-driven one, not a polling loop")
     let save = pull.range(of: "PendingNotification.saveNSEDistroBlobs(blobs)")
-    let unwrap = pull.range(of: "unwrapToShow(blob, distroHandle: distroHandle)")
+    let unwrap = pull.range(of: "unwrapToShow(blob, distroHandle: distroHandle, groups: groups)")
     check(save != nil && unwrap != nil && save!.lowerBound < unwrap!.lowerBound,
           "the NSE saves every pulled blob before it unwraps any (the pull drained RFed)")
 

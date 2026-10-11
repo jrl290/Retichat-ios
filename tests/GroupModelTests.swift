@@ -248,11 +248,11 @@ func testTheReceiveWiring() {
           "a group declined or left counts as closed")
     let incoming = body(repo, "private func handleIncomingMessage(")
     check(incoming.contains("DeliveryPolicy.Signature.reason(valid: signatureValid,")
-            && before(incoming, "guard let standing = admitGroupMessage(", "handleGroupMessage("),
+            && before(incoming, "guard case .kept(let standing, let ownAct) = admitGroupMessage(", "handleGroupMessage("),
           "the router's path admits a group message by the rule, with its signature, before any write")
     let nse = body(repo, "func importNSEMessages()")
     check(nse.contains("DeliveryPolicy.Signature.reason(valid: msg.signatureValid,")
-            && before(nse, "if let standing = admitGroupMessage(", "handleGroupMessage("),
+            && before(nse, "if case .kept(let standing, let ownAct) = admitGroupMessage(", "handleGroupMessage("),
           "so does the NSE import")
     check(!repo.contains("fields.groupSender ?? srcHex"), "GROUP_SENDER is never taken as the source")
     let handle = body(repo, "private func handleGroupMessage(")
@@ -270,11 +270,12 @@ func testTheReceiveWiring() {
           "a status moves only for a listed member, never back from left, and nobody is added")
     // RFed-spec Group.md, "The privacy filter" (2026-10-06): the members pass from the user's accept, so a member's
     // accept lets it through only in a group the user joined (until then, in a pending group too: v0.1.8, James 2026-10-05).
-    check(change.contains("if accepted, src != me, chat.held == .joined { store.allow(memberHex: src) }"),
+    // GROUPS-DISTRO-DESIGN.md §9: "me" is the group's self predicate (the device, or the distro and its devices).
+    check(change.contains("if accepted, !isSelf(chat.id, src), chat.held == .joined { store.allow(memberHex: src) }"),
           "a member's own accept allowlists it only in a group the user joined")
     check(!repo.contains("func applyGroupStatus("), "the old status path is gone: the engine decides")
     let relay = body(repo, "private func handleGroupRelayRequest(")
-    check(relay.contains("GroupMemberStatuses.acceptedMembers(standing.members, selfHash: ownHashHex)")
+    check(relay.contains("standing.members, selfAddresses: standing.chat.map { groupSelf($0, rows: standing.members) } ?? [ownHashHex])")
             && relay.contains("let originalSender = groupAuthor("),
           "a relay goes to the accepted members, for the author the rule believes")
 }
@@ -283,7 +284,7 @@ func testTheInviteWiring() {
     let repo = source("Retichat/Services/ChatRepository.swift")
     let invite = body(repo, "private func handleGroupInvite(")
     check(invite.contains("let members = held ? distinct(standing.members.map(\\.hash)) : distinct(listed + [srcHex])")
-            && invite.contains("guard let hash = DeliveryPolicy.hash(memberHash), members.contains(hash), hash != ownHashHex,"),
+            && invite.contains("guard let hash = DeliveryPolicy.hash(memberHash), members.contains(hash), !selfAddresses.contains(hash),"),
           "an invite brings keys only for members on the held list, or for a new group the list it gives")
     // RFed-spec Group.md, "The privacy filter" (2026-10-06): an invite lets nobody through; the members pass from the
     // user's accept (acceptGroupInvite), and the creator's status brings back what the filter dropped before.
@@ -294,10 +295,12 @@ func testTheInviteWiring() {
     check(before(invite, "member keys only", "ctx.insert(ChatEntity(")
             && !invite.contains("existing.inviteStatus = MemberStatus.accepted"),
           "a held group keeps its list: another invite changes nobody's status")
+    // GROUPS-DISTRO-DESIGN.md §9.3: the user is a member only if listed; the self-add is gone.
     check(invite.contains("inviteStatus: memberHash == srcHex ? MemberStatus.accepted")
-            && invite.contains("distinct(listed + [srcHex, ownHashHex])")
+            && invite.contains("for memberHash in distinct(listed + [srcHex]) {")
+            && !invite.contains("distinct(listed + [srcHex, ownHashHex])")
             && invite.contains("groupStatus: \"pending\""),
-          "a new group is pending, its inviter accepted and everyone else invited")
+          "a new group is pending, its inviter accepted and everyone else invited; the user only as listed")
     check(invite.contains("names another chat: ignored"), "an invite never replaces a DM chat with the same id")
     let accept = body(repo, "func acceptGroupInvite(")
     check(before(accept, "guard missingKeys.isEmpty else", "chat.groupStatus = \"active\""),
@@ -315,16 +318,18 @@ func testDeclineLeaveAndDelete() {
             && delete.contains("deleteChatLocal(chatId: chatId)"),
           "deleting a group conversation is leaving it; a DM's is deleted here")
     let quit = body(repo, "private func quitGroup(")
-    check(quit.contains("GroupMemberStatuses.leaveTargets(rows, selfHash: ownHashHex)")
-            && quit.contains("GroupChatManager.shared.sendLeave(groupId: chatId, to: targets, from: selfHash, via: client)"),
+    check(quit.contains("GroupMemberStatuses.leaveTargets(rows, selfAddresses: groupSelf(chat, rows: rows))")
+            && quit.contains("GroupChatManager.shared.sendLeave(groupId: chatId, to: targets, as: signer, via: client)"),
           "the leave goes to every listed member that has not left")
     check(before(quit, "prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)", "deleteChatLocal(chatId: chatId)")
             && before(quit, "GroupChatManager.shared.sendLeave(", "deleteChatLocal(chatId: chatId)"),
           "the group is recorded as closed and the leave sent before the chat goes")
     let manager = source("Retichat/Services/GroupChatManager.swift")
     let leave = body(manager, "func sendLeave(")
-    check(leave.contains("createMessage(\n                to: destData, content: \"\", title: \"\", method: LxmfMethod.direct")
-            && leave.contains("GroupEnvelopes.leave(groupId: groupId, selfHex: selfHash, ownKey: ownKey)"),
+    // GROUPS-DISTRO-DESIGN.md §8.1: created as the group's own address, with its identity.
+    check(leave.contains("create(to: destData, content: \"\", as: signer)")
+            && manager.contains("RetichatBridge.shared.messageCreate(destHash: dest, sourceHash: signer.hash, content: content, title: \"\",\n                                            method: LxmfMethod.direct, identityHandle: signer.identityHandle)")
+            && leave.contains("GroupEnvelopes.leave(groupId: groupId, selfHex: signer.hex, ownKey: ownKey)"),
           "the leave is GROUP_ID, GROUP_ACTION leave and GROUP_SENDER the user, no content, and the user's own key (GroupEnvelopes)")
     let envelopes = body(source("Retichat/Services/GroupEnvelopes.swift"), "private static func control(")
     check(envelopes.contains("Entry(entry: .id, value: groupId)") && envelopes.contains("Entry(entry: .action, value: action)")
@@ -339,29 +344,29 @@ func testTheDialogs() {
     check(view.contains("Button(\"Decline Invite\", role: .destructive) {\n                            showDeclineConfirm = true")
             && view.contains("Button {\n                    showDeclineConfirm = true\n                } label: {\n                    Text(\"Decline\")"),
           "the conversation's Decline asks first")
-    check(view.contains(".confirmationDialog(GroupInviteText.declineTitle, isPresented: $showDeclineConfirm,")
+    check(view.contains(".confirmationDialog(GroupInviteText.title(distro: isDistroGroup), isPresented: $showDeclineConfirm,")
             && view.contains("repository.declineGroupInvite(groupId: chatId)"),
           "and declines on confirmation")
     check(view.contains("static let declineMessage = \"The group's members are told you declined, and you won't be able to join this group later.\""),
           "the decline dialog says the members are told and it is final")
     check(view.contains("The members are told you left, and this conversation is deleted. You won't receive future messages, and you won't be able to rejoin this group."),
           "the leave dialog says so")
-    check(view.contains("isGroup ? GroupDeleteText.title : \"Delete this conversation?\"")
-            && view.contains("Text(isGroup ? GroupDeleteText.message")
+    check(view.contains("isGroup ? GroupDeleteText.title(distro: isDistroGroup) : \"Delete this conversation?\"")
+            && view.contains("Text(isGroup ? GroupDeleteText.message(distro: isDistroGroup)")
             && view.contains("static let title = \"Delete and leave this group?\"")
             && view.contains("Deleting a group conversation leaves the group: the members are told you left, and you won't be able to rejoin it."),
           "a group's delete dialog says it leaves the group")
     let list = source("Retichat/Views/ChatList/ChatListView.swift")
     check(list.contains("Button(role: .destructive) {\n                                                declining = chat")
-            && list.contains(".confirmationDialog(GroupInviteText.declineTitle,")
-            && list.contains("Text(GroupInviteText.declineMessage)"),
+            && list.contains(".confirmationDialog(GroupInviteText.title(distro: declining?.isDistroGroup ?? false),")
+            && list.contains("Text(GroupInviteText.message(distro: chat.isDistroGroup))"),
           "the chat list's Decline asks first, with the same words")
 }
 
 func testPendingGroupOpensNoLinks() {
     let repo = source("Retichat/Services/ChatRepository.swift")
     let open = body(repo, "func openConversation(chatId: String)")
-    check(open.contains("GroupMemberStatuses.conversationPeers(rows, selfHash: ownHashHex, held: held)")
+    check(open.contains("GroupMemberStatuses.conversationPeers(rows, selfAddresses: groupSelf(chat, rows: rows), held: held)")
             && open.contains("openedGroupPeers[chatId] = peers"),
           "opening a group's chat opens links only once the user accepted it")
     check(body(repo, "func closeConversation(chatId: String)").contains("openedGroupPeers.removeValue(forKey: chatId)"),

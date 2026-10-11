@@ -770,7 +770,8 @@ func theWiringDecidesInOnePlaceAndStartsNoTimerAndRetriesNothing() {
     checkEqual(code.components(separatedBy: "store.setMemberStatus(").count - 1, 1, "a member is moved in one place")
     checkEqual(code.components(separatedBy: "store.putCopy(").count - 1, 1, "a copy is kept in one place")
     checkEqual(code.components(separatedBy: "answer(chat, memberHex, statuses)").count - 1, 1, "a status is sent in one place, once")
-    check(code.contains("guard chat.creatorHex == me else { return }"), "only the creator answers")
+    // GROUPS-DISTRO-DESIGN.md §9.4: the creator is any address of the user's in the group (D on every device of D).
+    check(code.contains("guard let creator = chat.creatorHex, isSelf(chat.id, creator) else { return }"), "only the creator answers")
     check(code.contains("if counted, arrival.action == GroupAction.accept, arrival.senderKey != nil {\n            answerAccept("),
           "only an accept that counted and carries a binding key is answered")
 
@@ -786,7 +787,10 @@ func theWiringDecidesInOnePlaceAndStartsNoTimerAndRetriesNothing() {
     check(standing.contains("sourceIsCreator: chat?.creatorHash != nil && chat?.creatorHash == sourceHex"),
           "a group whose creator is not recorded has no creator")
     // The creator is recorded where the group is made.
-    check(body(repo, "func createGroupChat(", "func archiveChat(").contains("creatorHash: ownHashHex"), "this device's own hash for a group it creates")
+    // §8.5: the group's own address, D when this device holds it, else the device.
+    check(body(repo, "func createGroupChat(", "func archiveChat(").contains("creatorHash: own,")
+            && body(repo, "func createGroupChat(", "func archiveChat(").contains("let own = signer.hex"),
+          "the group's own address for a group it creates")
     check(body(repo, "private func handleGroupInvite(", "private func insertGroupMemberLine").contains("groupStatus: \"pending\", creatorHash: srcHex"),
           "the invite's source for a group it is invited into")
     // Keys that may unlock what was held.
@@ -799,10 +803,10 @@ func theWiringDecidesInOnePlaceAndStartsNoTimerAndRetriesNothing() {
     // The status is sent once, off the main thread, by the group manager.
     check(repo.contains("GroupChatManager.shared.sendStatus(groupId: groupId, to: member, statuses: statuses,"), "the answer is GroupChatManager.sendStatus")
     let manager = source("Retichat/Services/GroupChatManager.swift")
-    check(body(manager, "func sendAccept(").contains("GroupEnvelopes.accept(groupId: groupId, selfHex: selfHash, ownKey: ownKey)"),
+    check(body(manager, "func sendAccept(").contains("GroupEnvelopes.accept(groupId: groupId, selfHex: signer.hex, ownKey: ownKey)"),
           "an accept carries the user's own key")
     let status = body(manager, "func sendStatus(")
-    check(before(status, "GroupEnvelopes.status(groupId: groupId, selfHex: selfHash)", "messageSetRetichatStatuses(handle: handle, elements: statuses)")
+    check(before(status, "GroupEnvelopes.status(groupId: groupId, selfHex: signer.hex)", "messageSetRetichatStatuses(handle: handle, elements: statuses)")
             && before(status, "messageSetRetichatStatuses(handle: handle, elements: statuses)", "destroyAfterSend(client: client, handle: handle)")
             && status.contains("LxmfClient.messageDestroy(handle)\n            return"),
           "a status that cannot be built is not sent")

@@ -13,6 +13,9 @@
 //
 //   swiftc -o /private/tmp/claude-501/chat-swipe \
 //     Retichat-ios/Retichat/Views/ChatList/ChatSwipe.swift \
+//     Retichat-ios/Retichat/Services/DeliveryPolicy.swift \
+//     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
+//     Retichat-ios/Retichat/Services/DistroGroupSync.swift \
 //     Retichat-ios/tests/ChatSwipeTests.swift && \
 //     /private/tmp/claude-501/chat-swipe
 //
@@ -60,17 +63,44 @@ func testTheWiring() {
           "a group's Delete only asks: nothing happens before the confirmation")
     check(span(swipe, from: "case .archive:", to: "}\n                                    }").contains("repository.archiveChat(chatId: chat.id)"),
           "a direct chat's Delete archives it")
-    let dialog = span(list, from: ".confirmationDialog(GroupDeleteText.title,", to: "Text(GroupDeleteText.message)")
+    let dialog = span(list, from: ".confirmationDialog(GroupDeleteText.title(distro: leaving?.isDistroGroup ?? false),",
+                      to: "Text(GroupDeleteText.message(distro: chat.isDistroGroup))")
     check(dialog.contains("presenting: leaving") && dialog.contains("repository.deleteChat(chatId: chat.id)")
             && dialog.contains("Button(\"Cancel\", role: .cancel) { leaving = nil }"),
           "confirmed, it deletes the group through deleteChat (quitGroup), as the chat info's Delete")
     let view = source("Retichat/Views/Conversation/ConversationView.swift")
-    check(view.contains(".confirmationDialog(isGroup ? GroupDeleteText.title : \"Delete this conversation?\"")
-            && view.contains("Text(isGroup ? GroupDeleteText.message")
+    check(view.contains(".confirmationDialog(isGroup ? GroupDeleteText.title(distro: isDistroGroup) : \"Delete this conversation?\"")
+            && view.contains("Text(isGroup ? GroupDeleteText.message(distro: isDistroGroup)")
             && view.contains("onDelete: {\n                        repository.deleteChat(chatId: chatId)"),
           "the chat info's Delete uses the same words and the same deleteChat")
     check(view.contains("static let message = \"Deleting a group conversation leaves the group: the members are told you left, and you won't be able to rejoin it. All messages will be permanently deleted.\""),
           "the words say the members are told and it is final")
+}
+
+/// GROUPS-DISTRO-DESIGN.md §8.7: a group whose own address is a distro this device does not
+/// hold (or not yet) offers no Accept, Decline or leave; its Delete asks, then removes it from
+/// this device only (deleteGroupFromThisDevice: no leave, no group sync).
+func testAGroupThisDeviceCannotActIn() {
+    check(ChatSwipe.of(isGroup: true, isPendingInvite: false, cannotAct: true) == .deleteFromThisDevice,
+          "§8.7: a joined group this device cannot sign for only deletes from this device")
+    check(ChatSwipe.of(isGroup: true, isPendingInvite: true, cannotAct: true) == .deleteFromThisDevice,
+          "§8.7: a pending invite this device cannot sign for offers no Accept or Decline")
+    check(ChatSwipe.of(isGroup: false, isPendingInvite: false, cannotAct: true) == .archive,
+          "a direct chat is unaffected")
+    check(ChatSwipe.of(isGroup: true, isPendingInvite: false, cannotAct: false) == .leaveGroup,
+          "a group this device can act in still leaves (after asking)")
+    let list = source("Retichat/Views/ChatList/ChatListView.swift")
+    check(list.contains("cannotAct: chat.cannotActText != nil) {"), "the swipe asks the chat whether this device can act")
+    let swipe = span(list, from: "case .deleteFromThisDevice:", to: "}\n                                    }")
+    check(swipe.contains("deletingHere = chat") && !swipe.contains("deleteChat") && !swipe.contains("deleteGroupFromThisDevice"),
+          "its Delete only asks: nothing happens before the confirmation")
+    let dialog = span(list, from: ".confirmationDialog(GroupSelf.deleteLocalTitle + \"?\",", to: "Text(GroupSelf.deleteLocalMessage)")
+    check(dialog.contains("presenting: deletingHere") && dialog.contains("repository.deleteGroupFromThisDevice(chatId: chat.id)")
+            && !dialog.contains("repository.deleteChat("),
+          "confirmed, it deletes the group from this device only, never through deleteChat (quitGroup)")
+    check(GroupSelf.deleteLocalTitle == "Delete from this device"
+            && GroupSelf.deleteLocalMessage == "This removes the group from this device only. You stay in the group on your other devices and for the other members.",
+          "§8.7's words, exactly")
 }
 
 @main
@@ -78,6 +108,7 @@ struct ChatSwipeTestsMain {
     static func main() {
         testTheChoice()
         testTheWiring()
+        testAGroupThisDeviceCannotActIn()
         if failures.isEmpty {
             print("all chat swipe tests passed")
             exit(0)
