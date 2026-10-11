@@ -20,13 +20,15 @@ nonisolated enum ChatSwipe: Equatable {
     case leaveGroup
     /// A direct chat: Delete archives it, as before.
     case archive
-    /// A group whose own address is a distro this device does not hold, or not yet
-    /// (GROUPS-DISTRO-DESIGN.md §8.7): no Accept, Decline or leave from here; Delete asks
-    /// first, then removes it from this device only (ChatRepository.deleteGroupFromThisDevice).
+    /// A group that uses a distro address no longer on this device (GROUPS-DISTRO-DESIGN.md
+    /// §8.7; James, 2026-10-11): no Accept, Decline or leave from here; Delete asks first, then
+    /// removes it from this device only (ChatRepository.deleteGroupFromThisDevice). Never at
+    /// start-up: the list then offers a group's usual actions, greyed
+    /// (Chat.groupActionsWait).
     case deleteFromThisDevice
 
-    static func of(isGroup: Bool, isPendingInvite: Bool, cannotAct: Bool = false) -> ChatSwipe {
-        if isGroup && cannotAct { return .deleteFromThisDevice }
+    static func of(isGroup: Bool, isPendingInvite: Bool, formerDistro: Bool = false) -> ChatSwipe {
+        if isGroup && formerDistro { return .deleteFromThisDevice }
         if isPendingInvite { return .invite }
         return isGroup ? .leaveGroup : .archive
     }

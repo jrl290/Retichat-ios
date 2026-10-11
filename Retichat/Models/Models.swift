@@ -253,10 +253,14 @@ struct Chat: Identifiable {
     /// (GROUPS-DISTRO-DESIGN.md §8.1): its decline, leave and delete act on all the user's
     /// devices (§13).
     var isDistroGroup: Bool = false
-    /// §8.7: why this device cannot act in the group (its D is not held here, or not loaded
-    /// yet): the composer, accept, decline and leave are disabled with this text, and only
-    /// "Delete from this device" is offered. Nil when it can.
-    var cannotActText: String? = nil
+    /// GROUPS-DISTRO-DESIGN.md §8.7 (James, 2026-10-11): the app is starting, or the distro this
+    /// group uses is still being read: Accept, Decline, Leave and Delete are greyed, with no
+    /// text, and a post waits as a DM does. Never "Delete from this device" then.
+    var groupActionsWait: Bool = false
+    /// §8.7: the group uses a distro address no longer on this device: this text, in a bar in
+    /// place of the composer, Accept, Decline and Leave, with "Delete from this device". Nil
+    /// otherwise.
+    var formerDistroText: String? = nil
 
     var isPendingInvite: Bool { groupStatus == "pending" }
 }

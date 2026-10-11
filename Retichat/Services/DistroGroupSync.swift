@@ -371,7 +371,8 @@ nonisolated enum GroupSelf {
         case device
         /// D, the distro this device holds now, loaded, equal to the group's own address.
         case distro(String)
-        /// D is held but not loaded yet (start-up): nothing is offered until it is (§8.7).
+        /// The Keychain has not said yet what this device holds (start-up, a launch before the
+        /// first unlock): nobody signs yet, and the group is in start-up (§8.7).
         case distroNotLoaded(String)
         /// The group's own address is a distro this device does not hold (§8.7).
         case formerDistro(String)
@@ -387,16 +388,46 @@ nonisolated enum GroupSelf {
         return .formerDistro(own)
     }
 
-    /// §8.7's text for a D-group this device cannot sign for. The not-loaded text is shared by
-    /// the three clients (decided 2026-10-11).
-    static func cannotSignText(_ signer: Signer) -> String? {
-        switch signer {
-        case .device, .distro: return nil
-        case .formerDistro(let d):
-            return "This group uses your distro address \(short(d)), which this device no longer holds. You can read it here, but cannot post or change your membership from this device."
-        case .distroNotLoaded:
-            return "Your distro address hasn't loaded on this device yet. You can post and change your membership once it has."
+    /// What this device offers in a group now (§8.7; James, 2026-10-11). UI texts never describe
+    /// the stack, the signer or the distro identity's loading: start-up shows nothing.
+    enum Ability: Equatable, Sendable {
+        /// Posts go; Accept, Decline, Leave and Delete are offered.
+        case acts
+        /// Start-up: the start has not finished, or the distro this group uses is still being
+        /// read from the Keychain. No text anywhere; Accept, Decline, Leave and Delete are greyed;
+        /// a post waits as a DM does (held, sent when the start finishes, failed if it can no
+        /// longer be signed then); "Delete from this device" is never offered.
+        case starting
+        /// The group uses a distro address no longer on this device: the composer, Accept,
+        /// Decline and Leave are replaced by the bar (`formerDistroText`) and "Delete from this
+        /// device".
+        case formerDistro(String)
+
+        /// Whether the group's Accept, Decline, Leave and Delete are greyed.
+        var waits: Bool { self == .starting }
+
+        /// The bar's text, for a former distro only.
+        var formerDistroText: String? {
+            if case .formerDistro(let d) = self { return GroupSelf.formerDistroText(d) }
+            return nil
         }
+    }
+
+    /// `started`: the start finished (the stack is held and the send gate open). Before it, every
+    /// group is in start-up, whatever its signer: a former distro is never shown at start-up.
+    static func ability(_ signer: Signer, started: Bool) -> Ability {
+        guard started else { return .starting }
+        switch signer {
+        case .device, .distro: return .acts
+        case .distroNotLoaded: return .starting
+        case .formerDistro(let d): return .formerDistro(d)
+        }
+    }
+
+    /// §8.7's text for a group whose distro is no longer on this device: the only text this
+    /// section adds, the same words on every client (James, 2026-10-11).
+    static func formerDistroText(_ distro: String) -> String {
+        "This group uses your distro address \(short(distro)), which is no longer on this device. New messages in it don't reach this device, and you can't post, join or leave from here. Import that distro again to use the group here."
     }
 
     /// "Delete from this device" (§8.7): the group's own address is a distro this device does
@@ -404,39 +435,12 @@ nonisolated enum GroupSelf {
     static let deleteLocalTitle = "Delete from this device"
     static let deleteLocalMessage = "This removes the group from this device only. You stay in the group on your other devices and for the other members."
 
-    /// §8.7, "If D is held but not yet loaded (start-up), group actions as D are not offered
-    /// until it is": what the new-group form says when a group cannot be created yet. Nothing
-    /// is queued or retried. (The design gives no wording for this case; this one is shared by
-    /// the three clients, decided 2026-10-11.)
-    static let createNotReadyText = "Your distro address hasn't loaded on this device yet. Create the group once it has."
-
-    /// What the new-group form says while the stack is not running: no invite could be signed or
-    /// sent, so no group is written (it would list members nobody invited). Nothing is queued.
-    static let createNotRunningText = "Retichat isn't running on this device right now. Create the group once it is."
-
-    /// Why a group cannot be created now.
-    enum CreateRefusal: Error, Equatable, Sendable {
-        /// The stack is starting, stopped, or failed to start.
-        case notRunning
-        /// The distro this device may hold has not loaded yet (§8.7).
-        case distroNotLoaded
-
-        var text: String {
-            switch self {
-            case .notRunning: return GroupSelf.createNotRunningText
-            case .distroNotLoaded: return GroupSelf.createNotReadyText
-            }
-        }
-    }
-
-    /// §8.5, §8.7: nil when a group can be created now (as D when `distroLoaded`, else as the
-    /// device), otherwise why not: first a stack that is not running (`stackRunning`: the start
-    /// finished, so an invite can be signed and sent), then a distro that may be held but has not
-    /// loaded (`distroSettled` false: the Keychain has not said yet what this device holds).
-    static func createRefusal(stackRunning: Bool, distroLoaded: Bool, distroSettled: Bool) -> CreateRefusal? {
-        if !stackRunning { return .notRunning }
-        if !distroLoaded && !distroSettled { return .distroNotLoaded }
-        return nil
+    /// §8.1, §8.7: whether New group › Create is offered: once the start finished (an invite can
+    /// be signed and sent, so no group is written listing members nobody invited) and the
+    /// Keychain has said what this device holds (`distroLoaded`: created as D; else settled:
+    /// created as the device). Otherwise it is greyed, with no text, and nothing is queued.
+    static func canCreate(started: Bool, distroLoaded: Bool, distroSettled: Bool) -> Bool {
+        started && (distroLoaded || distroSettled)
     }
 
     /// The subject of a known sibling's own join or leave line (decided 2026-10-11, the same on
@@ -457,7 +461,8 @@ nonisolated enum GroupSelf {
         return otherDeviceSubject
     }
 
-    static func short(_ hex: String) -> String { String(hex.prefix(8)) }
+    /// The first 8 hex characters of an address, then "…" (U+2026), as every client shows it (§8.7).
+    static func short(_ hex: String) -> String { String(hex.prefix(8)) + "…" }
 }
 
 // MARK: - §6.3's first three rules

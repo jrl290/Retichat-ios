@@ -81,7 +81,7 @@ func testTheWiring() {
             && send.contains("channelClient.sendMessage(content: content, toChannel: ch)"),
           "every send path (DMs, groups, channel posts) sends the trimmed text")
     check(source("Retichat/Services/ChatRepository.swift").contains(
-            "func sendMessage(chatId: String, content: String, attachments: [(String, Data)] = []) {\n        let content = content.trimmingCharacters(in: .whitespacesAndNewlines)"),
+            "func sendMessage(chatId: String, content: String, attachments: [(String, Data)] = []) -> Bool {\n        let content = content.trimmingCharacters(in: .whitespacesAndNewlines)"),
           "and the repository trims what it is given too")
 }
 

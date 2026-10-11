@@ -60,8 +60,8 @@ struct ChatListView: View {
     /// The group whose Delete was swiped: it asks first, since deleting a
     /// group conversation leaves the group, for good (ChatSwipe.leaveGroup).
     @State private var leaving: Chat?
-    /// The group whose Delete was swiped where this device cannot act in it
-    /// (ChatSwipe.deleteFromThisDevice): it asks first, then removes it here only.
+    /// The group whose Delete was swiped where it uses a distro no longer on this
+    /// device (ChatSwipe.deleteFromThisDevice): it asks first, then removes it here only.
     @State private var deletingHere: Chat?
 
     private var showsStatusLine: Bool {
@@ -185,27 +185,32 @@ struct ChatListView: View {
                                         selectedChatId = chat.id
                                     }
                                     .swipeActions(edge: .trailing) {
+                                        // GROUPS-DISTRO-DESIGN.md §8.7 (James, 2026-10-11): while the
+                                        // app is starting a group's actions are greyed, with no text.
                                         switch ChatSwipe.of(isGroup: chat.isGroup,
                                                             isPendingInvite: chat.isPendingInvite,
-                                                            cannotAct: chat.cannotActText != nil) {
+                                                            formerDistro: chat.formerDistroText != nil) {
                                         case .invite:
                                             Button(role: .destructive) {
                                                 declining = chat
                                             } label: {
                                                 Label("Decline", systemImage: "xmark")
                                             }
+                                            .disabled(chat.groupActionsWait)
                                             Button {
                                                 repository.acceptGroupInvite(groupId: chat.id)
                                             } label: {
                                                 Label("Accept", systemImage: "checkmark")
                                             }
                                             .tint(.green)
+                                            .disabled(chat.groupActionsWait)
                                         case .leaveGroup:
                                             Button(role: .destructive) {
                                                 leaving = chat
                                             } label: {
                                                 Label("Delete", systemImage: "trash")
                                             }
+                                            .disabled(chat.groupActionsWait)
                                         case .archive:
                                             Button(role: .destructive) {
                                                 repository.archiveChat(chatId: chat.id)

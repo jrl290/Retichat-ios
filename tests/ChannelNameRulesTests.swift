@@ -254,7 +254,7 @@ func testTheFormWiring() {
           "the name filter is not duplicated in the view")
     check(view.contains("ChannelNameRules.fullName(isPrivate: isPrivate, root: privatePrefix, name: subdomain)"),
           "the joined name comes from ChannelNameRules.fullName")
-    check(view.contains(".disabled(convType == .channel && !channelCanStart)"),
+    check(view.contains(".disabled((convType == .channel && !channelCanStart)\n"),
           "Start is disabled while the channel form cannot start")
     check(view.contains("canStart = ChannelNameRules.canStart("),
           "the form reports ChannelNameRules.canStart to the Start button")

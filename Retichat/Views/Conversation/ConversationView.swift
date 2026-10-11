@@ -55,6 +55,8 @@ struct ConversationView: View {
     @State private var showChatInfo = false
     /// A decline is the user's leave, final: it asks first.
     @State private var showDeclineConfirm = false
+    /// The former-distro bar's "Delete from this device" asks first (§8.7).
+    @State private var showDeleteLocalConfirm = false
 
     /// Raw direct-link status to the DM peer, refreshed on the 3 s timer.
     /// Encoding: high byte = appLinkStatus (0..4, 0xFF = unknown),
@@ -89,12 +91,17 @@ struct ConversationView: View {
         return repository.chats.first(where: { $0.id == chatId })?.isPendingInvite ?? false
     }
 
-    /// GROUPS-DISTRO-DESIGN.md §8.7: why this device cannot post, accept, decline or leave in
-    /// this group (its own address is a distro this device does not hold, or not yet); nil
-    /// when it can.
-    private var cannotActText: String? {
+    /// GROUPS-DISTRO-DESIGN.md §8.7 (James, 2026-10-11): the bar's text when this group uses a
+    /// distro address no longer on this device; nil otherwise.
+    private var formerDistroText: String? {
         guard !isChannelMode else { return nil }
-        return repository.chats.first(where: { $0.id == chatId })?.cannotActText
+        return repository.chats.first(where: { $0.id == chatId })?.formerDistroText
+    }
+
+    /// §8.7: the app is starting: Accept and Decline are greyed, with no text (a post waits).
+    private var groupActionsWait: Bool {
+        guard !isChannelMode else { return false }
+        return repository.chats.first(where: { $0.id == chatId })?.groupActionsWait ?? false
     }
 
     /// §13: a D-group's decline, leave and delete are final on all the user's devices.
@@ -253,9 +260,9 @@ struct ConversationView: View {
                     attachmentPreview
                 }
 
-                if viewModel.isGroup, let why = cannotActText {
-                    // §8.7: the composer, accept and decline are disabled, with the reason.
-                    cannotActBar(why)
+                if viewModel.isGroup, let text = formerDistroText {
+                    // §8.7: the composer, Accept and Decline are replaced by the bar.
+                    formerDistroBar(text)
                 } else if viewModel.isGroup && isGroupPending {
                     inviteOverlay
                 } else {
@@ -292,14 +299,16 @@ struct ConversationView: View {
                         Image(systemName: "info.circle")
                             .foregroundColor(.retichatPrimary)
                     }
-                } else if isGroupPending && cannotActText == nil {
+                } else if isGroupPending && formerDistroText == nil {
                     Menu {
                         Button("Accept Invite") {
                             repository.acceptGroupInvite(groupId: chatId)
                         }
+                        .disabled(groupActionsWait)
                         Button("Decline Invite", role: .destructive) {
                             showDeclineConfirm = true
                         }
+                        .disabled(groupActionsWait)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                             .foregroundColor(.retichatPrimary)
@@ -328,6 +337,18 @@ struct ConversationView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(GroupInviteText.message(distro: isDistroGroup))
+        }
+        // §8.7: the bar's "Delete from this device": removes the group here only, no leave and
+        // no group sync, after asking.
+        .confirmationDialog(GroupSelf.deleteLocalTitle + "?", isPresented: $showDeleteLocalConfirm,
+                            titleVisibility: .visible) {
+            Button(GroupSelf.deleteLocalTitle, role: .destructive) {
+                repository.deleteGroupFromThisDevice(chatId: chatId)
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(GroupSelf.deleteLocalMessage)
         }
         .photosPicker(isPresented: $showAttachmentPicker, selection: $selectedPhotos,
                       maxSelectionCount: 5, matching: .any(of: [.images, .videos]))
@@ -699,19 +720,29 @@ struct ConversationView: View {
 
     // MARK: - Group invite overlay (DM only)
 
-    /// §8.7: in a group this device cannot sign for, the text in place of the composer and
-    /// the invite's Accept and Decline. "Delete from this device" is in the chat info.
-    private func cannotActBar(_ why: String) -> some View {
+    /// §8.7 (James, 2026-10-11): in a group that uses a distro address no longer on this device,
+    /// the bar in place of the composer and the invite's Accept and Decline: its text and
+    /// "Delete from this device", which asks first. The chat info shows the same.
+    private func formerDistroBar(_ text: String) -> some View {
         VStack(spacing: 0) {
             Divider()
-            Text(why)
-                .font(.caption)
-                .foregroundColor(.retichatOnSurfaceVariant)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity)
-                .background(Color.retichatSurface)
+            VStack(spacing: 8) {
+                Text(text)
+                    .font(.caption)
+                    .foregroundColor(.retichatOnSurfaceVariant)
+                    .multilineTextAlignment(.center)
+                Button {
+                    showDeleteLocalConfirm = true
+                } label: {
+                    Label(GroupSelf.deleteLocalTitle, systemImage: "trash")
+                        .font(.subheadline)
+                        .foregroundColor(.retichatError)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity)
+            .background(Color.retichatSurface)
         }
     }
 
@@ -722,6 +753,7 @@ struct ConversationView: View {
                 .font(.caption)
                 .foregroundColor(.retichatOnSurfaceVariant)
                 .padding(.top, 8)
+            // §8.7: greyed, with no text, while the app is starting.
             HStack(spacing: 16) {
                 Button {
                     showDeclineConfirm = true
@@ -733,6 +765,7 @@ struct ConversationView: View {
                         .cornerRadius(10)
                         .foregroundColor(.retichatOnSurface)
                 }
+                .disabled(groupActionsWait)
                 Button {
                     repository.acceptGroupInvite(groupId: chatId)
                 } label: {
@@ -743,7 +776,9 @@ struct ConversationView: View {
                         .cornerRadius(10)
                         .foregroundColor(.white)
                 }
+                .disabled(groupActionsWait)
             }
+            .opacity(groupActionsWait ? 0.4 : 1)
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
             .background(Color.retichatSurface)
@@ -813,12 +848,13 @@ struct ConversationView: View {
         let atts = pendingAttachments
         guard !content.isEmpty || !atts.isEmpty else { return }
 
-        messageText = ""
-        pendingAttachments = []
-
         switch mode {
         case .dm(let id):
-            repository.sendMessage(chatId: id, content: content, attachments: atts)
+            // §8.7 (James, 2026-10-11): a post the repository does not take (a group whose
+            // distro is no longer on this device) gets no notice; the draft stays as typed.
+            guard repository.sendMessage(chatId: id, content: content, attachments: atts) else { return }
+            messageText = ""
+            pendingAttachments = []
             viewModel.refreshMessages(chatId: id, repository: repository)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 if let lastId = viewModel.messages.last?.id {
@@ -826,6 +862,8 @@ struct ConversationView: View {
                 }
             }
         case .channel(let ch):
+            messageText = ""
+            pendingAttachments = []
             channelClient.sendMessage(content: content, toChannel: ch)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 if let lastId = channelClient.messages[ch.id]?.last?.id {
@@ -859,8 +897,10 @@ struct ChatInfoSheet: View {
     private var chat: Chat? { repository.chats.first(where: { $0.id == chatId }) }
     /// §13: a D-group's leave and delete are final on all the user's devices.
     private var isDistroGroup: Bool { chat?.isDistroGroup ?? false }
-    /// §8.7: set when this device cannot act in the group.
-    private var cannotActText: String? { isGroup ? chat?.cannotActText : nil }
+    /// §8.7: the bar's text when the group uses a distro address no longer on this device.
+    private var formerDistroText: String? { isGroup ? chat?.formerDistroText : nil }
+    /// §8.7: the app is starting: Leave Group is greyed, with no text.
+    private var groupActionsWait: Bool { isGroup && (chat?.groupActionsWait ?? false) }
     private var title: String { chat?.displayName ?? repository.contactDisplayName(for: chatId) }
     private var peerHash: String { chat?.peerHash ?? chatId }
     /// The contact's three name slots (DISPLAY_NAMES.md §5.1); nil for a group.
@@ -1000,9 +1040,9 @@ struct ChatInfoSheet: View {
                         // Archive / Delete / Leave
                         GlassCard {
                             VStack(spacing: 0) {
-                                if isGroup, let why = cannotActText {
+                                if isGroup, let text = formerDistroText {
                                     // §8.7: no leave from here; only the local delete.
-                                    Text(why)
+                                    Text(text)
                                         .font(.caption)
                                         .foregroundColor(.retichatOnSurfaceVariant)
                                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1015,6 +1055,7 @@ struct ChatInfoSheet: View {
                                             .foregroundColor(.retichatError)
                                     }
                                 } else if isGroup {
+                                    // §8.7: greyed, with no text, while the app is starting.
                                     Button {
                                         showLeaveConfirm = true
                                     } label: {
@@ -1022,6 +1063,8 @@ struct ChatInfoSheet: View {
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .foregroundColor(.retichatError)
                                     }
+                                    .disabled(groupActionsWait)
+                                    .opacity(groupActionsWait ? 0.4 : 1)
                                 } else {
                                     Button {
                                         dismiss()

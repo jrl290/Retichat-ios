@@ -55,6 +55,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private var modelContext: ModelContext?
     /// RfedDistroClient.$distro, for GROUPS-DISTRO-DESIGN.md §8.7 (configure).
     private var distroHeldWatch: AnyCancellable?
+    /// RfedDistroClient.$distroSettled and $storedKeyUnreadable, for §8.7 (configure).
+    private var distroSettledWatch: AnyCancellable?
+    /// $serviceRunning: what a group offers follows the start (§8.7, configure).
+    private var startWatch: AnyCancellable?
     /// The privacy filter's switch (UserPreferences.filterStrangersChanged): the NSE's group file
     /// is written again when it changes (GROUPS-DISTRO-DESIGN.md §6.7).
     private var filterWatch: AnyCancellable?
@@ -259,6 +263,28 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             .removeDuplicates()
             .sink { [weak self] held in
                 Task { @MainActor [weak self] in self?.onDistroHeldChanged(held) }
+            }
+        // The Keychain has said what this device holds, or a stored key will not load (§8.7):
+        // a group whose distro was still being read is shown again, as one it acts in or as a
+        // former distro, without waiting for the distro held to change (it does not, for a
+        // device that holds none). As for a change of the distro held.
+        distroSettledWatch = RfedDistroClient.shared.$distroSettled
+            .combineLatest(RfedDistroClient.shared.$storedKeyUnreadable)
+            .map { $0 || $1 }
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.onDistroHeldChanged(self.heldDistroHex)
+                }
+            }
+        // The start finished or stopped (§8.7, James, 2026-10-11): until it finishes every
+        // group's Accept, Decline, Leave and Delete are greyed; then each group shows what it
+        // offers.
+        startWatch = $serviceRunning
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in self?.scheduleRefreshChats() }
             }
         // §6.7: nse_groups.json says whether the filter is on, and is written whenever the filter
         // changes (Settings is a sheet: no refresh follows its toggle), so a suspended app's NSE
@@ -1152,12 +1178,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     // MARK: - Send message
 
-    func sendMessage(chatId: String, content: String, attachments: [(String, Data)] = []) {
+    /// Send a post. False when it was not taken (nothing shown, stored or sent): the composer keeps
+    /// the draft as typed. A group post to a group that uses a distro address no longer on this
+    /// device is refused so, with no notice (GROUPS-DISTRO-DESIGN.md §8.7; James, 2026-10-11).
+    @discardableResult
+    func sendMessage(chatId: String, content: String, attachments: [(String, Data)] = []) -> Bool {
         let content = content.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[Retichat] sendMessage called chatId=\(chatId.prefix(8)) content=\(content.prefix(20))")
         guard let ctx = modelContext else {
             print("[Retichat] sendMessage: ABORT - modelContext is nil")
-            return
+            return false
         }
 
         // Look up the chat
@@ -1166,20 +1196,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         )
         guard let chat = try? ctx.fetch(chatDescriptor).first else {
             print("[Retichat] sendMessage: ABORT - chat not found for id=\(chatId)")
-            return
+            return false
         }
 
         // Branch: group vs. direct
         if chat.isGroup {
-            sendGroupMessage(chat: chat, chatId: chatId, content: content, attachments: attachments)
-            return
+            return sendGroupMessage(chat: chat, chatId: chatId, content: content, attachments: attachments)
         }
 
         let destHashHex = chat.peerHash
         print("[Retichat] sendMessage: destHashHex=\(destHashHex.prefix(8)) lxmfClientNil=\(lxmfClient == nil)")
         guard let destData = Data(hexString: destHashHex) else {
             print("[Retichat] sendMessage: ABORT - invalid destHashHex=\(destHashHex)")
-            return
+            return false
         }
 
         // Decide delivery method at send time from live link state.
@@ -1224,12 +1253,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                    content: content, attachments: attachments, tempId: tempId,
                                    optimisticTimestamp: optimisticTimestamp))
             print("[Retichat] sendMessage: stack not started — held until it is (\(heldSends.count) held)")
-            return
+            return true
         }
 
         submitDirectMessage(client: client, chatId: chatId, destHashHex: destHashHex, destData: destData,
                             content: content, attachments: attachments, tempId: tempId,
                             optimisticTimestamp: optimisticTimestamp)
+        return true
     }
 
     /// Hand a 1:1 message to the router. Its pending bubble (`tempId`) is
@@ -1462,18 +1492,24 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     // MARK: - Group message send (fanout to all accepted members)
 
+    /// A group post: shown at once, then fanned out, or held while the start has not finished
+    /// and fanned out when it does (releaseHeldSends), exactly as a DM is. False, with nothing
+    /// stored, sent or held, for a group that uses a distro address no longer on this device.
     private func sendGroupMessage(
         chat: ChatEntity, chatId: String, content: String, attachments: [(String, Data)]
-    ) {
-        guard let ctx = modelContext else { return }
-        // GROUPS-DISTRO-DESIGN.md §8.7: a group whose own address this device cannot sign for
-        // (its D given up or replaced, or not loaded yet) takes no post: nothing is stored, sent
-        // or queued, and the conversation says why.
-        if let why = cannotActText(chat) {
-            print("[GroupChat] post to \(chatId.prefix(8)) refused: \(why)")
-            return
+    ) -> Bool {
+        guard let ctx = modelContext else { return false }
+        // GROUPS-DISTRO-DESIGN.md §8.7 (James, 2026-10-11): a group that uses a distro address no
+        // longer on this device takes no post, and says nothing: the draft stays in the composer
+        // and the chat is shown again, with the former-distro bar.
+        if case .formerDistro = ability(chat) {
+            print("[GroupChat] post to \(chatId.prefix(8)) not taken: the group's distro is no longer on this device (§8.7)")
+            scheduleRefreshChats()
+            return false
         }
-        // nil while the stack is starting or stopped: the send is held.
+        // At start-up a post waits exactly as a DM does (§8.7; ordering, not a retry): nil while
+        // the stack is starting or stopped, and the send is held. Who signs is asked when it is
+        // fanned out; with nobody to sign then, it shows failed.
         let client = heldSends.isOpen ? lxmfClient : nil
 
         // Generate a stable local ID for this outbound group message
@@ -1508,13 +1544,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                   messageId: msgId))
             print("[GroupChat] send held until the stack has started (\(heldSends.count) held)")
             refreshChats()
-            return
+            return true
         }
 
-        _ = fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
-                               content: content, attachments: attachments, timestamp: msgEntity.timestamp,
-                               via: client)
+        let sent = fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
+                                      content: content, attachments: attachments, timestamp: msgEntity.timestamp,
+                                      via: client)
+        if !sent {
+            // Nobody to sign for the group now (its distro still being read): the DM failed state.
+            msgEntity.deliveryState = DeliveryState.failed
+            try? ctx.save()
+        }
         refreshChats()
+        return true
     }
 
     /// Fan a group message out to the accepted members, as the group's own
@@ -1624,15 +1666,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// record the user's own entry as accepted, and broadcast acceptance to
     /// the others, as the group's own address (groupSigner). In a D-group the
     /// accept goes as D and owes one `accept` group sync, in the same step
-    /// (GROUPS-DISTRO-DESIGN.md §10.6); with no signer here (§8.7) nothing
-    /// changes and nothing is sent.
+    /// (GROUPS-DISTRO-DESIGN.md §10.6). Only in a group this device acts in
+    /// (§8.7): at start-up Accept is greyed, and for a former distro it is not
+    /// offered; otherwise nothing changes and nothing is sent.
     func acceptGroupInvite(groupId: String) {
         guard let ctx = modelContext, let client = lxmfClient else { return }
 
         let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
         guard let chat = try? ctx.fetch(chatDesc).first else { return }
-        guard let signer = groupSigner(chat) else {
-            print("[GroupChat] accept of \(groupId.prefix(8)) refused: \(cannotActText(chat) ?? "no signer")")
+        guard ability(chat) == .acts, let signer = groupSigner(chat) else {
+            print("[GroupChat] accept of \(groupId.prefix(8)) not done: \(ability(chat)), no signer for the group here (§8.7)")
             return
         }
 
@@ -1732,31 +1775,30 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     ///
     /// GROUPS-DISTRO-DESIGN.md: in a D-group the leave goes as D, the id goes
     /// in this device's `left` list for D, and one `leave` group sync is owed,
-    /// in the same step (§10.6), so every device of D closes it (§13). With no
-    /// signer for the group here (§8.7) nothing happens: only "Delete from this
-    /// device" is offered (deleteGroupFromThisDevice).
+    /// in the same step (§10.6), so every device of D closes it (§13). Only in a
+    /// group this device acts in (§8.7; James, 2026-10-11): at start-up Decline,
+    /// Leave and Delete are greyed, and a former distro's group offers only
+    /// "Delete from this device" (deleteGroupFromThisDevice); otherwise nothing
+    /// is recorded, sent or deleted.
     private func quitGroup(chatId: String, how: String) {
         guard let ctx = modelContext else { return }
         let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
         guard let chat = try? ctx.fetch(chatDesc).first, chat.isGroup else { return }
-        // §8.7: a D-group this device cannot sign for is never left from here (no leave, no
-        // group sync): "Delete from this device" is its only removal.
-        if let why = cannotActText(chat) {
-            print("[GroupChat] \(how) of \(chatId.prefix(8)) refused: \(why)")
+        guard ability(chat) == .acts else {
+            print("[GroupChat] \(how) of \(chatId.prefix(8)) not done: \(ability(chat)) (§8.7)")
             return
         }
-        let signer = groupSigner(chat)
+        guard let client = lxmfClient, let signer = groupSigner(chat) else {
+            print("[GroupChat] \(how) of \(chatId.prefix(8)) not done: no signer for the group here (§8.7)")
+            return
+        }
         let rows = groupRows(chatId)
         let targets = GroupMemberStatuses.leaveTargets(rows, selfAddresses: groupSelf(chat, rows: rows))
         prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)
-        if let client = lxmfClient, let signer {
-            ffiQueue.async {
-                GroupChatManager.shared.sendLeave(groupId: chatId, to: targets, as: signer, via: client)
-            }
-        } else {
-            print("[GroupChat] quitGroup: stack offline, the leave of \(chatId.prefix(8)) is not sent")
+        ffiQueue.async {
+            GroupChatManager.shared.sendLeave(groupId: chatId, to: targets, as: signer, via: client)
         }
-        if let signer, signer.isDistro {
+        if signer.isDistro {
             recordLeft([chatId], distro: signer.hex)
             oweGroupSync(.leave, groupId: chatId, signer: signer, atMs: DistroGroupSync.atMs(Date().timeIntervalSince1970))
         }
@@ -1769,11 +1811,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// is owed: the user stays in the group on the other devices and for the other members. The
     /// id is recorded closed on this device (decided 2026-10-11, the same on every client), so a
     /// later invite or group sync for it does not bring it back here; nothing goes in a `left`
-    /// list, so no other device closes it.
+    /// list, so no other device closes it. Only for such a group, never at start-up (James,
+    /// 2026-10-11): it would close for good a group this device can use once started.
     func deleteGroupFromThisDevice(chatId: String) {
         guard let ctx = modelContext,
               let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first,
               chat.isGroup else { return }
+        guard case .formerDistro = ability(chat) else {
+            print("[GroupChat] group \(chatId.prefix(8)) not deleted from this device: \(ability(chat)), not a former distro's (§8.7)")
+            return
+        }
         prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)
         print("[GroupChat] group \(chatId.prefix(8)) deleted from this device only and closed here: no leave, no group sync (§8.7)")
         deleteChatLocal(chatId: chatId)
@@ -2785,26 +2832,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// group's own address (GROUPS-DISTRO-DESIGN.md §8.1, §8.5): the distro D when this device
     /// holds it (recorded creator D, invite chunks signed by D, D's chunk carrying D's key from
     /// DistroManager, one `create` group sync owed once the chunks are built), otherwise the
-    /// device. Refused, with nothing written, queued or retried (GroupSelf.createRefusal), while
-    /// the stack is not running (no invite could be signed or sent: the group would list members
-    /// nobody invited), then while D may be held but is not loaded yet: group actions as D are
-    /// not offered until it is (§8.7). The form says which (CreateRefusal.text).
-    func createGroupChat(name: String, memberHashes: [String]) -> Result<String, GroupSelf.CreateRefusal> {
+    /// device. Nil, with nothing written, queued or retried, unless a group can be created now
+    /// (`canCreateGroup`; the forms grey Create until then, with no text, §8.7).
+    func createGroupChat(name: String, memberHashes: [String]) -> String? {
         // Running means what it means for a send: the start finished (releaseHeldSends opened
         // the gate) and the stack is held. nil while it is starting or stopped.
-        let client = heldSends.isOpen ? lxmfClient : nil
-        if let why = GroupSelf.createRefusal(stackRunning: client != nil,
-                                            distroLoaded: DistroManager.shared.signing() != nil,
-                                            distroSettled: distroSettled) {
-            print("[GroupChat] group not created: \(why.text)")
-            return .failure(why)
+        guard canCreateGroup, let ctx = modelContext, let client = heldSends.isOpen ? lxmfClient : nil else {
+            print("[GroupChat] group not created: the start has not finished, or the distro is still being read (§8.7)")
+            return nil
         }
-        guard let ctx = modelContext, let client else { return .failure(.notRunning) }
         guard let signer = creationSigner() else {
-            // createRefusal let it through, so D is loaded or settled: only an identity the
+            // canCreateGroup let it through, so D is loaded or settled: only an identity the
             // stack cannot give now leaves no signer.
             print("[GroupChat] group not created: no identity to sign its invites with")
-            return .failure(.notRunning)
+            return nil
         }
         let own = signer.hex
 
@@ -2849,7 +2890,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         try? ctx.save()
 
         // Send invites to everyone except the user (fire-and-forget). The stack is running
-        // (createRefusal), so every invite is signed and goes.
+        // (canCreateGroup), so every invite is signed and goes.
         var memberPublicKeys: [String: String] = [:]
         for memberHash in allMembers {
             guard let hashData = Data(hexString: memberHash) else { continue }
@@ -2881,7 +2922,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
 
         refreshChats()
-        return .success(groupId)
+        return groupId
     }
 
     func archiveChat(chatId: String) {
@@ -3016,6 +3057,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                   entity.peerHash.localizedCaseInsensitiveContains(lower) else { return nil }
 
             let lastMsg = try? lastMessage(forChatId: entity.id)
+            // §8.7: a found group's swipe offers what the list's does.
+            let ability: GroupSelf.Ability = entity.isGroup ? self.ability(entity) : .acts
             return Chat(
                 id: entity.id,
                 peerHash: entity.peerHash,
@@ -3027,7 +3070,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 isArchived: entity.isArchived,
                 isGroup: entity.isGroup,
                 groupName: entity.groupName,
-                groupStatus: entity.groupStatus
+                groupStatus: entity.groupStatus,
+                isDistroGroup: entity.isGroup && GroupSelf.isDistroGroup(ownMember: entity.ownMember, device: ownHashHex),
+                groupActionsWait: ability.waits,
+                formerDistroText: ability.formerDistroText
             )
         }
     }
@@ -3254,6 +3300,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let preview = previewByChat[entity.id].map {
                 shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names, groupSelf: selves[entity.id])
             } ?? ""
+            // §8.7: what the group offers now (a direct chat acts).
+            let ability: GroupSelf.Ability = entity.isGroup ? self.ability(entity) : .acts
 
             return Chat(
                 id: entity.id,
@@ -3267,7 +3315,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 groupName: entity.groupName,
                 groupStatus: entity.groupStatus,
                 isDistroGroup: entity.isGroup && GroupSelf.isDistroGroup(ownMember: entity.ownMember, device: ownHashHex),
-                cannotActText: entity.isGroup ? cannotActText(entity) : nil
+                groupActionsWait: ability.waits,
+                formerDistroText: ability.formerDistroText
             )
         }
 
@@ -3671,9 +3720,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                          distroSettled: distroSettled)
     }
 
-    /// §8.7: why this device cannot act in the group (nil when it can).
-    private func cannotActText(_ chat: ChatEntity) -> String? {
-        GroupSelf.cannotSignText(signerState(chat))
+    /// The start finished: the stack is held and the send gate open (releaseHeldSends), so a
+    /// send goes now rather than waiting. What `serviceRunning` says to the views (both change in
+    /// one main-actor step).
+    private var startFinished: Bool { heldSends.isOpen && lxmfClient != nil }
+
+    /// What this device offers in the group now (§8.7; James, 2026-10-11): it acts, it is in
+    /// start-up (greyed, no text, posts wait), or the group uses a former distro (the bar).
+    private func ability(_ chat: ChatEntity) -> GroupSelf.Ability {
+        GroupSelf.ability(signerState(chat), started: startFinished)
+    }
+
+    /// Whether New group › Create is offered now (§8.1, §8.7): greyed, with no text, otherwise.
+    var canCreateGroup: Bool {
+        GroupSelf.canCreate(started: startFinished, distroLoaded: DistroManager.shared.signing() != nil,
+                            distroSettled: distroSettled)
     }
 
     /// `groupSigner(ownMember)` (§8.1): resolved at send time from the group's own address and

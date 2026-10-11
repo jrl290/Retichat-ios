@@ -77,20 +77,32 @@ func testTheWiring() {
           "the words say the members are told and it is final")
 }
 
-/// GROUPS-DISTRO-DESIGN.md §8.7: a group whose own address is a distro this device does not
-/// hold (or not yet) offers no Accept, Decline or leave; its Delete asks, then removes it from
-/// this device only (deleteGroupFromThisDevice: no leave, no group sync).
-func testAGroupThisDeviceCannotActIn() {
-    check(ChatSwipe.of(isGroup: true, isPendingInvite: false, cannotAct: true) == .deleteFromThisDevice,
-          "§8.7: a joined group this device cannot sign for only deletes from this device")
-    check(ChatSwipe.of(isGroup: true, isPendingInvite: true, cannotAct: true) == .deleteFromThisDevice,
-          "§8.7: a pending invite this device cannot sign for offers no Accept or Decline")
-    check(ChatSwipe.of(isGroup: false, isPendingInvite: false, cannotAct: true) == .archive,
+/// GROUPS-DISTRO-DESIGN.md §8.7 (James, 2026-10-11): a group that uses a distro address no
+/// longer on this device offers no Accept, Decline or leave; its Delete asks, then removes it
+/// from this device only (deleteGroupFromThisDevice: no leave, no group sync). While the app is
+/// starting a group's swipe offers what it always offers, greyed, with no text, and never
+/// "Delete from this device".
+func testAFormerDistroGroupAndStartUp() {
+    check(ChatSwipe.of(isGroup: true, isPendingInvite: false, formerDistro: true) == .deleteFromThisDevice,
+          "§8.7: a joined group whose distro is gone only deletes from this device")
+    check(ChatSwipe.of(isGroup: true, isPendingInvite: true, formerDistro: true) == .deleteFromThisDevice,
+          "§8.7: a pending invite whose distro is gone offers no Accept or Decline")
+    check(ChatSwipe.of(isGroup: false, isPendingInvite: false, formerDistro: true) == .archive,
           "a direct chat is unaffected")
-    check(ChatSwipe.of(isGroup: true, isPendingInvite: false, cannotAct: false) == .leaveGroup,
-          "a group this device can act in still leaves (after asking)")
+    check(ChatSwipe.of(isGroup: true, isPendingInvite: false, formerDistro: false) == .leaveGroup,
+          "a group whose distro is here, or not read yet, still leaves (after asking)")
     let list = source("Retichat/Views/ChatList/ChatListView.swift")
-    check(list.contains("cannotAct: chat.cannotActText != nil) {"), "the swipe asks the chat whether this device can act")
+    check(list.contains("formerDistro: chat.formerDistroText != nil) {"),
+          "the swipe asks the chat whether its distro is gone, never whether it is merely not ready")
+    check(!list.contains("cannotAct"), "nothing else turns the swipe into Delete from this device")
+    let all = span(list, from: "switch ChatSwipe.of(isGroup: chat.isGroup,", to: "case .channel(let channel):")
+    let invite = span(all, from: "case .invite:", to: "case .leaveGroup:")
+    check(invite.components(separatedBy: ".disabled(chat.groupActionsWait)").count - 1 == 2,
+          "start-up: Decline and Accept are greyed")
+    check(span(all, from: "case .leaveGroup:", to: "case .archive:").contains(".disabled(chat.groupActionsWait)"),
+          "start-up: a group's Delete is greyed")
+    check(!span(all, from: "case .archive:", to: "case .deleteFromThisDevice:").contains(".disabled("),
+          "a direct chat's Delete never is")
     let swipe = span(list, from: "case .deleteFromThisDevice:", to: "}\n                                    }")
     check(swipe.contains("deletingHere = chat") && !swipe.contains("deleteChat") && !swipe.contains("deleteGroupFromThisDevice"),
           "its Delete only asks: nothing happens before the confirmation")
@@ -108,7 +120,7 @@ struct ChatSwipeTestsMain {
     static func main() {
         testTheChoice()
         testTheWiring()
-        testAGroupThisDeviceCannotActIn()
+        testAFormerDistroGroupAndStartUp()
         if failures.isEmpty {
             print("all chat swipe tests passed")
             exit(0)

@@ -64,9 +64,12 @@ struct NewConversationView: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    // A group's Create is greyed, with no text, until a group can be created
+                    // (GROUPS-DISTRO-DESIGN.md §8.7; James, 2026-10-11).
                     Button("Start") { triggerStart = true }
                         .fontWeight(.semibold)
-                        .disabled(convType == .channel && !channelCanStart)
+                        .disabled((convType == .channel && !channelCanStart)
+                                  || (convType == .group && !repository.canCreateGroup))
                 }
             }
         }
@@ -318,15 +321,11 @@ private struct GroupForm: View {
             name = trimmed
         }
         guard !selectedMembers.isEmpty else { errorMessage = "Select at least one member"; return }
-        switch repository.createGroupChat(name: name, memberHashes: Array(selectedMembers)) {
-        case .failure(let why):
-            // The stack is not running, or the distro this device holds has not loaded yet
-            // (GROUPS-DISTRO-DESIGN.md §8.7): nothing was created, and nothing is queued.
-            errorMessage = why.text
-        case .success(let chatId):
-            selectedChatId = chatId
-            dismiss()
-        }
+        // Nil only when no group can be created yet (Start is greyed then, §8.7): nothing was
+        // created or queued, and nothing is said.
+        guard let chatId = repository.createGroupChat(name: name, memberHashes: Array(selectedMembers)) else { return }
+        selectedChatId = chatId
+        dismiss()
     }
 }
 

@@ -8,7 +8,7 @@
 // their bounds), the group rule (DeliveryPolicy), the group engine (GroupStatuses.swift) with a
 // creator that is the distro on two devices, and the NSE's decision (PendingNotification.swift,
 // NSEGroupShow). The group sync readings are the shared vectors
-// (rust/retichat-ffi/tests/data/distro_group_sync_vectors.json, LXMF-rust 16a9902); the engine's
+// (rust/retichat-ffi/tests/data/distro_group_sync_vectors.json, LXMF-rust b873c00); the engine's
 // messages are the member-status vectors' (tests/GroupStatusFixtures.swift, real Ed25519).
 // ChatRepository, GroupChatManager, the NSE and the views need SwiftData, UIKit and the FFI, so
 // their wiring is asserted on the source, in the same tests. The bridge itself (the unwrap of a
@@ -286,40 +286,142 @@ func theAcceptGoesOutAsDSignedByDWithGroupSenderDAndDsOwnKey() {
     check(!repo.contains("Group sends stay device-signed"), "\"Group sends stay device-signed\" is gone")
 }
 
-func theSignerRefusesWhenDIsNotLoadedOrReplacedAndTheConversationSaysWhy() {
+/// §8.1: who signs for a group, resolved at send time; nobody for a former D or while D is read.
+/// §8.7 (James, 2026-10-11): what the group offers now. Until the start finishes (the stack held
+/// and the send gate open), and while the distro this group uses is still being read from the
+/// Keychain, it is start-up: no text anywhere, Accept, Decline, Leave and Delete greyed, a post
+/// waiting as a DM does, and never "Delete from this device" (it would close for good a group
+/// this device can use once started). Once started, a group whose distro is no longer on this
+/// device shows the former-distro bar. Nothing else.
+func whatAGroupOffersFollowsTheStartAndTheDistroHeld() {
     let D2 = String(repeating: "d2", count: 16)
     checkEqual(GroupSelf.signer(ownMember: D, device: THIS, loadedDistro: D, distroSettled: true), .distro(D), "D held: D signs")
     checkEqual(GroupSelf.signer(ownMember: nil, device: THIS, loadedDistro: D, distroSettled: true), .device, "a device group: the device")
     checkEqual(GroupSelf.signer(ownMember: THIS, device: THIS, loadedDistro: nil, distroSettled: false), .device, "the device named: the device")
     checkEqual(GroupSelf.signer(ownMember: D, device: THIS, loadedDistro: nil, distroSettled: false), .distroNotLoaded(D),
-               "D not loaded yet: nobody signs")
+               "D still being read: nobody signs yet")
     checkEqual(GroupSelf.signer(ownMember: D, device: THIS, loadedDistro: D2, distroSettled: true), .formerDistro(D),
                "D replaced by D': nobody signs, never D'")
     checkEqual(GroupSelf.signer(ownMember: D, device: THIS, loadedDistro: nil, distroSettled: true), .formerDistro(D),
                "D given up: nobody signs, never the device")
-    checkEqual(GroupSelf.cannotSignText(.formerDistro(D)),
-               "This group uses your distro address \(D.prefix(8)), which this device no longer holds. You can read it here, but cannot post or change your membership from this device.",
-               "§8.7's text")
-    check(GroupSelf.cannotSignText(.distro(D)) == nil && GroupSelf.cannotSignText(.device) == nil, "no text when it can act")
-    check(GroupSelf.cannotSignText(.distroNotLoaded(D)) != nil, "a text while D loads")
+
+    let signers: [GroupSelf.Signer] = [.device, .distro(D), .distroNotLoaded(D), .formerDistro(D)]
+    for signer in signers {
+        checkEqual(GroupSelf.ability(signer, started: false), .starting, "before the start finishes it is start-up (\(signer))")
+    }
+    checkEqual(GroupSelf.ability(.device, started: true), .acts, "started, a device group acts")
+    checkEqual(GroupSelf.ability(.distro(D), started: true), .acts, "started, D held, a D-group acts")
+    checkEqual(GroupSelf.ability(.distroNotLoaded(D), started: true), .starting, "started, D still being read: start-up still")
+    checkEqual(GroupSelf.ability(.formerDistro(D), started: true), .formerDistro(D), "started, D gone: a former distro")
+
+    check(GroupSelf.Ability.starting.waits && !GroupSelf.Ability.acts.waits && !GroupSelf.Ability.formerDistro(D).waits,
+          "only start-up greys the group's actions")
+    checkEqual(GroupSelf.Ability.starting.formerDistroText, nil, "start-up shows no text")
+    checkEqual(GroupSelf.Ability.acts.formerDistroText, nil, "a group it acts in shows no text")
+    checkEqual(GroupSelf.Ability.formerDistro(D).formerDistroText, GroupSelf.formerDistroText(D), "a former distro shows its bar")
+    checkEqual(GroupSelf.ability(.formerDistro(D), started: false).formerDistroText, nil,
+               "never the bar, so never \"Delete from this device\", before the start finishes")
 
     let signer = body(repo, "private func groupSigner(_ chat: ChatEntity)")
     check(signer.contains("case .distroNotLoaded, .formerDistro:\n            return nil"), "groupSigner gives nothing then")
+    let ability = body(repo, "private func ability(_ chat: ChatEntity)")
+    check(ability.contains("GroupSelf.ability(signerState(chat), started: startFinished)"), "the repository asks GroupSelf")
+    check(body(repo, "private var startFinished: Bool").contains("heldSends.isOpen && lxmfClient != nil"),
+          "started means what it means for a send: the gate is open and the stack is held")
+    let refresh = body(repo, "func refreshChats()")
+    check(refresh.contains("groupActionsWait: ability.waits") && refresh.contains("formerDistroText: ability.formerDistroText"),
+          "each group in the list carries what it offers")
+    check(!repo.contains("cannotActText"), "no \"cannot act\" text is kept anywhere")
+    check(repo.contains("startWatch = $serviceRunning") && repo.contains("distroSettledWatch = RfedDistroClient.shared.$distroSettled"),
+          "the groups are shown again when the start finishes or stops, and when the Keychain has said what this device holds")
+    check(span(repo, from: "distroSettledWatch = RfedDistroClient.shared.$distroSettled", to: "}\n            }")
+            .contains("self.onDistroHeldChanged(self.heldDistroHex)"),
+          "as for a change of the distro held (onDistroHeldChanged refreshes the chats)")
+    let models = source("Retichat/Models/Models.swift")
+    check(models.contains("var groupActionsWait: Bool = false") && models.contains("var formerDistroText: String? = nil")
+            && !models.contains("cannotActText"), "the chat row carries the two, never a reason text")
+}
+
+/// §8.7 (James, 2026-10-11): at start-up a group post waits exactly as a DM does: it is shown at
+/// once with the pending clock (the held send), is sent when the start finishes (releaseHeldSends,
+/// the signer asked then) and shows the DM failed state if it can no longer be signed then. A post
+/// sent at once that finds no signer shows failed too. A post to a former distro's group, refused
+/// after Send, shows nothing: nothing is stored, sent or held, the draft stays in the composer and
+/// the bar shows.
+func aGroupPostWaitsAsADMDoesAndARefusedOneKeepsTheDraft() {
     let post = body(repo, "private func sendGroupMessage(")
-    check(before(post, "if let why = cannotActText(chat) {", "insertMessage(msgEntity, into: ctx)"),
-          "a post is refused before anything is stored or sent")
-    check(body(repo, "private func fanOutGroupMessage(").contains("let signer = groupSigner(chat) else {"),
-          "and a held post is sent only with a signer")
+    check(post.contains("-> Bool {"), "the group send says whether it took the post")
+    check(before(post, "if case .formerDistro = ability(chat) {", "insertMessage(msgEntity, into: ctx)"),
+          "a former distro's post is refused before anything is stored or sent")
+    let refused = span(post, from: "if case .formerDistro = ability(chat) {", to: "return false")
+    check(!refused.isEmpty && refused.contains("scheduleRefreshChats()") && !refused.contains("heldSends.hold("),
+          "refused, nothing is held and the chat is shown again (the bar)")
+    check(!post.contains("if case .starting") && !post.contains("ability(chat) == .acts"),
+          "start-up never refuses a post: it waits")
+    check(post.contains("let client = heldSends.isOpen ? lxmfClient : nil")
+            && before(post, "insertMessage(msgEntity, into: ctx)", "heldSends.hold(.group(chatId: chatId, content: content, attachments: attachments,"),
+          "before the start finishes it is shown at once, pending, and held as a DM is")
+    check(post.contains("? DeliveryState.pending"), "with the pending clock")
+    check(before(post, "let sent = fanOutGroupMessage(", "msgEntity.deliveryState = DeliveryState.failed")
+            && post.contains("if !sent {"), "sent at once without a signer, it shows the DM failed state")
+    let release = body(repo, "private func releaseHeldSends()")
+    check(release.contains("bubble.deliveryState = sent ? DeliveryState.sent : DeliveryState.failed"),
+          "released when the start finishes, failed if it can no longer be signed then")
+    let send = body(repo, "func sendMessage(chatId: String, content: String, attachments: [(String, Data)] = [])")
+    check(send.contains("-> Bool {") && send.contains("return sendGroupMessage(chat: chat, chatId: chatId, content: content, attachments: attachments)"),
+          "sendMessage says whether the group send took the post")
+    let compose = span(conversation, from: "private func sendMessage() {", to: "case .channel(let ch):")
+    check(before(compose, "guard repository.sendMessage(chatId: id, content: content, attachments: atts) else { return }", "messageText = \"\"")
+            && before(compose, "guard repository.sendMessage(chatId: id, content: content, attachments: atts) else { return }", "pendingAttachments = []"),
+          "the composer is cleared only once the post was taken: a refused one stays as typed")
+    check(!compose.contains("print(") && !compose.contains("alert") && !compose.contains("errorMessage"), "with no notice")
+}
+
+/// §8.7 (James, 2026-10-11): Accept, Decline, Leave and Delete (the chat info, the conversation's
+/// invite bar and menu, the chat-list swipe) are greyed, with no text, while the app is starting;
+/// the repository acts only for a group it acts in. A former distro's group replaces the composer,
+/// Accept, Decline and Leave with the bar and "Delete from this device", in the conversation and
+/// in the chat info; that delete is refused for any other group.
+func groupActionsAreGreyedAtStartUpAndAFormerDistroShowsTheBar() {
     let accept = body(repo, "func acceptGroupInvite(")
-    check(before(accept, "guard let signer = groupSigner(chat) else {", "chat.groupStatus = \"active\""), "an accept changes nothing without a signer")
+    check(before(accept, "guard ability(chat) == .acts,", "chat.groupStatus = \"active\"")
+            && before(accept, "guard ability(chat) == .acts,", "GroupChatManager.shared"),
+          "an accept changes and sends nothing unless the group acts")
     let quit = body(repo, "private func quitGroup(")
-    check(before(quit, "if let why = cannotActText(chat) {", "prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)")
-            && before(quit, "if let why = cannotActText(chat) {", "GroupChatManager.shared.sendLeave("),
-          "a decline, leave or delete is refused before anything is recorded or sent")
-    check(conversation.contains("if viewModel.isGroup, let why = cannotActText {\n                    // §8.7: the composer, accept and decline are disabled, with the reason.\n                    cannotActBar(why)"),
-          "the conversation shows the text in place of the composer and the invite's buttons")
-    check(conversation.contains("} else if isGroupPending && cannotActText == nil {"), "and no Accept or Decline in its menu")
-    check(body(repo, "func createGroupChat(").contains("guard let signer = creationSigner() else {"), "no group is created while D loads")
+    check(before(quit, "guard ability(chat) == .acts else {", "prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)")
+            && before(quit, "guard ability(chat) == .acts else {", "GroupChatManager.shared.sendLeave("),
+          "a decline, leave or delete is refused, nothing recorded or sent, unless the group acts (never at start-up)")
+    check(!quit.contains("stack offline"), "no leave is recorded without being sent")
+    let local = body(repo, "func deleteGroupFromThisDevice(")
+    check(before(local, "guard case .formerDistro = ability(chat) else {", "prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)"),
+          "Delete from this device only for a former distro's group, never at start-up")
+
+    check(conversation.contains("if viewModel.isGroup, let text = formerDistroText {\n                    // §8.7: the composer, Accept and Decline are replaced by the bar.\n                    formerDistroBar(text)"),
+          "the conversation shows the bar in place of the composer and the invite's buttons")
+    let bar = body(conversation, "private func formerDistroBar(")
+    check(bar.contains("Text(text)") && bar.contains("showDeleteLocalConfirm = true")
+            && bar.contains("Label(GroupSelf.deleteLocalTitle, systemImage: \"trash\")"),
+          "the bar is the text and \"Delete from this device\", which asks first")
+    let barDialog = span(conversation, from: "// §8.7: the bar's \"Delete from this device\"", to: "Text(GroupSelf.deleteLocalMessage)")
+    check(barDialog.contains("repository.deleteGroupFromThisDevice(chatId: chatId)") && barDialog.contains("dismiss()")
+            && !barDialog.contains("deleteChat("), "confirmed, it removes the group from this device only")
+    check(conversation.contains("} else if isGroupPending && formerDistroText == nil {"), "no Accept or Decline in the menu of a former distro's group")
+    let menu = span(conversation, from: "} else if isGroupPending && formerDistroText == nil {", to: "} label: {")
+    check(count(menu, ".disabled(groupActionsWait)") == 2, "the menu's Accept and Decline are greyed at start-up")
+    let invite = body(conversation, "private var inviteOverlay: some View")
+    check(count(invite, ".disabled(groupActionsWait)") == 2, "the invite bar's Accept and Decline are greyed at start-up")
+    check(!invite.contains("Text(\"Retichat") && !invite.contains("loaded"), "with no text")
+    let info = span(conversation, from: "struct ChatInfoSheet: View {", to: "private func applyRename()")
+    check(info.contains("if isGroup, let text = formerDistroText {"), "the chat info shows the same bar")
+    check(span(info, from: "} else if isGroup {", to: "} else {").contains(".disabled(groupActionsWait)"),
+          "and greys Leave Group at start-up")
+
+    for path in ["Retichat/Views/NewChat/NewGroupView.swift", "Retichat/Views/NewChat/NewConversationView.swift"] {
+        let view = source(path)
+        check(view.contains("!repository.canCreateGroup"), "\(path): Create is greyed until a group can be created")
+        check(view.contains("guard let chatId = repository.createGroupChat(") && !view.contains("errorMessage = why"),
+              "\(path): nothing is said when nothing was created")
+    }
 }
 
 func deleteFromThisDeviceSendsNoLeaveAndOwesNoGroupSync() {
@@ -371,8 +473,13 @@ func deleteChatInADGroupSendsOneLeaveAsDAndOwesOneLeaveSync() {
     let quit = body(repo, "private func quitGroup(")
     checkEqual(count(quit, "GroupChatManager.shared.sendLeave("), 1, "one leave")
     check(quit.contains("GroupChatManager.shared.sendLeave(groupId: chatId, to: targets, as: signer, via: client)"), "as the signer")
-    check(quit.contains("if let signer, signer.isDistro {\n            recordLeft([chatId], distro: signer.hex)\n            oweGroupSync(.leave,"),
+    check(quit.contains("if signer.isDistro {\n            recordLeft([chatId], distro: signer.hex)\n            oweGroupSync(.leave,"),
           "in a D-group, the id goes in the left list and one leave G is owed")
+    // §8.7 (James, 2026-10-11): never recorded closed without its leave: a group it does not act
+    // in (start-up, a former distro) is not left from here at all.
+    check(before(quit, "guard let client = lxmfClient, let signer = groupSigner(chat) else {", "prefs.closedGroupIds = ClosedGroups.record(")
+            && !quit.contains("let signer = groupSigner(chat)\n"),
+          "the leave is sent whenever the group is closed and deleted here")
     checkEqual(count(quit, "oweGroupSync("), 1, "one G")
     let owe = body(repo, "private func oweGroupSync(")
     check(owe.contains("guard signer.isDistro else { return }")
@@ -1099,50 +1206,51 @@ func theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt() {
     checkEqual(LxmfFieldsDecoder.groupMemberKeys("\(M):\u{301}\(key)"), [:], "a combining mark after the colon spoils the key, as in Rust")
 }
 
-// MARK: - The texts the three clients share (decided 2026-10-11)
+// MARK: - The texts (James, 2026-10-11)
 
-/// The group view while D is stored but not loaded, the create form's two refusals, and the
-/// former-D text: the same words on iOS, Android and the web. A create is refused while the stack
-/// is not running (no invite could be signed or sent: the group would be written with nobody
-/// invited), then while D may be held but has not loaded; nothing is written, queued or retried.
-func theGroupTextsAreTheOnesTheThreeClientsShare() {
-    checkEqual(GroupSelf.cannotSignText(.distroNotLoaded(D)),
-               "Your distro address hasn't loaded on this device yet. You can post and change your membership once it has.",
-               "the group view while D has not loaded")
-    checkEqual(GroupSelf.cannotSignText(.formerDistro(D)),
-               "This group uses your distro address \(D.prefix(8)), which this device no longer holds. You can read it here, but cannot post or change your membership from this device.",
-               "the former-D text stays")
-    checkEqual(GroupSelf.createNotReadyText, "Your distro address hasn't loaded on this device yet. Create the group once it has.",
-               "create while D has not loaded")
-    checkEqual(GroupSelf.createNotRunningText, "Retichat isn't running on this device right now. Create the group once it is.",
-               "create while the stack is not running")
-    checkEqual(GroupSelf.CreateRefusal.distroNotLoaded.text, GroupSelf.createNotReadyText, "the refusal says its text")
-    checkEqual(GroupSelf.CreateRefusal.notRunning.text, GroupSelf.createNotRunningText, "the refusal says its text")
-    for (loaded, settled) in [(true, true), (false, true), (false, false)] {
-        checkEqual(GroupSelf.createRefusal(stackRunning: false, distroLoaded: loaded, distroSettled: settled), .notRunning,
-                   "the stack not running refuses first (D loaded \(loaded), settled \(settled))")
+/// §8.7: the former-distro text is the one text a group shows for what this device cannot do,
+/// the same words on iOS, Android and the web, with the first 8 hex of that distro and "…"
+/// (U+2026). Every not-running, not-loaded and create-refused text added for groups-distro is
+/// gone. Create is offered once the start finished and the Keychain has said what this device
+/// holds; otherwise it is greyed, with no text, and nothing is written, queued or retried.
+func theFormerDistroTextIsTheOnlyTextAndTheOthersAreGone() {
+    checkEqual(GroupSelf.formerDistroText(D),
+               "This group uses your distro address \(D.prefix(8))\u{2026}, which is no longer on this device. New messages in it don't reach this device, and you can't post, join or leave from here. Import that distro again to use the group here.",
+               "§8.7's text, exactly")
+    checkEqual(GroupSelf.short(D), String(D.prefix(8)) + "…", "the short address ends in U+2026")
+    let fm = FileManager.default
+    var sources: [String] = []
+    for dir in ["Retichat", "NotificationService"] {
+        let at = root.appendingPathComponent(dir)
+        for case let url as URL in fm.enumerator(at: at, includingPropertiesForKeys: nil)! where url.pathExtension == "swift" {
+            sources.append(String(url.path.dropFirst(root.path.count + 1)))
+        }
     }
-    checkEqual(GroupSelf.createRefusal(stackRunning: true, distroLoaded: false, distroSettled: false), .distroNotLoaded,
-               "running, D not read yet: refused")
-    checkEqual(GroupSelf.createRefusal(stackRunning: true, distroLoaded: true, distroSettled: true), nil, "D loaded: created as D")
-    checkEqual(GroupSelf.createRefusal(stackRunning: true, distroLoaded: false, distroSettled: true), nil,
-               "no distro held: created as the device")
-    // The wiring: refused before anything is written, and the form says which refusal.
+    check(sources.count > 40, "every app and extension source is read (\(sources.count))")
+    let deleted = ["hasn't loaded on this device", "isn't running on this device", "which this device no longer holds",
+                   "You can read it here", "Create the group once", "createNotRunningText", "createNotReadyText", "cannotSignText",
+                   "CreateRefusal", "cannotActText", "cannotActBar"]
+    for path in sources {
+        let text = source(path)
+        for gone in deleted where text.contains(gone) { check(false, "\(path) still has \"\(gone)\"") }
+    }
+    check(GroupSelf.otherDeviceSubject == "Your other device", "\"Your other device\" stays")
+
+    for (started, loaded, settled) in [(false, true, true), (false, false, true), (false, false, false)] {
+        check(!GroupSelf.canCreate(started: started, distroLoaded: loaded, distroSettled: settled),
+              "not before the start finishes (D loaded \(loaded), settled \(settled))")
+    }
+    check(!GroupSelf.canCreate(started: true, distroLoaded: false, distroSettled: false), "not while D is still being read")
+    check(GroupSelf.canCreate(started: true, distroLoaded: true, distroSettled: true), "D loaded: created as D")
+    check(GroupSelf.canCreate(started: true, distroLoaded: false, distroSettled: true), "no distro held: created as the device")
+    check(body(repo, "var canCreateGroup: Bool").contains("GroupSelf.canCreate(started: startFinished,"), "the forms ask the repository")
     let create = body(repo, "func createGroupChat(")
-    check(create.contains("-> Result<String, GroupSelf.CreateRefusal> {"), "createGroupChat says why it created nothing")
-    check(create.contains("let client = heldSends.isOpen ? lxmfClient : nil")
-            && create.contains("if let why = GroupSelf.createRefusal(stackRunning: client != nil,"),
-          "running means what a send means: the start finished and the stack is held")
-    check(before(create, "if let why = GroupSelf.createRefusal(", "ctx.insert(chat)")
-            && before(create, "if let why = GroupSelf.createRefusal(", "guard let signer = creationSigner() else {"),
-          "the refusal comes before the signer and before anything is written")
+    check(create.contains("-> String? {"), "createGroupChat gives the group, or nil when it created nothing")
+    check(before(create, "guard canCreateGroup, let ctx = modelContext, let client = heldSends.isOpen ? lxmfClient : nil else {", "ctx.insert(chat)")
+            && before(create, "guard canCreateGroup,", "guard let signer = creationSigner() else {"),
+          "nothing is written before it can be created")
     check(!create.contains("if let client = lxmfClient {"), "the invites are never skipped for a stack that is not running")
     check(!body(repo, "private func creationSigner(").contains("identityHandle: 0"), "no signer without an identity")
-    for path in ["Retichat/Views/NewChat/NewGroupView.swift", "Retichat/Views/NewChat/NewConversationView.swift"] {
-        let view = source(path)
-        check(view.contains("case .failure(let why):") && view.contains("errorMessage = why.text"), "\(path): the form says why")
-        check(!view.contains("createNotReadyText") && !view.contains("chatId.isEmpty"), "\(path): no single text for both refusals")
-    }
 }
 
 /// A known sibling device's own accept or leave, in a group that lists that device: "Your other
@@ -1403,7 +1511,9 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("an invite the filter drops is ignored and its id enters the filtered-invite set", anInviteTheFilterDropsIsIgnoredAndItsIdEntersTheFilteredInviteSet),
     ("in a D-group no send targets D or a known sibling, and the own entry is D only", inADGroupNoSendTargetsDOrAKnownSiblingAndTheOwnEntryIsDOnly),
     ("the accept goes out as D, signed by D, GROUP_SENDER D, with D's own key", theAcceptGoesOutAsDSignedByDWithGroupSenderDAndDsOwnKey),
-    ("the signer refuses when D is not loaded or replaced, and the conversation says why", theSignerRefusesWhenDIsNotLoadedOrReplacedAndTheConversationSaysWhy),
+    ("what a group offers follows the start and the distro held", whatAGroupOffersFollowsTheStartAndTheDistroHeld),
+    ("a group post waits as a DM does, and a refused one keeps the draft", aGroupPostWaitsAsADMDoesAndARefusedOneKeepsTheDraft),
+    ("group actions are greyed at start-up, and a former distro shows the bar", groupActionsAreGreyedAtStartUpAndAFormerDistroShowsTheBar),
     ("Delete from this device sends no leave and owes no group sync", deleteFromThisDeviceSendsNoLeaveAndOwesNoGroupSync),
     ("a D-group post owes one post sync and no sent copy; a failed send owes neither", aDGroupPostOwesOnePostSyncAndNoSentCopyAndAFailedSendOwesNeither),
     ("deleteChat in a D-group sends one leave as D and owes one leave sync", deleteChatInADGroupSendsOneLeaveAsDAndOwesOneLeaveSync),
@@ -1432,7 +1542,7 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("the NSE file is written when the filter or the allowlist changes", theNSEFileIsWrittenWhenTheFilterOrTheAllowlistChanges),
     ("a known sibling's message that is not validated is never the user's own", aKnownSiblingsMessageThatIsNotValidatedIsNeverTheUsersOwn),
     ("the member csv is split on code points as the shared parser splits it", theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt),
-    ("the group texts are the ones the three clients share", theGroupTextsAreTheOnesTheThreeClientsShare),
+    ("the former-distro text is the only text, and the others are gone", theFormerDistroTextIsTheOnlyTextAndTheOthersAreGone),
     ("a known sibling's own accept or leave is \"Your other device\"", aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice),
     ("the group sync vectors are LXMF-rust b873c00's copy", theGroupSyncVectorsAreLXMFRustB873c00sCopy),
     ("the invite parser lists each invite_members vector", theInviteParserListsEachInviteMembersVector),

@@ -109,9 +109,11 @@ struct NewGroupView: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    // Greyed, with no text, until a group can be created (§8.7; James, 2026-10-11).
                     Button("Create") { createGroup() }
                         .disabled(groupName.trimmingCharacters(in: .whitespaces).isEmpty
-                                  || selectedMembers.isEmpty)
+                                  || selectedMembers.isEmpty
+                                  || !repository.canCreateGroup)
                 }
             }
         }
@@ -128,15 +130,11 @@ struct NewGroupView: View {
             return
         }
 
-        switch repository.createGroupChat(name: trimmedName, memberHashes: Array(selectedMembers)) {
-        case .failure(let why):
-            // The stack is not running, or the distro this device holds has not loaded yet
-            // (GROUPS-DISTRO-DESIGN.md §8.7): nothing was created, and nothing is queued.
-            errorMessage = why.text
-        case .success(let chatId):
-            selectedChatId = chatId
-            dismiss()
-            onDismissParent?()
-        }
+        // Nil only when no group can be created yet (Create is greyed then, GROUPS-DISTRO-DESIGN.md
+        // §8.7): nothing was created or queued, and nothing is said.
+        guard let chatId = repository.createGroupChat(name: trimmedName, memberHashes: Array(selectedMembers)) else { return }
+        selectedChatId = chatId
+        dismiss()
+        onDismissParent?()
     }
 }
