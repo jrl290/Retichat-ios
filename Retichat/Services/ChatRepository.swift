@@ -2765,13 +2765,26 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// group's own address (GROUPS-DISTRO-DESIGN.md §8.1, §8.5): the distro D when this device
     /// holds it (recorded creator D, invite chunks signed by D, D's chunk carrying D's key from
     /// DistroManager, one `create` group sync owed once the chunks are built), otherwise the
-    /// device. "" (nothing made) while D may be held but is not loaded yet: group actions as D
-    /// are not offered until it is (§8.7).
-    func createGroupChat(name: String, memberHashes: [String]) -> String {
-        guard let ctx = modelContext else { return "" }
+    /// device. Refused, with nothing written, queued or retried (GroupSelf.createRefusal), while
+    /// the stack is not running (no invite could be signed or sent: the group would list members
+    /// nobody invited), then while D may be held but is not loaded yet: group actions as D are
+    /// not offered until it is (§8.7). The form says which (CreateRefusal.text).
+    func createGroupChat(name: String, memberHashes: [String]) -> Result<String, GroupSelf.CreateRefusal> {
+        // Running means what it means for a send: the start finished (releaseHeldSends opened
+        // the gate) and the stack is held. nil while it is starting or stopped.
+        let client = heldSends.isOpen ? lxmfClient : nil
+        if let why = GroupSelf.createRefusal(stackRunning: client != nil,
+                                            distroLoaded: DistroManager.shared.signing() != nil,
+                                            distroSettled: distroSettled) {
+            print("[GroupChat] group not created: \(why.text)")
+            return .failure(why)
+        }
+        guard let ctx = modelContext, let client else { return .failure(.notRunning) }
         guard let signer = creationSigner() else {
-            print("[GroupChat] group not created: the distro this device may hold has not loaded yet (§8.7)")
-            return ""
+            // createRefusal let it through, so D is loaded or settled: only an identity the
+            // stack cannot give now leaves no signer.
+            print("[GroupChat] group not created: no identity to sign its invites with")
+            return .failure(.notRunning)
         }
         let own = signer.hex
 
@@ -2815,41 +2828,40 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         try? ctx.save()
 
-        // Send invites to everyone except the user (fire-and-forget)
-        if let client = lxmfClient {
-            var memberPublicKeys: [String: String] = [:]
-            for memberHash in allMembers {
-                guard let hashData = Data(hexString: memberHash) else { continue }
-                let publicKey = memberHash == own
-                    ? signer.publicKey
-                    : bridge.recalledPublicKey(destHash: hashData)
-                if let publicKey, publicKey.count == 64 {
-                    memberPublicKeys[memberHash] = publicKey.hexString
-                }
+        // Send invites to everyone except the user (fire-and-forget). The stack is running
+        // (createRefusal), so every invite is signed and goes.
+        var memberPublicKeys: [String: String] = [:]
+        for memberHash in allMembers {
+            guard let hashData = Data(hexString: memberHash) else { continue }
+            let publicKey = memberHash == own
+                ? signer.publicKey
+                : bridge.recalledPublicKey(destHash: hashData)
+            if let publicKey, publicKey.count == 64 {
+                memberPublicKeys[memberHash] = publicKey.hexString
             }
-            let targets = allMembers.filter { $0 != own }
-            let atMs = DistroGroupSync.atMs(now)
-            ffiQueue.async { [weak self] in
-                let keys = GroupChatManager.shared.sendInvites(
-                    groupId: groupId,
-                    groupName: name,
-                    allMembers: allMembers,
-                    memberPublicKeys: memberPublicKeys,
-                    targets: targets,
-                    as: signer,
-                    via: client
-                )
-                // §10.6: the `create` group sync, once the invite chunks are built.
-                guard signer.isDistro, let keys else { return }
-                Task { @MainActor [weak self] in
-                    self?.oweGroupSync(.create, groupId: groupId, signer: signer, atMs: atMs, name: name,
-                                       membersCsv: membersCsv, keys: keys)
-                }
+        }
+        let targets = allMembers.filter { $0 != own }
+        let atMs = DistroGroupSync.atMs(now)
+        ffiQueue.async { [weak self] in
+            let keys = GroupChatManager.shared.sendInvites(
+                groupId: groupId,
+                groupName: name,
+                allMembers: allMembers,
+                memberPublicKeys: memberPublicKeys,
+                targets: targets,
+                as: signer,
+                via: client
+            )
+            // §10.6: the `create` group sync, once the invite chunks are built.
+            guard signer.isDistro, let keys else { return }
+            Task { @MainActor [weak self] in
+                self?.oweGroupSync(.create, groupId: groupId, signer: signer, atMs: atMs, name: name,
+                                   membersCsv: membersCsv, keys: keys)
             }
         }
 
         refreshChats()
-        return groupId
+        return .success(groupId)
     }
 
     func archiveChat(chatId: String) {
@@ -3034,16 +3046,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // exactly that group's self addresses (GROUPS-DISTRO-DESIGN.md §9.1).
         let names = contactNameIndex()
         let me = groupSelf(forChatId: chatId)
+        let siblings = knownSiblingAddresses()
 
         // Reverse back to chronological order for display
         return entities.reversed().map { entity in
             let attachments = attachmentsByMsg[entity.id] ?? []
             let senderName = label(for: entity.senderHash, in: names, groupSelf: me)
+            // A known sibling's own join or leave is "Your other device", not "You".
+            let subject = GroupSelf.memberLineSubject(entity.senderHash, messageId: entity.id, groupSelf: me,
+                                                      device: ownHashHex, siblings: siblings) ?? senderName
             return ChatMessage(
                 id: entity.id,
                 senderHash: entity.senderHash,
                 senderName: senderName,
-                content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: senderName),
+                content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: subject),
                 timestamp: entity.timestamp,
                 isOutgoing: entity.isOutgoing,
                 deliveryState: entity.deliveryState,
@@ -3675,7 +3691,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// Who a group created now is created as (§8.1, §8.5): D when this device holds it, the
-    /// device when it holds none, nil while it may hold one not loaded yet (§8.7).
+    /// device when it holds none, nil while it may hold one not loaded yet (§8.7), or while the
+    /// stack gives no device identity (never a signer without one: its invites would go unsigned).
     private func creationSigner() -> GroupSigner? {
         if let signing = DistroManager.shared.signing(), let hash = Data(hexString: signing.info.deliveryHashHex) {
             return GroupSigner(hex: signing.info.deliveryHashHex, hash: hash, identityHandle: signing.handle,
@@ -3683,8 +3700,6 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         guard distroSettled else { return nil }
         return deviceSigner()
-            ?? GroupSigner(hex: ownHashHex, hash: Data(hexString: ownHashHex) ?? Data(), identityHandle: 0,
-                           publicKey: nil, isDistro: false)
     }
 
     /// GROUP_MEMBER_KEYS entries for the listed members whose key this device holds (the
@@ -4270,11 +4285,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return (names[hash] ?? nil) ?? DisplayNames.shortHash(hash)
     }
 
-    /// A stored message's text as shown: a system message's subject named now.
+    /// A stored message's text as shown: a system message's subject named now ("Your other device"
+    /// for a known sibling's own join or leave, GroupSelf.memberLineSubject).
     private func shownText(_ content: String, id: String, senderHash: String, names: [String: String?],
                            groupSelf: Set<String>? = nil) -> String {
-        DisplayNames.systemText(content, messageId: id, subject: label(for: senderHash, in: names, groupSelf: groupSelf))
+        let subject = GroupSelf.memberLineSubject(senderHash, messageId: id, groupSelf: groupSelf,
+                                                  device: ownHashHex, siblings: knownSiblingAddresses())
+            ?? label(for: senderHash, in: names, groupSelf: groupSelf)
+        return DisplayNames.systemText(content, messageId: id, subject: subject)
     }
+
+    /// Every known sibling of every distro (§9.1): the user's other devices this device has
+    /// learnt. Within a group's self addresses, exactly its distro's.
+    private func knownSiblingAddresses() -> Set<String> { Set(prefs.distroSiblings.values.joined()) }
 
     /// The self addresses of group `chatId` held here (§9.1); nil for a chat that is not a group.
     private func groupSelf(forChatId chatId: String) -> Set<String>? {

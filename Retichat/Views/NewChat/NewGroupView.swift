@@ -128,18 +128,15 @@ struct NewGroupView: View {
             return
         }
 
-        let chatId = repository.createGroupChat(
-            name: trimmedName,
-            memberHashes: Array(selectedMembers)
-        )
-        // "" when the distro this device holds has not loaded yet (GROUPS-DISTRO-DESIGN.md
-        // §8.7): nothing was created, and nothing is queued.
-        guard !chatId.isEmpty else {
-            errorMessage = GroupSelf.createNotReadyText
-            return
+        switch repository.createGroupChat(name: trimmedName, memberHashes: Array(selectedMembers)) {
+        case .failure(let why):
+            // The stack is not running, or the distro this device holds has not loaded yet
+            // (GROUPS-DISTRO-DESIGN.md §8.7): nothing was created, and nothing is queued.
+            errorMessage = why.text
+        case .success(let chatId):
+            selectedChatId = chatId
+            dismiss()
+            onDismissParent?()
         }
-        selectedChatId = chatId
-        dismiss()
-        onDismissParent?()
     }
 }

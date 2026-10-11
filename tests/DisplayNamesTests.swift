@@ -752,8 +752,9 @@ func testTheSurfaces() {
             && source("Retichat/Services/GroupStatuses.swift").contains("id: accepted ? \"acc_\\(src.prefix(8))_\\(groupId.prefix(8))\" : msgId"),
           "each system message's id has a DisplayNames.systemMessageIdPrefixes prefix (review IOS-DN-2)")
     let messages = body(repo, "func messages(forChatId chatId: String")
-    check(messages.contains("content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: senderName)"),
-          "bubbles name the subject when shown, system messages only")
+    check(messages.contains("content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: subject)")
+            && messages.contains("?? senderName"),
+          "bubbles name the subject when shown, system messages only (a known sibling's join or leave: \"Your other device\")")
     let refresh = body(repo, "func refreshChats()")
     check(refresh.contains("shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names, groupSelf: selves[entity.id])")
             && refresh.contains("previewByChat[m.chatId] = (m.id, m.content, m.senderHash)"),

@@ -387,14 +387,15 @@ nonisolated enum GroupSelf {
         return .formerDistro(own)
     }
 
-    /// §8.7's text for a D-group this device cannot sign for.
+    /// §8.7's text for a D-group this device cannot sign for. The not-loaded text is shared by
+    /// the three clients (decided 2026-10-11).
     static func cannotSignText(_ signer: Signer) -> String? {
         switch signer {
         case .device, .distro: return nil
         case .formerDistro(let d):
             return "This group uses your distro address \(short(d)), which this device no longer holds. You can read it here, but cannot post or change your membership from this device."
-        case .distroNotLoaded(let d):
-            return "This group uses your distro address \(short(d)), which has not loaded on this device yet. You can read it here, and post or change your membership once it has loaded."
+        case .distroNotLoaded:
+            return "Your distro address hasn't loaded on this device yet. You can post and change your membership once it has."
         }
     }
 
@@ -405,8 +406,56 @@ nonisolated enum GroupSelf {
 
     /// §8.7, "If D is held but not yet loaded (start-up), group actions as D are not offered
     /// until it is": what the new-group form says when a group cannot be created yet. Nothing
-    /// is queued or retried. (The design gives no wording for this case.)
-    static let createNotReadyText = "Your distro address has not loaded on this device yet. Create the group once it has."
+    /// is queued or retried. (The design gives no wording for this case; this one is shared by
+    /// the three clients, decided 2026-10-11.)
+    static let createNotReadyText = "Your distro address hasn't loaded on this device yet. Create the group once it has."
+
+    /// What the new-group form says while the stack is not running: no invite could be signed or
+    /// sent, so no group is written (it would list members nobody invited). Nothing is queued.
+    static let createNotRunningText = "Retichat isn't running on this device right now. Create the group once it is."
+
+    /// Why a group cannot be created now.
+    enum CreateRefusal: Error, Equatable, Sendable {
+        /// The stack is starting, stopped, or failed to start.
+        case notRunning
+        /// The distro this device may hold has not loaded yet (§8.7).
+        case distroNotLoaded
+
+        var text: String {
+            switch self {
+            case .notRunning: return GroupSelf.createNotRunningText
+            case .distroNotLoaded: return GroupSelf.createNotReadyText
+            }
+        }
+    }
+
+    /// §8.5, §8.7: nil when a group can be created now (as D when `distroLoaded`, else as the
+    /// device), otherwise why not: first a stack that is not running (`stackRunning`: the start
+    /// finished, so an invite can be signed and sent), then a distro that may be held but has not
+    /// loaded (`distroSettled` false: the Keychain has not said yet what this device holds).
+    static func createRefusal(stackRunning: Bool, distroLoaded: Bool, distroSettled: Bool) -> CreateRefusal? {
+        if !stackRunning { return .notRunning }
+        if !distroLoaded && !distroSettled { return .distroNotLoaded }
+        return nil
+    }
+
+    /// The subject of a known sibling's own join or leave line (decided 2026-10-11, the same on
+    /// every client).
+    static let otherDeviceSubject = "Your other device"
+
+    /// The subject of a join or leave line (an `acc_` or `left_` system message, the engine's,
+    /// GroupStatuses.swift) about one of the user's other devices: a known sibling (`siblings`,
+    /// learnt from the 0xFD of a D-signed sync, §9.1) among the group's self addresses
+    /// (`groupSelf`), that is, a device listed in a group that names the distro. "Your other
+    /// device joined the group", never "You joined the group", which reads as if the user had
+    /// joined or left. nil for anything else: the line names its subject as before.
+    static func memberLineSubject(_ hex: String, messageId: String, groupSelf: Set<String>?, device: String,
+                                  siblings: Set<String>) -> String? {
+        guard messageId.hasPrefix("acc_") || messageId.hasPrefix("left_"), let groupSelf else { return nil }
+        let h = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !h.isEmpty, h != device.lowercased(), groupSelf.contains(h), siblings.contains(h) else { return nil }
+        return otherDeviceSubject
+    }
 
     static func short(_ hex: String) -> String { String(hex.prefix(8)) }
 }

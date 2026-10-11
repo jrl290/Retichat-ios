@@ -1085,6 +1085,86 @@ func theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt() {
     checkEqual(LxmfFieldsDecoder.groupMemberKeys("\(M):\u{301}\(key)"), [:], "a combining mark after the colon spoils the key, as in Rust")
 }
 
+// MARK: - The texts the three clients share (decided 2026-10-11)
+
+/// The group view while D is stored but not loaded, the create form's two refusals, and the
+/// former-D text: the same words on iOS, Android and the web. A create is refused while the stack
+/// is not running (no invite could be signed or sent: the group would be written with nobody
+/// invited), then while D may be held but has not loaded; nothing is written, queued or retried.
+func theGroupTextsAreTheOnesTheThreeClientsShare() {
+    checkEqual(GroupSelf.cannotSignText(.distroNotLoaded(D)),
+               "Your distro address hasn't loaded on this device yet. You can post and change your membership once it has.",
+               "the group view while D has not loaded")
+    checkEqual(GroupSelf.cannotSignText(.formerDistro(D)),
+               "This group uses your distro address \(D.prefix(8)), which this device no longer holds. You can read it here, but cannot post or change your membership from this device.",
+               "the former-D text stays")
+    checkEqual(GroupSelf.createNotReadyText, "Your distro address hasn't loaded on this device yet. Create the group once it has.",
+               "create while D has not loaded")
+    checkEqual(GroupSelf.createNotRunningText, "Retichat isn't running on this device right now. Create the group once it is.",
+               "create while the stack is not running")
+    checkEqual(GroupSelf.CreateRefusal.distroNotLoaded.text, GroupSelf.createNotReadyText, "the refusal says its text")
+    checkEqual(GroupSelf.CreateRefusal.notRunning.text, GroupSelf.createNotRunningText, "the refusal says its text")
+    for (loaded, settled) in [(true, true), (false, true), (false, false)] {
+        checkEqual(GroupSelf.createRefusal(stackRunning: false, distroLoaded: loaded, distroSettled: settled), .notRunning,
+                   "the stack not running refuses first (D loaded \(loaded), settled \(settled))")
+    }
+    checkEqual(GroupSelf.createRefusal(stackRunning: true, distroLoaded: false, distroSettled: false), .distroNotLoaded,
+               "running, D not read yet: refused")
+    checkEqual(GroupSelf.createRefusal(stackRunning: true, distroLoaded: true, distroSettled: true), nil, "D loaded: created as D")
+    checkEqual(GroupSelf.createRefusal(stackRunning: true, distroLoaded: false, distroSettled: true), nil,
+               "no distro held: created as the device")
+    // The wiring: refused before anything is written, and the form says which refusal.
+    let create = body(repo, "func createGroupChat(")
+    check(create.contains("-> Result<String, GroupSelf.CreateRefusal> {"), "createGroupChat says why it created nothing")
+    check(create.contains("let client = heldSends.isOpen ? lxmfClient : nil")
+            && create.contains("if let why = GroupSelf.createRefusal(stackRunning: client != nil,"),
+          "running means what a send means: the start finished and the stack is held")
+    check(before(create, "if let why = GroupSelf.createRefusal(", "ctx.insert(chat)")
+            && before(create, "if let why = GroupSelf.createRefusal(", "guard let signer = creationSigner() else {"),
+          "the refusal comes before the signer and before anything is written")
+    check(!create.contains("if let client = lxmfClient {"), "the invites are never skipped for a stack that is not running")
+    check(!body(repo, "private func creationSigner(").contains("identityHandle: 0"), "no signer without an identity")
+    for path in ["Retichat/Views/NewChat/NewGroupView.swift", "Retichat/Views/NewChat/NewConversationView.swift"] {
+        let view = source(path)
+        check(view.contains("case .failure(let why):") && view.contains("errorMessage = why.text"), "\(path): the form says why")
+        check(!view.contains("createNotReadyText") && !view.contains("chatId.isEmpty"), "\(path): no single text for both refusals")
+    }
+}
+
+/// A known sibling device's own accept or leave, in a group that lists that device: "Your other
+/// device joined the group" / "Your other device left the group", never "You ...", which reads as
+/// if the user had joined or left (decided 2026-10-11, the same on every client).
+func aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice() {
+    let me: Set<String> = [THIS, D, SIB]
+    let joined = "\(DisplayNames.subjectToken) joined the group"
+    let left = "\(DisplayNames.subjectToken) left the group"
+    func subject(_ hex: String, _ id: String, _ groupSelf: Set<String>?) -> String? {
+        GroupSelf.memberLineSubject(hex, messageId: id, groupSelf: groupSelf, device: THIS, siblings: [SIB])
+    }
+    checkEqual(subject(SIB, "acc_\(SIB.prefix(8))_\(GID.prefix(8))", me), "Your other device", "a sibling's accept")
+    checkEqual(subject(SIB.uppercased(), "left_\(hash64(1))", me), "Your other device", "a sibling's leave")
+    checkEqual(DisplayNames.systemText(joined, messageId: "acc_x", subject: subject(SIB, "acc_x", me)!),
+               "Your other device joined the group", "the join line")
+    checkEqual(DisplayNames.systemText(left, messageId: "left_x", subject: subject(SIB, "left_x", me)!),
+               "Your other device left the group", "the leave line")
+    checkEqual(subject(THIS, "acc_x", me), nil, "this device is not another device")
+    checkEqual(subject(D, "acc_x", me), nil, "nor is D")
+    checkEqual(subject(M, "acc_x", me), nil, "a member is named as before")
+    checkEqual(subject(SIB, "acc_x", [THIS]), nil, "a sibling in a group that does not name the distro is a member there")
+    checkEqual(subject(SIB, "acc_x", nil), nil, "outside a group")
+    checkEqual(subject(SIB, "inv_x", me), nil, "only a join or leave line")
+    checkEqual(subject(SIB, hash64(2), me), nil, "never a message's sender")
+    // The wiring: both the conversation and the chat list's preview name the line so.
+    let loader = body(repo, "func messages(forChatId chatId: String")
+    check(loader.contains("let siblings = knownSiblingAddresses()")
+            && loader.contains("let subject = GroupSelf.memberLineSubject(entity.senderHash, messageId: entity.id, groupSelf: me,")
+            && loader.contains("device: ownHashHex, siblings: siblings) ?? senderName")
+            && loader.contains("content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: subject),"),
+          "the conversation's line")
+    check(body(repo, "private func shownText(").contains("GroupSelf.memberLineSubject(senderHash, messageId: id, groupSelf: groupSelf,"),
+          "the chat list's preview")
+}
+
 // MARK: - Run
 
 let allTests: [(String, @MainActor () -> Void)] = [
@@ -1123,6 +1203,8 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("the NSE file is written when the filter or the allowlist changes", theNSEFileIsWrittenWhenTheFilterOrTheAllowlistChanges),
     ("a known sibling's message that is not validated is never the user's own", aKnownSiblingsMessageThatIsNotValidatedIsNeverTheUsersOwn),
     ("the member csv is split on code points as the shared parser splits it", theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt),
+    ("the group texts are the ones the three clients share", theGroupTextsAreTheOnesTheThreeClientsShare),
+    ("a known sibling's own accept or leave is \"Your other device\"", aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice),
 ]
 
 @main
