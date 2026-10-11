@@ -683,8 +683,8 @@ func testTheReceivePaths() {
     let incoming = body(repo, "private func handleIncomingMessage(")
     check(before(incoming, "if let key = fields.distroTransferKey", "LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw)"),
           "transfers and sent copies are dropped before any name is read")
-    check(before(incoming, "guard case .kept(let standing, let ownAct) = admitGroupMessage(", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                             messageTime: timestamp)\n            handleGroupMessage("),
-          "a group message's 0xD1 names its LXMF source, only when the group policy accepts it (audit H11), ordered by its timestamp")
+    check(before(incoming, "guard case .kept(let standing, let ownAct) = admitGroupMessage(", "if !ownAct {\n                applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                                 messageTime: timestamp)\n            }\n            handleGroupMessage("),
+          "a group message's 0xD1 names its LXMF source, only when the group policy accepts it (audit H11), ordered by its timestamp; never a known sibling acting as the user (GROUPS-DISTRO-DESIGN.md §9.2)")
     check(before(incoming, "guard allowlist.isAllowed else", "applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,\n                         messageTime: timestamp)\n        storeIncomingDirect("),
           "a DM's 0xD1 is applied after the allowlist and before the bubble and notification, ordered by its timestamp")
     let nse = body(repo, "func importNSEMessages()")
@@ -755,9 +755,9 @@ func testTheSurfaces() {
     check(messages.contains("content: DisplayNames.systemText(entity.content, messageId: entity.id, subject: senderName)"),
           "bubbles name the subject when shown, system messages only")
     let refresh = body(repo, "func refreshChats()")
-    check(refresh.contains("shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names)")
+    check(refresh.contains("shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names, groupSelf: selves[entity.id])")
             && refresh.contains("previewByChat[m.chatId] = (m.id, m.content, m.senderHash)"),
-          "so does the chat-list preview, by the message's id")
+          "so does the chat-list preview, by the message's id (\"You\" in a group by its own self, GROUPS-DISTRO-DESIGN.md §9.1)")
     check(refresh.contains("let entries = contactNameEntries()") && refresh.contains("let snapshot = entries")
             && !refresh.contains("chatNameMap[chat.peerHash]"),
           "chat_names.json holds every named contact's resolved name, keyed by contact, never a placeholder (audit M3)")

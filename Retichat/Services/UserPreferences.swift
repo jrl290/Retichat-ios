@@ -242,8 +242,17 @@ final class UserPreferences {
     /// via "New Chat" or QR scan.  Defaults to true (block strangers).
     var filterStrangers: Bool {
         get { defaults.object(forKey: Keys.filterStrangers) != nil ? defaults.bool(forKey: Keys.filterStrangers) : true }
-        set { defaults.set(newValue, forKey: Keys.filterStrangers) }
+        set {
+            let changed = newValue != filterStrangers
+            defaults.set(newValue, forKey: Keys.filterStrangers)
+            // The NSE's group file says whether the filter is on (GROUPS-DISTRO-DESIGN.md §6.7):
+            // ChatRepository writes it again on this, whoever changed the switch.
+            if changed { NotificationCenter.default.post(name: UserPreferences.filterStrangersChanged, object: nil) }
+        }
     }
+
+    /// Posted when `filterStrangers` changes.
+    static let filterStrangersChanged = Notification.Name("RetichatFilterStrangersChanged")
 
     /// Set of chat IDs for which notifications are silenced by the user.
     var mutedChatIds: Set<String> {

@@ -363,12 +363,33 @@ final class LxmfFieldsDecoder {
     }
 
     /// GROUP_MEMBERS and GROUP_RELAY_SEEN: comma-separated (Android-compatible), each element
-    /// trimmed of spaces, empty ones skipped. The invite's own parser, which a group sync's
-    /// `members` is read with too (GROUPS-DISTRO-DESIGN.md §10.2).
+    /// trimmed of spaces (Unicode Zs and tab, LXMF-rust's is_invite_space), empty ones skipped.
+    /// The invite's own parser, which a group sync's `members` is read with too
+    /// (GROUPS-DISTRO-DESIGN.md §10.2). Split on the code point ',', as LXMF-rust's
+    /// invite_members and the web's inviteMembers split it: never on Swift's grapheme clusters,
+    /// where a combining mark after a comma takes the comma with it and the list reads otherwise.
     nonisolated static func groupCsv(_ raw: String) -> [String] {
-        raw.split(separator: ",")
-            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        splitOnScalar(raw, ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+    }
+
+    /// `raw` split on every occurrence of the code point `separator` (never on a grapheme cluster).
+    nonisolated static func splitOnScalar(_ raw: String, _ separator: Unicode.Scalar, maxSplits: Int = Int.max) -> [String] {
+        raw.unicodeScalars.split(separator: separator, maxSplits: maxSplits, omittingEmptySubsequences: false)
+            .map { String(String.UnicodeScalarView($0)) }
+    }
+
+    /// GROUP_MEMBER_KEYS: `hash:base64` entries, comma-separated, split on code points as the
+    /// member list is (groupCsv). An entry whose hash is not 32 long or whose key is not 64 bytes
+    /// is skipped; the hash is lowercased; the first entry for a hash is kept.
+    nonisolated static func groupMemberKeys(_ raw: String) -> [String: String] {
+        Dictionary(splitOnScalar(raw, ",").compactMap { entry in
+            let parts = splitOnScalar(entry, ":", maxSplits: 1)
+            guard parts.count == 2, parts[0].count == 32,
+                Data(base64Encoded: parts[1])?.count == 64 else { return nil }
+            return (parts[0].lowercased(), parts[1])
+        }, uniquingKeysWith: { first, _ in first })
     }
 
     /// The typed group fields of `fields`, from its resolved groupEntries.
@@ -390,12 +411,7 @@ final class LxmfFieldsDecoder {
         fields.groupRelayFor = str(.relayFor)
         if case .bool(let done)? = entries[.relayDone] { fields.groupRelayDone = done }
         if let raw = str(.memberKeys) {
-            fields.groupMemberKeys = Dictionary(raw.split(separator: ",").compactMap { entry in
-                let parts = entry.split(separator: ":", maxSplits: 1).map(String.init)
-                guard parts.count == 2, parts[0].count == 32,
-                    Data(base64Encoded: parts[1])?.count == 64 else { return nil }
-                return (parts[0].lowercased(), parts[1])
-            }, uniquingKeysWith: { first, _ in first })
+            fields.groupMemberKeys = groupMemberKeys(raw)
         }
     }
 

@@ -224,7 +224,7 @@ func anInviteTheFilterDropsIsIgnoredAndItsIdEntersTheFilteredInviteSet() {
     let arrival = body(repo, "private func handleDistroGroupArrival(")
     check(arrival.contains("if action == GroupAction.invite {\n                noteFilteredInvite("), "a dropped invite is noted")
     let note = body(repo, "private func noteFilteredInvite(")
-    check(note.contains("guard !isAllowlisted(destHash: sourceHex), !standing.closed,")
+    check(note.contains("guard FilteredInvites.records(sourceAllowlisted: isAllowlisted(destHash: sourceHex), closed: standing.closed,")
             && note.contains("prefs.filteredInviteIds = FilteredInvites.record(prefs.filteredInviteIds, groupId)"),
           "the filter's drop records the id")
 }
@@ -802,7 +802,8 @@ func siblingsAreLearntFromEveryAcceptedDeviceAddressAndKeptWhileAGroupNeedsThem(
     check(handle.contains("case .apply(let form, let sibling):\n            if let sibling { learnSibling(sibling, of: a.distroHex) }"), "and the group sync")
     check(repo.contains("RfedDistroClient.shared.onSiblingSeen = { [weak self] by, distro in\n            self?.learnSibling(by, of: distro)"),
           "wired to the repository")
-    check(body(repo, "func isOwnAddress(").contains("knownSiblings(of:"), "a sibling is one of the user's own addresses")
+    check(body(repo, "private func groupSelf(_ chat: ChatEntity").contains("siblings: knownSiblings(of:)"),
+          "a sibling is one of the user's own addresses in a group naming its distro (§9.1), not everywhere")
 }
 
 func anOlderSiblingsPostIsStoredAsTheUsersOwnOutgoingPost() {
@@ -839,8 +840,8 @@ func aMembersAcceptToDCarryingANameShowsThatNameInTheMemberList() {
           "the name row of the direct path is made for its source")
     check(conversation.contains("Text(repository.groupMemberDisplayName(for: member.memberHash, groupId: chatId))"),
           "the member list shows the member's name (and \"You\" for the user's addresses)")
-    check(body(repo, "func groupMemberDisplayName(").contains("if isGroupSelf(chatId: groupId, hex: hash) { return \"You\" }\n        return contactDisplayName(for: hash)"),
-          "resolved as any contact's name")
+    check(body(repo, "func groupMemberDisplayName(").contains("if isGroupSelf(chatId: groupId, hex: hash) { return \"You\" }\n        return resolvedContactName(for: hash) ?? DisplayNames.shortHash(hash)"),
+          "resolved as any contact's name, \"You\" for exactly the group's self addresses")
 }
 
 // MARK: - §10.5: the writer's JSON; §13: the words

@@ -529,9 +529,15 @@ final class GroupStatusEngine {
     /// member that has not answered is absent: still invited. An empty list is a valid answer. Only
     /// the creator answers: any other device sends nothing. A creator that is the user's distro D
     /// answers from every device of D that holds the group joined (GROUPS-DISTRO-DESIGN.md §12.1);
-    /// one that applied D's leave holds no group, so it answers nothing.
+    /// one that applied D's leave holds no group, so it answers nothing. An accept by one of the
+    /// user's own addresses (an older device of D acting as its listed entry, §14) counts for its
+    /// entry and is never answered: a self address is never a send target, a status included (§9.2).
     private func answerAccept(_ chat: GroupChatInfo, _ memberHex: String) {
         guard let creator = chat.creatorHex, isSelf(chat.id, creator) else { return }
+        guard !isSelf(chat.id, memberHex) else {
+            log("Group \(chat.id): no answer to the user's own accept (\(memberHex.prefix(12))): a self address is never a send target")
+            return
+        }
         let listed = Set(store.members(chatId: chat.id).map(\.hash))
         let statuses = store.copies(chatId: chat.id)
             .filter { !isSelf(chat.id, $0.memberHex) && $0.memberHex != memberHex && listed.contains($0.memberHex) }

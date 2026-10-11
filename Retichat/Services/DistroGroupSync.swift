@@ -335,6 +335,20 @@ nonisolated enum GroupSelf {
         return out
     }
 
+    /// Whether `hex` is shown as "You" (§9.1, §9.2). In a group, exactly that group's self
+    /// addresses (`groupSelf`, from `addresses`): a sibling listed in a group that names no distro
+    /// this device holds or held is a separate member there, and a former D is "You" in the groups
+    /// it is the own address of (§8.7). Outside groups (a DM, the new-chat, QR and contact checks),
+    /// the device and the distro held now (`heldDistro`), never a sibling.
+    static func shownAsYou(_ hex: String, groupSelf: Set<String>?, device: String, heldDistro: String?) -> Bool {
+        let h = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !h.isEmpty else { return false }
+        if !device.isEmpty, h == device.lowercased() { return true }
+        if let groupSelf { return groupSelf.contains(h) }
+        if let d = heldDistro?.lowercased(), h == d { return true }
+        return false
+    }
+
     /// A D-group: one whose own address is a distro (the current D or a former one). nil (a
     /// group held from before this change) is the device.
     static func isDistroGroup(ownMember: String?, device: String) -> Bool {
@@ -411,6 +425,11 @@ nonisolated enum GroupFirstRules {
         /// The author would be a self address (GROUP_SENDER) while the packet source is not one:
         /// dropped.
         case selfSenderFromOther
+        /// The packet source is a known sibling (one of the user's own addresses here) and the
+        /// signature did not validate (SOURCE_UNKNOWN): only a validly signed message from another
+        /// device of D is the user's own (§9.2, SPEC §17.14), and a self address is never another
+        /// member, so it is dropped, never stored as sent, never held.
+        case selfSourceUnproven
     }
 
     /// `selfAddresses`: the group's (GroupSelf.addresses); `distros`: the D this device holds
@@ -423,7 +442,9 @@ nonisolated enum GroupFirstRules {
         if let named = DeliveryPolicy.hash(groupSender), selfAddresses.contains(named), !sourceIsSelf {
             return .selfSenderFromOther
         }
-        return .pass(ownAct: sourceIsSelf && siblings.contains(sourceHex))
+        let fromSibling = sourceIsSelf && siblings.contains(sourceHex)
+        if fromSibling, signature != DeliveryPolicy.Signature.validated { return .selfSourceUnproven }
+        return .pass(ownAct: fromSibling)
     }
 }
 
@@ -441,6 +462,15 @@ nonisolated enum FilteredInvites {
     }
 
     static func remove(_ ids: [String], _ groupId: String) -> [String] { ids.filter { $0 != groupId } }
+
+    /// Whether an invite to D the privacy filter dropped records its group id: the set is for
+    /// groups the filter decided not to hold. Not for a group held here (pending from an inviter
+    /// the filter admitted, or joined): a co-member's own invite for it (§11.2) must not make this
+    /// device refuse to hold that group's traffic. Not from an allowlisted inviter, for a closed
+    /// group, or for a forged invite.
+    static func records(sourceAllowlisted: Bool, closed: Bool, signature: Int, heldHere: Bool) -> Bool {
+        !sourceAllowlisted && !closed && signature != DeliveryPolicy.Signature.invalid && !heldHere
+    }
 }
 
 // MARK: - Known siblings (§9.1)
