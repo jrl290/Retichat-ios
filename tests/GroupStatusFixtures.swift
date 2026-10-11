@@ -297,6 +297,9 @@ final class FakeGroupNative: GroupNative {
     private var keys: [String: Data] = [:]      // lxmf.delivery hash (hex) -> public key
     private(set) var remembered: [String] = []
     private(set) var unpacked = 0
+    /// Packed messages the native layer refuses whole (RFed SPEC §17.14 "Repeated keys": LXMF-rust refuses a payload
+    /// that repeats a key, and logs the one line).
+    var refused: [Data] = []
 
     func know(_ identity: VIdentity) { keys[identity.hashHex] = identity.publicKey }
     func holds(_ hex: String) -> Bool { keys[hex] != nil }
@@ -315,11 +318,13 @@ final class FakeGroupNative: GroupNative {
         return verifier.isValidSignature(Data(b[32..<96]), for: signed + TestLxmf.sha256(signed))
     }
 
-    /// An element of a status, or an entry held, as the glue unpacks it. Nil for what is no LXMF message of an accept's size.
-    func unpack(_ packed: Data) -> UnpackedGroupMessage? {
+    /// An element of a status, or an entry held, as the glue unpacks it: `notLxmf` for what is no LXMF message of an
+    /// accept's size, `refused` for what the native layer refuses whole (as `RetichatBridge.groupUnpack` tells it).
+    func unpack(_ packed: Data) -> GroupUnpack {
         unpacked += 1
-        guard packed.count > GroupStatuses.packedHeaderLength, packed.count <= GroupStatuses.statusPackedLimit else { return nil }
-        return receipt(packed)
+        guard packed.count > GroupStatuses.packedHeaderLength, packed.count <= GroupStatuses.statusPackedLimit else { return .notLxmf }
+        if refused.contains(packed) { return .refused }
+        return receipt(packed).map(GroupUnpack.unpacked) ?? .notLxmf
     }
 
     /// What the delivery callback reports of a message the router has delivered (`group_status::receipt`): the same checks, of

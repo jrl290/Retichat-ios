@@ -115,7 +115,7 @@ func everyMessagesVerdictForAReceiverHoldingNoMembersKeyAndOneHoldingEveryMember
         for m in v.messages {
             let native = FakeGroupNative()
             for name in names { native.know(v.identities[name]!) }
-            guard let u = native.unpack(m.packed) else { check(false, "\(m.name) does not unpack"); continue }
+            guard let u = native.unpack(m.packed).message else { check(false, "\(m.name) does not unpack"); continue }
             checkEqual(verdictName(u.signature), m.verdict[context]!, "\(m.name): holding \(context)")
             checkEqual(outcomeName(u.signature, switched: false), m.before[context]!, "\(m.name): before the switch, holding \(context)")
             checkEqual(outcomeName(u.signature, switched: true), m.from[context]!, "\(m.name): from the switch, holding \(context)")
@@ -151,8 +151,8 @@ func theStatusesAreSignedByTheCreatorAndKeyTenIsAnArrayOfBinHoldingExactlyTheLis
     for s in v.statuses {
         let withCreator = FakeGroupNative()
         withCreator.know(v.identities["creator"]!)
-        checkEqual(withCreator.unpack(s.packed)?.signature, DeliveryPolicy.Signature.validated, "\(s.name): signed by the creator")
-        checkEqual(FakeGroupNative().unpack(s.packed)?.signature, DeliveryPolicy.Signature.sourceUnknown, "\(s.name): and by nobody whose key is not held")
+        checkEqual(withCreator.unpack(s.packed).message?.signature, DeliveryPolicy.Signature.validated, "\(s.name): signed by the creator")
+        checkEqual(FakeGroupNative().unpack(s.packed).message?.signature, DeliveryPolicy.Signature.sourceUnknown, "\(s.name): and by nobody whose key is not held")
         checkEqual(s.packed.prefix(16).hexString, v.hashOf(s.destination), "\(s.name): addressed to its recipient")
         let fields = LxmfFieldsDecoder.decode(s.fieldsRaw)
         checkEqual(fields.groupId, v.groupId, "\(s.name): the group")

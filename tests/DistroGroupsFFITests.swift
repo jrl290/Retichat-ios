@@ -371,9 +371,10 @@ func everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerRe
 /// app takes, as Python LXMF refuses it. The distro unwrap returns nothing, with an error the app
 /// knows as the refusal LXMF-rust has already logged (RepeatedKeys.isRefusal: the app says
 /// nothing more, so the refusal is logged once); the group receipt's unpack, the direct path's
-/// LXMessage unpack that the router also runs before any delivery, returns nothing. Nothing
-/// reaches a reader of the fields, so nothing is shown, stored or applied. Each pair the
-/// reference reads is unwrapped and unpacked.
+/// LXMessage unpack that the router also runs before any delivery, returns nothing, and the app's
+/// native layer (FFIGroupNative, what reads a creator's status) knows it as a refusal, so the skip
+/// names it "refused whole", never "not an LXMF message". Nothing reaches a reader of the fields,
+/// so nothing is shown, stored or applied. Each pair the reference reads is unwrapped and unpacked.
 func everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath() {
     let d = identity("distro")
     checkEqual(gvList("refused").count, 11, "the refused vectors of 16a9902")
@@ -393,16 +394,16 @@ func everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath() 
             retichat_distro_unwrap(d, raw.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(sealed.sealed.count), &outLen)
         }
         let error = bridge.rnsLastError()
-        let element = bridge.groupUnpackPacked(packed)
+        let element = MainActor.assumeIsolated { FFIGroupNative(bridge: bridge).unpack(packed) }
         if refuse {
             refusals += 1
             check(ptr == nil, "\(name): the distro unwrap refuses it whole")
             check(RepeatedKeys.isRefusal(error) && (error ?? "").contains("repeats a key"),
                   "\(name): the app knows the unwrap's error as the refusal already logged (\(error ?? "no error"))")
-            check(element == nil, "\(name): the direct path's unpack refuses it whole")
+            checkEqual(element, .refused, "\(name): the direct path's unpack refuses it whole, and the app knows it as the refusal")
         } else {
             check(ptr != nil && outLen > 0, "\(name): the reference reads it, and so does the unwrap (\(error ?? "no error"))")
-            check(element != nil, "\(name): and the direct path's unpack")
+            check(element.message != nil, "\(name): and the direct path's unpack (\(element))")
         }
         if let ptr { rns_free_bytes(ptr, outLen) }
     }

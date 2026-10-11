@@ -1065,16 +1065,27 @@ extension RetichatBridge {
     /// An element of a `status`, or an entry held for its sender's key (a member's own packed
     /// accept or leave, 97..=2144 bytes), unpacked and checked as if it had arrived directly: what
     /// its signature is worth under the key held for its source, else under the key it carries
-    /// for its own sender when that binds. Nothing is remembered. Nil, with the error slot set,
-    /// when it is not an LXMF message of that size.
-    nonisolated func groupUnpackPacked(_ packed: Data) -> UnpackedGroupMessage? {
+    /// for its own sender when that binds. Nothing is remembered. `refused` when the library
+    /// refused it whole because its payload repeats a key (RFed SPEC §17.14 "Repeated keys";
+    /// LXMF-rust has logged that line, and `RepeatedKeys.isRefusal` knows its error), `notLxmf`
+    /// when it is not an LXMF message of that size; as Retichat-android's `groupUnpackPacked`.
+    nonisolated func groupUnpack(_ packed: Data) -> GroupUnpack {
+        guard let buffer = groupUnpackBuffer(packed) else {
+            // Read on this thread, at once: the Rust error slot is thread-local, and this call set it.
+            return RepeatedKeys.isRefusal(rnsLastError()) ? .refused : .notLxmf
+        }
+        return UnpackedGroupMessage.parse(buffer).map(GroupUnpack.unpacked) ?? .notLxmf
+    }
+
+    /// The buffer `retichat_group_unpack_packed` returns for `packed`, or nil with the error slot set.
+    private nonisolated func groupUnpackBuffer(_ packed: Data) -> Data? {
         var outLen: UInt32 = 0
         let ptr = packed.withUnsafeBytes { buf in
             retichat_group_unpack_packed(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(packed.count), &outLen)
         }
         guard let ptr else { return nil }
         defer { rns_free_bytes(ptr, outLen) }
-        return UnpackedGroupMessage.parse(Data(bytes: ptr, count: Int(outLen)))
+        return Data(bytes: ptr, count: Int(outLen))
     }
 
     /// Write key 10 (GROUP_STATUSES) on an outbound message: a native array of bin in the
@@ -1105,7 +1116,7 @@ final class FFIGroupNative: GroupNative {
 
     init(bridge: RetichatBridge) { self.bridge = bridge }
 
-    func unpack(_ packed: Data) -> UnpackedGroupMessage? { bridge.groupUnpackPacked(packed) }
+    func unpack(_ packed: Data) -> GroupUnpack { bridge.groupUnpack(packed) }
 
     /// Remembered only when the key produces `memberHex` as an `lxmf.delivery` destination
     /// (`retichat_identity_remember_lxmf_delivery` checks it).

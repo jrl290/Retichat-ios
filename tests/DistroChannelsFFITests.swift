@@ -293,7 +293,7 @@ func anInterfaceUpEventReachesTheHandlerWithItsNameUntilItIsCleared() {
 // MARK: - Member statuses and keys, through the real library (RFed-spec Group.md, 2026-10-06)
 
 /// Pack an outbound message once and read it back as a status's element is read: through the library's own unpack and check.
-func unpacked(_ packed: Data) -> UnpackedGroupMessage? { bridge.groupUnpackPacked(packed) }
+func unpacked(_ packed: Data) -> UnpackedGroupMessage? { bridge.groupUnpack(packed).message }
 
 /// An accept or leave the library makes, written as GroupChatManager writes it (GroupEnvelopes, both forms are the sender's), packed once.
 /// `signer` is the identity that signs; `source` the one whose hash and key it carries.
@@ -368,6 +368,11 @@ func theLibrariesUnpackRefusesWhatIsNoAcceptOrLeaveInSizeOrKind() {
     check(unpacked(Data(repeating: 0, count: 96)) == nil, "a header and no payload")
     check(unpacked(Data(repeating: 7, count: 2145)) == nil, "over the size of an accept or leave")
     check(unpacked(Data(repeating: 7, count: 300)) == nil, "bytes that are no LXMF message")
+    // None of these is a refusal (RFed SPEC §17.14 "Repeated keys" is for a message that repeats a key): a status's
+    // element of this kind is skipped as "not an LXMF message".
+    for bytes in [Data(), Data(repeating: 0, count: 96), Data(repeating: 7, count: 2145), Data(repeating: 7, count: 300)] {
+        checkEqual(bridge.groupUnpack(bytes), .notLxmf, "\(bytes.count) bytes are not an LXMF message, and not a refusal")
+    }
 }
 
 func aStatusTheLibraryWritesHoldsItsElementsAsAnArrayOfBinAndReadsBackExactlyAsWritten() {

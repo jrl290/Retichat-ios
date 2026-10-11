@@ -247,7 +247,7 @@ func aStampedAcceptIsVerifiedUnderItsCarriedKeyLikeAnyOtherTheStampIsNotSigned()
     checkEqual(r.receive(maker().msg("alice", stamp: true)), true, "a stamped accept counts")
     checkEqual(r.status("alice"), MemberStatus.accepted, "verified: the stamp is not part of what is signed")
     let u = r.native.unpack(maker().msg("alice", stamp: true))
-    checkEqual(u?.signature, DeliveryPolicy.Signature.validated, "validated")
+    checkEqual(u.message?.signature, DeliveryPolicy.Signature.validated, "validated")
 }
 
 // MARK: - The creator
@@ -612,6 +612,60 @@ func anUnverifiableElementCountsUntilTheSwitchAndIsHeldFromItAForgedOneUnderAHel
     }
 }
 
+// MARK: RFed SPEC §17.14 "Repeated keys": what the native layer refuses whole
+
+/// The reason a skip or a drop gives for a message the native layer refused whole, as Retichat-android's
+/// `GroupUnpack.Refused` gives it. LXMF-rust has logged the refusal's own line; this names it, never "not an LXMF message".
+let refusedWholeReason = "refused whole: a map in it repeats a key, as Python LXMF refuses it (RFed SPEC §17.14)"
+
+/// An element the native layer refuses whole (its payload repeats a key) is skipped as refused, under that name, and
+/// is never counted, held or a key remembered from; the rest of the status still applies
+/// (Retichat-android's anElementTheNativeLayerRefusesIsSkippedAsRefusedNeverCountedOrHeld).
+@MainActor
+func anElementTheNativeLayerRefusesIsSkippedAsRefusedNeverCountedOrHeld() {
+    let m = maker()
+    for switched in bothForms {
+        let r = rig(switched: switched, holds: ["creator"])
+        r.hold(accepted: true)
+        let refused = m.msg("alice")
+        let unverifiable = m.msg("erin", key: false)
+        r.native.refused += [refused, unverifiable]
+        r.receive(m.status(to: "frank", elements: [refused, unverifiable, m.msg("bob", action: GroupAction.leave)]))
+        checkEqual(r.lastTally, StatusTally(elements: 3, counted: 1, held: 0, skipped: 2), "the two refused are skipped, switched \(switched)")
+        checkEqual(r.status("alice"), MemberStatus.invited, "alice's refused accept changed nothing")
+        checkEqual(r.status("erin"), MemberStatus.invited, "nor erin's, before or from the switch")
+        checkEqual(r.status("bob"), MemberStatus.left, "bob's leave still counts")
+        check(r.store.heldRows.isEmpty, "nothing refused is held")
+        check(!r.native.remembered.contains(hex("alice")), "no key is remembered from a refused element")
+        // The skip names the refusal; the native layer wrote the refusal's own line.
+        for index in 0..<2 {
+            check(r.logs.contains { $0.hasPrefix("Skipped element \(index) of the status") && $0.hasSuffix(": \(refusedWholeReason)") },
+                  "element \(index) is skipped as refused whole: \(r.logs)")
+        }
+        check(!r.logs.contains { $0.contains("not an LXMF message") }, "a refused element is not called something else: \(r.logs)")
+    }
+}
+
+/// An entry held before this build refused such a message, that the native layer now refuses whole, is released when its
+/// sender's key arrives, never counted, and the drop names the refusal
+/// (Retichat-android's aHeldEntryTheNativeLayerNowRefusesIsReleasedNeverCounted).
+@MainActor
+func aHeldEntryTheNativeLayerNowRefusesIsReleasedNeverCounted() {
+    let m = maker()
+    let r = rig(switched: true, holds: ["creator"])
+    r.hold(accepted: true)
+    let keyless = m.msg("erin", key: false)
+    r.receive(m.status(to: "frank", elements: [keyless]))
+    checkEqual(r.store.heldRows.count, 1, "held from the switch")
+    r.native.refused.append(keyless)
+    r.native.know(V.identities["erin"]!)
+    r.engine.decideHeld(source: hex("erin"))
+    check(r.store.heldRows.isEmpty, "released")
+    checkEqual(r.status("erin"), MemberStatus.invited, "never counted")
+    check(r.logs.contains { $0.hasPrefix("Dropped held accept") && $0.hasSuffix("it no longer unpacks (\(refusedWholeReason))") },
+          "the drop names the refusal: \(r.logs)")
+}
+
 @MainActor
 func aStatusReadsAtMostAsManyElementsAsTheGroupHasMembersAnEmptyOneOrOneWithNoKeyTenChangesNothingAndTheSameStatusTwiceIsOne() {
     let m = maker()
@@ -862,6 +916,8 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("an element is about the status's group alone; one over the size limit is skipped", anElementIsAboutThisStatusesGroupAloneAndOneOverTheSizeLimitIsSkippedWhileTheSameMessageDirectlyIsNot),
     ("an element applies with the normal rules: a leave stays final, whatever the order", anElementAppliesWithTheNormalRulesALeaveStaysFinalAndOrderDoesNotMatterWhetherTheElementsTheDirectMessagesOrBothComeFirst),
     ("an unverifiable element counts until the switch and is held from it; a forged one is skipped either way", anUnverifiableElementCountsUntilTheSwitchAndIsHeldFromItAForgedOneUnderAHeldKeyIsSkippedEitherWay),
+    ("an element the native layer refuses is skipped as refused, never counted or held", anElementTheNativeLayerRefusesIsSkippedAsRefusedNeverCountedOrHeld),
+    ("a held entry the native layer now refuses is released, never counted", aHeldEntryTheNativeLayerNowRefusesIsReleasedNeverCounted),
     ("a status reads at most as many elements as the group has members", aStatusReadsAtMostAsManyElementsAsTheGroupHasMembersAnEmptyOneOrOneWithNoKeyTenChangesNothingAndTheSameStatusTwiceIsOne),
     ("the creator's status is read whole even once the creator has left", theCreatorsStatusIsReadWholeEvenOnceTheCreatorHasLeftBeingOnlyTheCarrierOfWhatMembersSigned),
     ("the group rule for a status as a table", theGroupRuleForAStatusAsATableOnlyTheCreatorOnlyForAJoinedGroupOnlyASignatureThatShowsIt),
