@@ -1179,19 +1179,27 @@ func aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice() {
           "the chat list's preview")
 }
 
-// MARK: - The shared vectors (LXMF-rust 16a9902; RFed SPEC §17.14 "Repeated keys")
+// MARK: - The shared vectors (LXMF-rust b873c00, 400accb; RFed SPEC §17.14 "Repeated keys", "Unhashable keys", "Nesting")
 
-/// The copy is LXMF-rust 16a9902's: a message that repeats a key is refused whole, as Python
-/// LXMF refuses it (James, 2026-10-11: parity). The vectors that pinned a first or a last entry
-/// are `refused` now, beside the `key_equality` pairs; an older copy lacks both.
-func theGroupSyncVectorsAreLXMFRust16a9902sCopy() {
+/// The copy is LXMF-rust b873c00's (400accb's is the same file): a message that repeats a key,
+/// has a key Python cannot hash or is nested past depth 493 is refused whole, as Python LXMF
+/// refuses it (James, 2026-10-11: parity; decided 2026-10-11: one limit), and each `refused`
+/// vector names the reference's reason. 16a9902's copy had 11 `refused` vectors (no reason),
+/// 22 `key_equality` pairs and no `nesting` set; an older copy lacks all three.
+func theGroupSyncVectorsAreLXMFRustB873c00sCopy() {
     checkEqual(gvList("variants").count, 15, "variants")
     checkEqual(gvList("rejects").count, 53, "rejects")
     checkEqual(gvList("group_entries").count, 21, "group_entries")
     checkEqual((GV["invite_members"] as? [[String: Any]])?.count, 2, "invite_members")
-    checkEqual(gvList("refused").count, 11, "refused")
-    checkEqual(gvList("key_equality").count, 22, "key_equality")
+    checkEqual(gvList("refused").count, 22, "refused")
+    checkEqual(gvList("refused").filter { $0["reason"] as? String == "repeated_key" }.count, 13, "refused for a repeated key")
+    checkEqual(gvList("refused").filter { $0["reason"] as? String == "unhashable_key" }.count, 9, "refused for a key Python cannot hash")
+    checkEqual(gvList("key_equality").count, 24, "key_equality")
     checkEqual(gvList("key_equality").filter { $0["refused"] as? Bool == true }.count, 15, "key_equality pairs refused")
+    checkEqual(gvList("nesting").count, 11, "nesting")
+    checkEqual(gvList("nesting").filter { $0["refused"] as? Bool == true && $0["reason"] as? String == "too_deep" }.count, 6,
+               "nesting vectors refused, each past the limit")
+    checkEqual(GV["nesting_max_depth"] as? Int, 493, "the one nesting limit")
 }
 
 /// invite_members: the csv split on the code point ',', never on grapheme clusters.
@@ -1426,7 +1434,7 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("the member csv is split on code points as the shared parser splits it", theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt),
     ("the group texts are the ones the three clients share", theGroupTextsAreTheOnesTheThreeClientsShare),
     ("a known sibling's own accept or leave is \"Your other device\"", aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice),
-    ("the group sync vectors are LXMF-rust 16a9902's copy", theGroupSyncVectorsAreLXMFRust16a9902sCopy),
+    ("the group sync vectors are LXMF-rust b873c00's copy", theGroupSyncVectorsAreLXMFRustB873c00sCopy),
     ("the invite parser lists each invite_members vector", theInviteParserListsEachInviteMembersVector),
     ("the direct path's reader reads each group_entries vector as LXMF-rust does", theDirectPathReaderReadsEachGroupEntriesVectorAsLXMFRustDoes),
     ("the direct path refuses a GROUP_ID that is not 32 hex and lowercases one that is", theDirectPathRefusesAGroupIdThatIsNot32HexAndLowercasesOneThatIs),

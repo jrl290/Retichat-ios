@@ -1066,7 +1066,8 @@ extension RetichatBridge {
     /// accept or leave, 97..=2144 bytes), unpacked and checked as if it had arrived directly: what
     /// its signature is worth under the key held for its source, else under the key it carries
     /// for its own sender when that binds. Nothing is remembered. `refused` when the library
-    /// refused it whole because its payload repeats a key (RFed SPEC §17.14 "Repeated keys";
+    /// refused it whole because its payload repeats a key, has a key Python cannot hash or is
+    /// nested past depth 493 (RFed SPEC §17.14 "Repeated keys", "Unhashable keys", "Nesting";
     /// LXMF-rust has logged that line, and `RepeatedKeys.isRefusal` knows its error), `notLxmf`
     /// when it is not an LXMF message of that size; as Retichat-android's `groupUnpackPacked`.
     nonisolated func groupUnpack(_ packed: Data) -> GroupUnpack {

@@ -11,9 +11,10 @@
 //    pack, writes the very fields bytes the Python reference packs for each op, signed by D, from
 //    D to D; sealed for D, it reads back as the same G on a sibling;
 //  - the writer refuses what a receiver's form check would drop, and a message not from D to D;
-//  - a message that repeats a key (RFed SPEC §17.14 "Repeated keys") is refused whole by the
-//    distro unwrap and by the direct path's unpack, with an error the app knows as the refusal
-//    LXMF-rust logged; a G whose source is not D is ignored by rule 1.
+//  - a message that repeats a key, has a key Python cannot hash or is nested past depth 493 (RFed
+//    SPEC §17.14 "Repeated keys", "Unhashable keys", "Nesting") is refused whole by the distro
+//    unwrap and by the direct path's unpack, with an error the app knows as the refusal LXMF-rust
+//    logged and that names the reference's reason; a G whose source is not D is ignored by rule 1.
 //
 // It runs as a command-line binary on this Mac, built for Mac Catalyst against the
 // xcframework's Catalyst slice (as tests/DistroChannelsFFITests.swift): no simulator, no app, no
@@ -366,23 +367,40 @@ func everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerRe
     }
 }
 
-/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity): each `refused` vector and each
-/// `key_equality` pair the reference refuses is refused whole by the library on both paths the
-/// app takes, as Python LXMF refuses it. The distro unwrap returns nothing, with an error the app
-/// knows as the refusal LXMF-rust has already logged (RepeatedKeys.isRefusal: the app says
-/// nothing more, so the refusal is logged once); the group receipt's unpack, the direct path's
-/// LXMessage unpack that the router also runs before any delivery, returns nothing, and the app's
-/// native layer (FFIGroupNative, what reads a creator's status) knows it as a refusal, so the skip
-/// names it "refused whole", never "not an LXMF message". Nothing reaches a reader of the fields,
-/// so nothing is shown, stored or applied. Each pair the reference reads is unwrapped and unpacked.
-func everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath() {
+/// RFed SPEC §17.14 "Repeated keys", "Unhashable keys" and "Nesting" (James, 2026-10-11: parity,
+/// one limit): each `refused` vector, each `key_equality` pair and each `nesting` vector the
+/// reference refuses is refused whole by the library on both paths the app takes, as Python LXMF
+/// refuses it, and the error names the reference's reason (the vector's `reason`: a repeated key,
+/// a key Python cannot hash, a value nested past `nesting_max_depth`). The distro unwrap returns
+/// nothing, with an error the app knows as the refusal LXMF-rust has already logged
+/// (RepeatedKeys.isRefusal: the app says nothing more, so the refusal is logged once); the group
+/// receipt's unpack, the direct path's LXMessage unpack that the router also runs before any
+/// delivery, returns nothing, and the app's native layer (FFIGroupNative, what reads a creator's
+/// status) knows it as a refusal, so the skip names it "refused whole", never "not an LXMF
+/// message". Nothing reaches a reader of the fields, so nothing is shown, stored or applied. Each
+/// pair and nesting vector the reference reads is unwrapped and unpacked (the library is a
+/// release build: its reader takes a few hundred bytes of stack a level, so depth 493 reads on
+/// this thread).
+func everyMessageThePythonReferenceRefusesIsRefusedWholeOnTheDistroPathAndTheDirectPath() {
     let d = identity("distro")
-    checkEqual(gvList("refused").count, 11, "the refused vectors of 16a9902")
-    checkEqual(gvList("key_equality").count, 22, "the key_equality pairs of 16a9902")
+    checkEqual(gvList("refused").count, 22, "the refused vectors of b873c00")
+    checkEqual(gvList("key_equality").count, 24, "the key_equality pairs of b873c00")
+    checkEqual(gvList("nesting").count, 11, "the nesting vectors of b873c00")
+    checkEqual(GV["nesting_max_depth"] as? Int, 493, "the one nesting limit")
     var refusals = 0
-    for v in gvList("refused") + gvList("key_equality") {
+    for v in gvList("refused") + gvList("key_equality") + gvList("nesting") {
         let name = v["name"] as! String
         let refuse = (v["refused"] as? Bool) ?? true
+        let reason = (v["reason"] as? String) ?? "repeated_key"
+        let why: String
+        switch reason {
+        case "repeated_key": why = "repeats a key"
+        case "unhashable_key": why = "cannot hash"
+        case "too_deep": why = "nested past depth"
+        default:
+            check(false, "\(name): a reason the reference gives (\(reason))")
+            continue
+        }
         let packed = unhexData(v["packed_hex"] as! String)
         guard let sealed = bridge.distroSeal(distroHandle: d, packed: packed) else {
             check(false, "\(name): sealed for D")
@@ -398,8 +416,8 @@ func everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath() 
         if refuse {
             refusals += 1
             check(ptr == nil, "\(name): the distro unwrap refuses it whole")
-            check(RepeatedKeys.isRefusal(error) && (error ?? "").contains("repeats a key"),
-                  "\(name): the app knows the unwrap's error as the refusal already logged (\(error ?? "no error"))")
+            check(RepeatedKeys.isRefusal(error) && (error ?? "").contains(why),
+                  "\(name): the app knows the unwrap's error as the refusal already logged, for the reference's reason (\(error ?? "no error"))")
             checkEqual(element, .refused, "\(name): the direct path's unpack refuses it whole, and the app knows it as the refusal")
         } else {
             check(ptr != nil && outLen > 0, "\(name): the reference reads it, and so does the unwrap (\(error ?? "no error"))")
@@ -407,7 +425,7 @@ func everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath() 
         }
         if let ptr { rns_free_bytes(ptr, outLen) }
     }
-    checkEqual(refusals, 11 + 15, "every message the reference refuses")
+    checkEqual(refusals, 22 + 15 + 6, "every message the reference refuses")
 }
 
 /// RFed SPEC §17.14 rule 1: a G whose unwrapped source is not D (a member's, a stranger's), sealed
@@ -461,8 +479,8 @@ let allTests: [(String, () -> Void)] = [
      everyRejectReachesASiblingAsAGroupSyncTheAppNeverApplies),
     ("every group_entries vector through the distro is decoded and routed as the shared layer reads it",
      everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerReadsIt),
-    ("every message that repeats a key is refused whole on the distro path and the direct path",
-     everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath),
+    ("every message the Python reference refuses is refused whole on the distro path and the direct path",
+     everyMessageThePythonReferenceRefusesIsRefusedWholeOnTheDistroPathAndTheDirectPath),
     ("a group sync whose source is not D is ignored by rule 1",
      aGroupSyncWhoseSourceIsNotDIsIgnoredByRuleOne),
 ]

@@ -233,8 +233,10 @@ struct LxmfFields {
     }
 }
 
-/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity): a payload holding a map that
-/// repeats a key is refused whole by LXMF-rust, as Python LXMF refuses it, on the direct path
+/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity), and since LXMF-rust b873c00
+/// "Unhashable keys" and "Nesting": a payload holding a map that repeats a key, a key Python
+/// cannot hash, or a value nested past depth 493 is refused whole by LXMF-rust, as Python LXMF
+/// refuses it, with that reason in its one log line and its error, on the direct path
 /// (`LXMessage::unpack_from_bytes`, which the router, the channel unpack and the group receipt
 /// run) and the distro path (`distro::unwrap_blob`), before any field is read. LXMF-rust logs
 /// the one line; its error starts with `msgpack_keys::REFUSED_WHOLE` (pinned against this by the
