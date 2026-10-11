@@ -79,10 +79,24 @@ final class ChatEntity {
     /// before it was recorded: such a group neither answers nor counts a status. A new
     /// optional attribute is a lightweight migration (tests/GroupStatusesMigrationTests.swift).
     var creatorHash: String?
+    /// For group chats: the group's own address, the member the user acts as in it
+    /// (GROUPS-DISTRO-DESIGN.md §8.1): the user's distro D for a group created here while D was
+    /// held, admitted from an invite whose list names the D held then, or built from a group
+    /// sync; nil for the device (every group held from before this change, and one whose list
+    /// names the device but not D). A D-group is one whose own address is a distro (the current
+    /// D or a former one): its sends are signed by D only, never by the device (§8.7). Pending or
+    /// joined is read from this member's row alone (§9.2). A new optional attribute is a
+    /// lightweight migration (tests/DistroGroupsMigrationTests.swift).
+    var ownMember: String?
+    /// For group chats: the GROUP_MEMBERS csv exactly as the invite carried it (or as this
+    /// device wrote it into its invite chunks), which an `accept` or `create` group sync carries
+    /// verbatim (§10.2). Nil for a group held from before this change.
+    var membersCsv: String?
 
     init(id: String, peerHash: String, lastMessageTime: Double = 0,
          isArchived: Bool = false, isGroup: Bool = false, groupName: String? = nil,
-         groupStatus: String? = nil, creatorHash: String? = nil) {
+         groupStatus: String? = nil, creatorHash: String? = nil, ownMember: String? = nil,
+         membersCsv: String? = nil) {
         self.id = id
         self.peerHash = peerHash
         self.lastMessageTime = lastMessageTime
@@ -91,6 +105,8 @@ final class ChatEntity {
         self.groupName = groupName
         self.groupStatus = groupStatus
         self.creatorHash = creatorHash
+        self.ownMember = ownMember
+        self.membersCsv = membersCsv
     }
 }
 
@@ -233,6 +249,14 @@ struct Chat: Identifiable {
     var groupName: String?
     /// "active" (full member), "pending" (awaiting accept/decline), or nil (treat as active).
     var groupStatus: String?
+    /// A group whose own address is the user's distro D, current or former
+    /// (GROUPS-DISTRO-DESIGN.md §8.1): its decline, leave and delete act on all the user's
+    /// devices (§13).
+    var isDistroGroup: Bool = false
+    /// §8.7: why this device cannot act in the group (its D is not held here, or not loaded
+    /// yet): the composer, accept, decline and leave are disabled with this text, and only
+    /// "Delete from this device" is offered. Nil when it can.
+    var cannotActText: String? = nil
 
     var isPendingInvite: Bool { groupStatus == "pending" }
 }
@@ -443,7 +467,7 @@ final class ChannelMembershipEntity {
 @Model
 final class DistroOutboxEntity {
     @Attribute(.unique) var id: String
-    var kind: String                              // "channel" | "sent"
+    var kind: String                              // "channel" | "sent" | "group"
     var distro: String
     var distroKey: String
     var msgHash: String
@@ -522,6 +546,45 @@ final class GroupHeldEntity {
         self.srcHash = srcHash
         self.action = action
         self.packed = packed
+        self.seq = seq
+    }
+}
+
+/// A group message that reached the user's distro D for a group not joined here yet, kept as
+/// the fan-out blob it arrived as until the group is joined, then fed to the distro path again
+/// in arrival order (GROUPS-DISTRO-DESIGN.md §6.5, "Held arrivals"): a creator's status, a
+/// member's accept or post, a `post` group sync. Never recorded as seen while held. `key` is
+/// the LXMF hash with the signature (or, when the unwrap gives none, whether it validated): the
+/// pair the store deduplicates on. `distro` is the D it arrived for: forgotten when the device
+/// gives D up. Bounded (HeldArrivals) by count and bytes, never by a clock. Client-local:
+/// nothing about it is on the wire.
+@Model
+final class GroupHeldArrivalEntity {
+    @Attribute(.unique) var key: String
+    var groupId: String
+    var srcHash: String
+    var msgHash: String
+    var signature: Data?
+    var validated: Bool
+    /// False for a `post` group sync (source D): it counts only against its group.
+    var countsAgainstSource: Bool
+    var distro: String
+    var blob: Data
+    var size: Int
+    var seq: Int
+
+    init(key: String, groupId: String, srcHash: String, msgHash: String, signature: Data?, validated: Bool,
+         countsAgainstSource: Bool, distro: String, blob: Data, seq: Int) {
+        self.key = key
+        self.groupId = groupId
+        self.srcHash = srcHash
+        self.msgHash = msgHash
+        self.signature = signature
+        self.validated = validated
+        self.countsAgainstSource = countsAgainstSource
+        self.distro = distro
+        self.blob = blob
+        self.size = blob.count
         self.seq = seq
     }
 }

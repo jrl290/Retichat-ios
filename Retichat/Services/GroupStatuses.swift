@@ -291,7 +291,12 @@ nonisolated struct StatusTally: Equatable, Sendable {
 final class GroupStatusEngine {
     private let store: GroupStatusStore
     private let native: GroupNative
-    private let selfHex: () -> String
+    /// Whether `hex` is the user in the group `chatId` (GROUPS-DISTRO-DESIGN.md §9.1): the device,
+    /// and in a group whose list names the user's distro D, D and D's known siblings too. Every
+    /// "me" the engine asks (an element about the user, the creator keeping copies and answering,
+    /// a member let through, never remembering one's own key) is this, so a creator that is D
+    /// answers from every device of D (§12.1).
+    private let isSelf: (_ chatId: String, _ hex: String) -> Bool
     /// Send the creator's `status` `statuses` to `memberHex` (fire and forget; once per accept).
     private let answer: (_ chat: GroupChatInfo, _ memberHex: String, _ statuses: [Data]) -> Void
     /// `GROUP_ENTRIES_IN_RETICHAT_FIELD`: from the switch an unverifiable accept or leave is
@@ -303,16 +308,27 @@ final class GroupStatusEngine {
 
     init(store: GroupStatusStore,
          native: GroupNative,
-         selfHex: @escaping () -> String,
+         isSelf: @escaping (_ chatId: String, _ hex: String) -> Bool,
          answer: @escaping (_ chat: GroupChatInfo, _ memberHex: String, _ statuses: [Data]) -> Void,
          switched: Bool = RetichatField.groupEntriesInRetichatField,
          log: @escaping (String) -> Void = { _ in }) {
         self.store = store
         self.native = native
-        self.selfHex = selfHex
+        self.isSelf = isSelf
         self.answer = answer
         self.switched = switched
         self.log = log
+    }
+
+    /// The user as one address in every group (the device), as before groups for distro holders.
+    convenience init(store: GroupStatusStore,
+                     native: GroupNative,
+                     selfHex: @escaping () -> String,
+                     answer: @escaping (_ chat: GroupChatInfo, _ memberHex: String, _ statuses: [Data]) -> Void,
+                     switched: Bool = RetichatField.groupEntriesInRetichatField,
+                     log: @escaping (String) -> Void = { _ in }) {
+        self.init(store: store, native: native, isSelf: { _, hex in hex == selfHex() }, answer: answer,
+                  switched: switched, log: log)
     }
 
     // MARK: What any group message the rule kept brings
@@ -322,9 +338,9 @@ final class GroupStatusEngine {
     /// chunk's key is, after the rule and never for a message the rule dropped, and when the
     /// message verified (`signature` validated) the accepts and leaves held for its source's
     /// key are decided now, before this message, so they count in the order they came.
-    func onKept(src: String, action: String?, signature: Int, senderKey: Data?) {
+    func onKept(src: String, action: String?, signature: Int, senderKey: Data?, chatId: String = "") {
         if (action == GroupAction.accept || action == GroupAction.leave), let senderKey {
-            remember(src, senderKey)
+            remember(chatId, src, senderKey)
         }
         if signature == DeliveryPolicy.Signature.validated, store.heldCount(srcHex: src) > 0 {
             decideHeldNow(src)
@@ -414,8 +430,7 @@ final class GroupStatusEngine {
             return "the action is \(fields.groupAction ?? "none"), not an accept or a leave"
         }
         let src = unpacked.source.hexString
-        let me = selfHex()
-        if src == me { return "about this device" }
+        if isSelf(chat.id, src) { return "about the user (this device, or the distro and its devices)" }
         let rows = store.members(chatId: chat.id)
         let allowed = DeliveryPolicy.shouldProcess(
             action: action,
@@ -431,7 +446,7 @@ final class GroupStatusEngine {
                 : "its source is not a member listed for the group that has not left, or it names another"
         }
         // The key it carries is remembered as the one an accept arriving directly brings.
-        if let key = unpacked.senderKey { remember(src, key) }
+        if let key = unpacked.senderKey { remember(chat.id, src, key) }
         let taken = takeChange(chat, src, action, unpacked.hash.hexString, unpacked.timestamp,
                                unpacked.signature, element)
         return taken == .counted ? Self.counted : Self.heldResult
@@ -461,9 +476,8 @@ final class GroupStatusEngine {
     /// status moves: a repeated accept, which changes nothing, is the newest copy too.
     private func applyChange(_ chat: GroupChatInfo, _ src: String, _ action: String, _ msgId: String,
                              _ timestamp: Double, _ packed: Data?) {
-        let me = selfHex()
         let rows = store.members(chatId: chat.id)
-        if let packed, chat.creatorHex == me {
+        if let packed, let creator = chat.creatorHex, isSelf(chat.id, creator) {
             if let why = keepCopy(chat, GroupMemberStatuses.statusOf(rows, src), src, action, packed) {
                 log("No copy kept of the \(action) of \(src.prefix(12)) for group \(chat.id): \(why)")
             }
@@ -479,7 +493,7 @@ final class GroupStatusEngine {
         // In a group the user joined, a member's accept passes the privacy filter, as the user's own
         // accept made every member. A pending group lets nobody through: the members pass from the
         // user's accept (and the creator's answer to it brings back what the filter dropped).
-        if accepted, src != me, chat.held == .joined { store.allow(memberHex: src) }
+        if accepted, !isSelf(chat.id, src), chat.held == .joined { store.allow(memberHex: src) }
         let groupId = chat.id
         store.memberLine(chatId: chat.id, memberHex: src, joined: accepted,
                          id: accepted ? "acc_\(src.prefix(8))_\(groupId.prefix(8))" : msgId,
@@ -511,15 +525,16 @@ final class GroupStatusEngine {
 
     /// The creator's answer to an accept that counted and carried its sender's key: one `status` to
     /// member `memberHex` alone, holding the copy kept of each other listed member's newest counted
-    /// accept or leave (neither this device's own nor the recipient's), by member hash ascending. A
+    /// accept or leave (neither the user's own nor the recipient's), by member hash ascending. A
     /// member that has not answered is absent: still invited. An empty list is a valid answer. Only
-    /// the creator answers: any other device sends nothing.
+    /// the creator answers: any other device sends nothing. A creator that is the user's distro D
+    /// answers from every device of D that holds the group joined (GROUPS-DISTRO-DESIGN.md §12.1);
+    /// one that applied D's leave holds no group, so it answers nothing.
     private func answerAccept(_ chat: GroupChatInfo, _ memberHex: String) {
-        let me = selfHex()
-        guard chat.creatorHex == me else { return }
+        guard let creator = chat.creatorHex, isSelf(chat.id, creator) else { return }
         let listed = Set(store.members(chatId: chat.id).map(\.hash))
         let statuses = store.copies(chatId: chat.id)
-            .filter { $0.memberHex != me && $0.memberHex != memberHex && listed.contains($0.memberHex) }
+            .filter { !isSelf(chat.id, $0.memberHex) && $0.memberHex != memberHex && listed.contains($0.memberHex) }
             .sorted { $0.memberHex < $1.memberHex }
             .map(\.packed)
         answer(chat, memberHex, statuses)
@@ -582,8 +597,8 @@ final class GroupStatusEngine {
 
     /// Keep `key` as `src`'s: the glue remembers it only when it produces `src` as an
     /// `lxmf.delivery` destination. This device's own key is never kept.
-    private func remember(_ src: String, _ key: Data) {
-        if src == selfHex() { return }
+    private func remember(_ chatId: String, _ src: String, _ key: Data) {
+        if isSelf(chatId, src) { return }
         if !native.rememberKey(memberHex: src, publicKey: key) {
             log("Ignored mismatched member key for \(src.prefix(8))")
         }

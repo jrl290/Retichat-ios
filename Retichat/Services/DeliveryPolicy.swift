@@ -207,17 +207,29 @@ nonisolated enum GroupMemberStatuses {
     /// invited is sent it too: it may have accepted already, or accept
     /// later, and must not go on counting the user as a member.
     static func leaveTargets(_ rows: [Row], selfHash: String) -> [String] {
+        leaveTargets(rows, selfAddresses: [selfHash])
+    }
+
+    /// leaveTargets with every self address of the group left out (GROUPS-DISTRO-DESIGN.md §9.2:
+    /// the device, and in a group listing the user's distro D, D and its known siblings).
+    static func leaveTargets(_ rows: [Row], selfAddresses: Set<String>) -> [String] {
         var seen = Set<String>()
         return rows.map(\.hash).filter { hash in
-            hash != selfHash && seen.insert(hash).inserted && DeliveryPolicy.isCurrent(statusOf(rows, hash))
+            !selfAddresses.contains(hash) && seen.insert(hash).inserted && DeliveryPolicy.isCurrent(statusOf(rows, hash))
         }
     }
 
     /// The members a relay goes to: those that accepted, not the user.
     static func acceptedMembers(_ rows: [Row], selfHash: String) -> [String] {
+        acceptedMembers(rows, selfAddresses: [selfHash])
+    }
+
+    /// The members a post, a relay or an accept goes to: those that accepted, no self address
+    /// (§9.2).
+    static func acceptedMembers(_ rows: [Row], selfAddresses: Set<String>) -> [String] {
         var seen = Set<String>()
         return rows.map(\.hash).filter { hash in
-            hash != selfHash && seen.insert(hash).inserted && statusOf(rows, hash) == MemberStatus.accepted
+            !selfAddresses.contains(hash) && seen.insert(hash).inserted && statusOf(rows, hash) == MemberStatus.accepted
         }
     }
 
@@ -226,9 +238,20 @@ nonisolated enum GroupMemberStatuses {
     /// group's members before the user accepts), else every listed member
     /// but the user.
     static func conversationPeers(_ rows: [Row], selfHash: String, held: DeliveryPolicy.Held) -> [String] {
+        conversationPeers(rows, selfAddresses: [selfHash], held: held)
+    }
+
+    static func conversationPeers(_ rows: [Row], selfAddresses: Set<String>, held: DeliveryPolicy.Held) -> [String] {
         guard held == .joined else { return [] }
         var seen = Set<String>()
-        return rows.map(\.hash).filter { $0 != selfHash && seen.insert($0).inserted }
+        return rows.map(\.hash).filter { !selfAddresses.contains($0) && seen.insert($0).inserted }
+    }
+
+    /// Where the user stands in a group, read from the row of the group's own address alone
+    /// (GROUPS-DISTRO-DESIGN.md §9.2), never from "any self row": in a list naming both the
+    /// device and D, the device row stays invited for ever and the group is joined once D's is.
+    static func ownStatus(_ rows: [Row], ownMember: String) -> String? {
+        statusOf(rows, ownMember)
     }
 }
 

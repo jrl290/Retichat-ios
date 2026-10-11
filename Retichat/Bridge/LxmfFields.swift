@@ -181,6 +181,9 @@ struct LxmfFields {
     // Group fields
     var groupId: String?
     var groupMembers: [String]?      // full member list (invite messages only)
+    /// GROUP_MEMBERS as it was carried, before the csv split: what an `accept` group sync
+    /// carries verbatim (GROUPS-DISTRO-DESIGN.md §10.2).
+    var groupMembersRaw: String?
     var groupName: String?
     var groupAction: String?         // nil = regular group message
     var groupSender: String?         // original sender's hex hash
@@ -359,6 +362,15 @@ final class LxmfFieldsDecoder {
         return out
     }
 
+    /// GROUP_MEMBERS and GROUP_RELAY_SEEN: comma-separated (Android-compatible), each element
+    /// trimmed of spaces, empty ones skipped. The invite's own parser, which a group sync's
+    /// `members` is read with too (GROUPS-DISTRO-DESIGN.md §10.2).
+    nonisolated static func groupCsv(_ raw: String) -> [String] {
+        raw.split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     /// The typed group fields of `fields`, from its resolved groupEntries.
     private static func applyGroupEntries(_ fields: inout LxmfFields) {
         let entries = fields.groupEntries
@@ -366,14 +378,11 @@ final class LxmfFieldsDecoder {
             if case .str(let s)? = entries[entry] { return s }
             return nil
         }
-        func csv(_ raw: String) -> [String] {
-            raw.split(separator: ",")
-                .map { String($0).trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-        }
+        func csv(_ raw: String) -> [String] { groupCsv(raw) }
         fields.groupId = str(.id)
         // Comma-separated strings (Android-compatible).
         fields.groupMembers = str(.members).map(csv)
+        fields.groupMembersRaw = str(.members)
         fields.groupName = str(.name)
         fields.groupAction = str(.action)
         fields.groupSender = str(.sender)

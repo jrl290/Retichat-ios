@@ -48,6 +48,9 @@ final class UserPreferences {
         static let contactNamesMigrated = "contact_names_migrated_v1"
         static let contactNamesPlaceholderPass = "contact_names_placeholder_pass_v1"
         static let closedGroupIds = "closed_group_ids"
+        static let filteredInviteIds = "filtered_invite_ids"
+        static let distroSiblings = "distro_siblings"
+        static let distroLeftIds = "distro_left_ids"
         static let defaultTcpEnabled = "default_tcp_enabled"
         static let rtnodeBluetoothEnabled = "rtnode_bluetooth_enabled"
         static let dropAnnounces = "drop_announces"
@@ -110,6 +113,27 @@ final class UserPreferences {
     /// The groups the user declined or left, for good, oldest first
     /// (ClosedGroups, DeliveryPolicy.swift, keeps it bounded). A later
     /// invite to one of them is ignored.
+    /// GROUPS-DISTRO-DESIGN.md §6.5: the group ids of invites to the distro that the privacy
+    /// filter dropped (FilteredInvites, at most 64, oldest first). Their traffic is never held.
+    var filteredInviteIds: [String] {
+        get { defaults.stringArray(forKey: Keys.filteredInviteIds) ?? [] }
+        set { defaults.set(newValue, forKey: Keys.filteredInviteIds) }
+    }
+
+    /// §9.1: distro → the user's other devices of it, learned from the 0xFD of what that
+    /// distro signs (KnownSiblings).
+    var distroSiblings: [String: [String]] {
+        get { (defaults.dictionary(forKey: Keys.distroSiblings) as? [String: [String]]) ?? [:] }
+        set { defaults.set(newValue, forKey: Keys.distroSiblings) }
+    }
+
+    /// §10.2: distro → the group ids this device holds as left by that distro, most recent
+    /// first, at most 32: the `left` of every group sync this device sends as it.
+    var distroLeftIds: [String: [String]] {
+        get { (defaults.dictionary(forKey: Keys.distroLeftIds) as? [String: [String]]) ?? [:] }
+        set { defaults.set(newValue, forKey: Keys.distroLeftIds) }
+    }
+
     var closedGroupIds: [String] {
         get { defaults.stringArray(forKey: Keys.closedGroupIds) ?? [] }
         set { defaults.set(newValue, forKey: Keys.closedGroupIds) }
