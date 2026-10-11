@@ -325,8 +325,22 @@ func theSignerRefusesWhenDIsNotLoadedOrReplacedAndTheConversationSaysWhy() {
 func deleteFromThisDeviceSendsNoLeaveAndOwesNoGroupSync() {
     let local = body(repo, "func deleteGroupFromThisDevice(")
     check(local.contains("deleteChatLocal(chatId: chatId)") && !local.contains("quitGroup(") && !local.contains("sendLeave(")
-            && !local.contains("oweGroupSync(") && !local.contains("closedGroupIds"),
-          "removed here only: no leave, no G, not recorded closed")
+            && !local.contains("oweGroupSync(") && !local.contains("recordLeft("),
+          "removed here only: no leave, no G, nothing in D's left list")
+    // Recorded closed on this device (decided 2026-10-11, the same on every client), before the
+    // chat goes: a later invite or group sync for the id does not bring it back here.
+    check(before(local, "prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)", "deleteChatLocal(chatId: chatId)"),
+          "the id is recorded closed here, then the chat goes")
+    check(body(repo, "private func groupStanding(").contains("ClosedGroups.contains(prefs.closedGroupIds, groupId)"),
+          "a closed id stands closed")
+    for op in [DistroGroupSync.Op.create, .accept, .post, .leave] {
+        if case .nothing = DistroGroupSync.step(op, standing: .closed, ownMemberIsD: true, pendingMatches: false) {} else {
+            check(false, "a \(op.rawValue) group sync for the id brings nothing back")
+        }
+    }
+    check(!DeliveryPolicy.shouldProcess(action: GroupAction.invite, sourceAllowed: true, held: .none, sourceStatus: nil,
+                                        namesOther: false, closed: true, signature: DeliveryPolicy.Signature.validated),
+          "nor does an invite for it")
     check(conversation.contains("onDeleteFromThisDevice: {\n                        repository.deleteGroupFromThisDevice(chatId: chatId)"),
           "the chat info's Delete from this device calls it")
     check(conversation.contains("Label(GroupSelf.deleteLocalTitle, systemImage: \"trash\")")

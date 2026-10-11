@@ -1758,13 +1758,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// GROUPS-DISTRO-DESIGN.md §8.7, "Delete from this device": a group whose own address is a
     /// distro this device does not hold is removed here only. No leave is sent and no group sync
-    /// is owed: the user stays in the group on the other devices and for the other members, and
-    /// the id is not recorded closed.
+    /// is owed: the user stays in the group on the other devices and for the other members. The
+    /// id is recorded closed on this device (decided 2026-10-11, the same on every client), so a
+    /// later invite or group sync for it does not bring it back here; nothing goes in a `left`
+    /// list, so no other device closes it.
     func deleteGroupFromThisDevice(chatId: String) {
         guard let ctx = modelContext,
               let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first,
               chat.isGroup else { return }
-        print("[GroupChat] group \(chatId.prefix(8)) deleted from this device only: no leave, no group sync (§8.7)")
+        prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)
+        print("[GroupChat] group \(chatId.prefix(8)) deleted from this device only and closed here: no leave, no group sync (§8.7)")
         deleteChatLocal(chatId: chatId)
     }
 
