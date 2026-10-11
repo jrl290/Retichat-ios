@@ -1038,16 +1038,16 @@ mod distro_unwrap_tests {
     }
 
     /// Every `group_entries` vector through the distro unwrap the app calls: a blob to D from a
-    /// fresh sender carrying the vector's fields map exactly as given (a repeated key, an ext of an
-    /// unknown type, a bin GROUP_ID) reports the entries LXMF-rust reads (RFed SPEC §17.14
-    /// "Repeated keys": a group entry from the first entry with its key, 0xFB from the last).
+    /// fresh sender carrying the vector's fields map exactly as given (an ext of an unknown type, a
+    /// bin GROUP_ID) reports the entries LXMF-rust reads. A map that repeats a key is never one of
+    /// them: it is refused whole (`the_unwrap_and_the_receipt_refuse_a_message_that_repeats_a_key`).
     #[test]
     fn the_distro_unwrap_reads_each_group_entries_vector_as_lxmf_rust_does() {
         let v = vectors();
         let mut d = distro(&v);
         let dest = lxmf_rust::distro::delivery_hash(&d).unwrap();
         let entries = v["group_entries"].as_array().unwrap();
-        for name in ["group_id_twice_the_first_malformed", "ext_beside_group_id", "custom_type_twice_the_last_a_marker"] {
+        for name in ["group_id_bin_in_both_forms", "ext_beside_group_id", "ext_beside_group_id_in_retichat_field"] {
             assert!(entries.iter().any(|e| e["name"] == name), "{name} is in the vectors");
         }
         for vector in entries {
@@ -1068,6 +1068,39 @@ mod distro_unwrap_tests {
                 assert_eq!(out[key], expected[key], "{name}: {key}");
             }
             assert_eq!(!out["group_sync"].is_null(), expected["group_sync"].as_bool().unwrap(), "{name}: group_sync");
+        }
+    }
+
+    /// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity with Python LXMF): a message
+    /// whose payload holds a map, at any depth, that repeats a key is refused whole by the distro
+    /// unwrap the app calls and by the group receipt of a message that arrived directly (the
+    /// router's own unpack), so the app never shows, stores or applies it. Each `refused` vector is
+    /// signed by its source; each `key_equality` pair is refused exactly when the reference
+    /// refuses it, and read otherwise.
+    #[test]
+    fn the_unwrap_and_the_receipt_refuse_a_message_that_repeats_a_key() {
+        let v = vectors();
+        let mut d = distro(&v);
+        let refused = v["refused"].as_array().unwrap();
+        assert_eq!(refused.len(), 11);
+        let pairs = v["key_equality"].as_array().unwrap();
+        assert_eq!(pairs.len(), 22);
+        for vector in refused.iter().chain(pairs) {
+            let name = vector["name"].as_str().unwrap();
+            let refuse = vector.get("refused").map_or(true, |r| r.as_bool().unwrap());
+            let packed = unhex(vector["packed_hex"].as_str().unwrap());
+            let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
+            let unwrapped = distro_unwrap_json(&mut d, &blob);
+            let received = unpack_element_with(&packed, &|_| None);
+            if refuse {
+                let err = unwrapped.err().unwrap_or_else(|| panic!("{name}: the distro unwrap must refuse it"));
+                assert!(err.contains("repeats a key"), "{name}: {err}");
+                let err = received.err().unwrap_or_else(|| panic!("{name}: the group receipt must refuse it"));
+                assert!(err.contains("repeats a key"), "{name}: {err}");
+            } else {
+                assert!(unwrapped.unwrap_or_else(|e| panic!("{name}: {e}")).is_some(), "{name}: a blob for D");
+                assert!(received.is_ok(), "{name}: read on the direct path");
+            }
         }
     }
 }

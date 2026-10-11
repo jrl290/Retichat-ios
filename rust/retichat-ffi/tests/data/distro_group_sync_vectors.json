@@ -5,15 +5,18 @@
     "All *_hex values are lowercase hex. Identities: private_key_hex is the X25519 private key (32) | Ed25519 seed (32); lxmf_delivery_hash_hex is Destination.hash(identity, 'lxmf', 'delivery'). D is the distro (the same key as distro_sync_vectors.json), M a member, X a key that is not M's.",
     "A G is the LXMF message D packs to itself (dest = src = D): empty title and content, fields {0x0C: bin '', 0xFB: 'rfed.distro.group', 0xFC: native array [op, group_id, at_ms, ...], 0xFD: the sending device's address}, in that order. packed_hex = dest(16) | src(16) | signature(64) | msgpack [timestamp f64, bin title, bin content, fields]; hash_hex = full_hash(dest | src | payload), the LXMF message hash; fields_hex = the fields map alone.",
     "ops: each op with an empty and a full (32) left, as set_group_sync_fields writes it from `sync` (the §7 group_sync object without by and problem) and a timestamp: an implementation that writes `sync` on a message from D to D with that timestamp and packs it must produce packed_hex exactly. `expected` is the §7 group_sync object a receiver reports for it.",
-    "variants: forms a receiver must read that a Rust writer does not make (the web's int 64 at_ms, bin name or text, elements after left, uppercase ids, 0xFD absent or uppercase, ...), each with its expected reading.",
+    "variants: forms a receiver must read that a Rust writer does not make (the web's int 64 at_ms, bin name or text, elements after left, uppercase ids, 0xFD absent or uppercase, ...), each with its expected reading. by is 0xFD as text, lowercased, when 0xFD is a str or a bin, else \"\" (absent, an int, an array, ...).",
     "at_ms_encodings: fields of a leave G whose at_ms is written in the encoding at_ms_hex; accepted ones read as at_ms, the others are refused (problem set).",
     "rejects: fields of a G that fails §11.1 rule 4; the reading has `by` and a non-null `problem`, and every other key null. The problem text is each implementation's own.",
     "members is parsed with the phones' invite parser (iOS/Android DeliveryPolicy.members): split on ',', each entry trimmed of invite_space (Unicode Zs and U+0009) at both ends, kept when it is exactly 32 lowercase hex, the first of each; it must name D. creator (an accept) is 32 hex, read lowercased, listed, not D.",
     "invite_space: the code points the invite parser trims, Unicode Zs and U+0009 (Swift's CharacterSet.whitespaces), and no other.",
     "sealed: blobs as RFed hands them to D's devices (blob_hex = D_hash | D.encrypt(packed[16:]); the encryption is random, so these bytes are fixed input), each with the unwrap's expected hash (hash_hex; LXMF.py's: full_hash(dest | src | payload) over the payload as received, packed again only to drop a stamp; g_accept_web_form_int64_at_ms is not in the form a packer makes, so a reader that always packs the payload again gets another hash and a failed signature), packed (packed_hex = blob[0:16] | plaintext) and the §7 keys after each phone's group receipt; sender_key_hex is the 128-hex key (null when none), packed true when the JSON's packed is the base64 of packed_hex, false when null. M is not known to the receiver.",
     "group_entries: the unwrap's has_group_id, group_id, group_action and group_name for a fields map alone, and whether group_sync is set (true) or null (false).",
-    "Repeated keys (RFed SPEC §17.14): a fields map, and the Retichat field 0xD1, may hold a key more than once. A group entry (0xA0-0xA8, the field 0xD1 itself, and keys 1-9 inside it) is read from the first entry with its key, even when that entry is not of the entry's type; 0xFB is read from the last. A reader that decodes the map into a dictionary keeps the last of each key and must read the group entries from the bytes. These readings are LXMF-rust's: the Python reference refuses a map that repeats a key, at any depth, whole (RNS umsgpack DuplicateKeyException), so they are not checked against it. group_entries (*_twice*, the custom_type_twice_* pair) and variants (leave_0xfb_twice_the_last_the_marker) pin it; group_entries also hold an ext of an unknown type beside a group id (skipped, the map read) and a bin GROUP_ID (no id, in either form).",
-    "invite_members: csv strings and the members the invite parser lists for each. The csv is split on the code point ',' (U+002C), never on grapheme clusters: a combining mark after a comma does not join it (Swift's String.split on Character would), and a combining mark before an entry is part of that entry. variants accept_members_combining_mark_after_a_comma and rejects members_naming_d_after_a_combining_mark are the same two cases in a G."
+    "group_entries also hold an ext of an unknown type beside a group id (skipped, the map read) and a bin GROUP_ID (no id, in either form).",
+    "invite_members: csv strings and the members the invite parser lists for each. The csv is split on the code point ',' (U+002C), never on grapheme clusters: a combining mark after a comma does not join it (Swift's String.split on Character would), and a combining mark before an entry is part of that entry. variants accept_members_combining_mark_after_a_comma and rejects members_naming_d_after_a_combining_mark are the same two cases in a G.",
+    "Repeated keys (RFed SPEC §17.14; James, 2026-10-11: parity): a message whose payload holds a map, at any depth, that repeats a key is refused whole, as Python LXMF refuses it (RNS umsgpack raises DuplicateKeyException in LXMessage.unpack_from_bytes): on the direct path and on the distro path, with a log line, and never shown, stored or applied. No reader of the group entries, the group sync or a channel membership message ever sees such a map. No vector outside refused and key_equality repeats a key.",
+    "refused: messages to D whose payload repeats a key, each signed by its source (source 'member' is M, 'distro' is D); packed_hex = dest(16) | src(16) | signature(64) | msgpack [timestamp f64, bin title '', bin content, fields as fields_hex]. Every client refuses each whole: the direct path's unpack of packed_hex, and the distro unwrap of packed_hex[0:16] | D.encrypt(packed_hex[16:]). The generator asserts the reference refuses each.",
+    "key_equality: a fields map {a: 0, b: 1} for each pair of keys keys_hex = [a, b], and the message from M to D carrying it (packed_hex as in refused); refused is whether the reference takes a and b for one key and refuses the message. Python's equality: an integer, float or boolean of one numeric value whatever its encoding is one key (1, 1.0, true); NaN is no key's equal; a str by its code points, a bin by its bytes, a str never a bin; nil; an ext by type and data, a timestamp ext (-1) by its instant to the microsecond; an array key is never compared (umsgpack skips the check for it). A map key is refused by umsgpack for another reason (UnhashableKeyException), not pinned here."
   ],
   "distro": {
     "private_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
@@ -1208,8 +1211,8 @@
       }
     },
     {
-      "name": "leave_0xfb_twice_the_last_the_marker",
-      "why": "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G",
+      "name": "leave_0xfd_int",
+      "why": "by is \"\" when 0xFD is not a str or a bin, here an int",
       "timestamp": 1790000205.75,
       "sync": {
         "op": "leave",
@@ -1222,11 +1225,43 @@
         "text": null,
         "left": []
       },
-      "fields_hex": "850cc400ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
-      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03cfae321c442e3c9bdcd7a3e79d850e03c12f50d65a46f88029fe9345a6cb418434d886ff220179046b5c8bb95baa286c299500516e7df8aca074ae83ceb1fbffecc37140fa08732ed45078ac95eca020794cb41daac4f13700000c400c400850cc400ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
-      "hash_hex": "de581cc0dbea15117731c0aab5133b962592eb9501dcc971a9d9b0baedfac15d",
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfd05",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03cfae321c442e3c9bdcd7a3e79d850e03c19a2da323798f99c6a08570a67e5a97c18be60fe641651382a7d1b72cb9e12872d65bd7984bc5ee178f6ab959702bebcf2a1eb8a4a32f78662d1e86a34e6480e94cb41daac4f13700000c400c400840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfd05",
+      "hash_hex": "e41072c0b6dce611c7cf771ada632d8e593f4179dfab205cbe7b2aa9b614e441",
       "expected": {
-        "by": "0123456789abcdef0123456789abcdef",
+        "by": "",
+        "problem": null,
+        "op": "leave",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000200789,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": []
+      }
+    },
+    {
+      "name": "leave_0xfd_array",
+      "why": "by is \"\" when 0xFD is not a str or a bin, here an array of D's device",
+      "timestamp": 1790000206.75,
+      "sync": {
+        "op": "leave",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000200789,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": []
+      },
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfd91d9203031323334353637383961626364656630313233343536373839616263646566",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03cfae321c442e3c9bdcd7a3e79d850e03c8b207015adbba723f7a3d52ceacd2dd4224faa3533c8549be6d5c74d11eee60e86e797cb724878511f035ea7310a76f4e12c28807debe054b79154b6f9981d0494cb41daac4f13b00000c400c400840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfd91d9203031323334353637383961626364656630313233343536373839616263646566",
+      "hash_hex": "c202eee00fb2f31c30ad72d50ae7b9eff6a773593defb3047e53840223bc27fb",
+      "expected": {
+        "by": "",
         "problem": null,
         "op": "leave",
         "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
@@ -2205,66 +2240,6 @@
       }
     },
     {
-      "name": "group_id_twice_the_first_read",
-      "why": "two 0xA0 entries: the first is read",
-      "fields_hex": "82cca0d9203966386537643663356234613339323831373036663565346433633262316130cca0d9203432343436376635333763643262393839326637656135383464303735613065",
-      "expected": {
-        "has_group_id": true,
-        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-        "group_action": null,
-        "group_name": null,
-        "group_sync": false
-      }
-    },
-    {
-      "name": "group_id_twice_the_first_malformed",
-      "why": "two 0xA0 entries: the first is read even when it is not a group id, so the group message has no id",
-      "fields_hex": "82cca0a178cca0d9203966386537643663356234613339323831373036663565346433633262316130",
-      "expected": {
-        "has_group_id": true,
-        "group_id": null,
-        "group_action": null,
-        "group_name": null,
-        "group_sync": false
-      }
-    },
-    {
-      "name": "retichat_field_group_id_twice",
-      "why": "key 1 twice in 0xD1: the first is read",
-      "fields_hex": "81ccd18201d920396638653764366335623461333932383137303666356534643363326231613001d9203432343436376635333763643262393839326637656135383464303735613065",
-      "expected": {
-        "has_group_id": true,
-        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-        "group_action": null,
-        "group_name": null,
-        "group_sync": false
-      }
-    },
-    {
-      "name": "retichat_field_twice",
-      "why": "two 0xD1 fields: the first is read whole, the second not at all",
-      "fields_hex": "82ccd18201d920396638653764366335623461333932383137303666356534643363326231613004a6616363657074ccd18201d920343234343637663533376364326239383932663765613538346430373561306503af48696b6520e280942053756e646179",
-      "expected": {
-        "has_group_id": true,
-        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-        "group_action": "accept",
-        "group_name": null,
-        "group_sync": false
-      }
-    },
-    {
-      "name": "group_action_and_name_twice",
-      "why": "0xA3 and 0xA2 twice each: the first of each is read",
-      "fields_hex": "85cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a6696e76697465cca2af48696b6520e280942053756e646179cca3a56c65617665cca2ac416e6f74686572206e616d65",
-      "expected": {
-        "has_group_id": true,
-        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-        "group_action": "invite",
-        "group_name": "Hike — Sunday",
-        "group_sync": false
-      }
-    },
-    {
       "name": "group_id_bin_in_both_forms",
       "why": "a GROUP_ID that is a bin, in 0xD1 and in 0xA0: a group entry is a str, so a group message with no id",
       "fields_hex": "82ccd18101c4203966386537643663356234613339323831373036663565346433633262316130cca0c4203966386537643663356234613339323831373036663565346433633262316130",
@@ -2311,30 +2286,6 @@
         "group_name": null,
         "group_sync": false
       }
-    },
-    {
-      "name": "custom_type_twice_the_last_not_a_marker",
-      "why": "two 0xFB entries: the last is read, here a type that is not a distro marker after the group sync marker, so the group entries are read and the message is no G",
-      "fields_hex": "86ccfbb1726665642e64697374726f2e67726f7570ccfbab6170702e6578616d706c65ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665",
-      "expected": {
-        "has_group_id": true,
-        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-        "group_action": "leave",
-        "group_name": null,
-        "group_sync": false
-      }
-    },
-    {
-      "name": "custom_type_twice_the_last_a_marker",
-      "why": "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G and its group entries are not read",
-      "fields_hex": "86ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665",
-      "expected": {
-        "has_group_id": false,
-        "group_id": null,
-        "group_action": null,
-        "group_name": null,
-        "group_sync": true
-      }
     }
   ],
   "invite_members": [
@@ -2354,6 +2305,351 @@
       "members": [
         "cf0b2a4a8d2a0b6978b71290da7cc80e"
       ]
+    }
+  ],
+  "refused": [
+    {
+      "name": "group_id_twice",
+      "why": "two 0xA0 entries, each a group id",
+      "source": "member",
+      "timestamp": 1790000600.5,
+      "content": "x",
+      "fields_hex": "82cca0d9203966386537643663356234613339323831373036663565346433633262316130cca0d9203432343436376635333763643262393839326637656135383464303735613065",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e24f1fc66a229181743bae47af338253e43afc6b8fd75b4c33528c67387c5460a7afbd5084ffd6f4fd60872242ffee298f8141f923574a1d3699ba3c18c8f850694cb41daac4f76200000c400c4017882cca0d9203966386537643663356234613339323831373036663565346433633262316130cca0d9203432343436376635333763643262393839326637656135383464303735613065"
+    },
+    {
+      "name": "group_id_twice_one_malformed",
+      "why": "two 0xA0 entries, the first not a group id",
+      "source": "member",
+      "timestamp": 1790000601.5,
+      "content": "x",
+      "fields_hex": "82cca0a178cca0d9203966386537643663356234613339323831373036663565346433633262316130",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e2befdcbdaef8fc2f1b7557f4aed6eb92e408ac8274a48c538ac09d0270d1ccd598474acb45cba838a127c4a8eaee31d7d8db84457ad36cf2ad18a5ff57bfd30894cb41daac4f76600000c400c4017882cca0a178cca0d9203966386537643663356234613339323831373036663565346433633262316130"
+    },
+    {
+      "name": "retichat_field_group_id_twice",
+      "why": "key 1 twice in the Retichat field 0xD1",
+      "source": "member",
+      "timestamp": 1790000602.5,
+      "content": "x",
+      "fields_hex": "81ccd18201d920396638653764366335623461333932383137303666356534643363326231613001d9203432343436376635333763643262393839326637656135383464303735613065",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80ed090dc494debd8ee0d05001b5183861954b000e6b07a7233dd2a171332f5a926657eed9b6225ebf5ef336e70ad5a66b9f7b7ca4d0c4af3f4036ce25268d8190494cb41daac4f76a00000c400c4017881ccd18201d920396638653764366335623461333932383137303666356534643363326231613001d9203432343436376635333763643262393839326637656135383464303735613065"
+    },
+    {
+      "name": "retichat_field_twice",
+      "why": "two 0xD1 fields",
+      "source": "member",
+      "timestamp": 1790000603.5,
+      "content": "x",
+      "fields_hex": "82ccd18201d920396638653764366335623461333932383137303666356534643363326231613004a6616363657074ccd18201d920343234343637663533376364326239383932663765613538346430373561306503af48696b6520e280942053756e646179",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e304a2053da410620548b9dc249f658f6310356e5868c03c83d0aa58cf446047f9959465397f6b39194eadd15433d3d988cd5f5b775959ec225fd1ff89ef2310e94cb41daac4f76e00000c400c4017882ccd18201d920396638653764366335623461333932383137303666356534643363326231613004a6616363657074ccd18201d920343234343637663533376364326239383932663765613538346430373561306503af48696b6520e280942053756e646179"
+    },
+    {
+      "name": "group_action_and_name_twice",
+      "why": "0xA3 and 0xA2 twice each beside one 0xA0",
+      "source": "member",
+      "timestamp": 1790000604.5,
+      "content": "x",
+      "fields_hex": "85cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a6696e76697465cca2af48696b6520e280942053756e646179cca3a56c65617665cca2ac416e6f74686572206e616d65",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e410f1b6bb023d3449b1fe2eaa98d02470eae4c540da8662a42d409ced8fce02647a090e5f79e1a8ebbaeafe1f208faf6cf32a6ed253948a7f982e41bbf05630994cb41daac4f77200000c400c4017885cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a6696e76697465cca2af48696b6520e280942053756e646179cca3a56c65617665cca2ac416e6f74686572206e616d65"
+    },
+    {
+      "name": "custom_type_twice_marker_first",
+      "why": "two 0xFB entries, the group sync marker then a type that is not a distro marker, beside group entries",
+      "source": "member",
+      "timestamp": 1790000605.5,
+      "content": "x",
+      "fields_hex": "86ccfbb1726665642e64697374726f2e67726f7570ccfbab6170702e6578616d706c65ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e6c2ccc14a8ea8f1f6c8717987715612aae6770674384548a327fa7902ac9bc5c1ac2cd49b7ef864e186c054549072055083bd6531aeb048d7519bcbae2b1060a94cb41daac4f77600000c400c4017886ccfbb1726665642e64697374726f2e67726f7570ccfbab6170702e6578616d706c65ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665"
+    },
+    {
+      "name": "custom_type_twice_marker_last",
+      "why": "two 0xFB entries, a type that is not a distro marker then the group sync marker, beside group entries",
+      "source": "member",
+      "timestamp": 1790000606.5,
+      "content": "x",
+      "fields_hex": "86ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e085d7886d0422073b8ef3d93a17ac8d06af623e72bce1b3d959a0eb3a5f1ab20e9d70211a7a58dabe586c59f572345c63596a8a95b5b0ca6352c32be8b6bc00794cb41daac4f77a00000c400c4017886ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665"
+    },
+    {
+      "name": "g_leave_0xfb_twice",
+      "why": "a leave G from D whose 0xFB is given twice, another type then the group sync marker",
+      "source": "distro",
+      "timestamp": 1790000607.5,
+      "content": "",
+      "fields_hex": "850cc400ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03cfae321c442e3c9bdcd7a3e79d850e03cb6e27ca3e84c2569d9cd06d992e0b6407aeaac5ffba0bf94c6363b4cc2da118ca962914d4eb0f6d8e767d4a9102fca63005ae4181b993bb83b9ec6b290f3aa0394cb41daac4f77e00000c400c400850cc400ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566"
+    },
+    {
+      "name": "retichat_field_nested_map_repeats_a_key",
+      "why": "well-formed group entries in 0xD1 beside its key 10 (no reader knows it), a map that repeats its key 0",
+      "source": "member",
+      "timestamp": 1790000608.5,
+      "content": "x",
+      "fields_hex": "81ccd18301d920396638653764366335623461333932383137303666356534643363326231613004a66163636570740a8200a16100a162",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e63d2de2d4acade961d95ed70d4ec32757ea116bae0728ad7cd389e3d7ca788f9271693add01d81dd4eedb738af1a9392af8680651ebd4455eb0475bcc137d00c94cb41daac4f78200000c400c4017881ccd18301d920396638653764366335623461333932383137303666356534643363326231613004a66163636570740a8200a16100a162"
+    },
+    {
+      "name": "non_group_field_twice",
+      "why": "a plain message, no group entry, whose renderer field 0x0F is given twice",
+      "source": "member",
+      "timestamp": 1790000609.5,
+      "content": "x",
+      "fields_hex": "820f020f00",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80eec3cb43c2f30eb9d9a9473602fcedeb449045200c304f7d84242c5a34d2b4682c1065dcf79f1e03d27a8b50465acdc4510990922426c6e92f6bfb433a80c230294cb41daac4f78600000c400c40178820f020f00"
+    },
+    {
+      "name": "non_group_field_nested_repeat",
+      "why": "a group post whose commands field 0x09 is an array holding one map that repeats its key 1",
+      "source": "member",
+      "timestamp": 1790000610.5,
+      "content": "x",
+      "fields_hex": "83cca0d9203966386537643663356234613339323831373036663565346433633262316130cca4d920636630623261346138643261306236393738623731323930646137636338306509918201c4016101c40162",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80ef2d23391d6a26ce74bbf20640b0cfb29cf2f8df113c2c37907ca5a889e3e73985093e97525294fd76793b68c27a484c3341a0b1fb78a125d5f3730f95fb4d30894cb41daac4f78a00000c400c4017883cca0d9203966386537643663356234613339323831373036663565346433633262316130cca4d920636630623261346138643261306236393738623731323930646137636338306509918201c4016101c40162"
+    }
+  ],
+  "key_equality": [
+    {
+      "name": "int_fixint_and_uint8",
+      "why": "1 as a positive fixint and as uint 8",
+      "keys_hex": [
+        "01",
+        "cc01"
+      ],
+      "refused": true,
+      "fields_hex": "820100cc0101",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e29ade7944e3678828fa990a0f8f020cd76dde7b8a99601fa77424b55f025467b97654d263eec82834b95e4c92d69480913e263e2598d1a6312fbd58924f2d00a94cb41daac4f8f200000c400c40178820100cc0101"
+    },
+    {
+      "name": "int_uint16_and_int64",
+      "why": "0xA0 as uint 16 and as int 64",
+      "keys_hex": [
+        "cd00a0",
+        "d300000000000000a0"
+      ],
+      "refused": true,
+      "fields_hex": "82cd00a000d300000000000000a001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80eadfccb2ca63d4976196ca074b757965ad55afea3923e8e5ff38636872e6df28a91a8a63b58c8f4404c0c0716202bbed41d18d3d5ddb9166cdaa7bf4a2a5f120394cb41daac4f8f600000c400c4017882cd00a000d300000000000000a001"
+    },
+    {
+      "name": "int_and_float64",
+      "why": "the int 1 and the float 64 1.0",
+      "keys_hex": [
+        "01",
+        "cb3ff0000000000000"
+      ],
+      "refused": true,
+      "fields_hex": "820100cb3ff000000000000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80ee546ccc3f21289acc92e1d1b8434e2778e974686344671138b46f4ab99a3b45427d3ea7e5f7eb8c6ee573cb87a81f438a880f9ba0982a42d5900b91314c0b20494cb41daac4f8fa00000c400c40178820100cb3ff000000000000001"
+    },
+    {
+      "name": "int_and_float32",
+      "why": "the int 1 and the float 32 1.0",
+      "keys_hex": [
+        "01",
+        "ca3f800000"
+      ],
+      "refused": true,
+      "fields_hex": "820100ca3f80000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80ed9eeb42f9508da6cf6082e81964fbe9b8126b70889b4b0296a26591a9ac1200b79648c50c40977b03cf15a8db9071fee787e58c4b7443f130ae9c900b2a1d90594cb41daac4f8fe00000c400c40178820100ca3f80000001"
+    },
+    {
+      "name": "true_and_int_1",
+      "why": "true and the int 1",
+      "keys_hex": [
+        "c3",
+        "01"
+      ],
+      "refused": true,
+      "fields_hex": "82c3000101",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e05239c121477b83bcce9f5c0228d3d4bde97b6bef8f8518a5a1ce60ad98656fe40b454501ab6c6bb60440a0c253a7f98db7621b27250f17a232ac16c88342e0794cb41daac4f90200000c400c4017882c3000101"
+    },
+    {
+      "name": "false_and_int_0",
+      "why": "false and the int 0",
+      "keys_hex": [
+        "c2",
+        "00"
+      ],
+      "refused": true,
+      "fields_hex": "82c2000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e3643a93fd441487b19081d6ad621f0ad876c7586a18158730b50ef5e87f828a8044fe45e468f1e52110031f4af97ebf4b0e7000c2764e2f4f7e7ca7876e5da0b94cb41daac4f90600000c400c4017882c2000001"
+    },
+    {
+      "name": "int_0_and_float_minus_0",
+      "why": "the int 0 and the float 64 -0.0",
+      "keys_hex": [
+        "00",
+        "cb8000000000000000"
+      ],
+      "refused": true,
+      "fields_hex": "820000cb800000000000000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e414ee85050309c36c71502e3e520b46f21a69c4564f3a72defb2d9612d8cb9f5f741b391cc59998094594321d94db40989628200181273209c50228dcc78890894cb41daac4f90a00000c400c40178820000cb800000000000000001"
+    },
+    {
+      "name": "float32_and_float64",
+      "why": "1.5 as float 32 and as float 64",
+      "keys_hex": [
+        "ca3fc00000",
+        "cb3ff8000000000000"
+      ],
+      "refused": true,
+      "fields_hex": "82ca3fc0000000cb3ff800000000000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e20a3833fd7853707cbeb36bb1843637080bf1f22c7091eed5b9323a839d82d5b737ffd97ffbb04172effbd4d193de4c8ea519df9bb0e15cc31d457b6c0b6e00594cb41daac4f90e00000c400c4017882ca3fc0000000cb3ff800000000000001"
+    },
+    {
+      "name": "infinity_float32_and_float64",
+      "why": "infinity as float 32 and as float 64",
+      "keys_hex": [
+        "ca7f800000",
+        "cb7ff0000000000000"
+      ],
+      "refused": true,
+      "fields_hex": "82ca7f80000000cb7ff000000000000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e711b89e929ffd9f54dc1579817126d879c535f2d6ce9486a3b840b8bc24424194337d68eeaaed6b45df60e88dccd9834391e57fce5df8119b4cffc8073a0a30094cb41daac4f91200000c400c4017882ca7f80000000cb7ff000000000000001"
+    },
+    {
+      "name": "int_minus_1_int8_and_fixint",
+      "why": "-1 as int 8 and as a negative fixint",
+      "keys_hex": [
+        "d0ff",
+        "ff"
+      ],
+      "refused": true,
+      "fields_hex": "82d0ff00ff01",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80ed06f08c11a3e54da2462d1fdce9ab8303e29d1c466dbd6731609af3bb867eebc19f76d6a03f68f29d21dd56d079274cb462e28eb3a3ff10b7695e9daef5ad10e94cb41daac4f91600000c400c4017882d0ff00ff01"
+    },
+    {
+      "name": "uint64_max_and_float_2_64",
+      "why": "2^64 - 1 (uint 64) and the float 64 2^64: not one value",
+      "keys_hex": [
+        "cfffffffffffffffff",
+        "cb43f0000000000000"
+      ],
+      "refused": false,
+      "fields_hex": "82cfffffffffffffffff00cb43f000000000000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80ea07db83d2340439e1fa3d383cedc9cae8fd63f3727c9c0f877fdee61bb37d0f9cf6cfa36329cb966d0b0ee1ad84e38eb84e86f330425d808eb681dc67fa7fa0e94cb41daac4f91a00000c400c4017882cfffffffffffffffff00cb43f000000000000001"
+    },
+    {
+      "name": "nan_twice",
+      "why": "NaN twice: NaN equals nothing, not even NaN",
+      "keys_hex": [
+        "cb7ff8000000000000",
+        "cb7ff8000000000000"
+      ],
+      "refused": false,
+      "fields_hex": "82cb7ff800000000000000cb7ff800000000000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e6823da96e46ed7a35116a7d45417115039582a844574e770d3403226e55d8a4b1d2319263bdc28f55d285a8b2433252d67b04df531c34f61cb86eaf16a1a9e0b94cb41daac4f91e00000c400c4017882cb7ff800000000000000cb7ff800000000000001"
+    },
+    {
+      "name": "nil_twice",
+      "why": "nil twice",
+      "keys_hex": [
+        "c0",
+        "c0"
+      ],
+      "refused": true,
+      "fields_hex": "82c000c001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e0bf56188565187f6c4871c6fca658b6522faf1c6ede8e3e6fd0fdd844952e9ad242cdb6af73c5a3c36802a01b3c59cbec38ca8b821adf769dce8f3eea26f2f0494cb41daac4f92200000c400c4017882c000c001"
+    },
+    {
+      "name": "empty_str_twice",
+      "why": "the empty str twice",
+      "keys_hex": [
+        "a0",
+        "a0"
+      ],
+      "refused": true,
+      "fields_hex": "82a000a001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e1417f0b7a84839365b2093c72e5bc6a721bef8d708f8e2a907fd5ad1719468980944e62feeeeb0d13f89f6e26d46067528dfb93b693921fdc8f4af8909212f0394cb41daac4f92600000c400c4017882a000a001"
+    },
+    {
+      "name": "str_and_bin",
+      "why": "the str 'a' and the bin 'a': a str is never a bin",
+      "keys_hex": [
+        "a161",
+        "c40161"
+      ],
+      "refused": false,
+      "fields_hex": "82a16100c4016101",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80eca452fd3b9e0022691dee95cce672e301f54076b4188e91182bccb7f7ee9a41201d3b2ffcbe150073be5d551d40f4e10af79a6bbafb897ab6d7754715086e80d94cb41daac4f92a00000c400c4017882a16100c4016101"
+    },
+    {
+      "name": "int_and_str",
+      "why": "the int 1 and the str '1'",
+      "keys_hex": [
+        "01",
+        "a131"
+      ],
+      "refused": false,
+      "fields_hex": "820100a13101",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e5ae91cf27aeb60ea2c7ede15e935cd8235090625dce2b9ead4a2be2895bdbe9a648b713b7ca1492aaf3dac853f5e6346c22b589694574020a65a29ca4aa5300794cb41daac4f92e00000c400c40178820100a13101"
+    },
+    {
+      "name": "str_not_normalised",
+      "why": "U+00E9 and U+0065 U+0301: a str is compared by its code points, never normalised",
+      "keys_hex": [
+        "a2c3a9",
+        "a365cc81"
+      ],
+      "refused": false,
+      "fields_hex": "82a2c3a900a365cc8101",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e1b472d582a067f956be778841deba22b17d6d27535ad042cffd7a968939e75e70de7055ee1491c5cd14e9c36ffde529c631f1810e1081fb45efb4f43e0f69a0e94cb41daac4f93200000c400c4017882a2c3a900a365cc8101"
+    },
+    {
+      "name": "ext_twice",
+      "why": "the ext (5, 00) twice",
+      "keys_hex": [
+        "d40500",
+        "d40500"
+      ],
+      "refused": true,
+      "fields_hex": "82d4050000d4050001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80ee8f7306c6bd48f44ab9d39fcda5681e33b12744ac548fb5f58f7a49217014a29b62cb99dc077984009240b02f5d5918565eaa7eed0908cbceaa2345ad01c3b0994cb41daac4f93600000c400c4017882d4050000d4050001"
+    },
+    {
+      "name": "ext_fixext1_and_ext8",
+      "why": "the ext (5, 00) as fixext 1 and as ext 8",
+      "keys_hex": [
+        "d40500",
+        "c7010500"
+      ],
+      "refused": true,
+      "fields_hex": "82d4050000c701050001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e6dc70f3ca289586d981fc2013c61feb138768f8242755c50298dbb7a1d21cee7981f101a1040ee5aeed7361ba0f6ed3eb14a71223c769e600959d868d12eaf0f94cb41daac4f93a00000c400c4017882d4050000c701050001"
+    },
+    {
+      "name": "ext_other_type",
+      "why": "the exts (5, 00) and (6, 00)",
+      "keys_hex": [
+        "d40500",
+        "d40600"
+      ],
+      "refused": false,
+      "fields_hex": "82d4050000d4060001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e9f76cd74e5e89e357758eeafc73a85f07477f9feee2281c2a550e1f316fbe49f1c3cd3cd2ca1752c601595ac7af28f726243b29ac0401e55d64f1a007cc8db0594cb41daac4f93e00000c400c4017882d4050000d4060001"
+    },
+    {
+      "name": "timestamp_32_and_64",
+      "why": "the timestamp ext (-1) of the epoch as timestamp 32 and as timestamp 64: one instant",
+      "keys_hex": [
+        "d6ff00000000",
+        "d7ff0000000000000000"
+      ],
+      "refused": true,
+      "fields_hex": "82d6ff0000000000d7ff000000000000000001",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e6f4976f4b19539f5460514b80875240d227f0ca54f59cb46dc952711217f3ccd26391ed281ff09af847d71eeb153dafc5175d4035098879bd5187798da77180994cb41daac4f94200000c400c4017882d6ff0000000000d7ff000000000000000001"
+    },
+    {
+      "name": "array_twice",
+      "why": "the array [1] twice: umsgpack never compares an array key (it makes it a tuple and skips the check)",
+      "keys_hex": [
+        "9101",
+        "9101"
+      ],
+      "refused": false,
+      "fields_hex": "82910100910101",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03ccf0b2a4a8d2a0b6978b71290da7cc80e9e7a7e78d4fe1d49150dec1cbe8554ef25ba8597311bfb6776d6da256693ec703fdd3512baf0e6bb8ed680c5bd0a989ac32ad6e1e71dfc12545c39cae5284a0a94cb41daac4f94600000c400c4017882910100910101"
     }
   ]
 }
