@@ -53,6 +53,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     private let notifManager = NotificationManager.shared
 
     private var modelContext: ModelContext?
+    /// RfedDistroClient.$distro, for GROUPS-DISTRO-DESIGN.md §8.7 (configure).
+    private var distroHeldWatch: AnyCancellable?
     private var pollTimer: Timer?
     private var serviceStarting = false
 
@@ -74,19 +76,26 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                             id: id, timestamp: timestamp)
             }),
         native: FFIGroupNative(bridge: RetichatBridge.shared),
-        selfHex: { [weak self] in self?.ownHashHex ?? "" },
+        // Who "me" is in each group (GROUPS-DISTRO-DESIGN.md §9.1): the device, and in a group
+        // listing the user's distro D, D and its known siblings.
+        isSelf: { [weak self] chatId, hex in self?.isGroupSelf(chatId: chatId, hex: hex) ?? false },
         answer: { [weak self] chat, member, statuses in
             // The creator's answer: one status to that member, fire and forget (FFI off the main
-            // thread), once per accept: nothing sends it again.
+            // thread), once per accept: nothing sends it again. As the group's own address
+            // (groupSigner): a creator that is D answers as D, from every device of D (§12.1);
+            // with no signer for it here (D not held, §8.7) nothing is sent.
             guard let self, let client = self.lxmfClient else {
                 print("[GroupChat] status for \(chat.id.prefix(8)) to \(member.prefix(8)) not sent: stack offline")
                 return
             }
-            let selfHash = self.ownHashHex
+            guard let signer = self.groupSigner(chatId: chat.id) else {
+                print("[GroupChat] status for \(chat.id.prefix(8)) to \(member.prefix(8)) not sent: no signer for the group's own address here (§8.7)")
+                return
+            }
             let groupId = chat.id
             self.ffiQueue.async {
                 GroupChatManager.shared.sendStatus(groupId: groupId, to: member, statuses: statuses,
-                                                   from: selfHash, via: client)
+                                                   as: signer, via: client)
             }
         },
         log: { print("[GroupChat] \($0)") })
@@ -222,6 +231,27 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         RfedDistroClient.shared.onSentCopy = { [weak self] copy in
             self?.handleDistroSentCopy(copy)
         }
+        // Groups for distro holders (GROUPS-DISTRO-DESIGN.md): a group message to the distro and
+        // the group sync land here, never on the DM path (§6.4); the siblings that sign as the
+        // distro are learned from every sync it signs (§9.1).
+        RfedDistroClient.shared.onGroup = { [weak self] arrival in
+            self?.handleDistroGroupArrival(arrival) ?? false
+        }
+        RfedDistroClient.shared.onGroupSync = { [weak self] arrival in
+            self?.handleDistroGroupSync(arrival) ?? false
+        }
+        RfedDistroClient.shared.onSiblingSeen = { [weak self] by, distro in
+            self?.learnSibling(by, of: distro)
+        }
+        // The distro held changed (loaded, forgotten, generated, imported): the arrivals held for
+        // a distro given up are forgotten, its known siblings pruned (§6.5, §8.7), and the
+        // groups' §8.7 state shown again.
+        distroHeldWatch = RfedDistroClient.shared.$distro
+            .map { $0?.deliveryHashHex }
+            .removeDuplicates()
+            .sink { [weak self] held in
+                Task { @MainActor [weak self] in self?.onDistroHeldChanged(held) }
+            }
         // Identity-transfer sends are tracked like group fan-out: replay any
         // state that arrived before the hash was tracked.
         DistroTransferTracker.shared.onTracked = { [weak self] hashHex in
@@ -630,7 +660,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let h = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !h.isEmpty else { return false }
         if h == ownHashHex.lowercased() { return true }
-        if let distro = RfedDistroClient.shared.distro, h == distro.deliveryHashHex.lowercased() { return true }
+        if let distro = RfedDistroClient.shared.distro {
+            let d = distro.deliveryHashHex.lowercased()
+            if h == d { return true }
+            // The user's other devices of the distro (GROUPS-DISTRO-DESIGN.md §9.1).
+            if knownSiblings(of: d).contains(h) { return true }
+        }
         return false
     }
 
@@ -978,8 +1013,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 // The group rule as on the router's path (admitGroupMessage).
                 let signature = DeliveryPolicy.Signature.reason(valid: msg.signatureValid,
                                                                 unverifiedReason: reason)
-                if let standing = admitGroupMessage(groupId: groupId, sourceHex: srcHex, fields: fields,
-                                                    signature: signature) {
+                if case .kept(let standing, let ownAct) = admitGroupMessage(groupId: groupId, sourceHex: srcHex,
+                                                                             fields: fields, signature: signature) {
                     applyMessageName(nameField, unverifiedReason: reason, sourceHex: srcHex,
                                      messageTime: msg.timestamp)
                     handleGroupMessage(
@@ -992,7 +1027,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                         standing: standing,
                         signature: signature,
                         senderKey: msg.senderKeyHex.flatMap { Data(hexString: $0) },
-                        packed: msg.packedBase64.flatMap { Data(base64Encoded: $0) }
+                        packed: msg.packedBase64.flatMap { Data(base64Encoded: $0) },
+                        ownAct: ownAct
                     )
                 }
                 continue
@@ -1384,8 +1420,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// Create an outbound DM whose source is the distro when one is held, so
     /// replies fan out to every device (Android DistroManager.sendingIdentity
     /// at ChatRepository.kt:426-435 and 666-673; web RnsClient.sendingIdentity).
-    /// Group sends stay device-signed; the optimistic bubble keeps
-    /// senderHash = ownHashHex either way (Android quirk 6).
+    /// The optimistic bubble keeps senderHash = ownHashHex either way (Android
+    /// quirk 6). Never for a group send: those go through groupSigner, from the
+    /// group's own address (GROUPS-DISTRO-DESIGN.md §8.1).
     ///
     /// nonisolated: runs on ffiQueue. Returns handle 0 on failure.
     nonisolated private static func createOutboundMessage(
@@ -1406,6 +1443,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         chat: ChatEntity, chatId: String, content: String, attachments: [(String, Data)]
     ) {
         guard let ctx = modelContext else { return }
+        // GROUPS-DISTRO-DESIGN.md §8.7: a group whose own address this device cannot sign for
+        // (its D given up or replaced, or not loaded yet) takes no post: nothing is stored, sent
+        // or queued, and the conversation says why.
+        if let why = cannotActText(chat) {
+            print("[GroupChat] post to \(chatId.prefix(8)) refused: \(why)")
+            return
+        }
         // nil while the stack is starting or stopped: the send is held.
         let client = heldSends.isOpen ? lxmfClient : nil
 
@@ -1417,7 +1461,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let msgEntity = MessageEntity(
             id: msgId,
             chatId: chatId,
-            senderHash: ownHashHex,
+            senderHash: ownAddress(chat),
             content: content,
             timestamp: Date().timeIntervalSince1970,
             isOutgoing: true,
@@ -1444,42 +1488,63 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
 
-        fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
-                           content: content, attachments: attachments, via: client)
+        _ = fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
+                               content: content, attachments: attachments, timestamp: msgEntity.timestamp,
+                               via: client)
         refreshChats()
     }
 
-    /// Fan a group message out to the accepted members. Members are read
-    /// here rather than when the message was typed: a send held through a
-    /// cold start had no own address yet to leave out of the list.
+    /// Fan a group message out to the accepted members, as the group's own
+    /// address (groupSigner, resolved now). Members are read here rather than
+    /// when the message was typed: a send held through a cold start had no own
+    /// address yet to leave out of the list. False, with nothing sent, when
+    /// this device cannot sign for the group (§8.7).
+    ///
+    /// GROUPS-DISTRO-DESIGN.md §10.6: in a D-group the post owes one `post`
+    /// group sync, once, after its fan-out was submitted (the router or its
+    /// outbox accepted the first member envelope), never for a send that
+    /// failed, and at once when there is no member to send to.
     private func fanOutGroupMessage(
         chatId: String, groupName: String, content: String, attachments: [(String, Data)],
-        via client: LxmfClient
-    ) {
-        guard let ctx = modelContext else { return }
+        timestamp: Double, via client: LxmfClient
+    ) -> Bool {
+        guard let ctx = modelContext else { return false }
+        guard let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first,
+              let signer = groupSigner(chat) else {
+            print("[GroupChat] post to \(chatId.prefix(8)) not sent: no signer for the group's own address here (§8.7)")
+            return false
+        }
 
-        // Get accepted members excluding self
-        let memberDesc = FetchDescriptor<GroupMemberEntity>(
-            predicate: #Predicate { $0.groupId == chatId }
-        )
-        let allMembers = (try? ctx.fetch(memberDesc)) ?? []
-        let targets = allMembers
-            .filter { $0.inviteStatus == MemberStatus.accepted && $0.memberHash != ownHashHex }
-            .map { $0.memberHash }
+        // The accepted members, no self address (§9.2).
+        let rows = groupRows(chatId)
+        let targets = GroupMemberStatuses.acceptedMembers(rows, selfAddresses: groupSelf(chat, rows: rows))
+        let owesSync = signer.isDistro
+        let atMs = DistroGroupSync.atMs(timestamp)
+        if owesSync && targets.isEmpty {
+            owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer)
+        }
 
         // Fan out to accepted members — FFI calls run off the main thread.
-        let selfHash = ownHashHex
-        ffiQueue.async {
-            GroupChatManager.shared.fanoutMessage(
+        ffiQueue.async { [weak self] in
+            let submitted = GroupChatManager.shared.fanoutMessage(
                 groupId: chatId,
                 groupName: groupName,
                 content: content,
                 attachments: attachments,
                 to: targets,
-                from: selfHash,
+                as: signer,
                 via: client
             )
+            guard owesSync, !targets.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                guard submitted > 0 else {
+                    print("[GroupChat] post to \(chatId.prefix(8)) left for no member: no group sync owed (§10.6)")
+                    return
+                }
+                self?.owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer)
+            }
         }
+        return true
     }
 
     // MARK: - Sends held through startup
@@ -1517,10 +1582,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     print("[GroupChat] held send to \(chatId.prefix(8)) dropped: its chat was deleted")
                     continue
                 }
-                bubble.senderHash = ownHashHex
-                bubble.deliveryState = DeliveryState.sent   // fanout is fire-and-forget
-                fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
-                                   content: content, attachments: attachments, via: client)
+                bubble.senderHash = ownAddress(chat)
+                // fanout is fire-and-forget; one this device cannot sign for any more (§8.7) failed.
+                let sent = fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
+                                              content: content, attachments: attachments,
+                                              timestamp: bubble.timestamp, via: client)
+                bubble.deliveryState = sent ? DeliveryState.sent : DeliveryState.failed
             }
         }
 
@@ -1531,21 +1598,32 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - Group invite / accept / leave
 
     /// Accept a pending group invite: mark all members as allowlisted,
-    /// record ourselves as accepted, and broadcast acceptance to others.
+    /// record the user's own entry as accepted, and broadcast acceptance to
+    /// the others, as the group's own address (groupSigner). In a D-group the
+    /// accept goes as D and owes one `accept` group sync, in the same step
+    /// (GROUPS-DISTRO-DESIGN.md §10.6); with no signer here (§8.7) nothing
+    /// changes and nothing is sent.
     func acceptGroupInvite(groupId: String) {
         guard let ctx = modelContext, let client = lxmfClient else { return }
 
         let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })
         guard let chat = try? ctx.fetch(chatDesc).first else { return }
+        guard let signer = groupSigner(chat) else {
+            print("[GroupChat] accept of \(groupId.prefix(8)) refused: \(cannotActText(chat) ?? "no signer")")
+            return
+        }
 
         // Gather the full member list stored from the invite
         let memberDesc = FetchDescriptor<GroupMemberEntity>(
             predicate: #Predicate { $0.groupId == groupId }
         )
         let existingMembers = (try? ctx.fetch(memberDesc)) ?? []
+        let rows = existingMembers.map { (hash: $0.memberHash, status: $0.inviteStatus) }
+        let selfAddresses = groupSelf(chat, rows: rows)
         let allHashes = existingMembers.map { $0.memberHash }
+        // Every member's key but the user's own (no self address: D's key is the distro's, §9.4).
         let missingKeys = allHashes.filter { hash in
-            guard hash != ownHashHex, let hashData = Data(hexString: hash) else { return false }
+            guard !selfAddresses.contains(hash), let hashData = Data(hexString: hash) else { return false }
             return !bridge.transportIdentityKnown(destHash: hashData)
         }
         guard missingKeys.isEmpty else {
@@ -1562,18 +1640,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // (autosaved), so the group counted as joined with nothing sent.
         chat.groupStatus = "active"
 
-        // Mark ourselves as accepted (add our entry if absent)
-        if let selfEntry = existingMembers.first(where: { $0.memberHash == ownHashHex }) {
+        // Mark the group's own address as accepted (add its entry if absent): pending or joined
+        // is read from that row alone (§9.2).
+        let own = signer.hex
+        if let selfEntry = existingMembers.first(where: { $0.memberHash == own }) {
             selfEntry.inviteStatus = MemberStatus.accepted
         } else {
-            ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: ownHashHex,
+            ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: own,
                                          inviteStatus: MemberStatus.accepted))
         }
 
         // Add all group members to allowlist (key spec requirement): from the user's accept, not
-        // from the invite's arrival (RFed-spec Group.md, "The privacy filter"); not this device,
+        // from the invite's arrival (RFed-spec Group.md, "The privacy filter"); no self address,
         // and not the group id (phantom contacts, audit L4).
-        for hash in allHashes where hash != ownHashHex {
+        for hash in allHashes where !selfAddresses.contains(hash) {
             ensureAllowlistedContact(destHash: hash)
             if let hashData = Data(hexString: hash) {
                 RetichatBridge.shared.watchAnnounce(destHash: hashData)
@@ -1583,13 +1663,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         try? ctx.save()
 
         // Broadcast acceptance to everyone else — FFI off main thread
-        let targets = allHashes.filter { $0 != ownHashHex }
-        let selfHash = ownHashHex
+        let targets = allHashes.filter { !selfAddresses.contains($0) }
         ffiQueue.async {
             GroupChatManager.shared.sendAccept(
-                groupId: groupId, to: targets, from: selfHash, via: client
+                groupId: groupId, to: targets, as: signer, via: client
             )
         }
+        if signer.isDistro, let creator = chat.creatorHash {
+            oweGroupSync(.accept, groupId: groupId, signer: signer, atMs: DistroGroupSync.atMs(Date().timeIntervalSince1970),
+                         name: chat.groupName ?? "Group",
+                         membersCsv: chat.membersCsv ?? allHashes.joined(separator: ","),
+                         keys: memberKeyEntries(allHashes, signer: signer), creator: creator)
+        }
+        // Joined here: what was held for the group is judged again (§6.5).
+        replayHeldArrivals(groupId: groupId)
 
         refreshChats()
     }
@@ -1610,33 +1697,60 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// A decline, a leave or a delete of group `chatId` (`how`, for the
     /// log), one path for all three: the user's leave (GroupChatManager
-    /// .sendLeave: GROUP_ID, GROUP_ACTION leave, GROUP_SENDER the user, no
-    /// content, DIRECT with the propagated fallback) goes to every listed
-    /// member that has not left, still-invited members too
-    /// (GroupMemberStatuses.leaveTargets); the group is recorded as closed
-    /// (James, 2026-10-01: "Once the group is rejected/left, that person
+    /// .sendLeave: GROUP_ID, GROUP_ACTION leave, GROUP_SENDER the group's own
+    /// address, no content, DIRECT with the propagated fallback) goes to every
+    /// listed member that has not left and is not the user, still-invited
+    /// members too (GroupMemberStatuses.leaveTargets); the group is recorded as
+    /// closed (James, 2026-10-01: "Once the group is rejected/left, that person
     /// cannot rejoin": a later invite to it is ignored, so nothing offers it
     /// again); then its chat goes. The sends neither wait for nor undo the
     /// close. Until 2026-10-05 a leave went to the accepted members only and
     /// nothing was recorded.
+    ///
+    /// GROUPS-DISTRO-DESIGN.md: in a D-group the leave goes as D, the id goes
+    /// in this device's `left` list for D, and one `leave` group sync is owed,
+    /// in the same step (§10.6), so every device of D closes it (§13). With no
+    /// signer for the group here (§8.7) nothing happens: only "Delete from this
+    /// device" is offered (deleteGroupFromThisDevice).
     private func quitGroup(chatId: String, how: String) {
         guard let ctx = modelContext else { return }
         let chatDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
         guard let chat = try? ctx.fetch(chatDesc).first, chat.isGroup else { return }
-        let memberDesc = FetchDescriptor<GroupMemberEntity>(predicate: #Predicate { $0.groupId == chatId })
-        let rows = ((try? ctx.fetch(memberDesc)) ?? []).map { (hash: $0.memberHash, status: $0.inviteStatus) }
-        let targets = GroupMemberStatuses.leaveTargets(rows, selfHash: ownHashHex)
+        // §8.7: a D-group this device cannot sign for is never left from here (no leave, no
+        // group sync): "Delete from this device" is its only removal.
+        if let why = cannotActText(chat) {
+            print("[GroupChat] \(how) of \(chatId.prefix(8)) refused: \(why)")
+            return
+        }
+        let signer = groupSigner(chat)
+        let rows = groupRows(chatId)
+        let targets = GroupMemberStatuses.leaveTargets(rows, selfAddresses: groupSelf(chat, rows: rows))
         prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, chatId)
-        if let client = lxmfClient {
-            let selfHash = ownHashHex
+        if let client = lxmfClient, let signer {
             ffiQueue.async {
-                GroupChatManager.shared.sendLeave(groupId: chatId, to: targets, from: selfHash, via: client)
+                GroupChatManager.shared.sendLeave(groupId: chatId, to: targets, as: signer, via: client)
             }
         } else {
             print("[GroupChat] quitGroup: stack offline, the leave of \(chatId.prefix(8)) is not sent")
         }
+        if let signer, signer.isDistro {
+            recordLeft([chatId], distro: signer.hex)
+            oweGroupSync(.leave, groupId: chatId, signer: signer, atMs: DistroGroupSync.atMs(Date().timeIntervalSince1970))
+        }
         deleteChatLocal(chatId: chatId)
         print("[GroupChat] group \(chatId.prefix(8)) \(how) (leave to \(targets.count) member(s))")
+    }
+
+    /// GROUPS-DISTRO-DESIGN.md §8.7, "Delete from this device": a group whose own address is a
+    /// distro this device does not hold is removed here only. No leave is sent and no group sync
+    /// is owed: the user stays in the group on the other devices and for the other members, and
+    /// the id is not recorded closed.
+    func deleteGroupFromThisDevice(chatId: String) {
+        guard let ctx = modelContext,
+              let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first,
+              chat.isGroup else { return }
+        print("[GroupChat] group \(chatId.prefix(8)) deleted from this device only: no leave, no group sync (§8.7)")
+        deleteChatLocal(chatId: chatId)
     }
 
     // MARK: - Conversation lifecycle (delegates to ConnectionStateManager)
@@ -1659,7 +1773,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             // opened are remembered, so the close matches the open even when
             // the user accepts meanwhile.
             let held = GroupMemberStatuses.held(groupExists: true, groupStatus: chat.groupStatus)
-            let peers = GroupMemberStatuses.conversationPeers(rows, selfHash: ownHashHex, held: held)
+            let peers = GroupMemberStatuses.conversationPeers(rows, selfAddresses: groupSelf(chat, rows: rows), held: held)
             openedGroupPeers[chatId] = peers
             for member in peers {
                 if let peerHash = Data(hexString: member) {
@@ -2006,14 +2120,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         if let groupId = fields.groupId {
             let signature = DeliveryPolicy.Signature.reason(valid: signatureValid,
                                                             unverifiedReason: unverifiedReason)
-            guard let standing = admitGroupMessage(groupId: groupId, sourceHex: srcHex, fields: fields,
-                                                   signature: signature) else { return }
+            guard case .kept(let standing, let ownAct) = admitGroupMessage(groupId: groupId, sourceHex: srcHex,
+                                                                            fields: fields, signature: signature)
+            else { return }
             applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,
                              messageTime: timestamp)
             handleGroupMessage(
                 hash: hash, srcHash: srcHash, content: content, timestamp: timestamp,
                 fields: fields, groupId: groupId, standing: standing, signature: signature,
-                senderKey: senderKey, packed: packed
+                senderKey: senderKey, packed: packed, ownAct: ownAct
             )
             return
         }
@@ -2193,7 +2308,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// pending group relays for nobody.
     private func handleGroupMessage(hash: Data, srcHash: Data, content: String, timestamp: Double,
                                     fields: LxmfFields, groupId: String, standing: GroupStanding,
-                                    signature: Int, senderKey: Data? = nil, packed: Data? = nil) {
+                                    signature: Int, senderKey: Data? = nil, packed: Data? = nil,
+                                    ownAct: Bool = false) {
         let srcHex = srcHash.hexString
         let action = fields.groupAction  // nil = regular message
 
@@ -2201,12 +2317,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // remembered (after the rule, never for a message it dropped), and a message its source
         // signed shows that source's key is here, so what was held for it is decided now, before
         // this message.
-        groupStatuses.onKept(src: srcHex, action: action, signature: signature, senderKey: senderKey)
+        groupStatuses.onKept(src: srcHex, action: action, signature: signature, senderKey: senderKey,
+                             chatId: groupId)
 
         switch action {
         case GroupAction.invite:
             handleGroupInvite(srcHex: srcHex, timestamp: timestamp, fields: fields,
-                              groupId: groupId, standing: standing)
+                              groupId: groupId, standing: standing, hashHex: hash.hexString)
         case GroupAction.accept, GroupAction.leave:
             // The source's own, never GROUP_SENDER's (the rule took it only from a current member
             // naming nobody else, not forged). Verified (under a key held, or the one it
@@ -2225,6 +2342,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             guard let chat = standing.chat else { return }
             groupStatuses.takeStatuses(chat: Self.groupInfo(chat), elements: fields.groupStatuses)
         case GroupAction.relayRequest:
+            // A relay request keeps today's behaviour only in a group whose own address is the
+            // device; a D-group relays for nobody (GROUPS-DISTRO-DESIGN.md §12.3: no designated
+            // relayer among the devices of D).
+            if let chat = standing.chat, GroupSelf.isDistroGroup(ownMember: chat.ownMember, device: ownHashHex) {
+                print("[GroupChat] relay_req for D-group \(groupId.prefix(8)) from \(srcHex.prefix(8)): not acted on (§12.3)")
+                return
+            }
             handleGroupRelayRequest(srcHex: srcHex, content: content, fields: fields,
                                     groupId: groupId, standing: standing, signature: signature)
         case GroupAction.relayDone:
@@ -2237,7 +2361,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             handleGroupChatMessage(hash: hash, content: content, timestamp: timestamp, fields: fields,
                                    chat: chat,
                                    author: groupAuthor(fields: fields, sourceHex: srcHex,
-                                                       standing: standing, signature: signature))
+                                                       standing: standing, signature: signature),
+                                   selfAddresses: groupSelf(chat, rows: standing.members), ownAct: ownAct)
         default:
             // Until 2026-10-05 an action this client does not know was
             // stored as a plain post.
@@ -2273,7 +2398,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// invite's source is recorded as the group's creator, once, with the
     /// group: a `status` counts only from it.
     private func handleGroupInvite(srcHex: String, timestamp: Double, fields: LxmfFields,
-                                   groupId: String, standing: GroupStanding) {
+                                   groupId: String, standing: GroupStanding, hashHex: String = "") {
         guard let ctx = modelContext else { return }
         let held = standing.chat != nil
         if !held {
@@ -2298,9 +2423,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // Whose keys this invite may bring: the held list, or for a new group
         // the list it gives, with its inviter.
         let members = held ? distinct(standing.members.map(\.hash)) : distinct(listed + [srcHex])
+        // The group's own address (GROUPS-DISTRO-DESIGN.md §8.1): D when the list names the
+        // distro this device holds now, else the device when listed; an invite listing neither
+        // is not for this user (§9.3). Never the user's own key, for any self address (§9.2).
+        let ownMember = standing.chat.map { $0.ownMember ?? ownHashHex }
+            ?? GroupSelf.ownMemberForInvite(listed: listed, device: ownHashHex, heldDistro: heldDistroHex)
+        let selfAddresses = GroupSelf.addresses(ownMember: ownMember, device: ownHashHex, listed: members,
+                                                heldDistro: heldDistroHex, siblings: knownSiblings(of:))
 
         for (memberHash, keyBase64) in fields.groupMemberKeys ?? [:] {
-            guard let hash = DeliveryPolicy.hash(memberHash), members.contains(hash), hash != ownHashHex,
+            guard let hash = DeliveryPolicy.hash(memberHash), members.contains(hash), !selfAddresses.contains(hash),
                   let hashData = Data(hexString: hash),
                   let publicKey = Data(base64Encoded: keyBase64), publicKey.count == 64 else { continue }
             guard bridge.rememberLxmfDelivery(destHash: hashData, publicKey: publicKey) else {
@@ -2322,10 +2454,18 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // A new group, pending until the user accepts or declines it. The
         // inviter started it, so it is accepted; everyone else is invited.
+        // The user is on it only as listed: no self-add (§9.3).
+        guard let ownMember else {
+            print("[GroupChat] invite for \(groupId.prefix(8)) from \(srcHex.prefix(8)) lists neither this device nor its distro: not for this user, dropped (§9.3)")
+            try? ctx.save()
+            return
+        }
         let groupName = fields.groupName ?? "Group"
         ctx.insert(ChatEntity(id: groupId, peerHash: srcHex, isGroup: true,
-                              groupName: groupName, groupStatus: "pending", creatorHash: srcHex))
-        for memberHash in distinct(listed + [srcHex, ownHashHex]) {
+                              groupName: groupName, groupStatus: "pending", creatorHash: srcHex,
+                              ownMember: ownMember == ownHashHex ? nil : ownMember,
+                              membersCsv: fields.groupMembersRaw))
+        for memberHash in distinct(listed + [srcHex]) {
             ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: memberHash,
                                          inviteStatus: memberHash == srcHex ? MemberStatus.accepted
                                                                             : MemberStatus.invited))
@@ -2348,11 +2488,16 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         updateChatTimestamp(chatId: groupId, timestamp: timestamp)
         try? ctx.save()
 
-        notifManager.postMessageNotification(
-            chatId: groupId,
-            senderName: contactDisplayName(for: srcHex),
-            content: "Group invite: \"\(groupName)\" — tap to accept or decline"
-        )
+        // The NSE already alerted for an invite it counted (GROUPS-DISTRO-DESIGN.md §6.7).
+        if PendingNotification.takeNSECountedGroupHash(hashHex) {
+            print("[GroupChat] invite \(hashHex.prefix(8)) was shown by the notification service: not notified again")
+        } else {
+            notifManager.postMessageNotification(
+                chatId: groupId,
+                senderName: contactDisplayName(for: srcHex),
+                content: "Group invite: \"\(groupName)\" — tap to accept or decline"
+            )
+        }
         refreshChats()
     }
 
@@ -2401,7 +2546,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let originalSender = groupAuthor(fields: fields, sourceHex: srcHex, standing: standing,
                                          signature: signature)
         let alreadySeen = (fields.groupRelaySeen ?? []).compactMap { DeliveryPolicy.hash($0) }
-        let accepted = GroupMemberStatuses.acceptedMembers(standing.members, selfHash: ownHashHex)
+        let accepted = GroupMemberStatuses.acceptedMembers(
+            standing.members, selfAddresses: standing.chat.map { groupSelf($0, rows: standing.members) } ?? [ownHashHex])
         let groupName = standing.chat?.groupName ?? "Group"
 
         let selfHash = ownHashHex
@@ -2421,9 +2567,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// Regular group content message, stored as `author`'s (groupAuthor).
+    ///
+    /// GROUPS-DISTRO-DESIGN.md §9.2: what counts as the user's own is decided by
+    /// the packet source (admitGroupMessage dropped a self author from another
+    /// source). A post from a self address (`selfAddresses`: the device, or a
+    /// known sibling acting as its listed entry, `ownAct`) is stored as the
+    /// user's own outgoing post, SENT, with no notification.
     private func handleGroupChatMessage(
         hash: Data, content: String, timestamp: Double, fields: LxmfFields,
-        chat: ChatEntity, author: String
+        chat: ChatEntity, author: String, selfAddresses: Set<String> = [], ownAct: Bool = false
     ) {
         guard let ctx = modelContext else { return }
         let groupId = chat.id
@@ -2436,11 +2588,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // The group's name, when the chat has none yet.
         if let groupName = fields.groupName, chat.groupName == nil { chat.groupName = groupName }
 
+        let own = ownAct || author == ownHashHex || selfAddresses.contains(author)
         let msg = MessageEntity(
             id: msgHashHex, chatId: groupId, senderHash: author,
             content: content, timestamp: timestamp,
-            isOutgoing: author == ownHashHex,
-            deliveryState: DeliveryState.delivered
+            isOutgoing: own,
+            deliveryState: own && author != ownHashHex ? DeliveryState.sent : DeliveryState.delivered
         )
         insertMessage(msg, into: ctx)
 
@@ -2453,7 +2606,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         updateChatTimestamp(chatId: groupId, timestamp: timestamp)
         try? ctx.save()
 
-        if author != ownHashHex {
+        if own {
+            // The user's own post: no notification.
+        } else if PendingNotification.takeNSECountedGroupHash(msgHashHex) {
+            // The NSE already alerted for it (GROUPS-DISTRO-DESIGN.md §6.7).
+            print("[GroupChat] post \(msgHashHex.prefix(8)) was shown by the notification service: not notified again")
+        } else {
             let senderName = contactDisplayName(for: author)
             let groupName = chat.groupName ?? "Group"
             notifManager.postMessageNotification(
@@ -2578,34 +2736,49 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return normalizedHash
     }
 
+    /// Create a group with `memberHashes` and invite them. The creator's own entry is the
+    /// group's own address (GROUPS-DISTRO-DESIGN.md §8.1, §8.5): the distro D when this device
+    /// holds it (recorded creator D, invite chunks signed by D, D's chunk carrying D's key from
+    /// DistroManager, one `create` group sync owed once the chunks are built), otherwise the
+    /// device. "" (nothing made) while D may be held but is not loaded yet: group actions as D
+    /// are not offered until it is (§8.7).
     func createGroupChat(name: String, memberHashes: [String]) -> String {
         guard let ctx = modelContext else { return "" }
+        guard let signer = creationSigner() else {
+            print("[GroupChat] group not created: the distro this device may hold has not loaded yet (§8.7)")
+            return ""
+        }
+        let own = signer.hex
 
         // Generate a 16-byte random group ID → 32-char hex string (Android-compatible)
         var randomBytes = [UInt8](repeating: 0, count: 16)
         _ = SecRandomCopyBytes(kSecRandomDefault, 16, &randomBytes)
         let groupId = randomBytes.map { String(format: "%02x", $0) }.joined()
 
+        // Every member but the user, then the group's own address: never the device in a group
+        // created as D, never a sibling (§9.2).
+        let userAddresses = signer.isDistro
+            ? Set([ownHashHex, own] + knownSiblings(of: own)) : Set([ownHashHex])
+        var allMembers = memberHashes.filter { !userAddresses.contains($0) }
+        allMembers.append(own)
+        let membersCsv = allMembers.joined(separator: ",")
+
         // Seconds, like every other chat time (ChatListView formats seconds).
         let now = Date().timeIntervalSince1970
         let chat = ChatEntity(
             id: groupId, peerHash: "", lastMessageTime: now,
-            isGroup: true, groupName: name, groupStatus: "active", creatorHash: ownHashHex
+            isGroup: true, groupName: name, groupStatus: "active", creatorHash: own,
+            ownMember: signer.isDistro ? own : nil, membersCsv: membersCsv
         )
         ctx.insert(chat)
 
-        // Add all members, including self
-        var allMembers = memberHashes
-        if !allMembers.contains(ownHashHex) {
-            allMembers.append(ownHashHex)
-        }
         for memberHash in allMembers {
-            let status = memberHash == ownHashHex ? MemberStatus.accepted : MemberStatus.invited
+            let status = memberHash == own ? MemberStatus.accepted : MemberStatus.invited
             let member = GroupMemberEntity(groupId: groupId, memberHash: memberHash,
                                            inviteStatus: status)
             ctx.insert(member)
-            // Not this device: it is no contact of its own (audit L4).
-            guard memberHash != ownHashHex else { continue }
+            // Not the user: no contact of its own (audit L4).
+            guard memberHash != own else { continue }
             ensureAllowlistedContact(destHash: memberHash)
             if let hashData = Data(hexString: memberHash) {
                 RetichatBridge.shared.watchAnnounce(destHash: hashData)
@@ -2617,28 +2790,36 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         try? ctx.save()
 
-        // Send invites to everyone except self (fire-and-forget)
+        // Send invites to everyone except the user (fire-and-forget)
         if let client = lxmfClient {
-            let selfHash = ownHashHex
             var memberPublicKeys: [String: String] = [:]
             for memberHash in allMembers {
                 guard let hashData = Data(hexString: memberHash) else { continue }
-                let publicKey = memberHash == selfHash
-                    ? bridge.identityPublicKey(handle: client.identityHandle)
+                let publicKey = memberHash == own
+                    ? signer.publicKey
                     : bridge.recalledPublicKey(destHash: hashData)
                 if let publicKey, publicKey.count == 64 {
                     memberPublicKeys[memberHash] = publicKey.hexString
                 }
             }
-            ffiQueue.async {
-                GroupChatManager.shared.sendInvites(
+            let targets = allMembers.filter { $0 != own }
+            let atMs = DistroGroupSync.atMs(now)
+            ffiQueue.async { [weak self] in
+                let keys = GroupChatManager.shared.sendInvites(
                     groupId: groupId,
                     groupName: name,
                     allMembers: allMembers,
                     memberPublicKeys: memberPublicKeys,
-                    from: selfHash,
+                    targets: targets,
+                    as: signer,
                     via: client
                 )
+                // §10.6: the `create` group sync, once the invite chunks are built.
+                guard signer.isDistro, let keys else { return }
+                Task { @MainActor [weak self] in
+                    self?.oweGroupSync(.create, groupId: groupId, signer: signer, atMs: atMs, name: name,
+                                       membersCsv: membersCsv, keys: keys)
+                }
             }
         }
 
@@ -2685,8 +2866,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// Permanently delete a chat and all its messages and attachments, here
-    /// only.
-    private func deleteChatLocal(chatId: String) {
+    /// only. `forgetHeld` false keeps what was held for a group until it is
+    /// joined (a pending invite discarded for the user's own group sync,
+    /// GROUPS-DISTRO-DESIGN.md §11.2).
+    private func deleteChatLocal(chatId: String, forgetHeld: Bool = true) {
         guard let ctx = modelContext else { return }
 
         // Remove from transport announce watchlist before deleting the entity.
@@ -2734,8 +2917,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         if let members = try? ctx.fetch(memberDescriptor) {
             for member in members { ctx.delete(member) }
         }
-        // The creator's copies and the entries held for a key go with the group.
+        // The creator's copies and the entries held for a key go with the group, and so does
+        // what was held for it until it was joined here (GROUPS-DISTRO-DESIGN.md §6.5).
         SwiftDataGroupStatusStore.deleteRows(groupId: chatId, in: ctx)
+        if forgetHeld { forgetHeldArrivals(groupId: chatId, why: "its group is gone from this device") }
 
         // Delete the chat entity
         let chatDescriptor = FetchDescriptor<ChatEntity>(
@@ -3011,7 +3196,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 isArchived: entity.isArchived,
                 isGroup: entity.isGroup,
                 groupName: entity.groupName,
-                groupStatus: entity.groupStatus
+                groupStatus: entity.groupStatus,
+                isDistroGroup: entity.isGroup && GroupSelf.isDistroGroup(ownMember: entity.ownMember, device: ownHashHex),
+                cannotActText: entity.isGroup ? cannotActText(entity) : nil
             )
         }
 
@@ -3023,8 +3210,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // message beat any name but the user's own. File I/O, off the main
         // actor.
         let snapshot = entries
+        // GROUPS-DISTRO-DESIGN.md §6.7: the groups, the filter, the inviters it lets through and
+        // the closed ids, for the NSE's group notifications, on every change.
+        let groupsSnapshot = nseGroupsSnapshot()
         Task.detached(priority: .utility) {
             PendingNotification.writeChatNames(snapshot)
+            PendingNotification.writeNSEGroups(groupsSnapshot)
         }
     }
 
@@ -3208,31 +3399,99 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         )
     }
 
+    /// What the group rule made of a group message (admitGroupMessage).
+    private enum GroupAdmission {
+        /// Kept, with the group as it stood. `ownAct`: its packet source is a known sibling of
+        /// the user, an older device acting as its own listed entry (GROUPS-DISTRO-DESIGN.md §9.2).
+        case kept(GroupStanding, ownAct: Bool)
+        /// Dropped by §6.3's first rules (forged, the user's own echo, a self address named by
+        /// someone else): never held.
+        case droppedFirst
+        /// Dropped by the group rule, with the group as it stood: the distro path may hold it
+        /// (§6.5).
+        case dropped(GroupStanding)
+    }
+
     /// James's group model (DeliveryPolicy.shouldProcess) for a group
     /// message from the packet source `sourceHex`: the group's standing
     /// when the message is kept, nil (logged) when it is dropped, before any
     /// write. Only an invite asks the privacy filter. Until 2026-10-05 every
     /// non-invite message for a group held here was processed, from any
     /// source, with GROUP_SENDER taken as its author.
+    ///
+    /// GROUPS-DISTRO-DESIGN.md §6.3: three rules come first, on both paths and
+    /// in every group (GroupFirstRules): a forged message (unverified_reason 2)
+    /// is dropped; one whose source is the user's distro D is the user's own
+    /// echo, dropped; one naming a self address (§9.1) as its sender while its
+    /// source is not one is dropped, never stored as the user's own.
     private func admitGroupMessage(groupId: String, sourceHex: String, fields: LxmfFields,
-                                   signature: Int) -> GroupStanding? {
+                                   signature: Int) -> GroupAdmission {
         let action = fields.groupAction
         let standing = groupStanding(groupId: groupId, sourceHex: sourceHex)
-        let allowed = DeliveryPolicy.shouldProcess(
-            action: action,
-            sourceAllowed: action == GroupAction.invite && isAllowlisted(destHash: sourceHex),
-            held: standing.held,
-            sourceStatus: standing.sourceStatus,
-            namesOther: DeliveryPolicy.namesOther(groupSender: fields.groupSender, source: sourceHex),
-            closed: standing.closed,
-            signature: signature,
-            sourceIsCreator: standing.sourceIsCreator
-        )
-        guard allowed else {
-            print("[GroupChat] DROPPED \(action ?? "message") for \(groupId.prefix(8)) from \(sourceHex.prefix(8)) (group \(standing.held), source \(standing.sourceStatus ?? "not listed"), closed=\(standing.closed), signature=\(signature), creator=\(standing.sourceIsCreator))")
-            return nil
+        let who = admissionSelf(standing: standing, fields: fields)
+        switch GroupFirstRules.check(signature: signature, sourceHex: sourceHex, groupSender: fields.groupSender,
+                                     selfAddresses: who.selfAddresses, distros: who.distros,
+                                     siblings: who.siblings) {
+        case .forged:
+            print("[GroupChat] DROPPED forged \(action ?? "message") for \(groupId.prefix(8)) from \(sourceHex.prefix(8)): its signature does not verify (§6.3)")
+            return .droppedFirst
+        case .ownEcho:
+            print("[GroupChat] DROPPED \(action ?? "message") for \(groupId.prefix(8)) from the user's own distro \(sourceHex.prefix(8)): the user's own echo (§6.3)")
+            return .droppedFirst
+        case .selfSenderFromOther:
+            print("[GroupChat] DROPPED \(action ?? "message") for \(groupId.prefix(8)) from \(sourceHex.prefix(8)): it names the user as its sender, and its source is not the user's (§6.3)")
+            return .droppedFirst
+        case .pass(let ownAct):
+            let allowed = DeliveryPolicy.shouldProcess(
+                action: action,
+                sourceAllowed: action == GroupAction.invite && isAllowlisted(destHash: sourceHex),
+                held: standing.held,
+                sourceStatus: standing.sourceStatus,
+                namesOther: DeliveryPolicy.namesOther(groupSender: fields.groupSender, source: sourceHex),
+                closed: standing.closed,
+                signature: signature,
+                sourceIsCreator: standing.sourceIsCreator
+            )
+            guard allowed else {
+                print("[GroupChat] DROPPED \(action ?? "message") for \(groupId.prefix(8)) from \(sourceHex.prefix(8)) (group \(standing.held), source \(standing.sourceStatus ?? "not listed"), closed=\(standing.closed), signature=\(signature), creator=\(standing.sourceIsCreator))")
+                return .dropped(standing)
+            }
+            return .kept(standing, ownAct: ownAct)
         }
-        return standing
+    }
+
+    /// Who the user is for §6.3 in the group a message names: for a group held here its own
+    /// self addresses (§9.1); for an invite to a group not held, those its list gives with the
+    /// own address it would get (§8.1); for anything else about a group not held, every address
+    /// of the user (the device, D and D's known siblings). `distros`: the D held now and the
+    /// group's X, whose messages are the user's own echo.
+    private func admissionSelf(standing: GroupStanding, fields: LxmfFields)
+        -> (selfAddresses: Set<String>, distros: Set<String>, siblings: Set<String>) {
+        let held = heldDistroHex
+        let listed: [String]
+        let ownMember: String?
+        if let chat = standing.chat {
+            listed = standing.members.map(\.hash)
+            ownMember = chat.ownMember
+        } else if fields.groupAction == GroupAction.invite {
+            listed = DeliveryPolicy.members(fields.groupMembers)
+            let own = GroupSelf.ownMemberForInvite(listed: listed, device: ownHashHex, heldDistro: held)
+            ownMember = own == ownHashHex ? nil : own
+        } else {
+            var all: Set<String> = ownHashHex.isEmpty ? [] : [ownHashHex]
+            var siblings: Set<String> = []
+            if let held {
+                all.insert(held)
+                siblings = Set(knownSiblings(of: held))
+                all.formUnion(siblings)
+            }
+            return (all, held.map { [$0] } ?? [], siblings)
+        }
+        let x = GroupSelf.distro(ownMember: ownMember, device: ownHashHex, listed: listed, heldDistro: held)
+        let addresses = GroupSelf.addresses(ownMember: ownMember, device: ownHashHex, listed: listed,
+                                            heldDistro: held, siblings: knownSiblings(of:))
+        let siblings = x.map { Set(knownSiblings(of: $0)).intersection(addresses) } ?? []
+        return (addresses, Set([held, x].compactMap { $0 }), siblings)
     }
 
     /// A distro identity transfer on the device address (RFed SPEC §17.9),
@@ -3248,6 +3507,605 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         RfedDistroClient.shared.offerTransfer(fromHashHex: srcHex, privateKeyHex: key)
     }
 
+    // MARK: - Groups for distro holders (GROUPS-DISTRO-DESIGN.md, James 2026-10-10)
+    //
+    // The user's distro D is a group member like any address. A group's own address
+    // (ChatEntity.ownMember, §8.1) is the member the user acts as in it; every send in a
+    // D-group is signed by D (groupSigner), never the device; what reaches D for a group is
+    // routed here by RfedDistroClient (never the DM path, §6.4), and the group sync G tells the
+    // user's other devices of D what the user did as D (§10, §11).
+
+    /// The distro this device holds now, loaded; nil when none is.
+    private var heldDistroHex: String? { DistroManager.shared.deliveryHashHex }
+
+    /// Whether the Keychain has said what this device holds. A stored key that will not load is
+    /// no distro; one not read yet (start-up, a background launch before the first unlock) may
+    /// be D not loaded yet (§8.7).
+    private var distroSettled: Bool {
+        DistroManager.shared.isSettled || DistroManager.shared.storedKeyUnreadable
+    }
+
+    /// §9.1: the user's other devices of `distro`, learned, never queried.
+    private func knownSiblings(of distro: String) -> [String] { prefs.distroSiblings[distro] ?? [] }
+
+    /// §9.1: `by`, the 0xFD of a sync `distro` signed that this device accepted, is a sibling.
+    private func learnSibling(_ by: String, of distro: String) {
+        let known = prefs.distroSiblings
+        let next = KnownSiblings.learn(known, by: by, distro: distro, device: ownHashHex)
+        guard next != known else { return }
+        prefs.distroSiblings = next
+        print("[GroupChat] \(by.prefix(8)) is another device of the distro \(distro.prefix(8)): a known sibling (§9.1)")
+        scheduleRefreshChats()
+    }
+
+    private func groupRows(_ groupId: String) -> [GroupMemberStatuses.Row] {
+        guard let ctx = modelContext else { return [] }
+        let desc = FetchDescriptor<GroupMemberEntity>(predicate: #Predicate { $0.groupId == groupId })
+        return ((try? ctx.fetch(desc)) ?? []).map { (hash: $0.memberHash, status: $0.inviteStatus) }
+    }
+
+    /// The group's own address: the member the user acts as (§8.1); nil is the device.
+    private func ownAddress(_ chat: ChatEntity) -> String { chat.ownMember ?? ownHashHex }
+
+    /// The self addresses of a group held here (§9.1).
+    private func groupSelf(_ chat: ChatEntity, rows: [GroupMemberStatuses.Row]) -> Set<String> {
+        GroupSelf.addresses(ownMember: chat.ownMember, device: ownHashHex, listed: rows.map(\.hash),
+                            heldDistro: heldDistroHex, siblings: knownSiblings(of:))
+    }
+
+    /// GroupStatusEngine's "me" (§9.2): the group's self addresses; for a group not held here,
+    /// every address of the user.
+    private func isGroupSelf(chatId: String, hex: String) -> Bool {
+        if hex == ownHashHex { return true }
+        if let ctx = modelContext,
+           let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first,
+           chat.isGroup {
+            return groupSelf(chat, rows: groupRows(chatId)).contains(hex)
+        }
+        guard let held = heldDistroHex else { return false }
+        return hex == held || knownSiblings(of: held).contains(hex)
+    }
+
+    /// Who may sign for the group now (§8.1, §8.7).
+    private func signerState(_ chat: ChatEntity) -> GroupSelf.Signer {
+        GroupSelf.signer(ownMember: chat.ownMember, device: ownHashHex,
+                         loadedDistro: DistroManager.shared.signing()?.info.deliveryHashHex,
+                         distroSettled: distroSettled)
+    }
+
+    /// §8.7: why this device cannot act in the group (nil when it can).
+    private func cannotActText(_ chat: ChatEntity) -> String? {
+        GroupSelf.cannotSignText(signerState(chat))
+    }
+
+    /// `groupSigner(ownMember)` (§8.1): resolved at send time from the group's own address and
+    /// the distro this device holds then. The device for a group whose own address is the
+    /// device; D only when `DistroManager.signing()` names exactly the group's own address;
+    /// otherwise nil, and the action is refused with §8.7's text: never the device or another
+    /// distro signing for a D-group.
+    private func groupSigner(_ chat: ChatEntity) -> GroupSigner? {
+        let signing = DistroManager.shared.signing()
+        switch GroupSelf.signer(ownMember: chat.ownMember, device: ownHashHex,
+                                loadedDistro: signing?.info.deliveryHashHex, distroSettled: distroSettled) {
+        case .device:
+            return deviceSigner()
+        case .distro(let d):
+            guard let signing, signing.info.deliveryHashHex == d, let hash = Data(hexString: d) else { return nil }
+            return GroupSigner(hex: d, hash: hash, identityHandle: signing.handle,
+                               publicKey: Data(hexString: signing.info.publicKeyHex), isDistro: true)
+        case .distroNotLoaded, .formerDistro:
+            return nil
+        }
+    }
+
+    private func groupSigner(chatId: String) -> GroupSigner? {
+        guard let ctx = modelContext,
+              let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first
+        else { return nil }
+        return groupSigner(chat)
+    }
+
+    /// The device as a group's signer: its own address and identity.
+    private func deviceSigner() -> GroupSigner? {
+        guard let client = lxmfClient, let hash = Data(hexString: ownHashHex), hash.count == 16 else { return nil }
+        return GroupSigner(hex: ownHashHex, hash: hash, identityHandle: client.identityHandle,
+                           publicKey: bridge.identityPublicKey(handle: client.identityHandle), isDistro: false)
+    }
+
+    /// Who a group created now is created as (§8.1, §8.5): D when this device holds it, the
+    /// device when it holds none, nil while it may hold one not loaded yet (§8.7).
+    private func creationSigner() -> GroupSigner? {
+        if let signing = DistroManager.shared.signing(), let hash = Data(hexString: signing.info.deliveryHashHex) {
+            return GroupSigner(hex: signing.info.deliveryHashHex, hash: hash, identityHandle: signing.handle,
+                               publicKey: Data(hexString: signing.info.publicKeyHex), isDistro: true)
+        }
+        guard distroSettled else { return nil }
+        return deviceSigner()
+            ?? GroupSigner(hex: ownHashHex, hash: Data(hexString: ownHashHex) ?? Data(), identityHandle: 0,
+                           publicKey: nil, isDistro: false)
+    }
+
+    /// GROUP_MEMBER_KEYS entries for the listed members whose key this device holds (the
+    /// signer's own from its identity): what an `accept` group sync carries (§10.2).
+    private func memberKeyEntries(_ members: [String], signer: GroupSigner) -> [String] {
+        members.compactMap { hash in
+            let key = hash == signer.hex ? signer.publicKey : Data(hexString: hash).flatMap { bridge.recalledPublicKey(destHash: $0) }
+            guard let key, key.count == 64 else { return nil }
+            return "\(hash):\(key.base64EncodedString())"
+        }
+    }
+
+    /// §10.2: `ids` left by `distro` go first in this device's own `left` list for it.
+    private func recordLeft(_ ids: [String], distro: String) {
+        var all = prefs.distroLeftIds
+        all[distro] = DistroGroupSync.recordLeft(ids, into: all[distro] ?? [])
+        prefs.distroLeftIds = all
+    }
+
+    /// §10.5-§10.6: owe the group sync G of an action the user made as D in a D-group: packed
+    /// and signed by D once, sealed, and owed on its own until the propagation node proves it
+    /// (DistroOutboxRuntime.oweGroupSync). Only for a signer that is D: nothing else sends one.
+    private func oweGroupSync(_ op: DistroGroupSync.Op, groupId: String, signer: GroupSigner, atMs: UInt64,
+                              name: String? = nil, membersCsv: String? = nil, keys: [String]? = nil,
+                              creator: String? = nil, text: String? = nil) {
+        guard signer.isDistro else { return }
+        let d = signer.hex
+        let json = DistroGroupSync.writerJSON(op: op, groupId: groupId, atMs: atMs, name: name,
+                                              membersCsv: membersCsv, keys: keys, creator: creator,
+                                              text: text, left: prefs.distroLeftIds[d] ?? [])
+        let device = ownHashHex
+        let label = "the \(op.rawValue) group sync of \(groupId.prefix(8)) (SPEC §17.14)"
+        Task { @MainActor in
+            await DistroOutboxRuntime.shared.oweGroupSync(groupD: d, syncJson: json, deviceHex: device, label: label)
+        }
+    }
+
+    /// §10.6: the `post` group sync of a post the user sent as D: its text alone (attachments
+    /// are not copied, §17.11), at the post's stored time.
+    private func owePostSync(groupId: String, text: String, atMs: UInt64, signer: GroupSigner) {
+        oweGroupSync(.post, groupId: groupId, signer: signer, atMs: atMs, text: text)
+    }
+
+    // MARK: Inbound on the distro path (§6)
+
+    /// A group message to the distro (§6.1 step 2): admitted as on the direct path, with §6.3's
+    /// first rules, and handed to the same group handler, or held until its group is joined here
+    /// (§6.5), or dropped. Never `ensureContact`/`storeIncomingDirect`: a group message is never
+    /// a DM (§6.4). True when kept (applied or stored): only then is its `grp:` key recorded.
+    private func handleDistroGroupArrival(_ a: DistroGroupArrival) -> Bool {
+        guard modelContext != nil else {
+            print("[GroupChat] distro group message \(a.hash.prefix(8)): modelContext is nil; not recorded")
+            return false
+        }
+        guard let distro = heldDistroHex else {
+            print("[GroupChat] distro group message \(a.hash.prefix(8)): no distro loaded; not recorded")
+            return false
+        }
+        let groupId = a.groupId
+        let srcHex = a.sourceHex
+        let fields = LxmfFieldsDecoder.decode(a.fieldsRaw ?? Data())
+        let action = fields.groupAction
+        let signature = DeliveryPolicy.Signature.reason(valid: a.signatureValidated, unverifiedReason: a.unverifiedReason)
+
+        // §12.3: no device of D acts on a relay request; none sends relay_done.
+        if action == GroupAction.relayRequest {
+            print("[GroupChat] relay_req for \(groupId.prefix(8)) from \(srcHex.prefix(8)) on the distro path: dropped, no device of the distro relays (§12.3)")
+            return false
+        }
+        // §6.3, §9.3: an invite to D must list D.
+        if action == GroupAction.invite, !DeliveryPolicy.members(fields.groupMembers).contains(distro) {
+            print("[GroupChat] invite for \(groupId.prefix(8)) from \(srcHex.prefix(8)) to the distro does not list the distro: dropped (§9.3)")
+            return false
+        }
+
+        switch admitGroupMessage(groupId: groupId, sourceHex: srcHex, fields: fields, signature: signature) {
+        case .kept(let standing, let ownAct):
+            // The name row the direct path makes for its sender, and nothing else (§6.4).
+            applyMessageName(a.displayName, unverifiedReason: a.unverifiedReason, sourceHex: srcHex,
+                             messageTime: a.timestamp)
+            handleGroupMessage(
+                hash: Data(hexString: a.hash) ?? Data(), srcHash: Data(hexString: srcHex) ?? Data(),
+                content: a.content.trimmingCharacters(in: .whitespacesAndNewlines), timestamp: a.timestamp,
+                fields: fields, groupId: groupId, standing: standing, signature: signature,
+                senderKey: a.senderKey, packed: a.packed, ownAct: ownAct)
+            return true
+        case .droppedFirst:
+            return false
+        case .dropped(let standing):
+            if action == GroupAction.invite {
+                noteFilteredInvite(groupId: groupId, sourceHex: srcHex, standing: standing, signature: signature)
+                return false
+            }
+            holdIfOnlyNotJoined(a, fields: fields, standing: standing, signature: signature, distro: distro)
+            return false
+        }
+    }
+
+    /// §6.5: an invite to D the privacy filter dropped puts its group id in the filtered-invite
+    /// set: that group's traffic is never held.
+    private func noteFilteredInvite(groupId: String, sourceHex: String, standing: GroupStanding, signature: Int) {
+        guard !isAllowlisted(destHash: sourceHex), !standing.closed,
+              signature != DeliveryPolicy.Signature.invalid else { return }
+        prefs.filteredInviteIds = FilteredInvites.record(prefs.filteredInviteIds, groupId)
+        print("[GroupChat] invite to the distro for \(groupId.prefix(8)) from \(sourceHex.prefix(8)) filtered: the group's traffic is not held (§6.5)")
+        scheduleRefreshChats()
+    }
+
+    /// §6.5: a group message the rules dropped is held instead only when the group not being
+    /// joined here is the sole reason.
+    private func holdIfOnlyNotJoined(_ a: DistroGroupArrival, fields: LxmfFields, standing: GroupStanding,
+                                     signature: Int, distro: String) {
+        let action = fields.groupAction
+        let filtered = prefs.filteredInviteIds.contains(a.groupId)
+        let selfAddresses = admissionSelf(standing: standing, fields: fields).selfAddresses
+        let keptIfJoined = standing.held == .pending && DeliveryPolicy.shouldProcess(
+            action: action, sourceAllowed: false, held: .joined, sourceStatus: standing.sourceStatus,
+            namesOther: DeliveryPolicy.namesOther(groupSender: fields.groupSender, source: a.sourceHex),
+            closed: false, signature: signature, sourceIsCreator: standing.sourceIsCreator)
+        guard HeldArrivals.holdable(isPostSync: false, action: action, held: standing.held, closed: standing.closed,
+                                    filtered: filtered, signature: signature,
+                                    sourceIsSelf: selfAddresses.contains(a.sourceHex), keptIfJoined: keptIfJoined)
+        else {
+            if filtered {
+                print("[GroupChat] \(action ?? "post") for \(a.groupId.prefix(8)) not held: the filter dropped its invite (§6.5)")
+            }
+            return
+        }
+        let signatureBytes = a.packed.flatMap { $0.count >= 96 ? $0.subdata(in: 32..<96) : nil }
+        holdArrival(blob: a.blob, groupId: a.groupId, source: a.sourceHex, hash: a.hash, signature: signatureBytes,
+                    validated: signature == DeliveryPolicy.Signature.validated, countsAgainstSource: true,
+                    distro: distro, what: action ?? "post")
+    }
+
+    /// §6.5: keep `blob` until its group is joined here, within the bounds (HeldArrivals). Every
+    /// eviction and refusal is logged with the group, the source and the bound.
+    private func holdArrival(blob: Data, groupId: String, source: String, hash: String, signature: Data?,
+                             validated: Bool, countsAgainstSource: Bool, distro: String, what: String) {
+        guard let ctx = modelContext else { return }
+        let rows = (try? ctx.fetch(FetchDescriptor<GroupHeldArrivalEntity>(sortBy: [SortDescriptor(\.seq)]))) ?? []
+        let pendingDesc = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.isGroup == true && $0.groupStatus == "pending" })
+        let pendingIds = Set(((try? ctx.fetch(pendingDesc)) ?? []).map(\.id))
+        let items = rows.map {
+            HeldArrivals.Item(seq: $0.seq, groupId: $0.groupId, source: $0.srcHash, hash: $0.msgHash,
+                              signature: $0.signature, validated: $0.validated, size: $0.size,
+                              countsAgainstSource: $0.countsAgainstSource)
+        }
+        let seq = (rows.map(\.seq).max() ?? 0) + 1
+        let new = HeldArrivals.Item(seq: seq, groupId: groupId, source: source, hash: hash, signature: signature,
+                                    validated: validated, size: blob.count, countsAgainstSource: countsAgainstSource)
+        switch HeldArrivals.decide(new, existing: items, pending: { pendingIds.contains($0) }) {
+        case .duplicate:
+            print("[GroupChat] \(what) \(hash.prefix(8)) for \(groupId.prefix(8)) is held already (§6.5)")
+        case .refuse(let why):
+            print("[GroupChat] \(what) for \(groupId.prefix(8)) from \(source.prefix(8)) not held: \(why) (§6.5)")
+        case .hold(let evict):
+            for eviction in evict {
+                guard let row = rows.first(where: { $0.seq == eviction.seq }) else { continue }
+                print("[GroupChat] held message \(row.msgHash.prefix(8)) for \(row.groupId.prefix(8)) from \(row.srcHash.prefix(8)) evicted: \(eviction.bound) (§6.5)")
+                ctx.delete(row)
+            }
+            let key = "\(hash):" + (signature?.hexString ?? (validated ? "validated" : "unverified"))
+            ctx.insert(GroupHeldArrivalEntity(key: key, groupId: groupId, srcHash: source, msgHash: hash,
+                                              signature: signature, validated: validated,
+                                              countsAgainstSource: countsAgainstSource, distro: distro,
+                                              blob: blob, seq: seq))
+            try? ctx.save()
+            print("[GroupChat] \(what) \(hash.prefix(8)) for \(groupId.prefix(8)) from \(source.prefix(8)) held until the group is joined here (§6.5)")
+        }
+    }
+
+    /// §6.5: the group is joined here now: what was held for it is fed to the distro path again,
+    /// in arrival order, and forgotten. Each is judged as a new arrival (ordering, not a retry).
+    private func replayHeldArrivals(groupId: String) {
+        guard let ctx = modelContext else { return }
+        let desc = FetchDescriptor<GroupHeldArrivalEntity>(predicate: #Predicate { $0.groupId == groupId },
+                                                            sortBy: [SortDescriptor(\.seq)])
+        let rows = (try? ctx.fetch(desc)) ?? []
+        guard !rows.isEmpty else { return }
+        let blobs = rows.map(\.blob)
+        for row in rows { ctx.delete(row) }
+        try? ctx.save()
+        print("[GroupChat] \(blobs.count) message(s) held for \(groupId.prefix(8)) judged again: the group is joined here (§6.5)")
+        for blob in blobs { RfedDistroClient.ingestBlob(blob) }
+    }
+
+    /// §6.5: the group is closed or gone here: what was held for it is forgotten (one line).
+    private func forgetHeldArrivals(groupId: String, why: String) {
+        guard let ctx = modelContext else { return }
+        let desc = FetchDescriptor<GroupHeldArrivalEntity>(predicate: #Predicate { $0.groupId == groupId })
+        let rows = (try? ctx.fetch(desc)) ?? []
+        guard !rows.isEmpty else { return }
+        for row in rows { ctx.delete(row) }
+        try? ctx.save()
+        print("[GroupChat] \(rows.count) message(s) held for \(groupId.prefix(8)) forgotten: \(why) (§6.5)")
+    }
+
+    /// The distro held changed. Once the Keychain has said what the device holds: the arrivals
+    /// held for a distro given up are forgotten (§6.5), and its known siblings dropped unless a
+    /// group here still has it as its own address (§8.7).
+    private func onDistroHeldChanged(_ held: String?) {
+        defer { refreshChats() }
+        guard distroSettled, let ctx = modelContext else { return }
+        let rows = (try? ctx.fetch(FetchDescriptor<GroupHeldArrivalEntity>())) ?? []
+        let gone = rows.filter { $0.distro != held }
+        if !gone.isEmpty {
+            for row in gone { ctx.delete(row) }
+            try? ctx.save()
+            print("[GroupChat] \(gone.count) message(s) held for a distro this device no longer holds forgotten (§6.5)")
+        }
+        let groups = (try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.isGroup == true }))) ?? []
+        let owners = Set(groups.compactMap(\.ownMember))
+        let known = prefs.distroSiblings
+        let pruned = KnownSiblings.prune(known, heldDistro: held, ownMembers: owners)
+        if pruned != known {
+            prefs.distroSiblings = pruned
+            print("[GroupChat] the known siblings of \(known.count - pruned.count) distro(s) this device no longer holds dropped (§8.7)")
+        }
+    }
+
+    // MARK: The group sync G (§11)
+
+    /// A group sync G (SPEC §17.14): §11.1's rules 1 to 4, then 5 and 6 by the group as held
+    /// here, then `left`. Applying G never sends anything and never owes a G. True when kept
+    /// (applied, or this device's own echo): its `gsync:` key is recorded. False when dropped
+    /// (judged again on its next copy) or held (judged as a new arrival when replayed).
+    private func handleDistroGroupSync(_ a: DistroGroupSyncArrival) -> Bool {
+        guard modelContext != nil else {
+            print("[GroupSync] G \(a.hash.prefix(8)): modelContext is nil; not recorded")
+            return false
+        }
+        let device = ownHashHex
+        guard !device.isEmpty else {
+            print("[GroupSync] G \(a.hash.prefix(8)) not judged yet: this device's own address is not known (the stack has not started); not recorded")
+            return false
+        }
+        switch DistroGroupSync.disposition(sourceHex: a.sourceHex, distroHex: a.distroHex,
+                                           signatureValidated: a.signatureValidated, reading: a.reading,
+                                           deviceHex: device) {
+        case .notFromDistro:
+            print("[GroupSync] G \(a.hash.prefix(8)) from \(a.sourceHex.prefix(8)) ignored: its source is not the distro (§11.1 rule 1)")
+            return false
+        case .forged:
+            print("[GroupSync] G \(a.hash.prefix(8)) dropped: its signature does not validate under the distro's key (§11.1 rule 2)")
+            return false
+        case .ownEcho:
+            return true
+        case .malformed(let why, let sibling):
+            if let sibling { learnSibling(sibling, of: a.distroHex) }
+            print("[GroupSync] G \(a.hash.prefix(8)) dropped: \(why) (§11.1 rule 4)")
+            return false
+        case .apply(let form, let sibling):
+            if let sibling { learnSibling(sibling, of: a.distroHex) }
+            let kept = applyGroupSync(form, arrival: a)
+            applyLeft(form, distro: a.distroHex, hash: a.hash)
+            return kept
+        }
+    }
+
+    /// Where the group `groupId` stands here, for §11.2.
+    private func syncStanding(_ groupId: String) -> (standing: DistroGroupSync.Standing, chat: ChatEntity?) {
+        if let ctx = modelContext,
+           let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })).first,
+           chat.isGroup {
+            return (chat.groupStatus == "pending" ? .pending : .joined, chat)
+        }
+        return (ClosedGroups.contains(prefs.closedGroupIds, groupId) ? .closed : .notHeld, nil)
+    }
+
+    /// §11.2 for G's own group. True when applied (recorded as seen), false when held.
+    private func applyGroupSync(_ form: DistroGroupSync.Form, arrival a: DistroGroupSyncArrival) -> Bool {
+        let d = a.distroHex
+        let groupId = form.groupId
+        let (standing, chat) = syncStanding(groupId)
+        let pendingMatches: Bool = {
+            guard form.op == .accept, standing == .pending, let chat else { return false }
+            return chat.creatorHash == form.creator && Set(groupRows(groupId).map(\.hash)) == Set(form.members)
+        }()
+        let step = DistroGroupSync.step(form.op, standing: standing, ownMemberIsD: chat?.ownMember == d,
+                                        pendingMatches: pendingMatches)
+        let what = "the \(form.op.rawValue) sync \(a.hash.prefix(8)) for \(groupId.prefix(8))"
+        switch step {
+        case .holdFromSync:
+            holdGroupFromSync(form, distro: d, what: what)
+        case .discardPendingThenHold:
+            // The user's own sync outranks anyone else's invite for its id: the pending invite is
+            // discarded, sending nothing (a decline would be a final leave as D).
+            print("[GroupSync] \(what): the pending invite from \(chat?.creatorHash?.prefix(8) ?? "?") is discarded, nothing sent; the group is held from the sync (§11.2)")
+            deleteChatLocal(chatId: groupId, forgetHeld: false)
+            holdGroupFromSync(form, distro: d, what: what)
+        case .joinPending:
+            if let chat { joinPendingFromSync(chat, distro: d, what: what) }
+        case .close:
+            if form.op == .leave { recordLeft([groupId], distro: d) }
+            closeGroupFromSync(groupId, why: what)
+        case .tombstone:
+            prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, groupId)
+            recordLeft([groupId], distro: d)
+            print("[GroupSync] \(what): not held here, recorded closed (§11.2)")
+        case .storeOwnPost:
+            if let chat { storeOwnPostFromSync(form, hash: a.hash, distro: d, chat: chat) }
+        case .holdArrival:
+            let filtered = prefs.filteredInviteIds.contains(groupId)
+            guard HeldArrivals.holdable(isPostSync: true, action: nil, held: standing == .pending ? .pending : .none,
+                                        closed: false, filtered: filtered,
+                                        signature: DeliveryPolicy.Signature.validated, sourceIsSelf: false,
+                                        keptIfJoined: true) else {
+                print("[GroupSync] \(what) dropped: the filter dropped the group's invite here (§6.5)")
+                return false
+            }
+            holdArrival(blob: a.blob, groupId: groupId, source: d, hash: a.hash, signature: nil, validated: true,
+                        countsAgainstSource: false, distro: d, what: "post sync")
+            return false
+        case .nothing(let why):
+            if form.op == .leave, standing == .closed { recordLeft([groupId], distro: d) }
+            print("[GroupSync] \(what): nothing to apply, \(why) (§11.1-§11.2)")
+        }
+        return true
+    }
+
+    /// "Hold the group from G" (§11.2): list = members; creator D for `create`, `creator` for
+    /// `accept`; own address D; joined; D accepted (and the creator, for `accept`), every other
+    /// member invited; the keys bound and remembered; the members let through the privacy
+    /// filter by association, no self address; the id out of the filtered-invite set; what was
+    /// held for it replayed.
+    private func holdGroupFromSync(_ form: DistroGroupSync.Form, distro d: String, what: String) {
+        guard let ctx = modelContext else { return }
+        let groupId = form.groupId
+        if (try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == groupId })).first) != nil {
+            print("[GroupSync] \(what) names another chat here: ignored")
+            return
+        }
+        let creator = form.op == .create ? d : (form.creator ?? d)
+        ctx.insert(ChatEntity(id: groupId, peerHash: creator == d ? "" : creator,
+                              lastMessageTime: Double(form.atMs) / 1000, isGroup: true,
+                              groupName: form.name.isEmpty ? nil : form.name, groupStatus: "active",
+                              creatorHash: creator, ownMember: d, membersCsv: form.membersCsv))
+        var seen = Set<String>()
+        for member in form.members where seen.insert(member).inserted {
+            let accepted = member == d || (form.op == .accept && member == creator)
+            ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: member,
+                                         inviteStatus: accepted ? MemberStatus.accepted : MemberStatus.invited))
+        }
+        let selfAddresses = GroupSelf.addresses(ownMember: d, device: ownHashHex, listed: form.members,
+                                                heldDistro: heldDistroHex, siblings: knownSiblings(of:))
+        bindSyncKeys(form.keys, listed: form.members, selfAddresses: selfAddresses)
+        for member in form.members where !selfAddresses.contains(member) {
+            ensureAllowlistedContact(destHash: member)
+            if let hashData = Data(hexString: member) { RetichatBridge.shared.watchAnnounce(destHash: hashData) }
+        }
+        prefs.filteredInviteIds = FilteredInvites.remove(prefs.filteredInviteIds, groupId)
+        try? ctx.save()
+        groupStatuses.decideHeld()
+        print("[GroupSync] \(what): the group is held from it, created by \(creator.prefix(8)), \(form.members.count) member(s), joined as the distro (§11.2)")
+        replayHeldArrivals(groupId: groupId)
+        refreshChats()
+    }
+
+    /// §11.2, `accept` for a matching pending invite: joined as the user's own accept here
+    /// would make it, without sending.
+    private func joinPendingFromSync(_ chat: ChatEntity, distro d: String, what: String) {
+        guard let ctx = modelContext else { return }
+        let groupId = chat.id
+        chat.groupStatus = "active"
+        let members = (try? ctx.fetch(FetchDescriptor<GroupMemberEntity>(predicate: #Predicate { $0.groupId == groupId }))) ?? []
+        if let own = members.first(where: { $0.memberHash == d }) {
+            own.inviteStatus = MemberStatus.accepted
+        } else {
+            ctx.insert(GroupMemberEntity(groupId: groupId, memberHash: d, inviteStatus: MemberStatus.accepted))
+        }
+        let rows = members.map { (hash: $0.memberHash, status: $0.inviteStatus) }
+        let selfAddresses = groupSelf(chat, rows: rows)
+        for member in members.map(\.memberHash) where !selfAddresses.contains(member) {
+            ensureAllowlistedContact(destHash: member)
+            if let hashData = Data(hexString: member) { RetichatBridge.shared.watchAnnounce(destHash: hashData) }
+        }
+        prefs.filteredInviteIds = FilteredInvites.remove(prefs.filteredInviteIds, groupId)
+        try? ctx.save()
+        groupStatuses.decideHeld()
+        print("[GroupSync] \(what): the pending invite matches, joined as the distro, nothing sent (§11.2)")
+        replayHeldArrivals(groupId: groupId)
+        refreshChats()
+    }
+
+    /// §11.2, closed as the local decline or leave closes it, minus the send and minus owing a
+    /// G: the id recorded closed and the conversation removed.
+    private func closeGroupFromSync(_ groupId: String, why: String) {
+        prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, groupId)
+        deleteChatLocal(chatId: groupId)
+        print("[GroupSync] \(why): group \(groupId.prefix(8)) closed and removed here, nothing sent (§11.2)")
+    }
+
+    /// §11.2, `post` in a joined group: the user's own outgoing post, sender D, SENT, at
+    /// `at_ms`, id = G's LXMF hash, the §17.11 placeholder for an empty text, no notification.
+    private func storeOwnPostFromSync(_ form: DistroGroupSync.Form, hash: String, distro d: String, chat: ChatEntity) {
+        guard let ctx = modelContext else { return }
+        let dup = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == hash })
+        if let existing = try? ctx.fetch(dup), !existing.isEmpty { return }
+        var content = form.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if content.isEmpty { content = DistroMessageStore.unavailablePlaceholder }
+        let timestamp = Double(form.atMs) / 1000
+        insertMessage(MessageEntity(id: hash, chatId: chat.id, senderHash: d, content: content,
+                                    timestamp: timestamp, isOutgoing: true, deliveryState: DeliveryState.sent),
+                      into: ctx)
+        updateChatTimestamp(chatId: chat.id, timestamp: timestamp)
+        try? ctx.save()
+        refreshChats()
+    }
+
+    /// §11.2, `left`: after the op, each id other than G's own.
+    private func applyLeft(_ form: DistroGroupSync.Form, distro d: String, hash: String) {
+        var changed: [String] = []
+        var recorded: [String] = []
+        for id in DistroGroupSync.leftIds(form) {
+            let (standing, chat) = syncStanding(id)
+            switch DistroGroupSync.leftStep(standing: standing, ownMemberIsD: chat?.ownMember == d) {
+            case .close:
+                closeGroupFromSync(id, why: "the left of G \(hash.prefix(8))")
+                changed.append(id); recorded.append(id)
+            case .tombstone:
+                prefs.closedGroupIds = ClosedGroups.record(prefs.closedGroupIds, id)
+                changed.append(id); recorded.append(id)
+            case .alreadyClosed:
+                recorded.append(id)
+            case .ignore:
+                break
+            }
+        }
+        if !recorded.isEmpty { recordLeft(recorded, distro: d) }
+        if !changed.isEmpty {
+            print("[GroupSync] the left of G \(hash.prefix(8)) closed \(changed.count) group(s) here: \(changed.map { String($0.prefix(8)) }.joined(separator: ", ")) (§11.2)")
+        }
+    }
+
+    /// GROUP_MEMBER_KEYS entries of a group sync, each bound as an invite chunk's is (its key
+    /// produces its hash, the hash is listed); one that does not bind is ignored.
+    private func bindSyncKeys(_ keys: [String], listed: [String], selfAddresses: Set<String>) {
+        for entry in keys {
+            let parts = entry.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let hash = DeliveryPolicy.hash(parts[0].lowercased()), listed.contains(hash),
+                  !selfAddresses.contains(hash), let hashData = Data(hexString: hash),
+                  let publicKey = Data(base64Encoded: parts[1]), publicKey.count == 64 else { continue }
+            if !bridge.rememberLxmfDelivery(destHash: hashData, publicKey: publicKey) {
+                print("[GroupSync] ignored a member key that does not hash to \(hash.prefix(8))")
+            }
+        }
+    }
+
+    // MARK: Shown
+
+    /// A member's label in a group's member list: "You" for every self address of the group
+    /// (§9.2), else contactDisplayName.
+    func groupMemberDisplayName(for hash: String, groupId: String) -> String {
+        if isGroupSelf(chatId: groupId, hex: hash) { return "You" }
+        return contactDisplayName(for: hash)
+    }
+
+    /// §6.7: the App Group file the NSE decides group notifications from.
+    private func nseGroupsSnapshot() -> NSEGroups {
+        var groups: [String: NSEGroups.Group] = [:]
+        if let ctx = modelContext {
+            let chats = (try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.isGroup == true }))) ?? []
+            let rows = (try? ctx.fetch(FetchDescriptor<GroupMemberEntity>())) ?? []
+            let byGroup = Dictionary(grouping: rows, by: \.groupId)
+            for chat in chats where chat.isGroup {
+                let members = (byGroup[chat.id] ?? []).map { (hash: $0.memberHash, status: $0.inviteStatus) }
+                let accepted = GroupMemberStatuses.acceptedMembers(members, selfAddresses: [])
+                groups[chat.id] = NSEGroups.Group(name: chat.groupName ?? "Group",
+                                                  state: chat.groupStatus == "pending" ? "pending" : "joined",
+                                                  accepted: accepted)
+            }
+        }
+        var inviters: [String] = []
+        if let ctx = modelContext {
+            let allowed = FetchDescriptor<ContactEntity>(predicate: #Predicate { $0.isAllowlisted == true })
+            inviters = ((try? ctx.fetch(allowed)) ?? []).map(\.destHash)
+        }
+        var me: [String] = ownHashHex.isEmpty ? [] : [ownHashHex]
+        if let held = heldDistroHex { me += [held] + knownSiblings(of: held) }
+        return NSEGroups(filterOn: prefs.filterStrangers, inviters: inviters, groups: groups,
+                         closed: prefs.closedGroupIds + prefs.filteredInviteIds, selfAddresses: me)
+    }
+
     // MARK: - Names (LXMF-rust/DISPLAY_NAMES.md §5)
     //
     // One resolver for every surface: localName ?? messageName ??
@@ -3257,7 +4115,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// The resolved label for a hash: "You" for this device's own address.
     func contactDisplayName(for destHash: String) -> String {
-        if destHash == ownHashHex { return "You" }
+        // The device, the distro it holds and that distro's known siblings are the user
+        // (GROUPS-DISTRO-DESIGN.md §9.2).
+        if destHash == ownHashHex || isOwnAddress(destHash) { return "You" }
         return resolvedContactName(for: destHash) ?? DisplayNames.shortHash(destHash)
     }
 
@@ -3328,7 +4188,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// contactDisplayName against a prefetched index.
     private func label(for hash: String, in names: [String: String?]) -> String {
-        if hash == ownHashHex { return "You" }
+        if hash == ownHashHex || isOwnAddress(hash) { return "You" }
         return (names[hash] ?? nil) ?? DisplayNames.shortHash(hash)
     }
 

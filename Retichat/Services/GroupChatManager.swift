@@ -35,6 +35,20 @@
 import Foundation
 import Security
 
+/// Who a group send goes out as (GROUPS-DISTRO-DESIGN.md §8.1-§8.2): the group's own address,
+/// resolved at send time by ChatRepository.groupSigner, never captured once. `hex` is the LXMF
+/// source and GROUP_SENDER, `identityHandle` signs, `publicKey` is the key an accept or leave
+/// carries. In a D-group it is D (the distro this device holds now, equal to the group's own
+/// address); otherwise the device.
+struct GroupSigner: Sendable {
+    let hex: String
+    let hash: Data
+    let identityHandle: UInt64
+    let publicKey: Data?
+    /// The signer is the user's distro, not the device: its acts are owed a group sync (§10.6).
+    let isDistro: Bool
+}
+
 final class GroupChatManager {
     static let shared = GroupChatManager()
     private init() {}
@@ -44,84 +58,95 @@ final class GroupChatManager {
     private var fallbackStarted: Set<UInt64> = []
     var onTracked: ((String) -> Void)?
 
+    // MARK: - Who sends
+
+    /// One envelope from the group's own address `signer` to `dest`, signed by its identity
+    /// (GROUPS-DISTRO-DESIGN.md §8.2): `retichat_message_create`, never `lxmf_message_new`, which
+    /// always signs as the device. DIRECT, with the propagated fallback (handleMessageState); a
+    /// member that is a distro is propagated at once by the router (§8.4).
+    private func create(to dest: Data, content: String, as signer: GroupSigner) -> UInt64 {
+        RetichatBridge.shared.messageCreate(destHash: dest, sourceHash: signer.hash, content: content, title: "",
+                                            method: LxmfMethod.direct, identityHandle: signer.identityHandle)
+    }
+
     // MARK: - Invite
 
-    /// Send group invites to all members except the creator (self).
+    /// Send group invites to `targets` (every listed member that is not the user), as the
+    /// group's own address `signer`, the creator: one chunk per member key, each listing every
+    /// member. Returns the GROUP_MEMBER_KEYS entries the chunks carry (what a `create` group sync
+    /// carries, §10.2), or nil when a member's key is missing and nothing was sent.
+    @discardableResult
     func sendInvites(
         groupId: String,
         groupName: String,
         allMembers: [String],
         memberPublicKeys: [String: String],
-        from selfHash: String,
+        targets: [String],
+        as signer: GroupSigner,
         via client: LxmfClient
-    ) {
+    ) -> [String]? {
         let membersCSV = allMembers.joined(separator: ",")
         guard allMembers.allSatisfy({ memberPublicKeys[$0]?.count == 128 }) else {
             print("[GroupChat] invite aborted: missing member public key")
-            return
+            return nil
         }
         let memberKeyEntries = allMembers.sorted().compactMap { hash -> String? in
             guard let keyData = Data(hexString: memberPublicKeys[hash]!) else { return nil }
             return "\(hash):\(keyData.base64EncodedString())"
         }
-        guard memberKeyEntries.count == allMembers.count else { return }
-        let invitees = allMembers.filter { $0 != selfHash }
+        guard memberKeyEntries.count == allMembers.count else { return nil }
         let content = ""
 
-        for target in invitees {
+        for target in targets where target != signer.hex {
             guard let destData = Data(hexString: target) else { continue }
             for memberKeyEntry in memberKeyEntries {
-                let handle = client.createMessage(
-                    to: destData, content: content, title: "", method: LxmfMethod.direct
-                )
+                let handle = create(to: destData, content: content, as: signer)
                 guard handle != 0 else { continue }
                 _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
                 _ = LxmfClient.messageSetGroupEntry(handle, .name, .str(groupName))
                 _ = LxmfClient.messageSetGroupEntry(handle, .members, .str(membersCSV))
                 _ = LxmfClient.messageSetGroupEntry(handle, .memberKeys, .str(memberKeyEntry))
                 _ = LxmfClient.messageSetGroupEntry(handle, .action, .str(GroupAction.invite))
-                _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
+                _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(signer.hex))
                 destroyAfterSend(client: client, handle: handle)
             }
         }
+        return memberKeyEntries
     }
 
     // MARK: - Accept
 
-    /// Broadcast acceptance to every member in the list (excluding self). Every accept
-    /// carries the user's own key (GroupEnvelopes, RFed-spec Group.md "The sender's key",
-    /// James 2026-10-06), so a member that never heard of this device can verify it, and
-    /// the creator answers it with a `status`.
+    /// Broadcast acceptance to `members` (the caller left out every self address), as the
+    /// group's own address. Every accept carries the signer's own key (GroupEnvelopes, RFed-spec
+    /// Group.md "The sender's key", James 2026-10-06), so a member that never heard of it can
+    /// verify it, and the creator answers it with a `status`. In a D-group that is D's key,
+    /// whichever device of D sends it (GROUPS-DISTRO-DESIGN.md §8.2).
     func sendAccept(
         groupId: String,
         to members: [String],
-        from selfHash: String,
+        as signer: GroupSigner,
         via client: LxmfClient
     ) {
-        let ownKey = ownKeyEntry(selfHash: selfHash, client: client)
-        for target in members where target != selfHash {
+        let ownKey = ownKeyEntry(signer)
+        for target in members where target != signer.hex {
             guard let destData = Data(hexString: target) else { continue }
-            let handle = client.createMessage(
-                to: destData, content: "", title: "", method: LxmfMethod.direct
-            )
+            let handle = create(to: destData, content: "", as: signer)
             guard handle != 0 else { continue }
-            write(GroupEnvelopes.accept(groupId: groupId, selfHex: selfHash, ownKey: ownKey), on: handle)
+            write(GroupEnvelopes.accept(groupId: groupId, selfHex: signer.hex, ownKey: ownKey), on: handle)
             destroyAfterSend(client: client, handle: handle)
         }
     }
 
-    /// The user's own GROUP_MEMBER_KEYS entry, `hash:base64-public-key`: the form an invite
+    /// The signer's own GROUP_MEMBER_KEYS entry, `hash:base64-public-key`: the form an invite
     /// chunk uses. Read from the identity, not the router, so a leave sent with no connection
-    /// carries it too. Nil, and logged, when the identity's key cannot be read (it is always
-    /// held): the accept or leave then goes without it, as a build from before this change
-    /// sent it, rather than not at all.
-    private func ownKeyEntry(selfHash: String, client: LxmfClient) -> String? {
-        guard let publicKey = RetichatBridge.shared.identityPublicKey(handle: client.identityHandle),
-              publicKey.count == 64 else {
+    /// carries it too. Nil, and logged, when the key cannot be read: the accept or leave then goes
+    /// without it, as a build from before this change sent it, rather than not at all.
+    private func ownKeyEntry(_ signer: GroupSigner) -> String? {
+        guard let publicKey = signer.publicKey, publicKey.count == 64 else {
             print("[GroupChat] own key not readable, the accept/leave carries none: \(LxmfClient.lastError ?? "unknown")")
             return nil
         }
-        return GroupEnvelopes.ownKeyEntry(selfHex: selfHash, publicKey: publicKey)
+        return GroupEnvelopes.ownKeyEntry(selfHex: signer.hex, publicKey: publicKey)
     }
 
     /// Write the envelope's entries on the native message `handle`, in the form the switch picks.
@@ -139,20 +164,19 @@ final class GroupChatManager {
     /// received it, by member hash ascending (the caller chose them; an empty list is a valid
     /// answer). It goes like every group control message: DIRECT, with the propagated fallback,
     /// and as a Resource when too large for a packet. Once per accept received: nothing here
-    /// sends it again (DESIGN_PRINCIPLES §3). A status that cannot be built is not sent.
+    /// sends it again (DESIGN_PRINCIPLES §3). A status that cannot be built is not sent. Sent as
+    /// the group's own address: a creator that is D answers as D (GROUPS-DISTRO-DESIGN.md §12.1).
     func sendStatus(
         groupId: String,
         to memberHex: String,
         statuses: [Data],
-        from selfHash: String,
+        as signer: GroupSigner,
         via client: LxmfClient
     ) {
         guard let destData = Data(hexString: memberHex) else { return }
-        let handle = client.createMessage(
-            to: destData, content: "", title: "", method: LxmfMethod.direct
-        )
+        let handle = create(to: destData, content: "", as: signer)
         guard handle != 0 else { return }
-        write(GroupEnvelopes.status(groupId: groupId, selfHex: selfHash), on: handle)
+        write(GroupEnvelopes.status(groupId: groupId, selfHex: signer.hex), on: handle)
         guard RetichatBridge.shared.messageSetRetichatStatuses(handle: handle, elements: statuses) else {
             print("[GroupChat] the status for \(memberHex.prefix(8)) could not be built, not sent: \(LxmfClient.lastError ?? "unknown")")
             LxmfClient.messageDestroy(handle)
@@ -163,49 +187,50 @@ final class GroupChatManager {
 
     // MARK: - Leave
 
-    /// Notify accepted members that we are leaving the group. Like an accept it carries the
-    /// user's own key (GroupEnvelopes), so a member that never heard of this device can verify
-    /// it before it makes the leave final.
+    /// Tell `members` (the caller left out every self address) that the user leaves the group,
+    /// as the group's own address. Like an accept it carries the signer's own key
+    /// (GroupEnvelopes), so a member that never heard of it can verify it before it makes the
+    /// leave final.
     func sendLeave(
         groupId: String,
         to members: [String],
-        from selfHash: String,
+        as signer: GroupSigner,
         via client: LxmfClient
     ) {
-        let ownKey = ownKeyEntry(selfHash: selfHash, client: client)
-        for target in members where target != selfHash {
+        let ownKey = ownKeyEntry(signer)
+        for target in members where target != signer.hex {
             guard let destData = Data(hexString: target) else { continue }
-            let handle = client.createMessage(
-                to: destData, content: "", title: "", method: LxmfMethod.direct
-            )
+            let handle = create(to: destData, content: "", as: signer)
             guard handle != 0 else { continue }
-            write(GroupEnvelopes.leave(groupId: groupId, selfHex: selfHash, ownKey: ownKey), on: handle)
+            write(GroupEnvelopes.leave(groupId: groupId, selfHex: signer.hex, ownKey: ownKey), on: handle)
             destroyAfterSend(client: client, handle: handle)
         }
     }
 
     // MARK: - Message fanout
 
-    /// Send a group message to a list of accepted members.
+    /// Send a group message to a list of accepted members (the caller left out every self
+    /// address), as the group's own address. Returns how many envelopes the router or its
+    /// outbox accepted: a `post` group sync is owed only once one was (§10.6).
     ///
     /// - Parameters:
     ///   - onHandle: Called once per successfully created send handle so the
     ///     caller can set up delivery-state polling if desired.
+    @discardableResult
     func fanoutMessage(
         groupId: String,
         groupName: String,
         content: String,
         attachments: [(String, Data)],
         to members: [String],
-        from selfHash: String,
+        as signer: GroupSigner,
         via client: LxmfClient,
         onHandle: ((UInt64, String) -> Void)? = nil
-    ) {
-        for target in members where target != selfHash {
+    ) -> Int {
+        var submitted = 0
+        for target in members where target != signer.hex {
             guard let destData = Data(hexString: target) else { continue }
-            let handle = client.createMessage(
-                to: destData, content: content, title: "", method: LxmfMethod.direct
-            )
+            let handle = create(to: destData, content: content, as: signer)
             guard handle != 0 else { continue }
 
             for (filename, data) in attachments {
@@ -213,15 +238,17 @@ final class GroupChatManager {
             }
             _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
             _ = LxmfClient.messageSetGroupEntry(handle, .name, .str(groupName))
-            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(selfHash))
+            _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(signer.hex))
 
             if client.sendMessageViaAppLinks(handle) {
+                submitted += 1
                 track(handle: handle)
                 onHandle?(handle, target)
             } else {
                 LxmfClient.messageDestroy(handle)
             }
         }
+        return submitted
     }
 
     // MARK: - Relay request
