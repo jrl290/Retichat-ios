@@ -11,7 +11,9 @@
     "members is parsed with the phones' invite parser (iOS/Android DeliveryPolicy.members): split on ',', each entry trimmed of invite_space (Unicode Zs and U+0009) at both ends, kept when it is exactly 32 lowercase hex, the first of each; it must name D. creator (an accept) is 32 hex, read lowercased, listed, not D.",
     "invite_space: the code points the invite parser trims, Unicode Zs and U+0009 (Swift's CharacterSet.whitespaces), and no other.",
     "sealed: blobs as RFed hands them to D's devices (blob_hex = D_hash | D.encrypt(packed[16:]); the encryption is random, so these bytes are fixed input), each with the unwrap's expected hash (hash_hex; LXMF.py's: full_hash(dest | src | payload) over the payload as received, packed again only to drop a stamp; g_accept_web_form_int64_at_ms is not in the form a packer makes, so a reader that always packs the payload again gets another hash and a failed signature), packed (packed_hex = blob[0:16] | plaintext) and the §7 keys after each phone's group receipt; sender_key_hex is the 128-hex key (null when none), packed true when the JSON's packed is the base64 of packed_hex, false when null. M is not known to the receiver.",
-    "group_entries: the unwrap's has_group_id, group_id, group_action and group_name for a fields map alone, and whether group_sync is set (true) or null (false)."
+    "group_entries: the unwrap's has_group_id, group_id, group_action and group_name for a fields map alone, and whether group_sync is set (true) or null (false).",
+    "Repeated keys (RFed SPEC §17.14): a fields map, and the Retichat field 0xD1, may hold a key more than once. A group entry (0xA0-0xA8, the field 0xD1 itself, and keys 1-9 inside it) is read from the first entry with its key, even when that entry is not of the entry's type; 0xFB is read from the last. A reader that decodes the map into a dictionary keeps the last of each key and must read the group entries from the bytes. These readings are LXMF-rust's: the Python reference refuses a map that repeats a key, at any depth, whole (RNS umsgpack DuplicateKeyException), so they are not checked against it. group_entries (*_twice*, the custom_type_twice_* pair) and variants (leave_0xfb_twice_the_last_the_marker) pin it; group_entries also hold an ext of an unknown type beside a group id (skipped, the map read) and a bin GROUP_ID (no id, in either form).",
+    "invite_members: csv strings and the members the invite parser lists for each. The csv is split on the code point ',' (U+002C), never on grapheme clusters: a combining mark after a comma does not join it (Swift's String.split on Character would), and a combining mark before an entry is part of that entry. variants accept_members_combining_mark_after_a_comma and rejects members_naming_d_after_a_combining_mark are the same two cases in a G."
   ],
   "distro": {
     "private_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
@@ -1204,6 +1206,76 @@
         "text": null,
         "left": []
       }
+    },
+    {
+      "name": "leave_0xfb_twice_the_last_the_marker",
+      "why": "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G",
+      "timestamp": 1790000205.75,
+      "sync": {
+        "op": "leave",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000200789,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": []
+      },
+      "fields_hex": "850cc400ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03cfae321c442e3c9bdcd7a3e79d850e03c12f50d65a46f88029fe9345a6cb418434d886ff220179046b5c8bb95baa286c299500516e7df8aca074ae83ceb1fbffecc37140fa08732ed45078ac95eca020794cb41daac4f13700000c400c400850cc400ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "hash_hex": "de581cc0dbea15117731c0aab5133b962592eb9501dcc971a9d9b0baedfac15d",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "leave",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000200789,
+        "name": null,
+        "members": null,
+        "keys": null,
+        "creator": null,
+        "text": null,
+        "left": []
+      }
+    },
+    {
+      "name": "accept_members_combining_mark_after_a_comma",
+      "why": "members is split on the code point ',' (U+002C), not on grapheme clusters: a combining mark (U+0301) after the last comma is an entry of its own, skipped, and D and the creator M are listed",
+      "timestamp": 1790000103.5,
+      "sync": {
+        "op": "accept",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000100456,
+        "name": "Hike — Sunday",
+        "members": "cf0b2a4a8d2a0b6978b71290da7cc80e,fae321c442e3c9bdcd7a3e79d850e03c,́",
+        "keys": [
+          "fae321c442e3c9bdcd7a3e79d850e03c:j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8prLrhQbzK8LIuGpTTTQvHNh5SbQv+EsiXlLyTIpZt1w==",
+          "cf0b2a4a8d2a0b6978b71290da7cc80e:eaYx7t4b+cmPEgMs3q3Q56B5OY/HhriMyEbsia+FpRoXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk/1Q=="
+        ],
+        "creator": "cf0b2a4a8d2a0b6978b71290da7cc80e",
+        "text": null,
+        "left": []
+      },
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc98a6616363657074d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c451f468af48696b6520e280942053756e646179d94463663062326134613864326130623639373862373132393064613763633830652c66616533323163343432653363396264636437613365373964383530653033632ccc8192d97966616533323163343432653363396264636437613365373964383530653033633a6a304446726261504a574a4b35624955366e5a3662736c4e677030396531346130627076506945344b463870724c726851627a4b384c497547705454545176484e6835536251762b457369586c4c795449705a7431773d3dd97963663062326134613864326130623639373862373132393064613763633830653a65615978377434622b636d5045674d7333713351353642354f592f486872694d7945627369612b4670526f5852564f30567433667870434f79724842416635717368347271675958655674395136593067706b2f31513d3dd920636630623261346138643261306236393738623731323930646137636338306590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "packed_hex": "fae321c442e3c9bdcd7a3e79d850e03cfae321c442e3c9bdcd7a3e79d850e03c884ff8fc3c2ec170a69c1a125ce00dc5357104c6b7c8d82982fccbf49986884bfe3e40b7884c6a845d9a2b7bfae14a460f23f42962bc45e4f8b16dc1d1feca0194cb41daac4ef9e00000c400c400840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc98a6616363657074d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c451f468af48696b6520e280942053756e646179d94463663062326134613864326130623639373862373132393064613763633830652c66616533323163343432653363396264636437613365373964383530653033632ccc8192d97966616533323163343432653363396264636437613365373964383530653033633a6a304446726261504a574a4b35624955366e5a3662736c4e677030396531346130627076506945344b463870724c726851627a4b384c497547705454545176484e6835536251762b457369586c4c795449705a7431773d3dd97963663062326134613864326130623639373862373132393064613763633830653a65615978377434622b636d5045674d7333713351353642354f592f486872694d7945627369612b4670526f5852564f30567433667870434f79724842416635717368347271675958655674395136593067706b2f31513d3dd920636630623261346138643261306236393738623731323930646137636338306590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "hash_hex": "52ac1660568f07109a24bff3fc5f84b6ca16f7545eeac2699e10702a8f72f704",
+      "expected": {
+        "by": "0123456789abcdef0123456789abcdef",
+        "problem": null,
+        "op": "accept",
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "at_ms": 1790000100456,
+        "name": "Hike — Sunday",
+        "members": "cf0b2a4a8d2a0b6978b71290da7cc80e,fae321c442e3c9bdcd7a3e79d850e03c,́",
+        "keys": [
+          "fae321c442e3c9bdcd7a3e79d850e03c:j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8prLrhQbzK8LIuGpTTTQvHNh5SbQv+EsiXlLyTIpZt1w==",
+          "cf0b2a4a8d2a0b6978b71290da7cc80e:eaYx7t4b+cmPEgMs3q3Q56B5OY/HhriMyEbsia+FpRoXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk/1Q=="
+        ],
+        "creator": "cf0b2a4a8d2a0b6978b71290da7cc80e",
+        "text": null,
+        "left": []
+      }
     }
   ],
   "at_ms_encodings": [
@@ -1695,6 +1767,12 @@
       "why": "a create whose left is where an accept's creator would be: left must be element 6",
       "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc98a6637265617465d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4506c7baf48696b6520e280942053756e646179d96266616533323163343432653363396264636437613365373964383530653033632c63663062326134613864326130623639373862373132393064613763633830652c653165316531653165316531653165316531653165316531653165316531653192d97966616533323163343432653363396264636437613365373964383530653033633a6a304446726261504a574a4b35624955366e5a3662736c4e677030396531346130627076506945344b463870724c726851627a4b384c497547705454545176484e6835536251762b457369586c4c795449705a7431773d3dd97963663062326134613864326130623639373862373132393064613763633830653a65615978377434622b636d5045674d7333713351353642354f592f486872694d7945627369612b4670526f5852564f30567433667870434f79724842416635717368347271675958655674395136593067706b2f31513d3dd920636630623261346138643261306236393738623731323930646137636338306590ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
       "by": "0123456789abcdef0123456789abcdef"
+    },
+    {
+      "name": "members_naming_d_after_a_combining_mark",
+      "why": "a combining mark (U+0301) after a comma and before D's entry is part of that entry, not of the comma (the csv is split on the code point ','), and the invite parser trims only Zs and U+0009, so D is not listed",
+      "fields_hex": "840cc400ccfbb1726665642e64697374726f2e67726f7570ccfc97a6637265617465d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4506c7baf48696b6520e280942053756e646179d94363663062326134613864326130623639373862373132393064613763633830652ccc81666165333231633434326533633962646364376133653739643835306530336392d97966616533323163343432653363396264636437613365373964383530653033633a6a304446726261504a574a4b35624955366e5a3662736c4e677030396531346130627076506945344b463870724c726851627a4b384c497547705454545176484e6835536251762b457369586c4c795449705a7431773d3dd97963663062326134613864326130623639373862373132393064613763633830653a65615978377434622b636d5045674d7333713351353642354f592f486872694d7945627369612b4670526f5852564f30567433667870434f79724842416635717368347271675958655674395136593067706b2f31513d3d90ccfdd9203031323334353637383961626364656630313233343536373839616263646566",
+      "by": "0123456789abcdef0123456789abcdef"
     }
   ],
   "sealed": [
@@ -2125,6 +2203,157 @@
         "group_name": null,
         "group_sync": true
       }
+    },
+    {
+      "name": "group_id_twice_the_first_read",
+      "why": "two 0xA0 entries: the first is read",
+      "fields_hex": "82cca0d9203966386537643663356234613339323831373036663565346433633262316130cca0d9203432343436376635333763643262393839326637656135383464303735613065",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": null,
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "group_id_twice_the_first_malformed",
+      "why": "two 0xA0 entries: the first is read even when it is not a group id, so the group message has no id",
+      "fields_hex": "82cca0a178cca0d9203966386537643663356234613339323831373036663565346433633262316130",
+      "expected": {
+        "has_group_id": true,
+        "group_id": null,
+        "group_action": null,
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "retichat_field_group_id_twice",
+      "why": "key 1 twice in 0xD1: the first is read",
+      "fields_hex": "81ccd18201d920396638653764366335623461333932383137303666356534643363326231613001d9203432343436376635333763643262393839326637656135383464303735613065",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": null,
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "retichat_field_twice",
+      "why": "two 0xD1 fields: the first is read whole, the second not at all",
+      "fields_hex": "82ccd18201d920396638653764366335623461333932383137303666356534643363326231613004a6616363657074ccd18201d920343234343637663533376364326239383932663765613538346430373561306503af48696b6520e280942053756e646179",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": "accept",
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "group_action_and_name_twice",
+      "why": "0xA3 and 0xA2 twice each: the first of each is read",
+      "fields_hex": "85cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a6696e76697465cca2af48696b6520e280942053756e646179cca3a56c65617665cca2ac416e6f74686572206e616d65",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": "invite",
+        "group_name": "Hike — Sunday",
+        "group_sync": false
+      }
+    },
+    {
+      "name": "group_id_bin_in_both_forms",
+      "why": "a GROUP_ID that is a bin, in 0xD1 and in 0xA0: a group entry is a str, so a group message with no id",
+      "fields_hex": "82ccd18101c4203966386537643663356234613339323831373036663565346433633262316130cca0c4203966386537643663356234613339323831373036663565346433633262316130",
+      "expected": {
+        "has_group_id": true,
+        "group_id": null,
+        "group_action": null,
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "group_id_bin_in_0xd1_str_in_0xa0",
+      "why": "key 1 of 0xD1 that is a bin gives way to 0xA0's str",
+      "fields_hex": "82ccd18101c4203966386537643663356234613339323831373036663565346433633262316130cca0d9203966386537643663356234613339323831373036663565346433633262316130",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": null,
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "ext_beside_group_id",
+      "why": "an ext of a type no reader knows (5) beside 0xA0 is skipped; the map is read",
+      "fields_hex": "82cca0d920396638653764366335623461333932383137303666356534643363326231613077d40500",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": null,
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "ext_beside_group_id_in_retichat_field",
+      "why": "an ext of a type no reader knows (9) beside key 1 of 0xD1 is skipped; the map is read",
+      "fields_hex": "81ccd18301d920396638653764366335623461333932383137303666356534643363326231613004a66163636570740ad60901020304",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": "accept",
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "custom_type_twice_the_last_not_a_marker",
+      "why": "two 0xFB entries: the last is read, here a type that is not a distro marker after the group sync marker, so the group entries are read and the message is no G",
+      "fields_hex": "86ccfbb1726665642e64697374726f2e67726f7570ccfbab6170702e6578616d706c65ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665",
+      "expected": {
+        "has_group_id": true,
+        "group_id": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "group_action": "leave",
+        "group_name": null,
+        "group_sync": false
+      }
+    },
+    {
+      "name": "custom_type_twice_the_last_a_marker",
+      "why": "two 0xFB entries: the last is read, here the group sync marker after another type, so the message is a G and its group entries are not read",
+      "fields_hex": "86ccfbab6170702e6578616d706c65ccfbb1726665642e64697374726f2e67726f7570ccfc94a56c65617665d9203966386537643663356234613339323831373036663565346433633262316130cf000001a0c4537c5590ccfdd9203031323334353637383961626364656630313233343536373839616263646566cca0d9203966386537643663356234613339323831373036663565346433633262316130cca3a56c65617665",
+      "expected": {
+        "has_group_id": false,
+        "group_id": null,
+        "group_action": null,
+        "group_name": null,
+        "group_sync": true
+      }
+    }
+  ],
+  "invite_members": [
+    {
+      "name": "combining_mark_after_a_comma",
+      "why": "a combining mark (U+0301) after the last comma does not join it: it is an entry of its own, skipped",
+      "csv": "cf0b2a4a8d2a0b6978b71290da7cc80e,fae321c442e3c9bdcd7a3e79d850e03c,́",
+      "members": [
+        "cf0b2a4a8d2a0b6978b71290da7cc80e",
+        "fae321c442e3c9bdcd7a3e79d850e03c"
+      ]
+    },
+    {
+      "name": "combining_mark_before_an_entry",
+      "why": "a combining mark (U+0301) after a comma is part of the entry that follows, which is then not 32 lowercase hex",
+      "csv": "cf0b2a4a8d2a0b6978b71290da7cc80e,́fae321c442e3c9bdcd7a3e79d850e03c",
+      "members": [
+        "cf0b2a4a8d2a0b6978b71290da7cc80e"
+      ]
     }
   ]
 }

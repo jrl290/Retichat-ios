@@ -1036,4 +1036,38 @@ mod distro_unwrap_tests {
             }
         }
     }
+
+    /// Every `group_entries` vector through the distro unwrap the app calls: a blob to D from a
+    /// fresh sender carrying the vector's fields map exactly as given (a repeated key, an ext of an
+    /// unknown type, a bin GROUP_ID) reports the entries LXMF-rust reads (RFed SPEC §17.14
+    /// "Repeated keys": a group entry from the first entry with its key, 0xFB from the last).
+    #[test]
+    fn the_distro_unwrap_reads_each_group_entries_vector_as_lxmf_rust_does() {
+        let v = vectors();
+        let mut d = distro(&v);
+        let dest = lxmf_rust::distro::delivery_hash(&d).unwrap();
+        let entries = v["group_entries"].as_array().unwrap();
+        for name in ["group_id_twice_the_first_malformed", "ext_beside_group_id", "custom_type_twice_the_last_a_marker"] {
+            assert!(entries.iter().any(|e| e["name"] == name), "{name} is in the vectors");
+        }
+        for vector in entries {
+            let name = vector["name"].as_str().unwrap();
+            let expected = &vector["expected"];
+            let sender = Identity::new(true);
+            let src = lxmf_rust::distro::delivery_hash(&sender).unwrap();
+            // [timestamp 1790000000.5, bin title "", bin content "x", the fields as given]
+            let mut payload = unhex("94cb41daac4ee0200000c400c40178");
+            payload.extend_from_slice(&unhex(vector["fields_hex"].as_str().unwrap()));
+            let mut signed = [dest.clone(), src.clone(), payload.clone()].concat();
+            let hash = identity::full_hash(&signed);
+            signed.extend_from_slice(&hash);
+            let signature = sender.sign(&signed);
+            let blob = [dest.clone(), d.encrypt(&[src, signature, payload].concat()).unwrap()].concat();
+            let out: Json = serde_json::from_str(&distro_unwrap_json(&mut d, &blob).unwrap().expect("a blob for D")).unwrap();
+            for key in ["has_group_id", "group_id", "group_action", "group_name"] {
+                assert_eq!(out[key], expected[key], "{name}: {key}");
+            }
+            assert_eq!(!out["group_sync"].is_null(), expected["group_sync"].as_bool().unwrap(), "{name}: group_sync");
+        }
+    }
 }
