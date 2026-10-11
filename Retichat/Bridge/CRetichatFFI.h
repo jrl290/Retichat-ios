@@ -920,6 +920,12 @@ int32_t retichat_distro_delivery_hash(uint64_t distro_handle,
 /// receipt runs on the rebuilt message, so signature_validated/unverified_reason
 /// are its verdict: an accept or leave from a source whose key is not held is
 /// decided under the key it carries.
+/// hash is LXMF.py's: full_hash(dest | src | payload) over the payload bytes as
+/// received (packed again only to drop a stamp). For a payload not in rmpv's form
+/// (the web's G writes at_ms as int 64, 0xd3) it differs from what unpacking the
+/// packed bytes again (retichat_group_unpack_packed, the router) computes, so key a
+/// group message, a G and an owed entry by this hash or the packer's, never by
+/// unpacking stored packed bytes again.
 ///
 /// A ZERO-LENGTH result is not an error: it means the blob is addressed to a
 /// different distro, which a node may legitimately hand over.

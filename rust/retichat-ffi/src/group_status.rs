@@ -979,7 +979,21 @@ mod distro_unwrap_tests {
         let member = unhex(v["member"]["lxmf_delivery_hash_hex"].as_str().unwrap());
         assert!(Identity::recall(&member).is_none(), "M is unknown here");
         let sealed = v["sealed"].as_array().unwrap();
-        assert_eq!(sealed.len(), 5);
+        // g_accept_web_form_int64_at_ms is the web's G (at_ms as int 64, 0xd3): not the form rmpv
+        // packs, so it holds the unwrap to §17.14 rule 2, the hash and the signature over the
+        // payload bytes as received; packing it again would give another hash and fail D's signature.
+        let names: Vec<&str> = sealed.iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "g_accept_full_left",
+                "g_accept_web_form_int64_at_ms",
+                "member_accept_legacy",
+                "member_accept_forged",
+                "member_invite_retichat_field",
+                "member_post_legacy"
+            ]
+        );
         for vector in sealed {
             let name = vector["name"].as_str().unwrap();
             let expected = &vector["expected"];

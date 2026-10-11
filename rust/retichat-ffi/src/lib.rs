@@ -1229,7 +1229,10 @@ pub extern "C" fn retichat_distro_delivery_hash(
 /// signature_validated / unverified_reason are its verdict: an accept or leave
 /// from a source whose key is not held is decided under the key it carries.
 /// The JSON is `lxmf_rust::distro::DistroMessage::to_json_with_receipt`, the one
-/// definition both bridges use.
+/// definition both bridges use. `hash` is LXMF.py's, over the payload bytes as
+/// received (`DistroMessage::hash`): for a payload not in rmpv's form (the web's
+/// G, at_ms as int 64) it is not what `LXMessage::unpack_from_bytes` computes
+/// from the same bytes, so the app keys by it, never by unpacking `packed` again.
 #[no_mangle]
 pub extern "C" fn retichat_distro_unwrap(
     distro_handle: u64,
