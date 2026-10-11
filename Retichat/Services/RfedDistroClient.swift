@@ -827,7 +827,13 @@ final class RfedDistroClient: ObservableObject {
         }
         guard let ptr else {
             // Read on this thread: the Rust error slot is thread-local.
-            print("[Distro] unwrap rejected blob: \(DistroMessageFFI.rnsLastError())")
+            let error = DistroMessageFFI.rnsLastError()
+            // A message that repeats a key (RFed SPEC §17.14 "Repeated keys") is refused whole by
+            // the unwrap, which has logged it once already: nothing is stored, shown or applied,
+            // and nothing more is said here.
+            if !RepeatedKeys.isRefusal(error) {
+                print("[Distro] unwrap rejected blob: \(error)")
+            }
             return
         }
         let json = Data(bytes: ptr, count: Int(outLen))

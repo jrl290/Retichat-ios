@@ -178,7 +178,14 @@ struct LxmfFields {
     /// holds the entry with its type, else from the old field 0xA0-0xA8.
     /// The group fields below are read from these.
     var groupEntries: [GroupEntry: GroupValue] = [:]
+    /// True when the fields carry a GROUP_ID entry in either form (key 1 of 0xD1, or 0xA0), of
+    /// any type, as LXMF-rust's unwrap reports `has_group_id` (its distro marker rule aside: on
+    /// the direct path a marker means nothing). With `groupId` nil it is a GROUP_ID that is not
+    /// one (RFed SPEC §17.14): see `groupIdRefused`.
+    var hasGroupId = false
     // Group fields
+    /// The group id by Group.md's reader rule, kept only when it is a str of 32 hex characters
+    /// and then lowercased (RFed SPEC §17.14: compared and stored lowercased); nil otherwise.
     var groupId: String?
     var groupMembers: [String]?      // full member list (invite messages only)
     /// GROUP_MEMBERS as it was carried, before the csv split: what an `accept` group sync
@@ -214,6 +221,33 @@ struct LxmfFields {
     /// must not become an incoming bubble.
     var isDistroSentCopy: Bool {
         customType == DistroSent.customType
+    }
+
+    /// RFed SPEC §17.14, on the direct path as on the distro's: a message whose GROUP_ID is not a
+    /// str of 32 hex characters (another length, not hex, a bin, an int, nil) is refused with a
+    /// log line, never a direct message or a group (never `group:xyz`). Every direct reader (the
+    /// router's delivery, the NSE's hand-off and the app's import of it) checks this first,
+    /// whatever the message's 0xFB says.
+    var groupIdRefused: Bool {
+        hasGroupId && groupId == nil
+    }
+}
+
+/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity): a payload holding a map that
+/// repeats a key is refused whole by LXMF-rust, as Python LXMF refuses it, on the direct path
+/// (`LXMessage::unpack_from_bytes`, which the router, the channel unpack and the group receipt
+/// run) and the distro path (`distro::unwrap_blob`), before any field is read. LXMF-rust logs
+/// the one line; its error starts with `msgpack_keys::REFUSED_WHOLE` (pinned against this by the
+/// retichat-ffi test `the_swift_refusal_prefix_is_lxmf_rusts`). A Swift caller that logs its
+/// own FFI errors stays silent for this one, so a refusal is logged once.
+nonisolated enum RepeatedKeys {
+    static let refusedWhole = "refused whole:"
+
+    /// Whether `error`, an FFI error text, is such a refusal (at its start, or after the
+    /// context a caller such as the channel unpack puts before it).
+    static func isRefusal(_ error: String?) -> Bool {
+        guard let error else { return false }
+        return error.hasPrefix(refusedWhole) || error.contains(": " + refusedWhole)
     }
 }
 
@@ -303,6 +337,7 @@ final class LxmfFieldsDecoder {
         }
 
         fields.groupEntries = resolveGroupEntries(retichat: retichatGroup, legacy: legacyGroup)
+        fields.hasGroupId = retichatGroup[.id] != nil || legacyGroup[.id] != nil
         applyGroupEntries(&fields)
         fields.groupStatuses = statuses
         return fields
@@ -392,6 +427,16 @@ final class LxmfFieldsDecoder {
         }, uniquingKeysWith: { first, _ in first })
     }
 
+    /// A GROUP_ID str as every path reads it (RFed SPEC §17.14; LXMF-rust distro.rs `hex32`):
+    /// exactly 32 ASCII hex characters, either case, lowercased; nil for anything else. Nothing
+    /// is trimmed.
+    nonisolated static func groupIdHex(_ raw: String) -> String? {
+        guard raw.utf8.count == 32, raw.utf8.allSatisfy({
+            (0x30...0x39).contains($0) || (0x41...0x46).contains($0) || (0x61...0x66).contains($0)
+        }) else { return nil }
+        return raw.lowercased()
+    }
+
     /// The typed group fields of `fields`, from its resolved groupEntries.
     private static func applyGroupEntries(_ fields: inout LxmfFields) {
         let entries = fields.groupEntries
@@ -400,7 +445,7 @@ final class LxmfFieldsDecoder {
             return nil
         }
         func csv(_ raw: String) -> [String] { groupCsv(raw) }
-        fields.groupId = str(.id)
+        fields.groupId = str(.id).flatMap(groupIdHex)
         // Comma-separated strings (Android-compatible).
         fields.groupMembers = str(.members).map(csv)
         fields.groupMembersRaw = str(.members)

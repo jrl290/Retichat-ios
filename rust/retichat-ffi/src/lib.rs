@@ -2994,3 +2994,67 @@ mod distro_outbox_bridge_tests {
         assert_eq!(rf, Some(rmpv::Value::Array(vec![])));
     }
 }
+
+/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity), at the C API the app calls: a
+/// message whose payload repeats a key is refused whole by the distro unwrap and by the group
+/// receipt's unpack, with an error the Swift callers know as a refusal (already logged once, by
+/// LXMF-rust), so they say nothing more.
+#[cfg(test)]
+mod repeated_keys_bridge_tests {
+    use super::*;
+
+    const GROUP_SYNC_VECTORS: &str = include_str!("../tests/data/distro_group_sync_vectors.json");
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// The Swift side tells a refusal by this prefix (`RepeatedKeys.refusedWhole`, LxmfFields.swift).
+    #[test]
+    fn the_swift_refusal_prefix_is_lxmf_rusts() {
+        let swift = include_str!("../../../Retichat/Bridge/LxmfFields.swift");
+        let line = format!("static let refusedWhole = \"{}\"", lxmf_rust::msgpack_keys::REFUSED_WHOLE);
+        assert!(swift.contains(&line), "LxmfFields.swift lacks: {line}");
+    }
+
+    /// Every `refused` vector and every refused `key_equality` pair, sealed for D: the C unwrap
+    /// returns NULL with an error that starts with the refusal prefix, and the C group unpack
+    /// returns NULL too; every pair the reference reads is unwrapped and unpacked.
+    #[test]
+    fn the_c_unwrap_and_the_c_group_unpack_refuse_a_message_that_repeats_a_key() {
+        let v: serde_json::Value = serde_json::from_str(GROUP_SYNC_VECTORS).unwrap();
+        let key = unhex(v["distro"]["private_key_hex"].as_str().unwrap());
+        let d = Identity::from_bytes(&key).unwrap();
+        let handle = rns::store_handle(Identity::from_bytes(&key).unwrap());
+        let refused = v["refused"].as_array().unwrap();
+        let pairs = v["key_equality"].as_array().unwrap();
+        assert_eq!((refused.len(), pairs.len()), (11, 22));
+        let mut refusals = 0;
+        for vector in refused.iter().chain(pairs) {
+            let name = vector["name"].as_str().unwrap();
+            let refuse = vector.get("refused").map_or(true, |r| r.as_bool().unwrap());
+            let packed = unhex(vector["packed_hex"].as_str().unwrap());
+            let blob = [packed[..16].to_vec(), d.encrypt(&packed[16..]).unwrap()].concat();
+            let mut len = 0u32;
+            let unwrapped = retichat_distro_unwrap(handle, blob.as_ptr(), blob.len() as u32, &mut len);
+            let unwrap_error = rns::take_error();
+            let mut element_len = 0u32;
+            let element = retichat_group_unpack_packed(packed.as_ptr(), packed.len() as u32, &mut element_len);
+            let element_error = rns::take_error();
+            if refuse {
+                refusals += 1;
+                assert!(unwrapped.is_null(), "{name}: the unwrap must refuse it");
+                let error = unwrap_error.unwrap_or_default();
+                assert!(lxmf_rust::msgpack_keys::is_refusal(&error) && error.contains("repeats a key"), "{name}: {error}");
+                assert!(element.is_null(), "{name}: the group unpack must refuse it");
+                assert!(element_error.unwrap_or_default().contains("repeats a key"), "{name}: the group unpack's error");
+            } else {
+                assert!(!unwrapped.is_null() && len > 0, "{name}: unwrapped ({unwrap_error:?})");
+                rns_free_bytes(unwrapped, len);
+                assert!(!element.is_null(), "{name}: unpacked ({element_error:?})");
+                rns_free_bytes(element, element_len);
+            }
+        }
+        assert_eq!(refusals, 11 + 15);
+    }
+}

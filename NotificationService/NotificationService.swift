@@ -55,6 +55,14 @@ private enum NSEDelivery {
 /// not stored.
 private func nseHandOffForm(_ msg: PendingNotification.NSEMessage) -> PendingNotification.NSEMessage? {
     let fields = LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data())
+    if fields.groupIdRefused {
+        // RFed SPEC §17.14, as the app's handleIncomingMessage: a GROUP_ID that is not a str of
+        // 32 hex characters is refused, never a direct message or a group: not stored for the
+        // app and not shown.
+        NSLog("[NSE] %@ from %@ refused: its GROUP_ID is not 32 hex characters (never a direct message, never a group)",
+              String(msg.messageHash.prefix(8)), String(msg.senderHash.prefix(8)))
+        return nil
+    }
     if fields.isDistroSentCopy {
         // RFed SPEC §17.11: a distro sent copy is the user's own message,
         // and is filed only from distro fan-out (RfedDistroClient). One

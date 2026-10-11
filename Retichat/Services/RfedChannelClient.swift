@@ -1167,10 +1167,15 @@ final class RfedChannelClient: ObservableObject {
         let lxmfData = channelHashData + blob
 
         guard let result = bridge.channelLxmUnpack(name: channel.channelName, lxmfData: lxmfData) else {
+            let error = bridge.lastError()
             let blobKey = channelHashHex.hashValue &+ blob.hashValue
+            // A post that repeats a key (RFed SPEC §17.14 "Repeated keys") is refused whole by
+            // the unpack, which has logged it once already: nothing more is said here.
             if !failedBlobKeys.contains(blobKey) {
                 failedBlobKeys.insert(blobKey)
-                print("[RfedChannel] dispatchBlob LXMF unpack FAILED (lxmf_bytes=\(lxmfData.count), err=\(bridge.lastError() ?? "?"), suppressing repeats)")
+                if !RepeatedKeys.isRefusal(error) {
+                    print("[RfedChannel] dispatchBlob LXMF unpack FAILED (lxmf_bytes=\(lxmfData.count), err=\(error ?? "?"), suppressing repeats)")
+                }
             }
             return
         }

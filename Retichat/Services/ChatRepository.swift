@@ -999,6 +999,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let fieldsData = Data(base64Encoded: msg.fieldsRawBase64) ?? Data()
             let fields = LxmfFieldsDecoder.decode(fieldsData)
 
+            // RFed SPEC §17.14, as handleIncomingMessage: a GROUP_ID that is not 32 hex is
+            // refused, never a DM or a group. The NSE no longer hands one over; this covers files
+            // an older NSE build wrote.
+            if fields.groupIdRefused {
+                print("[Retichat] importNSEMessages: REFUSED \(msg.messageHash.prefix(8)) from \(srcHex.prefix(8)): its GROUP_ID is not 32 hex characters (never a direct message, never a group)")
+                continue
+            }
+
             // A distro transfer the NSE fetched is still an offer, not a chat
             // message, under the same filter as handleIncomingMessage.
             if let key = fields.distroTransferKey {
@@ -2104,6 +2112,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Decode LXMF fields
         let fields = LxmfFieldsDecoder.decode(fieldsRaw)
+
+        // RFed SPEC §17.14, on this path as on the distro's: a GROUP_ID that is not a str of 32
+        // hex characters (a bin, an int, nil, "xyz") is refused with a log line, never a direct
+        // message and never a group, whatever else the message carries. Until 2026-10-11 a bin
+        // or int id went on as a DM and "xyz" made a group of that name.
+        if fields.groupIdRefused {
+            print("[Retichat] handleIncomingMessage: REFUSED \(msgHashHex.prefix(8)) from \(srcHex.prefix(8)): its GROUP_ID is not 32 hex characters (never a direct message, never a group)")
+            return
+        }
 
         // Distro identity transfer from another of our devices (SPEC §17.9):
         // never a chat message, and offered only when the privacy filter lets

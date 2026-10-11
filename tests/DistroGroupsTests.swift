@@ -8,7 +8,7 @@
 // their bounds), the group rule (DeliveryPolicy), the group engine (GroupStatuses.swift) with a
 // creator that is the distro on two devices, and the NSE's decision (PendingNotification.swift,
 // NSEGroupShow). The group sync readings are the shared vectors
-// (rust/retichat-ffi/tests/data/distro_group_sync_vectors.json, LXMF-rust 5f9edff); the engine's
+// (rust/retichat-ffi/tests/data/distro_group_sync_vectors.json, LXMF-rust 16a9902); the engine's
 // messages are the member-status vectors' (tests/GroupStatusFixtures.swift, real Ed25519).
 // ChatRepository, GroupChatManager, the NSE and the views need SwiftData, UIKit and the FFI, so
 // their wiring is asserted on the source, in the same tests. The bridge itself (the unwrap of a
@@ -1179,15 +1179,19 @@ func aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice() {
           "the chat list's preview")
 }
 
-// MARK: - The shared vectors (LXMF-rust 5f9edff; RFed SPEC §17.14 "Repeated keys")
+// MARK: - The shared vectors (LXMF-rust 16a9902; RFed SPEC §17.14 "Repeated keys")
 
-/// The copy is LXMF-rust 5f9edff's: an older one lacks the repeated-key, ext, bin GROUP_ID and
-/// comma-split vectors.
-func theGroupSyncVectorsAreLXMFRust5f9edffsCopy() {
-    checkEqual(gvList("variants").count, 14, "variants")
+/// The copy is LXMF-rust 16a9902's: a message that repeats a key is refused whole, as Python
+/// LXMF refuses it (James, 2026-10-11: parity). The vectors that pinned a first or a last entry
+/// are `refused` now, beside the `key_equality` pairs; an older copy lacks both.
+func theGroupSyncVectorsAreLXMFRust16a9902sCopy() {
+    checkEqual(gvList("variants").count, 15, "variants")
     checkEqual(gvList("rejects").count, 53, "rejects")
-    checkEqual(gvList("group_entries").count, 28, "group_entries")
+    checkEqual(gvList("group_entries").count, 21, "group_entries")
     checkEqual((GV["invite_members"] as? [[String: Any]])?.count, 2, "invite_members")
+    checkEqual(gvList("refused").count, 11, "refused")
+    checkEqual(gvList("key_equality").count, 22, "key_equality")
+    checkEqual(gvList("key_equality").filter { $0["refused"] as? Bool == true }.count, 15, "key_equality pairs refused")
 }
 
 /// invite_members: the csv split on the code point ',', never on grapheme clusters.
@@ -1207,33 +1211,179 @@ func theInviteParserListsEachInviteMembersVector() {
 }
 
 /// Every group_entries vector through the direct path's reader (LxmfFieldsDecoder.decode on the
-/// fields the router hands over): a group entry from the first entry with its key, even one of
-/// the wrong type; 0xFB from the last; an ext of an unknown type skipped and the rest of the map
-/// read; a bin GROUP_ID no id. The id compared is what the group branch takes (32 hex, lowercase);
-/// the action and the name only of a message it takes (the shared layer reports none without an
-/// id). A message whose last 0xFB is a distro marker is classified on the distro path, by the
-/// shared unwrap (tests/DistroGroupsFFITests.swift): here only its 0xFB is compared.
+/// fields the router hands over), as LXMF-rust reads it: a GROUP_ID entry of any type in either
+/// form is one (`hasGroupId`), the id read by Group.md's rule and kept only when it is 32 hex,
+/// lowercased, as the app takes it, with no lowercasing of its own; an ext of an unknown type
+/// skipped and the rest of the map read; a bin GROUP_ID no id. The action and the name only of a
+/// message the group branch takes (the shared layer reports none without an id). A message whose
+/// 0xFB is a distro marker is classified on the distro path by the shared unwrap
+/// (tests/DistroGroupsFFITests.swift): here only its 0xFB is compared. No vector repeats a key:
+/// those are `refused`, and the router never delivers one (tests/DistroGroupsFFITests.swift).
 func theDirectPathReaderReadsEachGroupEntriesVectorAsLXMFRustDoes() {
     let markers: Set<String> = [DistroGroupSync.marker, "rfed.distro.channel", DistroTransfer.customType, DistroSent.customType]
     var compared = 0
+    var refusedHere = 0
     for v in gvList("group_entries") {
         let name = v["name"] as! String
         let e = v["expected"] as! [String: Any]
         let f = LxmfFieldsDecoder.decode(unhex(v["fields_hex"] as! String))
-        checkEqual(f.customType == DistroGroupSync.marker, e["group_sync"] as! Bool, "\(name): a G by its last 0xFB")
+        checkEqual(f.customType == DistroGroupSync.marker, e["group_sync"] as! Bool, "\(name): a G by its 0xFB")
         if let type = f.customType, markers.contains(type) { continue }
-        let id = DeliveryPolicy.hash(f.groupId?.lowercased())
-        checkEqual(id, e["group_id"] as? String, "\(name): GROUP_ID")
-        guard id != nil else { continue }
+        checkEqual(f.hasGroupId, e["has_group_id"] as! Bool, "\(name): has a GROUP_ID")
+        checkEqual(f.groupId, e["group_id"] as? String, "\(name): GROUP_ID, as the app takes it")
+        checkEqual(f.groupIdRefused, (e["has_group_id"] as! Bool) && e["group_id"] is NSNull, "\(name): refused on the direct path")
+        if f.groupIdRefused { refusedHere += 1 }
+        guard f.groupId != nil else { continue }
         compared += 1
         checkEqual(f.groupAction, e["group_action"] as? String, "\(name): GROUP_ACTION")
         checkEqual(f.groupName, e["group_name"] as? String, "\(name): GROUP_NAME")
     }
-    for name in ["group_id_twice_the_first_read", "retichat_field_twice", "group_action_and_name_twice", "ext_beside_group_id",
-                 "ext_beside_group_id_in_retichat_field", "custom_type_twice_the_last_not_a_marker", "group_id_bin_in_0xd1_str_in_0xa0"] {
+    for name in ["group_id_uppercase", "group_id_int", "group_id_nil", "group_id_short", "retichat_field_wins", "ext_beside_group_id",
+                 "ext_beside_group_id_in_retichat_field", "group_id_bin_in_both_forms", "group_id_bin_in_0xd1_str_in_0xa0"] {
         check(gvList("group_entries").contains { $0["name"] as? String == name }, "\(name) is in the vectors")
     }
-    check(compared >= 12, "the entries of every vector the group branch takes are compared (\(compared))")
+    for name in ["group_id_twice", "retichat_field_twice", "group_action_and_name_twice", "custom_type_twice_marker_last"] {
+        check(gvList("refused").contains { $0["name"] as? String == name }
+                && !gvList("group_entries").contains { $0["name"] as? String == name }, "\(name) is refused, not read")
+    }
+    check(compared >= 10, "the entries of every vector the group branch takes are compared (\(compared))")
+    check(refusedHere >= 6, "every vector with a GROUP_ID that is not one is refused (\(refusedHere))")
+}
+
+/// RFed SPEC §17.14, the direct path: a GROUP_ID is read as on the distro path, a str of 32 hex
+/// characters compared and stored lowercased; any other GROUP_ID (another length, not hex, a
+/// bin, an int, nil) is refused with a log line, never a direct message or a group; a distro
+/// marker means nothing there. Each of the three direct readers (the router's delivery, the NSE's
+/// hand-off, the app's import of it) refuses it first, before the transfer, the sent copy, the
+/// group branch and the privacy filter's DM path. Until 2026-10-11 a bin or int id went on as a
+/// DM, "xyz" made the group "xyz", and an uppercase id was stored as sent, so one group could
+/// split by case across clients.
+func theDirectPathRefusesAGroupIdThatIsNot32HexAndLowercasesOneThatIs() {
+    let upper = "9F8E7D6C5B4A39281706F5E4D3C2B1A0"
+    let lower = upper.lowercased()
+    /// A fields map {0xA0: value} (0xA0, GROUP_ID's old field), with 0xFB first when given.
+    func legacy(_ valueHex: String, marker: String? = nil) -> LxmfFields {
+        var bytes: [UInt8] = [marker == nil ? 0x81 : 0x82]
+        if let marker {
+            bytes += [0xCC, 0xFB, 0xA0 | UInt8(marker.utf8.count)] + Array(marker.utf8)
+        }
+        bytes += [0xCC, 0xA0] + [UInt8](unhex(valueHex))
+        return LxmfFieldsDecoder.decode(Data(bytes))
+    }
+    /// The same in the Retichat field: {0xD1: {1: value}}.
+    func retichat(_ valueHex: String) -> LxmfFields {
+        LxmfFieldsDecoder.decode(Data([0x81, 0xCC, 0xD1, 0x81, 0x01] + [UInt8](unhex(valueHex))))
+    }
+    /// A msgpack str: fixstr below 32 bytes, else str 8.
+    func str(_ s: String) -> String {
+        let n = s.utf8.count
+        return (n < 32 ? String(format: "%02x", 0xA0 | n) : String(format: "d9%02x", n)) + s.utf8.map { String(format: "%02x", $0) }.joined()
+    }
+    for (what, f) in [("an uppercase id in 0xA0", legacy(str(upper))), ("an uppercase id in 0xD1", retichat(str(upper)))] {
+        checkEqual(f.groupId, lower, "\(what): read lowercased")
+        check(f.hasGroupId && !f.groupIdRefused, "\(what): a group message")
+    }
+    let malformed: [(String, LxmfFields)] = [
+        ("\"xyz\" in 0xA0", legacy("a378797a")),
+        ("\"xyz\" in 0xD1", retichat("a378797a")),
+        ("a bin of the id's 16 bytes", legacy("c410" + lower)),
+        ("a bin of the id's 32 hex characters", legacy("c420" + lower.utf8.map { String(format: "%02x", $0) }.joined())),
+        ("an int", legacy("2a")),
+        ("nil", legacy("c0")),
+        ("a bool in 0xD1", retichat("c3")),
+        ("31 hex characters", legacy(str(String(lower.dropLast())))),
+        ("33 hex characters", legacy(str(lower + "0"))),
+        ("32 characters, one not hex", legacy(str(String(lower.dropLast()) + "g"))),
+        ("32 hex characters with a space before them", legacy(str(" " + String(lower.dropLast())))),
+        ("\"xyz\" beside the group sync marker", legacy("a378797a", marker: DistroGroupSync.marker)),
+        ("\"xyz\" beside the channel marker", legacy("a378797a", marker: "rfed.distro.channel")),
+        ("\"xyz\" beside the transfer marker", legacy("a378797a", marker: DistroTransfer.customType)),
+        ("\"xyz\" beside the sent-copy marker", legacy("a378797a", marker: DistroSent.customType)),
+    ]
+    for (what, f) in malformed {
+        check(f.hasGroupId && f.groupId == nil && f.groupIdRefused, "\(what): refused, never a DM or a group")
+    }
+    check(!LxmfFieldsDecoder.decode(Data([0x80])).groupIdRefused, "no GROUP_ID: not refused (a DM)")
+
+    // The wiring: each direct reader refuses it first, with a log line.
+    let direct = body(repo, "private func handleIncomingMessage(")
+    check(direct.contains("if fields.groupIdRefused {") && direct.contains("REFUSED") && direct.contains("(never a direct message, never a group)"),
+          "the router's delivery refuses it with a log line")
+    for later in ["if let key = fields.distroTransferKey {", "if fields.isDistroSentCopy {", "if let groupId = fields.groupId {",
+                  "let allowlist = allowlistDecision(destHash: srcHex)", "storeIncomingDirect("] {
+        check(before(direct, "if fields.groupIdRefused {", later), "the router's delivery refuses it before \(later)")
+    }
+    check(span(direct, from: "if fields.groupIdRefused {", to: "}").contains("return"), "and stops there")
+    let upToGroup = span(direct, from: "if fields.groupIdRefused {", to: "if let groupId = fields.groupId {")
+    check(!upToGroup.isEmpty && !upToGroup.contains("DistroGroupSync.marker") && !upToGroup.contains("rfed.distro.channel")
+            && !upToGroup.contains("DistroChannelSync"),
+          "a group sync or channel marker means nothing on the direct path: the message is classified by its group id")
+    let imported = body(repo, "func importNSEMessages(")
+    check(imported.contains("if fields.groupIdRefused {") && imported.contains("REFUSED"), "the app's import of the NSE's file refuses it")
+    for later in ["if let key = fields.distroTransferKey {", "if fields.isDistroSentCopy {", "if let groupId = fields.groupId {"] {
+        check(before(imported, "if fields.groupIdRefused {", later), "the import refuses it before \(later)")
+    }
+    check(span(imported, from: "if fields.groupIdRefused {", to: "}").contains("continue"), "and goes on to the next")
+    let service = source("NotificationService/NotificationService.swift")
+    let handOff = span(service, from: "private func nseHandOffForm(", to: "// MARK: - C callback trampoline")
+    check(handOff.contains("if fields.groupIdRefused {") && handOff.contains("refused: its GROUP_ID is not 32 hex characters")
+            && before(handOff, "if fields.groupIdRefused {", "if fields.isDistroSentCopy {")
+            && before(handOff, "if fields.groupIdRefused {", "guard let key = fields.distroTransferKey"),
+          "the NSE neither hands it over nor shows it, and logs it")
+    check(span(handOff, from: "if fields.groupIdRefused {", to: "    }").contains("return nil"), "the NSE's hand-off form is nil")
+}
+
+/// RFed SPEC §17.14 "Repeated keys": LXMF-rust refuses such a message whole on the direct path
+/// (the router, the channel unpack, the group receipt) and the distro path (the unwrap) and logs
+/// the one line; its error starts with "refused whole:" (retichat-ffi's
+/// `the_swift_refusal_prefix_is_lxmf_rusts` pins the prefix). The app's callers that log their
+/// own FFI errors stay silent for it, so a refusal is logged once, and drop it; the NSE's
+/// unwrap and channel unpack say nothing of any failure.
+func aRefusalIsLoggedOnceByLXMFRustAndTheAppSaysNothingMore() {
+    let unwrapText = "refused whole: a map at depth 1 repeats a key (160), as Python LXMF refuses it"
+    check(RepeatedKeys.isRefusal(unwrapText), "the unwrap's error is a refusal")
+    check(RepeatedKeys.isRefusal("LXMessage::unpack: " + unwrapText), "so is the channel unpack's, after its context")
+    check(!RepeatedKeys.isRefusal("msgpack decode: unexpected end") && !RepeatedKeys.isRefusal(nil) && !RepeatedKeys.isRefusal("unknown"),
+          "other errors are not")
+    let unwrap = body(distroClient, "nonisolated private static func unwrapAndDeliver(")
+    let failed = span(unwrap, from: "guard let ptr else {", to: "let json = Data(bytes: ptr, count: Int(outLen))")
+    check(failed.contains("if !RepeatedKeys.isRefusal(error) {\n                print(\"[Distro] unwrap rejected blob: \\(error)\")")
+            && failed.contains("return") && count(failed, "print(") == 1,
+          "the distro unwrap's caller logs every other failure, and drops the blob")
+    let channels = source("Retichat/Services/RfedChannelClient.swift")
+    let unpackFailed = span(channels, from: "guard let result = bridge.channelLxmUnpack(", to: "guard result.signatureValidated else {")
+    check(unpackFailed.contains("if !RepeatedKeys.isRefusal(error) {") && count(unpackFailed, "print(") == 1
+            && unpackFailed.contains("return"),
+          "the channel's caller logs every other failure, and drops the post")
+    let pull = source("NotificationService/NSEDistroPull.swift")
+    let toShow = span(pull, from: "private static func unwrapToShow(", to: "guard !json.isEmpty")
+    check(toShow.contains("guard let ptr else { return nil }") && !toShow.contains("NSLog"), "the NSE's unwrap shows nothing and says nothing")
+    let channelPull = source("NotificationService/NSEChannelPull.swift")
+    let channelToShow = span(channelPull, from: "private static func unpackToShow(", to: "let raw = Data(bytes: ptr, count: Int(outLen))")
+    check(channelToShow.contains("}) else { return nil }") && !channelToShow.contains("NSLog"), "the NSE's channel unpack shows nothing and says nothing")
+}
+
+/// RFed SPEC §17.14 rule 1: a G whose source is not D is ignored with a log line, before rule 2,
+/// and before anything of it is learnt or applied: its 0xFD is no sibling and its `left` closes
+/// nothing (the library's side: tests/DistroGroupsFFITests.swift).
+func aGroupSyncWhoseSourceIsNotDIsIgnoredBeforeAnythingIsLearntOrApplied() {
+    var r = DistroGroupSync.Reading()
+    r.by = SIB; r.op = "leave"; r.groupId = GID; r.atMs = 1_790_000_000_000; r.left = [GID, OTHER]
+    for source in [M, X, SIB, THIS] {
+        for validated in [true, false] {
+            checkEqual(DistroGroupSync.disposition(sourceHex: source, distroHex: D, signatureValidated: validated, reading: r, deviceHex: THIS),
+                       .notFromDistro, "a leave G from \(source.prefix(8)) (validated \(validated)): ignored by rule 1")
+        }
+    }
+    checkEqual(DistroGroupSync.disposition(sourceHex: D.uppercased(), distroHex: D, signatureValidated: true, reading: r, deviceHex: THIS),
+               .apply(try! DistroGroupSync.form(r, distroHex: D).get(), sibling: SIB), "from D, whatever the case of its hex: applied")
+    checkEqual(DistroGroupSync.disposition(sourceHex: M, distroHex: nil, signatureValidated: true, reading: r, deviceHex: THIS),
+               .notFromDistro, "no distro held: ignored")
+    let handle = body(repo, "private func handleDistroGroupSync(")
+    let rule1 = span(handle, from: "case .notFromDistro:", to: "case .forged:")
+    check(rule1.contains("(§11.1 rule 1)") && rule1.contains("return false") && !rule1.contains("learnSibling(")
+            && !rule1.contains("applyLeft(") && !rule1.contains("applyGroupSync("),
+          "logged, not recorded as seen, nothing learnt or applied")
 }
 
 // MARK: - Run
@@ -1276,9 +1426,12 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("the member csv is split on code points as the shared parser splits it", theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt),
     ("the group texts are the ones the three clients share", theGroupTextsAreTheOnesTheThreeClientsShare),
     ("a known sibling's own accept or leave is \"Your other device\"", aKnownSiblingsOwnAcceptOrLeaveIsYourOtherDevice),
-    ("the group sync vectors are LXMF-rust 5f9edff's copy", theGroupSyncVectorsAreLXMFRust5f9edffsCopy),
+    ("the group sync vectors are LXMF-rust 16a9902's copy", theGroupSyncVectorsAreLXMFRust16a9902sCopy),
     ("the invite parser lists each invite_members vector", theInviteParserListsEachInviteMembersVector),
     ("the direct path's reader reads each group_entries vector as LXMF-rust does", theDirectPathReaderReadsEachGroupEntriesVectorAsLXMFRustDoes),
+    ("the direct path refuses a GROUP_ID that is not 32 hex and lowercases one that is", theDirectPathRefusesAGroupIdThatIsNot32HexAndLowercasesOneThatIs),
+    ("a refusal is logged once, by LXMF-rust, and the app says nothing more", aRefusalIsLoggedOnceByLXMFRustAndTheAppSaysNothingMore),
+    ("a group sync whose source is not D is ignored before anything is learnt or applied", aGroupSyncWhoseSourceIsNotDIsIgnoredBeforeAnythingIsLearntOrApplied),
 ]
 
 @main

@@ -99,7 +99,11 @@ func testTheRetiredFieldNoLongerStopsTheParse() {
     var map = Data([0x82, 0x10, 0xC4, 0x05]) + Data("Alice".utf8)
     map += Data([0xCC, 0xA0, 0xA1]) + Data("g".utf8)
     let fields = LxmfFieldsDecoder.decode(map)
-    check(fields.groupId == "g",
+    // "g" is read as the GROUP_ID entry, which is all this asks; it is no group id (32 hex), so
+    // the direct path refuses the message (RFed SPEC §17.14, tests/DistroGroupsTests.swift).
+    var entry: String?
+    if case .str(let s)? = fields.groupEntries[.id] { entry = s }
+    check(entry == "g" && fields.hasGroupId,
           "a bin value at 0x10 is skipped and the fields after it still decode (audit H2)")
     let lxmf = source("Retichat/Bridge/LxmfFields.swift")
     check(!lxmf.contains("senderName"), "0x10 is neither a field key nor a decoded field any more (§2.1)")

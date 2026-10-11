@@ -24,6 +24,15 @@
 import CryptoKit
 import Foundation
 
+/// The GROUP_ID entry as carried, a str whatever it holds. These tests use a short str ("g") as
+/// the sign that the walk reached the entry; as a group id it is refused on the direct path
+/// (RFed SPEC §17.14: a str of 32 hex characters only), so `groupId` keeps only a real one,
+/// lowercased (tests/DistroGroupsTests.swift).
+func groupIdEntry(_ fields: LxmfFields) -> String? {
+    if case .str(let s)? = fields.groupEntries[.id] { return s }
+    return nil
+}
+
 let V = Vectors.load()
 let bothForms = [false, true]
 
@@ -692,7 +701,7 @@ func groupStatusesReadsKeyTenOfTheRetichatFieldOnlyAndAnArrayOnlyElementsAsTheyC
     check(LxmfFieldsDecoder.decode(MP.map([(MP.uint(0xD1), MP.array([MP.bin(packed)]))])).groupStatuses == nil, "a 0xD1 that is not a map")
     // A malformed key 10 costs the entries after it nothing, and the group entries read as ever.
     let mixed = LxmfFieldsDecoder.decode(fields(retichat: [(MP.uint(10), MP.str("x")), (MP.uint(1), MP.str("gid")), key9]))
-    checkEqual(mixed.groupId, "gid", "the group id after a malformed key 10")
+    checkEqual(groupIdEntry(mixed), "gid", "the group id after a malformed key 10")
     // Key 10 is not a group entry: the nine are what they were.
     checkEqual(GroupEntry.allCases.count, 9, "nine group entries")
     check(LxmfFieldsDecoder.decode(fields(retichat: [(MP.uint(10), MP.array([MP.bin(packed)])), (MP.uint(4), MP.str("status"))])).groupAction == "status",

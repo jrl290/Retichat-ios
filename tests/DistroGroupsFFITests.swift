@@ -10,7 +10,10 @@
 //  - the app's writer JSON (DistroGroupSync.writerJSON), through messageSetDistroGroupSync and the
 //    pack, writes the very fields bytes the Python reference packs for each op, signed by D, from
 //    D to D; sealed for D, it reads back as the same G on a sibling;
-//  - the writer refuses what a receiver's form check would drop, and a message not from D to D.
+//  - the writer refuses what a receiver's form check would drop, and a message not from D to D;
+//  - a message that repeats a key (RFed SPEC §17.14 "Repeated keys") is refused whole by the
+//    distro unwrap and by the direct path's unpack, with an error the app knows as the refusal
+//    LXMF-rust logged; a G whose source is not D is ignored by rule 1.
 //
 // It runs as a command-line binary on this Mac, built for Mac Catalyst against the
 // xcframework's Catalyst slice (as tests/DistroChannelsFFITests.swift): no simulator, no app, no
@@ -234,7 +237,7 @@ func theWriterRefusesWhatAReceiverWouldDropAndAMessageNotFromDToD() {
     check(!attempt(good, dest: unhexData(M)), "a message not to D is refused")
 }
 
-// MARK: - The vectors given as fields bytes (LXMF-rust 5f9edff; RFed SPEC §17.14 "Repeated keys")
+// MARK: - The vectors given as fields bytes (LXMF-rust 16a9902; RFed SPEC §17.14 "Repeated keys")
 
 /// D's Ed25519 key, from the vectors' private key (X25519 private | Ed25519 seed).
 let dSigningKey: Curve25519.Signing.PrivateKey = {
@@ -242,17 +245,29 @@ let dSigningKey: Curve25519.Signing.PrivateKey = {
     return try! Curve25519.Signing.PrivateKey(rawRepresentation: bytes.suffix(32))
 }()
 
-/// A message from D to D whose fields map is `fieldsHex` exactly as given (a repeated key, an ext
-/// of an unknown type, a bin GROUP_ID), packed as LXMF packs it, [1790000000.5, "", "x", fields],
-/// and signed by D as LXMF signs: dest | src | payload | SHA-256(dest | src | payload).
-func packedFromD(fieldsHex: String) -> Data {
+/// The Ed25519 key of the vectors' identity `who` ("distro", "member", "forger").
+func signingKey(_ who: String) -> Curve25519.Signing.PrivateKey {
+    let bytes = unhexData(gv(who)["private_key_hex"] as! String)
+    return try! Curve25519.Signing.PrivateKey(rawRepresentation: bytes.suffix(32))
+}
+
+/// A message from `source` to D whose fields map is `fieldsHex` exactly as given (an ext of an
+/// unknown type, a bin GROUP_ID), packed as LXMF packs it, [1790000000.5, "", "x", fields], and
+/// signed by `key` as LXMF signs: dest | src | payload | SHA-256(dest | src | payload).
+func packedToD(from source: String, key: Curve25519.Signing.PrivateKey, fieldsHex: String) -> Data {
     let dHash = unhexData(D)
+    let src = unhexData(source)
     var payload = unhexData("94cb41daac4ee0200000c400c40178")
     payload.append(unhexData(fieldsHex))
-    let signed = dHash + dHash + payload
+    let signed = dHash + src + payload
     let hash = Data(SHA256.hash(data: signed))
-    let signature = try! dSigningKey.signature(for: signed + hash)
-    return dHash + dHash + signature + payload
+    let signature = try! key.signature(for: signed + hash)
+    return dHash + src + signature + payload
+}
+
+/// A message from D to D (packedToD), signed by D.
+func packedFromD(fieldsHex: String) -> Data {
+    packedToD(from: D, key: dSigningKey, fieldsHex: fieldsHex)
 }
 
 /// `packed` sealed for D (retichat_distro_seal) and unwrapped with D's key, as a sibling gets it.
@@ -261,12 +276,12 @@ func throughTheDistro(_ d: UInt64, _ packed: Data) -> (json: [String: Any], pars
     return unwrap(d, sealed.sealed)
 }
 
-/// variants: each G of the reference (the web's int-64 at_ms, a 0xFB given twice with the marker
-/// last, a members csv with a combining mark after its last comma, ...) reaches a sibling, is read
+/// variants: each G of the reference (the web's int-64 at_ms, a members csv with a combining mark
+/// after its last comma, a 0xFD that is an int or an array, ...) reaches a sibling, is read
 /// as the shared layer reads it, and passes the app's own rules.
 func everyVariantReachesASiblingAndPassesTheAppsRulesAsTheSharedLayerReadsIt() {
     let d = identity("distro")
-    checkEqual(gvList("variants").count, 14, "the variants of 5f9edff")
+    checkEqual(gvList("variants").count, 15, "the variants of 16a9902")
     for v in gvList("variants") {
         let name = v["name"] as! String
         guard let (_, u) = throughTheDistro(d, unhexData(v["packed_hex"] as! String)) else {
@@ -296,7 +311,7 @@ func everyVariantReachesASiblingAndPassesTheAppsRulesAsTheSharedLayerReadsIt() {
 /// app's own rule 4 too.
 func everyRejectReachesASiblingAsAGroupSyncTheAppNeverApplies() {
     let d = identity("distro")
-    checkEqual(gvList("rejects").count, 53, "the rejects of 5f9edff")
+    checkEqual(gvList("rejects").count, 53, "the rejects of 16a9902")
     for v in gvList("rejects") {
         let name = v["name"] as! String
         guard let (_, u) = throughTheDistro(d, packedFromD(fieldsHex: v["fields_hex"] as! String)) else {
@@ -322,12 +337,12 @@ func everyRejectReachesASiblingAsAGroupSyncTheAppNeverApplies() {
     }
 }
 
-/// group_entries: each fields map, the first of a repeated group key, the last 0xFB, an unknown
-/// ext skipped and a bin GROUP_ID, through the distro unwrap the app calls, decoded into the
-/// app's DistroUnwrapped and routed as the distro path routes it.
+/// group_entries: each fields map (none repeats a key: those are `refused`), an unknown ext
+/// skipped and a bin GROUP_ID, through the distro unwrap the app calls, decoded into the app's
+/// DistroUnwrapped and routed as the distro path routes it.
 func everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerReadsIt() {
     let d = identity("distro")
-    checkEqual(gvList("group_entries").count, 28, "the group_entries of 5f9edff")
+    checkEqual(gvList("group_entries").count, 21, "the group_entries of 16a9902")
     for v in gvList("group_entries") {
         let name = v["name"] as! String
         let e = v["expected"] as! [String: Any]
@@ -351,6 +366,87 @@ func everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerRe
     }
 }
 
+/// RFed SPEC §17.14 "Repeated keys" (James, 2026-10-11: parity): each `refused` vector and each
+/// `key_equality` pair the reference refuses is refused whole by the library on both paths the
+/// app takes, as Python LXMF refuses it. The distro unwrap returns nothing, with an error the app
+/// knows as the refusal LXMF-rust has already logged (RepeatedKeys.isRefusal: the app says
+/// nothing more, so the refusal is logged once); the group receipt's unpack, the direct path's
+/// LXMessage unpack that the router also runs before any delivery, returns nothing. Nothing
+/// reaches a reader of the fields, so nothing is shown, stored or applied. Each pair the
+/// reference reads is unwrapped and unpacked.
+func everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath() {
+    let d = identity("distro")
+    checkEqual(gvList("refused").count, 11, "the refused vectors of 16a9902")
+    checkEqual(gvList("key_equality").count, 22, "the key_equality pairs of 16a9902")
+    var refusals = 0
+    for v in gvList("refused") + gvList("key_equality") {
+        let name = v["name"] as! String
+        let refuse = (v["refused"] as? Bool) ?? true
+        let packed = unhexData(v["packed_hex"] as! String)
+        guard let sealed = bridge.distroSeal(distroHandle: d, packed: packed) else {
+            check(false, "\(name): sealed for D")
+            continue
+        }
+        _ = bridge.rnsLastError()
+        var outLen: UInt32 = 0
+        let ptr = sealed.sealed.withUnsafeBytes { raw -> UnsafeMutablePointer<UInt8>? in
+            retichat_distro_unwrap(d, raw.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(sealed.sealed.count), &outLen)
+        }
+        let error = bridge.rnsLastError()
+        let element = bridge.groupUnpackPacked(packed)
+        if refuse {
+            refusals += 1
+            check(ptr == nil, "\(name): the distro unwrap refuses it whole")
+            check(RepeatedKeys.isRefusal(error) && (error ?? "").contains("repeats a key"),
+                  "\(name): the app knows the unwrap's error as the refusal already logged (\(error ?? "no error"))")
+            check(element == nil, "\(name): the direct path's unpack refuses it whole")
+        } else {
+            check(ptr != nil && outLen > 0, "\(name): the reference reads it, and so does the unwrap (\(error ?? "no error"))")
+            check(element != nil, "\(name): and the direct path's unpack")
+        }
+        if let ptr { rns_free_bytes(ptr, outLen) }
+    }
+    checkEqual(refusals, 11 + 15, "every message the reference refuses")
+}
+
+/// RFed SPEC §17.14 rule 1: a G whose unwrapped source is not D (a member's, a stranger's), sealed
+/// for D and fanned out, reaches a sibling as a well-formed group sync on its hash, and is ignored
+/// whatever its signature is worth: rule 1 decides before rule 2, so its `left` is never applied
+/// and its 0xFD never learnt. The same G from D is applied.
+func aGroupSyncWhoseSourceIsNotDIsIgnoredByRuleOne() {
+    let d = identity("distro")
+    let leave = gvList("ops").first { $0["name"] as? String == "leave_full_left" }!
+    let fieldsHex = leave["fields_hex"] as! String
+    for who in ["member", "forger"] {
+        let source = gv(who)["lxmf_delivery_hash_hex"] as! String
+        guard let (_, u) = throughTheDistro(d, packedToD(from: source, key: signingKey(who), fieldsHex: fieldsHex)) else {
+            check(false, "\(who): sealed and unwrapped")
+            continue
+        }
+        checkEqual(u.source_hash, source, "\(who): the unwrapped source")
+        guard let hash = u.hash, let r = u.group_sync else {
+            check(false, "\(who): a group sync with its hash")
+            continue
+        }
+        checkEqual(u.groupRoute, .groupSync(hash: hash), "\(who): routed as a group sync, on its hash")
+        check(r.problem == nil, "\(who): well formed: only its source is wrong")
+        for validated in [u.signature_validated ?? false, true, false] {
+            checkEqual(DistroGroupSync.disposition(sourceHex: u.source_hash, distroHex: D, signatureValidated: validated,
+                                                   reading: r, deviceHex: THIS),
+                       .notFromDistro, "\(who): ignored by rule 1 (signature validated: \(validated))")
+        }
+    }
+    guard let (_, fromD) = throughTheDistro(d, packedFromD(fieldsHex: fieldsHex)), let r = fromD.group_sync else {
+        check(false, "the control from D: sealed and unwrapped")
+        return
+    }
+    if case .apply = DistroGroupSync.disposition(sourceHex: fromD.source_hash, distroHex: D,
+                                                 signatureValidated: fromD.signature_validated ?? false,
+                                                 reading: r, deviceHex: THIS) {} else {
+        check(false, "the control: the same G from D, signed by D, is applied")
+    }
+}
+
 let allTests: [(String, () -> Void)] = [
     ("a sealed group sync and a member's group messages unwrap, route and pass the app's rules as the shared layer read them",
      aSealedGroupSyncAndAMembersGroupMessagesUnwrapRouteAndPassTheAppsRulesAsTheSharedLayerReadThem),
@@ -364,6 +460,10 @@ let allTests: [(String, () -> Void)] = [
      everyRejectReachesASiblingAsAGroupSyncTheAppNeverApplies),
     ("every group_entries vector through the distro is decoded and routed as the shared layer reads it",
      everyGroupEntriesVectorThroughTheDistroIsDecodedAndRoutedAsTheSharedLayerReadsIt),
+    ("every message that repeats a key is refused whole on the distro path and the direct path",
+     everyMessageThatRepeatsAKeyIsRefusedWholeOnTheDistroPathAndTheDirectPath),
+    ("a group sync whose source is not D is ignored by rule 1",
+     aGroupSyncWhoseSourceIsNotDIsIgnoredByRuleOne),
 ]
 
 @main

@@ -16,6 +16,15 @@
 
 import Foundation
 
+/// The GROUP_ID entry as carried, a str whatever it holds. These tests use a short str ("g") as
+/// the sign that the walk reached the entry; as a group id it is refused on the direct path
+/// (RFed SPEC §17.14: a str of 32 hex characters only), so `groupId` keeps only a real one,
+/// lowercased (tests/DistroGroupsTests.swift).
+func groupIdEntry(_ fields: LxmfFields) -> String? {
+    if case .str(let s)? = fields.groupEntries[.id] { return s }
+    return nil
+}
+
 var failures: [String] = []
 
 func check(_ condition: @autoclosure () -> Bool, _ name: String) {
@@ -87,7 +96,7 @@ enum LxmfFieldsDistroTransferTests {
             key(GroupEntry.id.legacyField) + str("g"),
         ]))
         check(wrongType.customData == nil, "int 0xFC leaves customData nil")
-        check(wrongType.groupId == "g", "field after int 0xFC still decodes (parse in sync)")
+        check(groupIdEntry(wrongType) == "g", "field after int 0xFC still decodes (parse in sync)")
 
         // Order reversed: a transfer after an unrelated known field.
         let afterGroup = LxmfFieldsDecoder.decode(map([
@@ -95,7 +104,7 @@ enum LxmfFieldsDistroTransferTests {
             key(0xFC) + bin8(keyHex),
             key(0xFB) + str("rfed.distro.transfer"),
         ]))
-        check(afterGroup.groupId == "g" && afterGroup.distroTransferKey == keyHex,
+        check(groupIdEntry(afterGroup) == "g" && afterGroup.distroTransferKey == keyHex,
               "transfer fields decode in any order alongside other fields")
 
         // Truncated 0xFC must not read past the buffer or invent a value.

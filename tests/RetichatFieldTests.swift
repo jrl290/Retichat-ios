@@ -24,6 +24,15 @@
 
 import Foundation
 
+/// The GROUP_ID entry as carried, a str whatever it holds. These tests use a short str ("g") as
+/// the sign that the walk reached the entry; as a group id it is refused on the direct path
+/// (RFed SPEC §17.14: a str of 32 hex characters only), so `groupId` keeps only a real one,
+/// lowercased (tests/DistroGroupsTests.swift).
+func groupIdEntry(_ fields: LxmfFields) -> String? {
+    if case .str(let s)? = fields.groupEntries[.id] { return s }
+    return nil
+}
+
 nonisolated(unsafe) var failures: [String] = []
 
 func check(_ ok: Bool, _ what: String, _ detail: String = "") {
@@ -186,12 +195,12 @@ func testTheWalkStaysInStep() {
     for (i, shape) in shapes.enumerated() {
         let bytes = [0x83, 0xCC, 0xA2] + shape + transfer + [0xCC, 0xA0] + str("g")
         let fields = LxmfFieldsDecoder.decode(Data(bytes))
-        check(fields.groupId == "g" && fields.customType == "rfed.distro.transfer",
+        check(groupIdEntry(fields) == "g" && fields.customType == "rfed.distro.transfer",
               "shape \(i) at 0xA2 is skipped whole and the fields after it decode")
         check(fields.groupName == (i == 4 ? "x" : nil), "shape \(i) at 0xA2 gives a group name only when a str")
         let inMap = [0x83, 0xCC, 0xD1, 0x82, 0x03] + shape + [0x01] + str("h") + transfer + [0xCC, 0xA0] + str("g")
         let viaMap = LxmfFieldsDecoder.decode(Data(inMap))
-        check(viaMap.groupId == "h" && viaMap.customType == "rfed.distro.transfer",
+        check(groupIdEntry(viaMap) == "h" && viaMap.customType == "rfed.distro.transfer",
               "shape \(i) inside the map is skipped whole: key 1 after it wins, fields after the map decode")
     }
     // A str32 group name reads (the old decoder knew str8/str16 only).
@@ -204,7 +213,7 @@ func testTheWalkStaysInStep() {
     // Deep nesting inside 0xD1 does not exhaust the stack.
     let deep = [0x82, 0xCC, 0xD1, 0x81, 0x05] + [UInt8](repeating: 0x91, count: 200_000) + [0xC0]
         + [0xCC, 0xA0] + str("g")
-    check(LxmfFieldsDecoder.decode(Data(deep)).groupId == "g", "200000 nested arrays are skipped")
+    check(groupIdEntry(LxmfFieldsDecoder.decode(Data(deep))) == "g", "200000 nested arrays are skipped")
     // Counts and lengths far past the buffer end the walk.
     let huge: [[UInt8]] = [
         [0xDF, 0xFF, 0xFF, 0xFF, 0xFF, 0xCC, 0xA0],
@@ -239,8 +248,8 @@ func testAMalformedAttachmentKeepsTheWalkInStep() {
     for (name, attachment) in malformed {
         for (form, group) in [("old 0xA0", oldG), ("0xD1 map", mapG)] {
             let fields = LxmfFieldsDecoder.decode(Data([0x82, 0x05] + attachment + group))
-            check(fields.groupId == "g", "attachments \(name) then \(form): the group id decodes",
-                  "got \(String(describing: fields.groupId))")
+            check(groupIdEntry(fields) == "g", "attachments \(name) then \(form): the group id decodes",
+                  "got \(String(describing: groupIdEntry(fields)))")
         }
     }
     // The good element after the short one still reads.
@@ -254,7 +263,7 @@ func testAMalformedAttachmentKeepsTheWalkInStep() {
                 0x92] + str("b") + str("yo") + [
                 0x93] + str("c") + [0xC4, 0x01, 0x7A] + [0x81, 0x01, 0x02]
     let fields = LxmfFieldsDecoder.decode(Data([0x82, 0x05] + good + oldG))
-    check(fields.groupId == "g", "well-formed attachments then 0xA0: the group id decodes")
+    check(groupIdEntry(fields) == "g", "well-formed attachments then 0xA0: the group id decodes")
     check(fields.attachments.map { $0.filename } == ["a.txt", "b", "c"]
           && fields.attachments.map { $0.data } == [Data("hi".utf8), Data("yo".utf8), Data([0x7A])],
           "well-formed attachments read: bin data, str data, extra entries skipped")
@@ -471,7 +480,7 @@ func testNothingReadsATopLevelNameInSwift() {
     // A map at 0xD1 with only a name in it: no group entries, fields after it decode.
     let named = Data([0x82, 0xCC, 0xD1, 0x81, 0x00, 0xC4, 0x03, 0x42, 0x6F, 0x62, 0xCC, 0xA0, 0xA1, 0x67])
     let fields = LxmfFieldsDecoder.decode(named)
-    check(fields.groupId == "g" && fields.groupEntries.count == 1, "a name-only map is walked, the old 0xA0 after it reads")
+    check(groupIdEntry(fields) == "g" && fields.groupEntries.count == 1, "a name-only map is walked, the old 0xA0 after it reads")
 }
 
 @main
