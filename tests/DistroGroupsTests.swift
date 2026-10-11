@@ -888,6 +888,203 @@ func theConfirmationsInADGroupSayOnAllYourDevices() {
           "a device group keeps its words")
 }
 
+// MARK: - The review of e89924e
+
+/// §9.2, §12.1: a self address is never a send target, a status included. In a list naming D and
+/// an older sibling's device entry (§14), the sibling's own keyed accept counts for its entry, and
+/// no device of D answers it.
+@MainActor
+func aSiblingsOwnAcceptIsNeverAnsweredWithAStatus() {
+    let dHex = V.hashOf(V.creator)
+    let aliceHex = V.hashOf("alice")
+    let r = GroupRig(V, me: V.creator)
+    // alice is a known sibling of D here: an older device of the user, listed as its device entry.
+    r.engine = GroupStatusEngine(
+        store: r.store, native: r.native, isSelf: { _, hex in hex == dHex || hex == THIS || hex == aliceHex },
+        answer: { [unowned r] chat, member, statuses in r.answers.append(Answer(chat: chat.id, to: member, statuses: statuses)) },
+        switched: false, log: { [unowned r] in r.logs.append($0) })
+    r.hold(accepted: true)
+    let m = MessageMaker(V)
+    r.receive(m.msg("alice"))
+    checkEqual(r.answeredNames(), [], "a sibling's own accept is never answered with a status (self is never a send target)")
+    check(r.logs.contains { $0.contains("no answer to the user's own accept") }, "with a log line")
+    r.receive(m.msg("bob"))
+    checkEqual(r.answeredNames(), ["bob"], "a member's keyed accept is still answered")
+    let answer = span(repo, from: "answer: { [weak self] chat, member, statuses in", to: "log: { print(\"[GroupChat] \\($0)\") })")
+    check(before(answer, "self.isGroupSelf(chatId: chat.id, hex: member)", "GroupChatManager.shared.sendStatus("),
+          "the app's answer sends nothing to a self address either")
+}
+
+/// §6.5: the filtered-invite set is for groups the filter decided not to hold. A co-member's own
+/// invite for a group held here (§11.2's squat) leaves the set alone, and an invite the filter
+/// admits takes out an id it recorded earlier: that group's later traffic is still held.
+func aFilteredInviteForAGroupHeldHereLeavesTheFilteredSetAlone() {
+    let valid = DeliveryPolicy.Signature.validated
+    check(FilteredInvites.records(sourceAllowlisted: false, closed: false, signature: valid, heldHere: false),
+          "an invite to D the filter dropped, for a group not held here: its id is recorded")
+    check(!FilteredInvites.records(sourceAllowlisted: false, closed: false, signature: valid, heldHere: true),
+          "one for a group held here (pending from an allowlisted inviter): not recorded")
+    check(!FilteredInvites.records(sourceAllowlisted: true, closed: false, signature: valid, heldHere: false),
+          "an allowlisted inviter's: not recorded")
+    check(!FilteredInvites.records(sourceAllowlisted: false, closed: true, signature: valid, heldHere: false),
+          "a closed group's: not recorded")
+    check(!FilteredInvites.records(sourceAllowlisted: false, closed: false, signature: DeliveryPolicy.Signature.invalid,
+                                   heldHere: false),
+          "a forged invite's: not recorded")
+    // A pending group from C; then M's own invite for it, which the filter drops.
+    var ids: [String] = []
+    if FilteredInvites.records(sourceAllowlisted: false, closed: false, signature: valid, heldHere: true) {
+        ids = FilteredInvites.record(ids, GID)
+    }
+    let filtered = ids.contains(GID)
+    check(HeldArrivals.holdable(isPostSync: false, action: GroupAction.status, held: .pending, closed: false, filtered: filtered,
+                                signature: valid, sourceIsSelf: false, keptIfJoined: true),
+          "a creator status that comes before the accept G is still held")
+    check(HeldArrivals.holdable(isPostSync: true, action: nil, held: .pending, closed: false, filtered: filtered,
+                                signature: valid, sourceIsSelf: false, keptIfJoined: true),
+          "and so is a post G, which gets no second copy")
+    let note = body(repo, "private func noteFilteredInvite(")
+    check(note.contains("FilteredInvites.records(sourceAllowlisted: isAllowlisted(destHash: sourceHex), closed: standing.closed,")
+            && note.contains("heldHere: standing.chat != nil"),
+          "the app records only a group it does not hold")
+    check(note.contains("is held here: the filtered-invite set is left alone (§6.5)"), "and logs the one it leaves alone")
+    let invite = body(repo, "private func handleGroupInvite(")
+    check(before(invite, "print(\"[GroupChat] pending group \\(groupId.prefix(8)) from an invite by",
+                 "prefs.filteredInviteIds = FilteredInvites.remove(prefs.filteredInviteIds, groupId)"),
+          "an invite the filter admits takes the id out of the set")
+}
+
+/// §6.5: when the group is closed here its held blobs are forgotten, with one line giving the
+/// count: also when a leave G, or a G's `left`, closes a group this device does not hold. Those
+/// blobs can never be replayed (a closed group is never joined again).
+func aLeaveSyncForAGroupNotHeldHereForgetsWhatWasHeldForIt() {
+    typealias S = DistroGroupSync
+    checkEqual(S.step(.post, standing: .notHeld, ownMemberIsD: false, pendingMatches: false), .holdArrival,
+               "a post G for a group not held here is held")
+    checkEqual(S.step(.leave, standing: .notHeld, ownMemberIsD: false, pendingMatches: false), .tombstone,
+               "a leave G for it then records it closed")
+    checkEqual(S.leftStep(standing: .notHeld, ownMemberIsD: false), .tombstone, "and so does a G's left")
+    if case .nothing = S.step(.create, standing: .closed, ownMemberIsD: false, pendingMatches: false) {} else {
+        check(false, "a closed group is never held again, so what was held for it can never be replayed")
+    }
+    let apply = body(repo, "private func applyGroupSync(")
+    check(span(apply, from: "case .tombstone:", to: "case .storeOwnPost:").contains("forgetHeldArrivals(groupId: groupId, why:"),
+          "the leave G forgets what was held for the group")
+    let left = body(repo, "private func applyLeft(")
+    check(span(left, from: "case .tombstone:", to: "case .alreadyClosed:").contains("forgetHeldArrivals(groupId: id, why:"),
+          "and so does left")
+    check(body(repo, "private func forgetHeldArrivals(").contains("print(\"[GroupChat] \\(rows.count) message(s) held for"),
+          "with one line giving the count")
+}
+
+/// §9.1: self is decided per group. In a group that lists no distro this device holds or held, a
+/// known sibling is a separate member, never "You". Outside groups (a DM, the new-chat and QR
+/// checks) the user is the device and the distro held now. In a group whose own address is a
+/// former D, that D is "You" (§8.7).
+func youIsDecidedPerGroup() {
+    let siblings: (String) -> [String] = { $0 == D ? [SIB] : [] }
+    let deviceGroup = GroupSelf.addresses(ownMember: nil, device: THIS, listed: [THIS, M, SIB], heldDistro: D, siblings: siblings)
+    checkEqual(deviceGroup, [THIS], "a device-listed group that lists no distro: self is the device")
+    check(!GroupSelf.shownAsYou(SIB, groupSelf: deviceGroup, device: THIS, heldDistro: D),
+          "a sibling listed there is a member, not \"You\"")
+    check(GroupSelf.shownAsYou(THIS, groupSelf: deviceGroup, device: THIS, heldDistro: D), "the device is \"You\"")
+    let dGroup = GroupSelf.addresses(ownMember: D, device: THIS, listed: [D, M, SIB], heldDistro: D, siblings: siblings)
+    check(GroupSelf.shownAsYou(SIB, groupSelf: dGroup, device: THIS, heldDistro: D) && GroupSelf.shownAsYou(D, groupSelf: dGroup, device: THIS, heldDistro: D),
+          "in a D-group, D and its known siblings are \"You\"")
+    let OLD = String(repeating: "0d", count: 16)
+    let former = GroupSelf.addresses(ownMember: OLD, device: THIS, listed: [OLD, M], heldDistro: D, siblings: siblings)
+    check(GroupSelf.shownAsYou(OLD, groupSelf: former, device: THIS, heldDistro: D),
+          "in a group whose own address is a former D, that D's own lines are \"You\"")
+    check(!GroupSelf.shownAsYou(SIB, groupSelf: nil, device: THIS, heldDistro: D),
+          "outside a group a sibling is not \"You\": a DM to one's other device is a DM")
+    check(GroupSelf.shownAsYou(D, groupSelf: nil, device: THIS, heldDistro: D) && GroupSelf.shownAsYou(THIS, groupSelf: nil, device: THIS, heldDistro: D),
+          "the device and the distro held now are")
+    check(!GroupSelf.shownAsYou(OLD, groupSelf: nil, device: THIS, heldDistro: D), "a former D is not, outside its groups")
+    // The wiring.
+    check(!body(repo, "func isOwnAddress(").contains("knownSiblings("), "the DM, QR and new-chat checks do not take the siblings")
+    check(body(repo, "func contactDisplayName(for destHash: String)").contains("GroupSelf.shownAsYou(destHash, groupSelf: nil,"),
+          "a contact's label outside a group")
+    check(body(repo, "private func label(for hash: String").contains("GroupSelf.shownAsYou(hash, groupSelf: groupSelf,"),
+          "the shared label takes the group's self")
+    let loader = body(repo, "func messages(forChatId chatId: String")
+    check(loader.contains("let me = groupSelf(forChatId: chatId)") && loader.contains("label(for: entity.senderHash, in: names, groupSelf: me)"),
+          "a group's message and system lines are labelled with that group's self")
+    let refresh = body(repo, "func refreshChats(")
+    check(refresh.contains("let selves = groupSelves(chatEntities)")
+            && refresh.contains("shownText($0.content, id: $0.id, senderHash: $0.senderHash, names: names, groupSelf: selves[entity.id])"),
+          "and so is a group's preview in the chat list")
+    // The user's own act through a sibling (§9.2) makes no name row for it.
+    for (name, f) in [("the direct path", "private func handleIncomingMessage("), ("the NSE import", "func importNSEMessages()"),
+                      ("the distro path", "private func handleDistroGroupArrival(")] {
+        check(body(repo, f).contains("if !ownAct {\n"), "\(name): no name row for a sibling acting as the user")
+    }
+}
+
+/// §6.7: nse_groups.json is written whenever the filter or the allowlist changes, not only on a
+/// refresh. Settings is a sheet, and the app may be suspended before its next refresh.
+func theNSEFileIsWrittenWhenTheFilterOrTheAllowlistChanges() {
+    let prefs = source("Retichat/Services/UserPreferences.swift")
+    let setter = span(prefs, from: "var filterStrangers: Bool {", to: "\n    }\n")
+    check(setter.contains("NotificationCenter.default.post(name: UserPreferences.filterStrangersChanged"),
+          "the filter's setter says that it changed")
+    check(repo.contains("filterWatch = NotificationCenter.default.publisher(for: UserPreferences.filterStrangersChanged)")
+            && span(repo, from: "publisher(for: UserPreferences.filterStrangersChanged)", to: "}").contains("scheduleNSEGroupsWrite()"),
+          "the repository writes the file when it does")
+    for f in ["private func ensureAllowlistedContact(", "private func addContact(", "func removeContact("] {
+        check(body(repo, f).contains("scheduleNSEGroupsWrite()"), "\(f) writes the file")
+    }
+    let write = body(repo, "private func writeNSEGroupsNow(")
+    check(write.contains("let groupsSnapshot = nseGroupsSnapshot()") && write.contains("PendingNotification.writeNSEGroups(groupsSnapshot)"),
+          "one writer builds the snapshot")
+    check(body(repo, "func refreshChats(").contains("writeNSEGroupsNow()"), "a refresh writes it too")
+}
+
+/// §9.2, SPEC §17.14: only a validly signed group message from another device of D is the user's
+/// own. One from a known sibling whose signature could not be checked (SOURCE_UNKNOWN) is neither
+/// the user's own nor another member's: dropped with a log line, never stored as sent.
+func aKnownSiblingsMessageThatIsNotValidatedIsNeverTheUsersOwn() {
+    let me: Set<String> = [D, THIS, SIB]
+    let unknown = DeliveryPolicy.Signature.sourceUnknown
+    checkEqual(GroupFirstRules.check(signature: unknown, sourceHex: SIB, groupSender: nil, selfAddresses: me, distros: [D], siblings: [SIB]),
+               .selfSourceUnproven, "SOURCE_UNKNOWN from a known sibling: dropped")
+    checkEqual(GroupFirstRules.check(signature: unknown, sourceHex: SIB, groupSender: SIB, selfAddresses: me, distros: [D], siblings: [SIB]),
+               .selfSourceUnproven, "naming itself as its sender too")
+    checkEqual(GroupFirstRules.check(signature: DeliveryPolicy.Signature.validated, sourceHex: SIB, groupSender: nil, selfAddresses: me,
+                                     distros: [D], siblings: [SIB]),
+               .pass(ownAct: true), "validated: the user's own")
+    checkEqual(GroupFirstRules.check(signature: unknown, sourceHex: SIB, groupSender: nil, selfAddresses: [THIS], distros: [D], siblings: []),
+               .pass(ownAct: false), "in a device-listed group the sibling is a member: the group rule decides")
+    checkEqual(GroupFirstRules.check(signature: unknown, sourceHex: M, groupSender: nil, selfAddresses: me, distros: [D], siblings: [SIB]),
+               .pass(ownAct: false), "a member's SOURCE_UNKNOWN keeps today's rule")
+    let admit = body(repo, "private func admitGroupMessage(")
+    check(span(admit, from: "case .selfSourceUnproven:", to: "case .pass(").contains("return .droppedFirst"),
+          "dropped before the group rule, never held")
+}
+
+/// GROUP_MEMBERS (and GROUP_MEMBER_KEYS) are split on the code point ',', as LXMF-rust's
+/// invite_members and the web's inviteMembers split them, never on Swift's grapheme clusters: a
+/// combining mark after a comma does not take the comma with it.
+func theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt() {
+    checkEqual(DeliveryPolicy.members(LxmfFieldsDecoder.groupCsv("\(M),\(D),\u{301}")), [M, D],
+               "a combining mark after the last comma: [M, D], as Rust and the web read it")
+    checkEqual(DeliveryPolicy.members(LxmfFieldsDecoder.groupCsv("\(M),\u{301}\(D)")), [M],
+               "a combining mark after a comma, before an entry: [M], as Rust and the web read it")
+    checkEqual(DeliveryPolicy.members(LxmfFieldsDecoder.groupCsv(" \(M)\t,\u{3000}\(D)\u{a0}")), [M, D], "invite space is trimmed")
+    var r = reading(gvList("ops").first { $0["name"] as? String == "accept_empty_left" }!["expected"]!)
+    r.members = "\(M),\(D),\u{301}"
+    if case .success(let f) = DistroGroupSync.form(r, distroHex: D) {
+        checkEqual(f.members, [M, D], "the accept G's members")
+    } else {
+        check(false, "an accept G whose members csv has a combining mark after a comma names D, as the shared layer reads it")
+    }
+    let key = Data(repeating: 7, count: 64).base64EncodedString()
+    checkEqual(LxmfFieldsDecoder.groupMemberKeys("\(M):\(key),\u{301}"), [M: key],
+               "a member key followed by a comma and a combining mark is kept")
+    checkEqual(LxmfFieldsDecoder.groupMemberKeys("\(M):\(key),\(D.uppercased()):\(key)"), [M: key, D: key],
+               "otherwise read as before: each hash lowercased")
+    checkEqual(LxmfFieldsDecoder.groupMemberKeys("\(M):\u{301}\(key)"), [:], "a combining mark after the colon spoils the key, as in Rust")
+}
+
 // MARK: - Run
 
 let allTests: [(String, @MainActor () -> Void)] = [
@@ -919,6 +1116,13 @@ let allTests: [(String, @MainActor () -> Void)] = [
     ("a member's accept to D carrying a name shows that name in the member list", aMembersAcceptToDCarryingANameShowsThatNameInTheMemberList),
     ("the writer's JSON carries exactly what the op carries", theWriterJSONCarriesExactlyWhatTheOpCarries),
     ("the confirmations in a D-group say \"on all your devices\"", theConfirmationsInADGroupSayOnAllYourDevices),
+    ("a sibling's own accept is never answered with a status", aSiblingsOwnAcceptIsNeverAnsweredWithAStatus),
+    ("a filtered invite for a group held here leaves the filtered set alone", aFilteredInviteForAGroupHeldHereLeavesTheFilteredSetAlone),
+    ("a leave sync for a group not held here forgets what was held for it", aLeaveSyncForAGroupNotHeldHereForgetsWhatWasHeldForIt),
+    ("\"You\" is decided per group", youIsDecidedPerGroup),
+    ("the NSE file is written when the filter or the allowlist changes", theNSEFileIsWrittenWhenTheFilterOrTheAllowlistChanges),
+    ("a known sibling's message that is not validated is never the user's own", aKnownSiblingsMessageThatIsNotValidatedIsNeverTheUsersOwn),
+    ("the member csv is split on code points as the shared parser splits it", theMemberCsvIsSplitOnCodePointsAsTheSharedParserSplitsIt),
 ]
 
 @main
