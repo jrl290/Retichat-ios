@@ -320,6 +320,12 @@ func sentCopy(_ hash: String, to: String = String(repeating: "c", count: 32), di
               msgHash: hash, packed: Data(hash.utf8), label: "the sent-copy for \(to.prefix(8)) (§17.11)", toHex: to)
 }
 
+/// A group sync G (RFed SPEC §17.14, GROUPS-DISTRO-DESIGN.md §10.5): owed under `group:<its message hash>`.
+func groupSync(_ hash: String, distro: HeldDistro = d1) -> OwedEntry {
+    OwedEntry(id: "group:\(hash)", kind: .group, distro: distro.delivery, distroKey: distro.publicKey,
+              msgHash: hash, packed: Data(hash.utf8), label: "the leave group sync of \(hash) (§17.14)")
+}
+
 func withRig(_ body: (Rig) async -> Void) async {
     let rig = Rig()
     await rig.outbox.start()
@@ -524,6 +530,37 @@ func theLogLineSaysAnUploadAlreadyOnTheWireCannotBeTakenBack() async {
         nth(rig.port.sent, 0).proved()
         await rig.settle()
         check(rig.lines.info.contains { $0.contains("propagated") }, "its proof is said")
+    }
+}
+
+/// GROUPS-DISTRO-DESIGN.md §10.5: each G is owed on its own (a later one never replaces it) and, as a sent
+/// copy, is kept when the device gives D up: it is already packed and signed as D, and says what the user did
+/// as D. The channel join owed to D is dropped, as before.
+func aGroupSyncIsOwedOnItsOwnAndStillGoesToItsOwnDistroWhenTheDeviceTakesAnother() async {
+    await withRig { rig in
+        let first = groupSync("g1")
+        let second = groupSync("g2")
+        let join = channel("join", "public.x", "join")
+        await rig.outbox.owe(first)
+        await rig.outbox.owe(second)
+        await rig.outbox.owe(join)
+        checkEqual(await rig.outbox.owed(), [first, second, join], "each G on its own, beside the join")
+        rig.setDistro(d2)
+        await rig.outbox.onDistroChanged()
+        await rig.settle()
+        // Mutation: dropping every kind but a sent copy loses the user's leave on the siblings.
+        checkEqual(await rig.outbox.owed(), [first, second], "the join goes with D1; the Gs stay")
+        check(rig.store.has(first.id) && rig.store.has(second.id) && !rig.store.has(join.id), "in storage as well")
+        rig.link("L1")
+        await rig.outbox.onLinkEstablished("L1")
+        await rig.settle()
+        checkEqual(ids(rig.port.sent), [first.id, second.id], "each goes, once")
+        checkEqual(rig.port.builds.map(\.distroKey), [d1.publicKey, d1.publicKey], "with D1's key, never D2's")
+        nth(rig.port.sent, 0).proved()
+        nth(rig.port.sent, 1).proved()
+        await rig.settle()
+        checkEqual(await rig.outbox.owed(), [], "the node's proof settles each")
+        checkEqual(rig.lines.info.filter { $0.contains("propagated") && $0.contains("§17.14") }.count, 2, "each proof said as a group sync's")
     }
 }
 
@@ -2158,6 +2195,7 @@ let allTests: [(String, () async -> Void)] = [
     ("a sent copy made under D1 still goes to D1 when the device holds D2", aSentCopyMadeUnderD1StillGoesToD1WhenTheDeviceHoldsD2),
     ("giving up the distro while a sent copy is built still uploads it to its own distro", givingUpTheDistroWhileASentCopyIsBuiltStillUploadsItToItsOwnDistro),
     ("the log line says an upload already on the wire cannot be taken back", theLogLineSaysAnUploadAlreadyOnTheWireCannotBeTakenBack),
+    ("a group sync is owed on its own and still goes to its own distro when the device takes another", aGroupSyncIsOwedOnItsOwnAndStillGoesToItsOwnDistroWhenTheDeviceTakesAnother),
     ("what is owed survives a restart and goes once on the next link", whatIsOwedSurvivesARestartAndGoesOnceOnTheNextLink),
     ("the stack's stop decides an open upload and sends nothing; it goes on the next start", theStacksStopDecidesAnOpenUploadAndSendsNothingAndItGoesOnTheNextStart),
     ("an upload reported lost is said and waits for the next coming-up, then goes once", anUploadReportedLostIsSaidAndWaitsForTheNextComingUpThenGoesOnce),
