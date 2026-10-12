@@ -1,18 +1,20 @@
-// AutoInterfaceCatalystOnlyTests.swift
+// AutoInterfaceOffTests.swift
 //
-// The generated Reticulum config has [[AutoInterface]] on Mac Catalyst only
-// (James, 2026-09-25: no more entitlements unless they are needed). Its peer
-// discovery is IPv6 multicast, which iOS allows only with Apple's
-// com.apple.developer.networking.multicast entitlement; the app does not
-// carry it, and since Reticulum-rust 33bea13 AutoInterface really tries, so
-// on iOS it could only fail. macOS needs no such entitlement.
+// The generated Reticulum config has no [[AutoInterface]] on any build for
+// now (James, 2026-10-12). Its peer discovery is IPv6 multicast, which iOS
+// allows only with Apple's com.apple.developer.networking.multicast
+// entitlement; the app does not carry it (James, 2026-09-25: no more
+// entitlements unless they are needed), and since Reticulum-rust 33bea13
+// AutoInterface really tries, so on iOS it could only fail. Mac Catalyst kept
+// it until 2026-10-12, when it took utun2, a VPN tunnel that carries no
+// multicast, and logged "No multicast echoes received" as an error.
 //
 // Run from the workspace root with:
 //
-//     swift Retichat-ios/tests/AutoInterfaceCatalystOnlyTests.swift
+//     swift Retichat-ios/tests/AutoInterfaceOffTests.swift
 //
 // Source-level, like DefaultEndpointParityTests.swift: the config is built
-// inside ChatRepository, which needs SwiftData and the FFI, so the gate is
+// inside ChatRepository, which needs SwiftData and the FFI, so the absence is
 // asserted on the code itself. The NSE starts from a copy of the same file.
 
 import Foundation
@@ -45,18 +47,7 @@ func function(_ signature: String, in source: String, indent: String = "    ") -
     return String(source[start.lowerBound..<end.upperBound])
 }
 
-/// The text from `from` through the next `to`.
-func span(from: String, to: String, in source: String) -> String {
-    guard let start = source.range(of: from),
-          let end = source.range(of: to, range: start.upperBound..<source.endIndex) else { return "" }
-    return String(source[start.lowerBound..<end.upperBound])
-}
-
-func occurrences(_ needle: String, in source: String) -> Int {
-    source.components(separatedBy: needle).count - 1
-}
-
-func testConfigGatesAutoInterfaceOnCatalyst() {
+func testConfigWritesNoAutoInterface() {
     let repository: String
     do {
         repository = try sourceFile(["Retichat", "Services", "ChatRepository.swift"])
@@ -68,23 +59,11 @@ func testConfigGatesAutoInterfaceOnCatalyst() {
     let generate = function("private func generateConfig(", in: repository)
     check(!generate.isEmpty, "finds generateConfig")
 
-    // The whole directive line: `#if targetEnvironment(macCatalyst) || os(iOS)`
-    // would write the section on iOS again.
-    let gate = span(from: "\n        #if targetEnvironment(macCatalyst)\n", to: "#endif", in: generate)
-    check(gate.contains("lines.append(\"  [[AutoInterface]]\")")
-            && gate.contains("lines.append(\"    type = AutoInterface\")")
-            && gate.contains("lines.append(\"    enabled = Yes\")"),
-          "the AutoInterface section is written under #if targetEnvironment(macCatalyst)")
-    check(!gate.contains("#else"), "the gate has no #else that writes it elsewhere")
-    check(!gate.contains("TCPClientInterface"), "the gate holds nothing but AutoInterface")
-
-    let outside = generate.replacingOccurrences(of: gate, with: "")
-    check(!outside.contains("[[AutoInterface]]") && !outside.contains("type = AutoInterface"),
-          "no AutoInterface section outside the gate")
-    check(occurrences("[[AutoInterface]]", in: repository) == 1,
-          "ChatRepository writes one AutoInterface section")
-    check(outside.contains("type = TCPClientInterface"),
-          "TCP interfaces stay ungated (a local IP needs only the Local Network permission)")
+    // Under any gate: a Catalyst-only section would bring the utun2 error back.
+    check(!repository.contains("[[AutoInterface]]") && !repository.contains("type = AutoInterface"),
+          "ChatRepository writes no AutoInterface section, under any #if")
+    check(generate.contains("type = TCPClientInterface"),
+          "TCP interfaces stay (a local IP needs only the Local Network permission)")
 }
 
 func testNothingElseOffersAutoInterface() {
@@ -104,7 +83,7 @@ func testNothingElseOffersAutoInterface() {
             }
         }
     }
-    check(offenders.isEmpty, "only ChatRepository mentions AutoInterface", "\(offenders)")
+    check(offenders.isEmpty, "only ChatRepository mentions AutoInterface (its comment)", "\(offenders)")
 
     do {
         let pending = try sourceFile(["Retichat", "Services", "PendingNotification.swift"])
@@ -118,11 +97,11 @@ func testNothingElseOffersAutoInterface() {
     }
 }
 
-testConfigGatesAutoInterfaceOnCatalyst()
+testConfigWritesNoAutoInterface()
 testNothingElseOffersAutoInterface()
 
 if failures.isEmpty {
-    print("all AutoInterface Catalyst-only tests passed")
+    print("all AutoInterface-off tests passed")
     exit(0)
 } else {
     print("\n\(failures.count) failure(s)")

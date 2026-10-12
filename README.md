@@ -110,7 +110,7 @@ gitignored and will be bundled only in your local build.
 | Persistence | SwiftData |
 | Networking & Crypto | Rust (via C FFI → XCFramework) |
 | Push Notifications | APNs via Notification Service Extension |
-| Current transport | TCP (internet or local-network hosts); AutoInterface LAN discovery on Mac only (iOS multicast needs an entitlement the app does not carry) |
+| Current transport | TCP (internet or local-network hosts); no AutoInterface LAN discovery for now (iOS multicast needs an entitlement the app does not carry; on the Mac it took a VPN tunnel, 2026-10-12) |
 
 ## Roadmap
 
