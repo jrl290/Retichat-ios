@@ -63,8 +63,9 @@ enum NSEDistroPull {
     private static let roundsMax = 8
 
     /// Pull, save and unwrap. Blocking: call from the NSE's own thread.
-    /// `deadline` bounds the link requests; each round's timeout is what is
-    /// left of it (never more than 10 s).
+    /// `deadline` bounds the link requests: each round must begin within what
+    /// is left of it (never more than 10 s) and ends by it, even while a big
+    /// page is still arriving. That page stays on RFed for the app's pull.
     static func run(identityHandle: UInt64, deadline: Date) -> Result {
         var result = Result()
         guard let key = PendingNotification.readSharedDistroKey(),
@@ -106,7 +107,7 @@ enum NSEDistroPull {
                 break
             }
             guard let response = pullRequest(dest: dest, identityHandle: identityHandle,
-                                             timeoutSecs: min(left, 10)) else {
+                                             timeoutSecs: min(left, 10), ceilingSecs: left) else {
                 // No answer: the path was there, so the link did not come up or the
                 // request went unanswered. Until 2026-10-10 this said "RFed not reachable".
                 NSLog("[NSE-Distro] pull round %d: no answer from RFed (the link did not come up, or the request went unanswered)", round)
@@ -224,27 +225,31 @@ enum NSEDistroPull {
 
     // MARK: - Request
 
-    private static func pullRequest(dest: Data, identityHandle: UInt64, timeoutSecs: Double) -> Data? {
+    private static func pullRequest(dest: Data, identityHandle: UInt64, timeoutSecs: Double,
+                                    ceilingSecs: Double) -> Data? {
         // msgpack nil: a distro pull carries no data
         linkRequest(dest: dest, aspects: "distro,register", path: "/rfed/pull", payload: Data([0xC0]),
-                    identityHandle: identityHandle, timeoutSecs: timeoutSecs)
+                    identityHandle: identityHandle, timeoutSecs: timeoutSecs, ceilingSecs: ceilingSecs)
     }
 
     /// One request on a fresh link identified as `identityHandle` (the RFed
     /// pulls take the caller from the link). Shared with NSEChannelPull.
+    /// `timeoutSecs` bounds the link and how long the response may take to
+    /// begin; a response still arriving is cut at `ceilingSecs`, the NSE's
+    /// own budget (retichat_link_request_within).
     static func linkRequest(dest: Data, aspects: String, path: String, payload: Data,
-                            identityHandle: UInt64, timeoutSecs: Double) -> Data? {
+                            identityHandle: UInt64, timeoutSecs: Double, ceilingSecs: Double) -> Data? {
         dest.withUnsafeBytes { destBuf in
             payload.withUnsafeBytes { payBuf in
                 "rfed".withCString { app in
                     aspects.withCString { aspects in
                         path.withCString { path in
                             var outLen: UInt32 = 0
-                            guard let ptr = retichat_link_request(
+                            guard let ptr = retichat_link_request_within(
                                 destBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(dest.count),
                                 app, aspects, identityHandle, path,
                                 payBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(payload.count),
-                                timeoutSecs, &outLen) else { return nil }
+                                timeoutSecs, ceilingSecs, &outLen) else { return nil }
                             let data = Data(bytes: ptr, count: Int(outLen))
                             lxmf_free_bytes(ptr, outLen)
                             return data

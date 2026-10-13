@@ -597,6 +597,18 @@ uint8_t *retichat_link_request(const uint8_t *dest_hash, uint32_t dest_hash_len,
                                 double timeout_secs,
                                 uint32_t *out_len);
 
+/// retichat_link_request, ended ceiling_secs after it starts whatever is still
+/// arriving: for the Notification Service Extension's time budget.
+uint8_t *retichat_link_request_within(const uint8_t *dest_hash, uint32_t dest_hash_len,
+                                       const char *app_name,
+                                       const char *aspects,
+                                       uint64_t identity_handle,
+                                       const char *path,
+                                       const uint8_t *payload, uint32_t payload_len,
+                                       double timeout_secs,
+                                       double ceiling_secs,
+                                       uint32_t *out_len);
+
 #pragma mark - RFed delivery fallback
 
 /// Callback fired for inbound RFed channel blobs delivered to the local

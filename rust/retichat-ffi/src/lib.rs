@@ -505,6 +505,10 @@ pub extern "C" fn retichat_packet_send_to_hash(
 /// Open a Link to a remote destination, identify, send a request, wait for
 /// response, tear down, and return the response bytes.
 ///
+/// `timeout_secs` bounds the link's establishment and how long the response
+/// may take to begin; a response that arrives as a Resource is then waited
+/// for while it moves (reticulum_rust `ffi::link_request`).
+///
 /// This is a **blocking** call — Swift must call it from a background thread.
 ///
 /// Returns a pointer to the response bytes (caller must free with
@@ -522,6 +526,49 @@ pub extern "C" fn retichat_link_request(
     timeout_secs: f64,
     out_len: *mut u32,
 ) -> *mut u8 {
+    link_request_capped(
+        dest_hash, dest_hash_len, app_name, aspects, identity_handle, path, payload, payload_len,
+        timeout_secs, None, out_len,
+    )
+}
+
+/// [`retichat_link_request`], ended `ceiling_secs` after it starts whatever
+/// is still arriving: for the Notification Service Extension, which the
+/// system ends after about 30 s (reticulum_rust `ffi::link_request_within`).
+#[no_mangle]
+pub extern "C" fn retichat_link_request_within(
+    dest_hash: *const u8,
+    dest_hash_len: u32,
+    app_name: *const c_char,
+    aspects: *const c_char,
+    identity_handle: u64,
+    path: *const c_char,
+    payload: *const u8,
+    payload_len: u32,
+    timeout_secs: f64,
+    ceiling_secs: f64,
+    out_len: *mut u32,
+) -> *mut u8 {
+    link_request_capped(
+        dest_hash, dest_hash_len, app_name, aspects, identity_handle, path, payload, payload_len,
+        timeout_secs, Some(ceiling_secs), out_len,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn link_request_capped(
+    dest_hash: *const u8,
+    dest_hash_len: u32,
+    app_name: *const c_char,
+    aspects: *const c_char,
+    identity_handle: u64,
+    path: *const c_char,
+    payload: *const u8,
+    payload_len: u32,
+    timeout_secs: f64,
+    ceiling_secs: Option<f64>,
+    out_len: *mut u32,
+) -> *mut u8 {
     let hash = slice_from_raw(dest_hash, dest_hash_len);
     let app = unsafe { cstr_to_string(app_name) };
     let asp_str = unsafe { cstr_to_string(aspects) };
@@ -529,7 +576,7 @@ pub extern "C" fn retichat_link_request(
     let p = unsafe { cstr_to_string(path) };
     let data = slice_from_raw(payload, payload_len);
 
-    match rns::link_request(
+    match rns::link_request_within(
         &hash,
         &app,
         asp_vec,
@@ -537,6 +584,7 @@ pub extern "C" fn retichat_link_request(
         &p,
         &data,
         timeout_secs,
+        ceiling_secs,
     ) {
         Ok(response) => {
             let len = response.len() as u32;

@@ -96,7 +96,7 @@ enum NSEChannelPull {
             }
             guard let response = NSEDistroPull.linkRequest(
                 dest: dest, aspects: "channel,pull", path: "/rfed/pull", payload: payload,
-                identityHandle: identityHandle, timeoutSecs: min(left, 10)) else {
+                identityHandle: identityHandle, timeoutSecs: min(left, 10), ceilingSecs: left) else {
                 NSLog("[NSE-Channel] pull round %d: RFed not reachable", round)
                 result.failed = true
                 break
