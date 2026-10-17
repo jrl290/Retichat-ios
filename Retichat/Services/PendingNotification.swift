@@ -205,18 +205,25 @@ nonisolated enum PendingNotification {
         private let lock = NSLock()
         private let prepare: (NSEMessage) -> NSEMessage?
         private let store: (NSEMessage) -> Bool
+        private let shows: (NSEMessage) -> Bool
         private var newest: NSEMessage?
         private var stored = 0
         private var failed = 0
         private var dropped = 0
+        private var quiet = 0
 
         /// `prepare` gives the form a delivered message is stored in, or
         /// nil when it is not stored (a distro sent copy). `store` writes
-        /// it for the app's import and says whether it did.
+        /// it for the app's import and says whether it did. `shows` says
+        /// whether a stored message may be shown: one that may not (a
+        /// reaction, REACTIONS-DESIGN.md §5) is stored for the app but is
+        /// never the newest and never counted in "+N more".
         init(prepare: @escaping (NSEMessage) -> NSEMessage?,
-             store: @escaping (NSEMessage) -> Bool = { PendingNotification.appendNSEMessage($0) }) {
+             store: @escaping (NSEMessage) -> Bool = { PendingNotification.appendNSEMessage($0) },
+             shows: @escaping (NSEMessage) -> Bool = { _ in true }) {
             self.prepare = prepare
             self.store = store
+            self.shows = shows
         }
 
         func deliver(_ message: NSEMessage) {
@@ -229,12 +236,17 @@ nonisolated enum PendingNotification {
             // The file has its own lock (nseMessagesLock); this one guards
             // only the run's counts.
             let written = store(toStore)
+            let shown = written && shows(toStore)
             lock.lock()
             defer { lock.unlock() }
             guard written else {
                 // Not in the file, so the app will never import it: it is
                 // neither shown nor counted in "+N more".
                 failed += 1
+                return
+            }
+            guard shown else {
+                quiet += 1
                 return
             }
             stored += 1
@@ -249,7 +261,7 @@ nonisolated enum PendingNotification {
             lock.lock()
             defer { lock.unlock() }
             return NSERunSummary(newest: newest, others: max(stored - 1, 0),
-                                 failed: failed, dropped: dropped)
+                                 failed: failed, dropped: dropped, quiet: quiet)
         }
     }
 
@@ -264,6 +276,8 @@ nonisolated enum PendingNotification {
         let failed: Int
         /// Delivered but not stored (distro sent copies).
         let dropped: Int
+        /// Stored for the app but not to be shown (reactions).
+        let quiet: Int
 
         /// The newest message's text, then "+N more" on its own line when
         /// the run stored others.

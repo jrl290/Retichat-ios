@@ -117,7 +117,7 @@ func testTheWiring() {
     check(pulls != nil && shows != nil && pulls!.lowerBound < shows!.lowerBound,
           "the NSE pulls the distro before it builds the notification")
     let failed = nse.range(of: "} else if distro.failed {")
-    let suppress = nse.range(of: "} else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {")
+    let suppress = nse.range(of: "} else if summary.dropped > 0 || summary.quiet > 0 || distro.pulled > 0 || channelPull.pulled > 0 {")
     check(failed != nil && suppress != nil && failed!.lowerBound < suppress!.lowerBound,
           "an incomplete distro pull keeps the alert: it is decided before any suppression")
 
@@ -153,7 +153,7 @@ func testMorePendingKeepsTheAlert() {
     let nse = source("NotificationService/NotificationService.swift")
     let failed = nse.range(of: "} else if distro.failed {")
     let more = nse.range(of: "} else if distro.morePending {")
-    let suppress = nse.range(of: "} else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {")
+    let suppress = nse.range(of: "} else if summary.dropped > 0 || summary.quiet > 0 || distro.pulled > 0 || channelPull.pulled > 0 {")
     check(failed != nil && more != nil && suppress != nil
             && failed!.lowerBound < more!.lowerBound && more!.lowerBound < suppress!.lowerBound,
           "more pending is decided with the incomplete pull, before any suppression")

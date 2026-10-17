@@ -447,7 +447,7 @@ func testNotificationServiceWiring() {
     // distro transfer's private key would be written in plain text to the
     // container file, which goes into device backups.
     check(occurrences("NSERun(", in: source) == 1
-            && source.contains("PendingNotification.NSERun(prepare: nseHandOffForm)")
+            && source.contains("PendingNotification.NSERun(prepare: nseHandOffForm, shows: nseShows)")
             && source.contains("static var run = newRun()")
             && function("    static func reset() {", in: source, indent: "    ").contains("run = newRun()"),
           "every NSE run is built with nseHandOffForm")

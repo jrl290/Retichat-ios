@@ -47,7 +47,7 @@ private enum NSEDelivery {
     /// nseHandOffForm, which keeps a distro transfer's private key out of
     /// the container file and drops sent copies.
     private static func newRun() -> PendingNotification.NSERun {
-        PendingNotification.NSERun(prepare: nseHandOffForm)
+        PendingNotification.NSERun(prepare: nseHandOffForm, shows: nseShows)
     }
 }
 
@@ -72,6 +72,13 @@ private func nseHandOffForm(_ msg: PendingNotification.NSEMessage) -> PendingNot
               String(msg.senderHash.prefix(8)))
         return nil
     }
+    if case .refused(let why)? = fields.reaction {
+        // REACTIONS-DESIGN.md §5: a reaction the app would refuse is dropped here as it is
+        // there, never stored and never shown. A valid one is stored for the app (nseShows).
+        NSLog("[NSE] reaction %@ from %@ dropped: %@",
+              String(msg.messageHash.prefix(8)), String(msg.senderHash.prefix(8)), why)
+        return nil
+    }
     // A distro identity transfer carries the distro private key in field
     // 0xFC: move it to the Keychain first and persist the message without
     // its fields, so the key never sits in the container file
@@ -85,6 +92,17 @@ private func nseHandOffForm(_ msg: PendingNotification.NSEMessage) -> PendingNot
     // send it again from the other device.
     NSLog("[NSE] distro transfer key not stored (Keychain %d); dropped", status)
     return msg.strippedForDistroTransfer(.lost)
+}
+
+/// Whether a stored message may be the notification: a reaction never is (REACTIONS-DESIGN.md
+/// §5). It is stored for the app, which applies it to its message on import.
+private func nseShows(_ msg: PendingNotification.NSEMessage) -> Bool {
+    guard LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data()).reaction == nil else {
+        NSLog("[NSE] reaction %@ from %@ stored for the app, not shown",
+              String(msg.messageHash.prefix(8)), String(msg.senderHash.prefix(8)))
+        return false
+    }
+    return true
 }
 
 // MARK: - C callback trampoline
@@ -470,8 +488,8 @@ class NotificationService: UNNotificationServiceExtension {
             // waiting in RFed. Not "0 new".
             NSLog("[NSE] channel pull incomplete — showing generic alert after %ds", elapsed)
 
-        } else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {
-            // Only distro sent copies, transfers or receipts, or channel
+        } else if summary.dropped > 0 || summary.quiet > 0 || distro.pulled > 0 || channelPull.pulled > 0 {
+            // Only distro sent copies, transfers, receipts or reactions, or channel
             // messages that are not to be shown (the channel's Notifications
             // toggle is off, or no signature verified), arrived: nothing to
             // show (the app files them on import).

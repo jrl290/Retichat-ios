@@ -326,6 +326,11 @@ enum NSEDistroPull {
                 shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: true, hash: m.hash ?? "")
                 content = "Group invitation: \(groupName)"
             case .post(let groupId, let groupName):
+                // REACTIONS-DESIGN.md §5: a reaction to a post is never shown; the app applies it.
+                if fields.reaction != nil {
+                    NSLog("[NSE] distro pull: group reaction from %@ not shown", String(m.source_hash.prefix(8)))
+                    return nil
+                }
                 shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: false, hash: m.hash ?? "")
                 content = m.content ?? ""
             }
@@ -338,6 +343,11 @@ enum NSEDistroPull {
         // Sent copies are the user's own messages (SPEC §17.11), a transfer
         // is an offer the app acts on, a delivery notification has no text.
         if m.sent_by != nil || !(m.distro_transfer_key ?? "").isEmpty || m.is_delivery_notification {
+            return nil
+        }
+        // REACTIONS-DESIGN.md §5: a reaction is never shown; the app applies it when it pulls.
+        if LxmfFieldsDecoder.decode(m.fields.flatMap { Data(base64Encoded: $0) } ?? Data()).reaction != nil {
+            NSLog("[NSE] distro pull: reaction from %@ not shown", String(m.source_hash.prefix(8)))
             return nil
         }
         return Shown(senderHash: m.source_hash.lowercased(), title: m.title ?? "",

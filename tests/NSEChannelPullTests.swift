@@ -193,7 +193,7 @@ func testTheWiring() {
                 "senderName: DisplayNames.channelNotificationTitle(channelName: channel.channelName, label: label)"),
           "a channel message is named as the app names its channel notifications")
     check(nse.contains("best.userInfo[\"chatId\"] = msg.thread"), "tapping opens the channel")
-    check(before(nse, "} else if channelPull.failed {", "} else if summary.dropped > 0 || distro.pulled > 0 || channelPull.pulled > 0 {"),
+    check(before(nse, "} else if channelPull.failed {", "} else if summary.dropped > 0 || summary.quiet > 0 || distro.pulled > 0 || channelPull.pulled > 0 {"),
           "an incomplete channel pull keeps the alert; it is decided before any suppression")
     check(before(nse, "} else if channelPull.silenced {", "} else if channelPull.failed {")
             && before(nse, "} else if channelPull.silenced {", "NSLog(\"[NSE] sync failed after %ds — showing generic alert\", elapsed)"),
