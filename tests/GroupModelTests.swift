@@ -259,7 +259,10 @@ func testTheReceiveWiring() {
     check(handle.contains("groupStatuses.takeDirect(GroupArrival(")
             && handle.contains("msgId: hash.hexString, src: srcHex, chat: Self.groupInfo(chat)"),
           "an accept or a leave is the packet source's own (decided by the group engine, GroupStatuses.swift)")
-    check(handle.contains("author: groupAuthor(fields: fields, sourceHex: srcHex,"),
+    // Since REACTIONS-DESIGN.md §4 the author is decided once, before the reaction check, and
+    // the post takes the same one.
+    check(handle.contains("let author = groupAuthor(fields: fields, sourceHex: srcHex,")
+            && handle.contains("author: author,"),
           "a plain post's author is decided by DeliveryPolicy.author")
     check(handle.contains("default:\n") && !handle.contains("default:\n            // Regular group message"),
           "an unknown action is not stored as a post")

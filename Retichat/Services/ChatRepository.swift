@@ -1049,7 +1049,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             // has none; an unvalidated message without one counts as invalid,
             // as the router reports it, which never lets a name through.
             let reason = msg.unverifiedReason ?? (msg.signatureValid ? 0 : 2)
-            let nameField = LxmfClient.decodeDisplayName(fieldsRaw: fieldsData)
+            // Never a name from a reaction (REACTIONS-DESIGN.md §3), which makes no contact.
+            let nameField = fields.reaction == nil ? LxmfClient.decodeDisplayName(fieldsRaw: fieldsData) : .absent
 
             if let groupId = fields.groupId {
                 // The group rule as on the router's path (admitGroupMessage).
@@ -1086,6 +1087,11 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 continue
             }
 
+            // REACTIONS-DESIGN.md §3, as on the router's path: never a bubble, chat or contact.
+            if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: msg.timestamp, path: "importNSEMessages") {
+                continue
+            }
+
             let chatId = srcHex
             ensureChat(id: chatId, peerHash: srcHex)
             ensureContact(destHash: srcHex)
@@ -1108,7 +1114,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 timestamp: msg.timestamp,
                 isOutgoing: false,
                 deliveryState: DeliveryState.delivered,
-                signatureValid: msg.signatureValid
+                signatureValid: msg.signatureValid,
+                lxmfHash: hashHex
             )
             insertMessage(entity, into: ctx)
 
@@ -1372,6 +1379,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == tempId })
                 if let temp = try? ctx.fetch(desc).first {
                     temp.id = msgHashHex
+                    temp.lxmfHash = msgHashHex
                     temp.nativeHandle = msgHandle
                     // Update attachment foreign keys to point to the real message id.
                     let attDesc = FetchDescriptor<AttachmentEntity>(
@@ -1390,7 +1398,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                         timestamp: optimisticTimestamp,
                         isOutgoing: true,
                         deliveryState: DeliveryState.pending,
-                        nativeHandle: msgHandle
+                        nativeHandle: msgHandle,
+                        lxmfHash: msgHashHex
                     ), into: ctx)
                     for (filename, data) in attachmentsCopy {
                         ctx.insert(AttachmentEntity(
@@ -1435,7 +1444,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             // channel messages use their own send paths.
             if DistroCodec.needsSentCopy(sentAsDistro: sentAsDistro, destHex: destHashHex,
                                          distroHex: DistroManager.shared.deliveryHashHex) {
-                Self.oweDistroSentCopy(recipient: destData, title: "", content: content)
+                Self.oweDistroSentCopy(recipient: destData, title: "", content: content, sentHash: msgHashHex)
             }
         }  // ffiQueue.async
     }
@@ -1459,10 +1468,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// could be had, was lost. No bubble, and the copy never touches the user's
     /// message state.
     ///
+    /// REACTIONS-DESIGN.md §5.2: the copy also carries M's own hash (`sentHash`, SENT_HASH),
+    /// so a sibling files M under it and a reaction to M finds it there; and M's 0x40 when M is
+    /// a reaction (`reaction`), which the sibling applies instead of storing a bubble.
+    ///
     /// nonisolated: runs on ffiQueue.
-    nonisolated private static func oweDistroSentCopy(recipient: Data, title: String, content: String) {
+    nonisolated private static func oweDistroSentCopy(recipient: Data, title: String, content: String,
+                                                      sentHash: String,
+                                                      reaction: (to: Data, content: String)? = nil) {
         Task { @MainActor in
-            await DistroOutboxRuntime.shared.oweSentCopy(recipient: recipient, title: title, content: content)
+            await DistroOutboxRuntime.shared.oweSentCopy(recipient: recipient, title: title, content: content,
+                                                         sentHash: sentHash, reaction: reaction)
         }
     }
 
@@ -1510,6 +1526,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         // Generate a stable local ID for this outbound group message
         let msgId = "grp_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(8))"
+        // REACTIONS-DESIGN.md §4: every Group post gets an id, the same on every member's copy,
+        // which is what a reaction to it names.
+        let postId = Reactions.newPostId()
+        if postId == nil {
+            print("[GroupChat] post to \(chatId.prefix(8)): no random bytes for its post id; it goes without one and offers no reactions")
+        }
 
         // Insert optimistically. A held send is pending until it is fanned
         // out, so it never shows sent before it has left the device.
@@ -1522,7 +1544,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             isOutgoing: true,
             deliveryState: client == nil
                 ? DeliveryState.pending
-                : DeliveryState.sent   // fanout is fire-and-forget
+                : DeliveryState.sent,   // fanout is fire-and-forget
+            postId: postId
         )
         insertMessage(msgEntity, into: ctx)
 
@@ -1545,7 +1568,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
         let sent = fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
                                       content: content, attachments: attachments, timestamp: msgEntity.timestamp,
-                                      via: client)
+                                      postId: postId, via: client)
         if !sent {
             // Nobody to sign for the group now (its distro still being read): the DM failed state.
             msgEntity.deliveryState = DeliveryState.failed
@@ -1567,7 +1590,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// failed, and at once when there is no member to send to.
     private func fanOutGroupMessage(
         chatId: String, groupName: String, content: String, attachments: [(String, Data)],
-        timestamp: Double, via client: LxmfClient
+        timestamp: Double, postId: String?, via client: LxmfClient
     ) -> Bool {
         guard let ctx = modelContext else { return false }
         guard let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first,
@@ -1582,7 +1605,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let owesSync = signer.isDistro
         let atMs = DistroGroupSync.atMs(timestamp)
         if owesSync && targets.isEmpty {
-            owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer)
+            owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer, postId: postId)
         }
 
         // Fan out to accepted members — FFI calls run off the main thread.
@@ -1594,7 +1617,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 attachments: attachments,
                 to: targets,
                 as: signer,
-                via: client
+                via: client,
+                postId: postId
             )
             guard owesSync, !targets.isEmpty else { return }
             Task { @MainActor [weak self] in
@@ -1602,7 +1626,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                     print("[GroupChat] post to \(chatId.prefix(8)) left for no member: no group sync owed (§10.6)")
                     return
                 }
-                self?.owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer)
+                self?.owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer, postId: postId)
             }
         }
         return true
@@ -1647,13 +1671,233 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 // fanout is fire-and-forget; one this device cannot sign for any more (§8.7) failed.
                 let sent = fanOutGroupMessage(chatId: chatId, groupName: chat.groupName ?? "Group",
                                               content: content, attachments: attachments,
-                                              timestamp: bubble.timestamp, via: client)
+                                              timestamp: bubble.timestamp, postId: bubble.postId, via: client)
                 bubble.deliveryState = sent ? DeliveryState.sent : DeliveryState.failed
             }
         }
 
         try? ctx.save()
         refreshChats()
+    }
+
+    // MARK: - Reactions (REACTIONS-DESIGN.md, approved by James 2026-10-17)
+
+    /// §3, on every receive path: true when `fields` make the message a reaction, which the
+    /// caller then stops on: no bubble, no notification, no unread, the chat list order unchanged,
+    /// and never a new chat or contact. A reaction is applied to its target in `chatId` (the chat
+    /// it came in on) as `reactor`'s at `timestamp`; one this client refuses, or whose target is
+    /// not in that chat, is dropped with one log line.
+    private func tookReaction(_ fields: LxmfFields, chatId: String, inGroup: Bool = false, reactor: String,
+                              timestamp: Double, path: String) -> Bool {
+        switch fields.reaction {
+        case nil:
+            return false
+        case .refused(let why)?:
+            print("[Reactions] \(path): reaction from \(reactor.prefix(8)) in \(chatId.prefix(8)) dropped: \(why)")
+        case .react(let to, let content)?:
+            applyReaction(to: to, content: content, chatId: chatId, inGroup: inGroup, reactor: reactor,
+                          timestamp: timestamp, path: path)
+        }
+        return true
+    }
+
+    /// apply_reaction (§3) to the message `to` names in `chatId`: a newer reaction from `reactor`
+    /// replaces theirs, an older or repeated one changes nothing, and "" is kept as a removal.
+    private func applyReaction(to: Data, content: String, chatId: String, inGroup: Bool, reactor: String,
+                               timestamp: Double, path: String) {
+        guard let ctx = modelContext else {
+            print("[Reactions] \(path): reaction from \(reactor.prefix(8)) dropped: modelContext is nil")
+            return
+        }
+        let toHex = Reactions.hex(to)
+        guard let target = reactionTarget(chatId: chatId, inGroup: inGroup, toHex: toHex) else {
+            print("[Reactions] \(path): reaction dropped: target \(toHex.prefix(16)) not in \(chatId.prefix(8))")
+            return
+        }
+        guard let json = Reactions.apply(target.reactionsJson, reactor: reactor, emoji: content,
+                                         atMs: Reactions.ms(timestamp)) else {
+            print("[Reactions] \(path): reaction from \(reactor.prefix(8)) on \(toHex.prefix(8)) not applied: one as new or newer is held")
+            return
+        }
+        target.reactionsJson = json
+        try? ctx.save()
+    }
+
+    /// find_target (§3): the message `toHex` names, looked for in `chatId` only, so a reactor
+    /// reaches only a conversation it is part of. In a Group the 16-byte post id (§4); in a direct
+    /// chat the 32-byte LXMF hash, which is the message's id or its stored `lxmfHash`. Any other
+    /// length names nothing.
+    private func reactionTarget(chatId: String, inGroup: Bool, toHex: String) -> MessageEntity? {
+        guard let ctx = modelContext else { return nil }
+        let wanted: String? = toHex
+        if inGroup {
+            guard toHex.utf8.count == 32 else { return nil }
+            let desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.chatId == chatId && $0.postId == wanted })
+            return try? ctx.fetch(desc).first
+        }
+        guard toHex.utf8.count == 64 else { return nil }
+        let byId = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == toHex && $0.chatId == chatId })
+        if let found = try? ctx.fetch(byId).first { return found }
+        let byHash = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.chatId == chatId && $0.lxmfHash == wanted })
+        return try? ctx.fetch(byHash).first
+    }
+
+    /// The addresses the user sends `chat` as (§3 "Display": a chip is the user's when one of its
+    /// reactors is one of them): a Group's self addresses (§9.1); in a direct chat this device and
+    /// the distro it holds, which a DM goes out as.
+    private func reactionSelf(_ chat: ChatEntity) -> Set<String> {
+        if chat.isGroup { return groupSelf(chat, rows: groupRows(chat.id)) }
+        var me: Set<String> = [ownHashHex]
+        if let d = heldDistroHex { me.insert(d) }
+        return me
+    }
+
+    /// The user picked `emoji` on the message `messageId` of `chatId` (§2, §4; James,
+    /// 2026-10-17): one reaction per person per message, so another one replaces the user's and
+    /// the same one again removes it. Applied here at once, then sent the way a message of that
+    /// chat goes; nothing here waits. Nothing is offered on a message that names no target
+    /// (Reactions.target), a system message, or a channel post (never in this store).
+    func react(messageId: String, chatId: String, emoji: String) {
+        guard let ctx = modelContext,
+              let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first,
+              let target = try? ctx.fetch(FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.id == messageId })).first,
+              target.chatId == chatId else {
+            print("[Reactions] reaction on \(messageId.prefix(8)) not taken: the message or its chat is gone")
+            return
+        }
+        guard !DisplayNames.isSystemMessageId(target.id),
+              let to = Reactions.target(isGroup: chat.isGroup, id: target.id, lxmfHash: target.lxmfHash,
+                                        postId: target.postId) else {
+            print("[Reactions] reaction on \(messageId.prefix(8)) not taken: it names no target")
+            return
+        }
+        guard emoji.utf8.count <= ReactionField.maxContentBytes else {
+            print("[Reactions] reaction on \(messageId.prefix(8)) not taken: more than \(ReactionField.maxContentBytes) bytes")
+            return
+        }
+        // Who-signs is asked now, as for a post; at start-up nothing is sent (no reaction is held).
+        guard heldSends.isOpen, let client = lxmfClient else {
+            print("[Reactions] reaction on \(messageId.prefix(8)) not sent: the stack has not finished starting")
+            return
+        }
+        let content = Reactions.toggled(current: Reactions.current(target.reactionsJson, me: reactionSelf(chat)),
+                                        picked: emoji)
+        if chat.isGroup {
+            reactInGroup(chat, target: target, to: to, content: content, via: client)
+        } else {
+            reactInDirectChat(chat, target: target, to: to, content: content, via: client)
+        }
+    }
+
+    /// §2: an otherwise-empty message to the peer with the 0x40 field, sent the way a text
+    /// message goes (createOutboundMessage, sendMessageViaAppLinks, the same DIRECT/propagated
+    /// attempts through `pendingOutbound`), with no bubble; the user's reaction applied at once
+    /// as the address it goes out as; and, sent as the distro, the Distro Sync of this send
+    /// (§5.2), which carries M's 0x40.
+    private func reactInDirectChat(_ chat: ChatEntity, target: MessageEntity, to: Data, content: String,
+                                   via client: LxmfClient) {
+        let chatId = chat.id
+        let destHashHex = chat.peerHash
+        guard let destData = Data(hexString: destHashHex) else {
+            print("[Reactions] reaction in \(chatId.prefix(8)) not sent: the peer \(destHashHex.prefix(8)) is not an address")
+            return
+        }
+        let deviceHash = client.destHash
+        let deviceHandle = client.identityHandle
+        // The address the reaction goes out as: what createOutboundMessage will read.
+        let reactor = DistroManager.shared.sendingIdentity(deviceHash: deviceHash, deviceHandle: deviceHandle).hash.hexString
+        if let json = Reactions.apply(target.reactionsJson, reactor: reactor, emoji: content,
+                                      atMs: Reactions.ms(Date().timeIntervalSince1970)) {
+            target.reactionsJson = json
+            try? modelContext?.save()
+        }
+
+        let linkMethod = ConnectionStateManager.shared.deliveryMethod(for: destData)
+        let knownDistro = prefs.isDistroContact(destHashHex)
+        let directMethod = LxmfMethod.direct
+        let propagatedMethod = LxmfMethod.propagated
+        let bridgeRef = bridge
+        let distroHex = DistroManager.shared.deliveryHashHex
+        ffiQueue.async { [weak self] in
+            let toDistro = knownDistro || bridgeRef.peerIsDistro(destHash: destData)
+            let method = toDistro ? propagatedMethod : linkMethod
+            let (handle, sentAsDistro) = Self.createOutboundMessage(
+                bridge: bridgeRef, deviceHash: deviceHash, deviceHandle: deviceHandle,
+                to: destData, content: "", title: "", method: method)
+            guard handle != 0 else {
+                print("[Reactions] reaction to \(destHashHex.prefix(8)) not made: \(LxmfClient.lastError ?? "unknown")")
+                return
+            }
+            guard LxmfClient.messageSetReaction(handle, to: to, content: content) else {
+                print("[Reactions] reaction to \(destHashHex.prefix(8)) not sent: \(LxmfClient.lastError ?? "unknown")")
+                LxmfClient.messageDestroy(handle)
+                return
+            }
+            guard client.sendMessageViaAppLinks(handle) else {
+                print("[Reactions] reaction to \(destHashHex.prefix(8)) not sent: \(LxmfClient.lastError ?? "unknown")")
+                LxmfClient.messageDestroy(handle)
+                return
+            }
+            guard let hash = LxmfClient.messageHash(handle), !hash.isEmpty else {
+                print("[Reactions] reaction to \(destHashHex.prefix(8)) sent, but its hash is not readable: its states are not followed")
+                LxmfClient.messageDestroy(handle)
+                return
+            }
+            let hashHex = hash.hexString
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // The text message's attempts (OutboundAttempts): no row has this id, so no
+                // bubble's state changes; the propagated copy and the handle's release are the same.
+                self.pendingOutbound[hashHex] = PendingOutbound(
+                    messageId: hashHex, chatId: chatId, peerHash: destData, msgHandle: handle,
+                    attempts: OutboundAttempts(direct: method == directMethod))
+                self.replayBufferedMessageStatesIfNeeded(for: hashHex)
+            }
+            if DistroCodec.needsSentCopy(sentAsDistro: sentAsDistro, destHex: destHashHex, distroHex: distroHex) {
+                Self.oweDistroSentCopy(recipient: destData, title: "", content: "", sentHash: hashHex,
+                                       reaction: (to, content))
+            }
+        }
+    }
+
+    /// §4: a Group reaction goes as a post goes (the Group Fanout to the accepted members, as the
+    /// group's own address), with no text and `REACTION_TO` the 16 bytes of the post id; applied
+    /// at once as the group's own address; and, taking part as a Distro Address, owing one `react`
+    /// Distro Sync of Group actions (§5.3) once its fan-out was submitted, or at once when there
+    /// is no member to send to, as a post's (§10.6).
+    private func reactInGroup(_ chat: ChatEntity, target: MessageEntity, to: Data, content: String,
+                              via client: LxmfClient) {
+        let chatId = chat.id
+        guard let postId = target.postId, let signer = groupSigner(chat) else {
+            print("[Reactions] reaction in group \(chatId.prefix(8)) not sent: no signer for the group's own address here (§8.7)")
+            return
+        }
+        let now = Date().timeIntervalSince1970
+        if let json = Reactions.apply(target.reactionsJson, reactor: signer.hex, emoji: content, atMs: Reactions.ms(now)) {
+            target.reactionsJson = json
+            try? modelContext?.save()
+        }
+        let rows = groupRows(chatId)
+        let targets = GroupMemberStatuses.acceptedMembers(rows, selfAddresses: groupSelf(chat, rows: rows))
+        let owesSync = signer.isDistro
+        let atMs = DistroGroupSync.atMs(now)
+        if owesSync && targets.isEmpty {
+            oweGroupSync(.react, groupId: chatId, signer: signer, atMs: atMs, text: content, postId: postId)
+        }
+        let groupName = chat.groupName ?? "Group"
+        ffiQueue.async { [weak self] in
+            let submitted = GroupChatManager.shared.fanoutMessage(
+                groupId: chatId, groupName: groupName, content: "", attachments: [],
+                to: targets, as: signer, via: client, reaction: (to, content))
+            guard owesSync, !targets.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                guard submitted > 0 else {
+                    print("[Reactions] reaction in group \(chatId.prefix(8)) left for no member: no group sync owed (§10.6)")
+                    return
+                }
+                self?.oweGroupSync(.react, groupId: chatId, signer: signer, atMs: atMs, text: content, postId: postId)
+            }
+        }
     }
 
     // MARK: - Group invite / accept / leave
@@ -2188,8 +2432,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // The sender's name, field 0xD1 (DISPLAY_NAMES.md §5.2). It names
         // the LXMF source (for a relayed group message, the relayer) and is
         // taken only from a message this device accepts: a group message
-        // the group policy lets through, or a DM past the allowlist.
-        let nameField = LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw)
+        // the group policy lets through, or a DM past the allowlist. Never
+        // from a reaction (REACTIONS-DESIGN.md §3), which makes no contact.
+        let nameField = fields.reaction == nil ? LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw) : .absent
 
         // Handle group message: the privacy filter and James's group model
         // (admitGroupMessage, DeliveryPolicy), before any write, so a dropped
@@ -2223,12 +2468,18 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
         print("[Retichat] handleIncomingMessage: ACCEPTED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
 
+        // REACTIONS-DESIGN.md §3: a reaction is applied to its target in this chat, or dropped
+        // with its log line; never a bubble, a notification, unread, or a new chat or contact.
+        if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: timestamp, path: "handleIncomingMessage") {
+            return
+        }
+
         applyMessageName(nameField, unverifiedReason: unverifiedReason, sourceHex: srcHex,
                          messageTime: timestamp)
         storeIncomingDirect(
             messageId: msgHashHex, srcHash: srcHash, title: title, content: content,
             timestamp: timestamp, signatureValid: signatureValid,
-            attachments: fields.attachments)
+            attachments: fields.attachments, lxmfHash: msgHashHex)
     }
 
     /// Store an accepted direct message and notify — the tail shared by the
@@ -2238,7 +2489,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                      title: String, content: String, timestamp: Double,
                                      signatureValid: Bool,
                                      attachments: [(filename: String, data: Data)],
-                                     notify: Bool = true) {
+                                     lxmfHash: String? = nil, notify: Bool = true) {
         guard let ctx = modelContext else { return }
         let srcHex = srcHash.hexString
 
@@ -2264,7 +2515,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             timestamp: timestamp,
             isOutgoing: false,
             deliveryState: DeliveryState.delivered,
-            signatureValid: signatureValid
+            signatureValid: signatureValid,
+            lxmfHash: lxmfHash
         )
         insertMessage(msgEntity, into: ctx)
 
@@ -2310,6 +2562,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
         let srcHex = m.sourceHash.hexString
+        // REACTIONS-DESIGN.md §3: a reaction to the distro names a message of the chat with its
+        // source; it is never stored, and makes no contact.
+        let fields = LxmfFieldsDecoder.decode(m.fields ?? Data())
+        if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: m.timestamp, path: "handleDistroMessage") {
+            return
+        }
         let (content, attachments) = DistroMessageStore.stored(m)
         // Deterministic id: the same message can arrive via the stream AND a
         // pull before the seen store records it.
@@ -2326,7 +2584,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         storeIncomingDirect(
             messageId: msgId, srcHash: m.sourceHash, title: m.title, content: content,
             timestamp: m.timestamp, signatureValid: m.unverifiedReason == 0,
-            attachments: attachments, notify: !m.shownByNSE)
+            attachments: attachments, lxmfHash: DistroGroupSync.messageHash(m.hash), notify: !m.shownByNSE)
     }
 
     /// A message another of our devices sent as the distro, reported by its
@@ -2343,6 +2601,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             return
         }
         let distroHex = c.distroHash.hexString
+        // REACTIONS-DESIGN.md §5.2: the copy of a reaction the user sent as the distro applies it
+        // (reactor the distro) to its target in the chat with the recipient; no bubble.
+        let fields = LxmfFieldsDecoder.decode(c.fields ?? Data())
+        if tookReaction(fields, chatId: c.recipientHex, reactor: distroHex, timestamp: c.timestamp,
+                        path: "handleDistroSentCopy") {
+            return
+        }
         var content = c.content.trimmingCharacters(in: .whitespacesAndNewlines)
         if content.isEmpty {
             // M carried only attachments, which the copy never does.
@@ -2375,7 +2640,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             title: c.title,
             timestamp: c.timestamp,
             isOutgoing: true,
-            deliveryState: DeliveryState.sent
+            deliveryState: DeliveryState.sent,
+            // §5.2: M's own hash (SENT_HASH, key 12), so a reaction to M finds it here.
+            lxmfHash: fields.sentHash
         ), into: ctx)
         updateChatTimestamp(chatId: chatId, timestamp: c.timestamp)
         try? ctx.save()
@@ -2439,10 +2706,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             // shown as its GROUP_SENDER's only when a current member of a
             // joined group relays a listed member's post (groupAuthor).
             guard let chat = standing.chat else { return }
+            let author = groupAuthor(fields: fields, sourceHex: srcHex, standing: standing, signature: signature)
+            // REACTIONS-DESIGN.md §4: a Group reaction is attributed as a post is (GROUP_SENDER
+            // when relayed, the same member rules) and names its target by post id, in this group.
+            if tookReaction(fields, chatId: chat.id, inGroup: true, reactor: author, timestamp: timestamp, path: "group") {
+                return
+            }
             handleGroupChatMessage(hash: hash, content: content, timestamp: timestamp, fields: fields,
                                    chat: chat,
-                                   author: groupAuthor(fields: fields, sourceHex: srcHex,
-                                                       standing: standing, signature: signature),
+                                   author: author,
                                    selfAddresses: groupSelf(chat, rows: standing.members), ownAct: ownAct)
         default:
             // Until 2026-10-05 an action this client does not know was
@@ -2637,6 +2909,20 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let accepted = GroupMemberStatuses.acceptedMembers(
             standing.members, selfAddresses: standing.chat.map { groupSelf($0, rows: standing.members) } ?? [ownHashHex])
         let groupName = standing.chat?.groupName ?? "Group"
+        // REACTIONS-DESIGN.md §4: a relay request carries what is relayed, so the post id and a
+        // reaction go on every relayed copy. A 0x40 this client refuses is not relayed: relayed
+        // without it, it would reach the members as an empty post.
+        let reaction: (to: Data, content: String)?
+        switch fields.reaction {
+        case nil:
+            reaction = nil
+        case .react(let to, let content)?:
+            reaction = (to, content)
+        case .refused(let why)?:
+            print("[GroupChat] relay_req from \(srcHex.prefix(8)) for group \(groupId.prefix(8)) not relayed: reaction dropped: \(why)")
+            return
+        }
+        let postId = fields.groupPostId
 
         let selfHash = ownHashHex
         ffiQueue.async {
@@ -2649,6 +2935,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 requester: srcHex,
                 allAcceptedMembers: accepted,
                 selfHash: selfHash,
+                postId: postId,
+                reaction: reaction,
                 via: client
             )
         }
@@ -2681,7 +2969,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             id: msgHashHex, chatId: groupId, senderHash: author,
             content: content, timestamp: timestamp,
             isOutgoing: own,
-            deliveryState: own && author != ownHashHex ? DeliveryState.sent : DeliveryState.delivered
+            deliveryState: own && author != ownHashHex ? DeliveryState.sent : DeliveryState.delivered,
+            lxmfHash: msgHashHex,
+            // REACTIONS-DESIGN.md §4: the post's id, what a Group reaction names.
+            postId: fields.groupPostId
         )
         insertMessage(msg, into: ctx)
 
@@ -3109,6 +3400,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let names = contactNameIndex()
         let me = groupSelf(forChatId: chatId)
         let siblings = knownSiblingAddresses()
+        // REACTIONS-DESIGN.md §3, §7: whose chips are the user's, and whether the chat is a group.
+        let chat = try? ctx.fetch(FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })).first
+        let isGroup = chat?.isGroup ?? false
+        let reactors = chat.map(reactionSelf) ?? [ownHashHex]
 
         // Reverse back to chronological order for display
         return entities.reversed().map { entity in
@@ -3130,7 +3425,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 // read off the main actor by ConversationViewModel on every
                 // tick (liveUploads, uploadBars; UploadProgress.swift).
                 uploadProgress: nil,
-                nativeHandle: entity.nativeHandle
+                nativeHandle: entity.nativeHandle,
+                reactions: Reactions.chips(entity.reactionsJson, me: reactors)
+                    .map { ReactionChip(emoji: $0.emoji, count: $0.count, mine: $0.mine) },
+                reactionsJson: entity.reactionsJson,
+                reactable: !DisplayNames.isSystemMessageId(entity.id)
+                    && Reactions.target(isGroup: isGroup, id: entity.id, lxmfHash: entity.lxmfHash,
+                                        postId: entity.postId) != nil
             )
         }
     }
@@ -3174,10 +3475,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return bars
     }
 
-    /// Lightweight query returning only (id, deliveryState) pairs — no
-    /// attachment blobs, no FFI calls.  Used by the refresh timer to decide
-    /// whether a full reload is needed.
-    func messagesSummary(forChatId chatId: String, limit: Int = 50) -> [(String, Int)] {
+    /// Lightweight query returning only (id, deliveryState, reactionsJson) —
+    /// no attachment blobs, no FFI calls.  Used by the refresh timer to decide
+    /// whether a full reload is needed; a reaction changes only the JSON.
+    func messagesSummary(forChatId chatId: String, limit: Int = 50) -> [(String, Int, String?)] {
         guard let ctx = modelContext else { return [] }
         var descriptor = FetchDescriptor<MessageEntity>(
             predicate: #Predicate { $0.chatId == chatId },
@@ -3185,7 +3486,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         )
         descriptor.fetchLimit = limit
         guard let entities = try? ctx.fetch(descriptor) else { return [] }
-        return entities.reversed().map { ($0.id, $0.deliveryState) }
+        return entities.reversed().map { ($0.id, $0.deliveryState, $0.reactionsJson) }
     }
 
     /// The contacts the user added (ContactRows.isListed: Contacts, New
@@ -3801,12 +4102,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// (DistroOutboxRuntime.oweGroupSync). Only for a signer that is D: nothing else sends one.
     private func oweGroupSync(_ op: DistroGroupSync.Op, groupId: String, signer: GroupSigner, atMs: UInt64,
                               name: String? = nil, membersCsv: String? = nil, keys: [String]? = nil,
-                              creator: String? = nil, text: String? = nil) {
+                              creator: String? = nil, text: String? = nil, postId: String? = nil) {
         guard signer.isDistro else { return }
         let d = signer.hex
         let json = DistroGroupSync.writerJSON(op: op, groupId: groupId, atMs: atMs, name: name,
                                               membersCsv: membersCsv, keys: keys, creator: creator,
-                                              text: text, left: prefs.distroLeftIds[d] ?? [])
+                                              text: text, left: prefs.distroLeftIds[d] ?? [], postId: postId)
         let device = ownHashHex
         let label = "the \(op.rawValue) group sync of \(groupId.prefix(8)) (SPEC §17.14)"
         Task { @MainActor in
@@ -3815,9 +4116,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     }
 
     /// §10.6: the `post` group sync of a post the user sent as D: its text alone (attachments
-    /// are not copied, §17.11), at the post's stored time.
-    private func owePostSync(groupId: String, text: String, atMs: UInt64, signer: GroupSigner) {
-        oweGroupSync(.post, groupId: groupId, signer: signer, atMs: atMs, text: text)
+    /// are not copied, §17.11), at the post's stored time, with its post id (REACTIONS-DESIGN.md
+    /// §5.3) when it has one.
+    private func owePostSync(groupId: String, text: String, atMs: UInt64, signer: GroupSigner, postId: String?) {
+        oweGroupSync(.post, groupId: groupId, signer: signer, atMs: atMs, text: text, postId: postId)
     }
 
     // MARK: Inbound on the distro path (§6)
@@ -3827,6 +4129,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// (§6.5), or dropped. Never `ensureContact`/`storeIncomingDirect`: a group message is never
     /// a DM (§6.4). True when kept (applied or stored): only then is its `grp:` key recorded.
     private func handleDistroGroupArrival(_ a: DistroGroupArrival) -> Bool {
+        var a = a
         guard modelContext != nil else {
             print("[GroupChat] distro group message \(a.hash.prefix(8)): modelContext is nil; not recorded")
             return false
@@ -3838,6 +4141,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let groupId = a.groupId
         let srcHex = a.sourceHex
         let fields = LxmfFieldsDecoder.decode(a.fieldsRaw ?? Data())
+        // Never a name from a reaction (REACTIONS-DESIGN.md §3), which makes no contact.
+        if fields.reaction != nil { a.displayName = .absent }
         let action = fields.groupAction
         let signature = DeliveryPolicy.Signature.reason(valid: a.signatureValidated, unverifiedReason: a.unverifiedReason)
 
@@ -4089,6 +4394,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             forgetHeldArrivals(groupId: groupId, why: "the group was closed here by the distro's leave")
         case .storeOwnPost:
             if let chat { storeOwnPostFromSync(form, hash: a.hash, distro: d, chat: chat) }
+        case .applyOwnReaction:
+            // REACTIONS-DESIGN.md §5.3: the user's reaction as D, applied as §3 with reactor = the
+            // address the user takes part in this group as (D, rule 5). No bubble.
+            if let postId = form.postId, let to = Reactions.hexBytes(postId, count: 16) {
+                applyReaction(to: to, content: form.text, chatId: groupId, inGroup: true, reactor: d,
+                              timestamp: Double(form.atMs) / 1000, path: "handleDistroGroupSync")
+            }
         case .holdArrival:
             let filtered = prefs.filteredInviteIds.contains(groupId)
             guard HeldArrivals.holdable(isPostSync: true, action: nil, held: standing == .pending ? .pending : .none,
@@ -4190,7 +4502,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         if content.isEmpty { content = DistroMessageStore.unavailablePlaceholder }
         let timestamp = Double(form.atMs) / 1000
         insertMessage(MessageEntity(id: hash, chatId: chat.id, senderHash: d, content: content,
-                                    timestamp: timestamp, isOutgoing: true, deliveryState: DeliveryState.sent),
+                                    timestamp: timestamp, isOutgoing: true, deliveryState: DeliveryState.sent,
+                                    // REACTIONS-DESIGN.md §5.3: the post's id, when the sending device gave one.
+                                    postId: form.postId),
                       into: ctx)
         updateChatTimestamp(chatId: chat.id, timestamp: timestamp)
         try? ctx.save()

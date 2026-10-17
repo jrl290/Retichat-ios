@@ -209,12 +209,12 @@ func testTheWiring() {
     check(before(distro, "let (content, attachments) = DistroMessageStore.stored(m)",
                  "let msgId = DistroCodec.messageId(sourceHex: srcHex, timestamp: m.timestamp, content: content)"),
           "handleDistroMessage takes the text and attachments from the store rule, before its id")
-    check(distro.contains("attachments: attachments, notify: !m.shownByNSE)") && !distro.contains("attachments: []"),
+    check(distro.contains("attachments: attachments, lxmfHash: DistroGroupSync.messageHash(m.hash), notify: !m.shownByNSE)") && !distro.contains("attachments: []"),
           "and hands the attachments to storeIncomingDirect")
     check(!distro.contains("[Attachment not available via the distro address]"),
           "the placeholder is decided by the store rule alone")
     let incoming = body(repo, "private func handleIncomingMessage(")
-    check(incoming.contains("attachments: fields.attachments)"),
+    check(incoming.contains("attachments: fields.attachments, lxmfHash: msgHashHex)"),
           "the direct path stores the decoder's attachments through storeIncomingDirect too")
     let store = body(repo, "private func storeIncomingDirect(")
     check(before(store, "for (filename, data) in attachments {", "let att = AttachmentEntity(")

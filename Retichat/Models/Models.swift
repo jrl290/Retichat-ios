@@ -122,10 +122,22 @@ final class MessageEntity {
     var deliveryState: Int  // 0=pending, 1=sent, 2=delivered, 3=failed
     var signatureValid: Bool
     var nativeHandle: UInt64  // Rust handle for tracking outbound state
+    /// REACTIONS-DESIGN.md §6, all optional so a store from before them opens (lightweight
+    /// migration). The message's LXMF hash, 64 hex, wherever it is known: the id already is the
+    /// hash where it can be, but a Distro Fanout message and a Distro Sync of a send are filed
+    /// under a derived id.
+    var lxmfHash: String? = nil
+    /// A Group post's id (GROUP_POST_ID, 32 hex): the target a Group reaction names. nil for a
+    /// post from an older client, which offers no reactions.
+    var postId: String? = nil
+    /// The message's reactions: `{"<reactor 32 hex>": {"e": "👍", "t": <ms>}}`, `"e": ""` a
+    /// removal (Reactions).
+    var reactionsJson: String? = nil
 
     init(id: String, chatId: String, senderHash: String, content: String,
          title: String = "", timestamp: Double = 0, isOutgoing: Bool = false,
-         deliveryState: Int = 0, signatureValid: Bool = false, nativeHandle: UInt64 = 0) {
+         deliveryState: Int = 0, signatureValid: Bool = false, nativeHandle: UInt64 = 0,
+         lxmfHash: String? = nil, postId: String? = nil) {
         self.id = id
         self.chatId = chatId
         self.senderHash = senderHash
@@ -136,6 +148,8 @@ final class MessageEntity {
         self.deliveryState = deliveryState
         self.signatureValid = signatureValid
         self.nativeHandle = nativeHandle
+        self.lxmfHash = lxmfHash
+        self.postId = postId
     }
 }
 
@@ -283,6 +297,22 @@ struct ChatMessage: Identifiable {
     var attachments: [Attachment]
     var uploadProgress: Float?
     var nativeHandle: UInt64 = 0
+    /// REACTIONS-DESIGN.md §3, §7: the chips under the bubble, the stored JSON they come from
+    /// (what a refresh compares), and whether reactions are offered on it (a target it can name:
+    /// never on a channel post, a system message, a Group post without a post id, or a send not
+    /// yet handed to the router).
+    var reactions: [ReactionChip] = []
+    var reactionsJson: String? = nil
+    var reactable: Bool = false
+}
+
+/// One reaction chip under a bubble (Reactions.chips): a reaction, how many hold it, and whether
+/// one of them is the user.
+struct ReactionChip: Equatable, Identifiable {
+    let emoji: String
+    let count: Int
+    let mine: Bool
+    var id: String { emoji }
 }
 
 struct Attachment: Identifiable {

@@ -37,7 +37,8 @@ nonisolated enum DistroGroupSync {
     static let leftLimit = 32
 
     enum Op: String, Sendable, CaseIterable {
-        case create, accept, leave, post
+        /// `react` (REACTIONS-DESIGN.md §5.3): the user reacted to a Group post as D.
+        case create, accept, leave, post, react
     }
 
     /// The outbox id of the G whose LXMF hash is `hashHex` (§10.5): each G is owed on its own.
@@ -68,17 +69,20 @@ nonisolated enum DistroGroupSync {
         var creator: String? = nil
         var text: String? = nil
         var left: [String]? = nil
+        /// `post` (optional: older devices send none) and `react` (required): the Group post id
+        /// (REACTIONS-DESIGN.md §5.3). The unwrap writes the key only when the sync has one.
+        var postId: String? = nil
 
         init(by: String = "", problem: String? = nil, op: String? = nil, groupId: String? = nil,
              atMs: UInt64? = nil, name: String? = nil, members: String? = nil, keys: [String]? = nil,
-             creator: String? = nil, text: String? = nil, left: [String]? = nil) {
+             creator: String? = nil, text: String? = nil, left: [String]? = nil, postId: String? = nil) {
             self.by = by; self.problem = problem; self.op = op; self.groupId = groupId; self.atMs = atMs
             self.name = name; self.members = members; self.keys = keys; self.creator = creator
-            self.text = text; self.left = left
+            self.text = text; self.left = left; self.postId = postId
         }
 
         private enum CodingKeys: String, CodingKey {
-            case by, problem, op, group_id, at_ms, name, members, keys, creator, text, left
+            case by, problem, op, group_id, at_ms, name, members, keys, creator, text, left, post_id
         }
 
         init(from decoder: Decoder) throws {
@@ -94,6 +98,7 @@ nonisolated enum DistroGroupSync {
             creator = (try? c.decodeIfPresent(String.self, forKey: .creator)) ?? nil
             text = (try? c.decodeIfPresent(String.self, forKey: .text)) ?? nil
             left = (try? c.decodeIfPresent([String].self, forKey: .left)) ?? nil
+            postId = (try? c.decodeIfPresent(String.self, forKey: .post_id)) ?? nil
         }
     }
 
@@ -112,9 +117,12 @@ nonisolated enum DistroGroupSync {
         let keys: [String]
         /// accept: the invite's authenticated source.
         let creator: String?
-        /// post: the text ("" for an attachment-only post).
+        /// post: the text ("" for an attachment-only post). react: the reaction, "" a removal.
         let text: String
         let left: [String]
+        /// post: its Group post id when the sending device gave one (32 lowercase hex), else nil.
+        /// react: the post reacted to, always.
+        var postId: String? = nil
     }
 
     /// §11.1 rules 1 to 4, in order; rule 0 (the repeat) is the seen store's, rules 5 and 6
@@ -152,7 +160,7 @@ nonisolated enum DistroGroupSync {
     static func form(_ r: Reading, distroHex d: String) -> Result<Form, Problem> {
         func fail(_ why: String) -> Result<Form, Problem> { .failure(Problem(text: why)) }
         if let problem = r.problem { return fail(problem) }
-        guard let opText = r.op, let op = Op(rawValue: opText) else { return fail("op is \(r.op ?? "absent"), not one of the four") }
+        guard let opText = r.op, let op = Op(rawValue: opText) else { return fail("op is \(r.op ?? "absent"), not one of the five") }
         guard let groupId = DeliveryPolicy.hash(r.groupId?.lowercased()) else { return fail("group_id is not 32 hex") }
         guard let atMs = r.atMs, atMs <= 9_007_199_254_740_991 else { return fail("at_ms is not an integer 0 to 2^53 - 1") }
         guard let left = r.left else { return fail("left is absent") }
@@ -163,6 +171,7 @@ nonisolated enum DistroGroupSync {
             leftIds.append(id)
         }
         var name = "", csv = "", members: [String] = [], keys: [String] = [], creator: String?, text = ""
+        var postId: String?
         switch op {
         case .create, .accept:
             guard let n = r.name else { return fail("name is absent") }
@@ -180,11 +189,23 @@ nonisolated enum DistroGroupSync {
         case .post:
             guard let t = r.text else { return fail("text is absent") }
             text = t
+            // Optional (older devices send none); one that is not 32 hex is ignored, as the
+            // unwrap ignores it.
+            postId = r.postId.flatMap(LxmfFieldsDecoder.groupIdHex)
+        case .react:
+            guard let t = r.text else { return fail("text is absent") }
+            guard t.utf8.count <= ReactionField.maxContentBytes else {
+                return fail("text is \(t.utf8.count) bytes, more than \(ReactionField.maxContentBytes) for a reaction")
+            }
+            guard let p = r.postId.flatMap(LxmfFieldsDecoder.groupIdHex) else { return fail("post_id is not 32 hex") }
+            text = t
+            postId = p
         case .leave:
             break
         }
         return .success(Form(op: op, groupId: groupId, atMs: atMs, name: name, membersCsv: csv,
-                             members: members, keys: keys, creator: creator, text: text, left: leftIds))
+                             members: members, keys: keys, creator: creator, text: text, left: leftIds,
+                             postId: postId))
     }
 
     // MARK: Apply (§11.2)
@@ -216,6 +237,9 @@ nonisolated enum DistroGroupSync {
         case tombstone
         /// Stored as the user's own outgoing post: sender D, SENT, at `atMs`, id = G's hash.
         case storeOwnPost
+        /// A `react` G in a joined group: the user's reaction applied to the post, reactor D
+        /// (REACTIONS-DESIGN.md §5.3). No bubble.
+        case applyOwnReaction
         /// A `post` G for a group not joined here: held (§6.5), not recorded as seen.
         case holdArrival
         /// Nothing changes; the text says why (for the log).
@@ -241,6 +265,11 @@ nonisolated enum DistroGroupSync {
         case (.post, .joined): return .storeOwnPost
         case (.post, .notHeld), (.post, .pending): return .holdArrival
         case (.post, .closed): return .nothing("the group was left here")
+        case (.react, .joined): return .applyOwnReaction
+        // A reaction names a post this device would hold only once the group is joined here; a
+        // pending group's posts are held, and the reaction is not (it never makes a bubble).
+        case (.react, .notHeld), (.react, .pending): return .nothing("the group is not joined here, so the post it reacts to is not here")
+        case (.react, .closed): return .nothing("the group was left here")
         }
     }
 
@@ -283,9 +312,10 @@ nonisolated enum DistroGroupSync {
 
     /// The JSON `retichat_message_set_distro_group_sync` takes: the unwrap's `group_sync` object
     /// without `by` and `problem`. Only the keys the op carries are written.
+    /// `postId`: a post's id (written when it has one) or the post a `react` names (required).
     static func writerJSON(op: Op, groupId: String, atMs: UInt64, name: String? = nil,
                            membersCsv: String? = nil, keys: [String]? = nil, creator: String? = nil,
-                           text: String? = nil, left: [String]) -> String {
+                           text: String? = nil, left: [String], postId: String? = nil) -> String {
         var object: [String: Any] = [
             "op": op.rawValue, "group_id": groupId, "at_ms": NSNumber(value: atMs), "left": left,
         ]
@@ -297,6 +327,10 @@ nonisolated enum DistroGroupSync {
             if op == .accept { object["creator"] = creator ?? "" }
         case .post:
             object["text"] = text ?? ""
+            if let postId { object["post_id"] = postId }
+        case .react:
+            object["text"] = text ?? ""
+            object["post_id"] = postId ?? ""
         case .leave:
             break
         }
@@ -698,7 +732,8 @@ nonisolated struct DistroGroupArrival: Sendable {
     let content: String
     let timestamp: Double
     let fieldsRaw: Data?
-    let displayName: DisplayNames.NameField
+    /// The sender's 0xD1; `.absent` for a reaction, from which no name is taken.
+    var displayName: DisplayNames.NameField
     /// 0 validated, 1 source unknown, 2 invalid: the receipt's verdict (§7).
     let unverifiedReason: Int
     let signatureValidated: Bool

@@ -53,6 +53,9 @@ nonisolated struct DistroMessage: Sendable {
     /// Pulled by the NSE, which already showed it: stored without a second
     /// notification (review of 793a542).
     var shownByNSE = false
+    /// The message's LXMF hash, as the unwrap says it (64 hex): stored beside
+    /// the derived id, so a reaction to it finds it (REACTIONS-DESIGN.md §5.1).
+    var hash: String? = nil
 }
 
 nonisolated extension DistroMessage {
@@ -65,7 +68,8 @@ nonisolated extension DistroMessage {
                   fields: parsed.fieldsRaw,
                   displayName: parsed.nameField,
                   unverifiedReason: parsed.reason,
-                  shownByNSE: shownByNSE)
+                  shownByNSE: shownByNSE,
+                  hash: parsed.hash)
     }
 }
 
@@ -210,6 +214,9 @@ nonisolated struct DistroSentCopy: Sendable {
     let content: String
     /// The copy's LXMF timestamp.
     let timestamp: Double
+    /// The copy's fields as msgpack (the unwrap's "fields"): its SENT_HASH (0xD1 key 12) and,
+    /// for a reaction, M's 0x40 (REACTIONS-DESIGN.md §5.2). nil from an FFI build without them.
+    var fields: Data? = nil
 }
 
 /// Speaks RFed's distro protocol on behalf of this device.
@@ -786,6 +793,8 @@ final class RfedDistroClient: ObservableObject {
         let title: String
         let content: String
         let timestamp: Double
+        /// The copy's fields (REACTIONS-DESIGN.md §5.2).
+        var fields: Data? = nil
     }
 
     /// Handle one distro blob, from the propagation stream, a pull, or (for
@@ -933,7 +942,7 @@ final class RfedDistroClient: ObservableObject {
                 source: src, signedByDistro: srcHex == distroHex && (parsed.signature_validated ?? false),
                 distroHex: distroHex, sentTo: parsed.sent_to, sentBy: sentBy,
                 title: parsed.title ?? "", content: parsed.content ?? "",
-                timestamp: parsed.timestamp))
+                timestamp: parsed.timestamp, fields: parsed.fieldsRaw))
         } else if parsed.is_delivery_notification {
             // This device signs as the distro, so recipients' delivery
             // notifications come back via fan-out. Storing them posts empty bubbles.
@@ -1020,7 +1029,8 @@ final class RfedDistroClient: ObservableObject {
             }
             if c.signedByDistro { onSiblingSeen?(c.sentBy, c.distroHex) }
             onSentCopy(DistroSentCopy(distroHash: c.source, recipientHex: recipientHex,
-                                      title: c.title, content: c.content, timestamp: c.timestamp))
+                                      title: c.title, content: c.content, timestamp: c.timestamp,
+                                      fields: c.fields))
             return true
         }
     }

@@ -195,10 +195,10 @@ func aMembershipMessageIsReadBeforeTheGenericDedupeAndTheDeliveryNotificationTes
 
 func theSentCopyIsOwedNotHandedToTheRouterOnce() {
     let owe = body(repository, "nonisolated private static func oweDistroSentCopy(", "/// Create an outbound DM whose source is the distro")
-    check(owe.contains("DistroOutboxRuntime.shared.oweSentCopy(recipient: recipient, title: title, content: content)"),
+    check(owe.contains("DistroOutboxRuntime.shared.oweSentCopy(recipient: recipient, title: title, content: content,\n                                                         sentHash: sentHash, reaction: reaction)"),
           "the copy is owed")
     check(repository.contains("if DistroCodec.needsSentCopy(sentAsDistro: sentAsDistro, destHex: destHashHex,")
-            && repository.contains("Self.oweDistroSentCopy(recipient: destData, title: \"\", content: content)"),
+            && repository.contains("Self.oweDistroSentCopy(recipient: destData, title: \"\", content: content, sentHash: msgHashHex)"),
           "only a message sent as the distro, to someone else, has a copy")
     // It no longer goes through the router, whose own re-send is paced by a timer and gives up after a count.
     check(!owe.contains("sendViaAppLinks") && !owe.contains("messageCreate"), "it does not go through the router")

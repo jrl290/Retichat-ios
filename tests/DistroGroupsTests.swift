@@ -455,7 +455,7 @@ func deleteFromThisDeviceSendsNoLeaveAndOwesNoGroupSync() {
 
 func aDGroupPostOwesOnePostSyncAndNoSentCopyAndAFailedSendOwesNeither() {
     let fan = body(repo, "private func fanOutGroupMessage(")
-    check(fan.contains("guard submitted > 0 else {") && before(fan, "guard submitted > 0 else {", "self?.owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer)"),
+    check(fan.contains("guard submitted > 0 else {") && before(fan, "guard submitted > 0 else {", "self?.owePostSync(groupId: chatId, text: content, atMs: atMs, signer: signer, postId: postId)"),
           "the post G is owed only once an envelope was submitted")
     check(fan.contains("if owesSync && targets.isEmpty {\n            owePostSync("), "and at once when there is no member to send to")
     check(count(fan, "owePostSync(") == 2 && fan.contains("let owesSync = signer.isDistro"), "once, and only in a D-group")
@@ -464,7 +464,7 @@ func aDGroupPostOwesOnePostSyncAndNoSentCopyAndAFailedSendOwesNeither() {
     let fanout = body(manager, "func fanoutMessage(")
     check(fanout.contains("if client.sendMessageViaAppLinks(handle) {\n                submitted += 1") && fanout.contains("return submitted"),
           "submitted counts only the envelopes the router accepted")
-    check(body(repo, "private func owePostSync(").contains("oweGroupSync(.post, groupId: groupId, signer: signer, atMs: atMs, text: text)"),
+    check(body(repo, "private func owePostSync(").contains("oweGroupSync(.post, groupId: groupId, signer: signer, atMs: atMs, text: text, postId: postId)"),
           "a post G carries the text at the post's time")
 }
 
@@ -569,7 +569,7 @@ func theGroupSyncRules() {
     fails({ $0.left = (0..<33).map(id32) }, "33 ids in left")
     fails({ $0.left = ["xyz"] }, "an id in left that is not 32 hex")
     fails({ $0.atMs = 9_007_199_254_740_992 }, "at_ms past 2^53 - 1")
-    fails({ $0.op = "rename" }, "an op that is not one of the four")
+    fails({ $0.op = "rename" }, "an op that is not one of the five")
     fails({ $0.problem = "0xFC is absent" }, "the unwrap's problem")
 
     // Rules 1 to 3.

@@ -213,6 +213,11 @@ final class GroupChatManager {
     /// address), as the group's own address. Returns how many envelopes the router or its
     /// outbox accepted: a `post` group sync is owed only once one was (§10.6).
     ///
+    /// REACTIONS-DESIGN.md §4: a post carries its `postId` (GROUP_POST_ID, key 11) on every
+    /// member copy; a reaction goes the same way, with `reaction` (0x40: the 16 bytes of the post
+    /// id it names, and the reaction) and no text. An envelope whose post id or reaction cannot
+    /// be set is not sent: it would reach the member as another message.
+    ///
     /// - Parameters:
     ///   - onHandle: Called once per successfully created send handle so the
     ///     caller can set up delivery-state polling if desired.
@@ -225,6 +230,8 @@ final class GroupChatManager {
         to members: [String],
         as signer: GroupSigner,
         via client: LxmfClient,
+        postId: String? = nil,
+        reaction: (to: Data, content: String)? = nil,
         onHandle: ((UInt64, String) -> Void)? = nil
     ) -> Int {
         var submitted = 0
@@ -239,6 +246,10 @@ final class GroupChatManager {
             _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
             _ = LxmfClient.messageSetGroupEntry(handle, .name, .str(groupName))
             _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(signer.hex))
+            guard setPostIdAndReaction(handle, postId: postId, reaction: reaction, for: target) else {
+                LxmfClient.messageDestroy(handle)
+                continue
+            }
 
             if client.sendMessageViaAppLinks(handle) {
                 submitted += 1
@@ -258,12 +269,16 @@ final class GroupChatManager {
     /// - Parameters:
     ///   - alreadySeen: Member hashes that have already received the message;
     ///     the relayer will skip these.
+    ///   - postId, reaction: what is relayed carries them (REACTIONS-DESIGN.md §4): the post's
+    ///     GROUP_POST_ID, or the reaction's 0x40.
     func sendRelayRequest(
         groupId: String,
         content: String,
         originalSender: String,
         alreadySeen: [String],
         to relayer: String,
+        postId: String? = nil,
+        reaction: (to: Data, content: String)? = nil,
         via client: LxmfClient
     ) {
         guard let destData = Data(hexString: relayer) else { return }
@@ -278,6 +293,10 @@ final class GroupChatManager {
         let seenCSV = alreadySeen.joined(separator: ",")
         if !seenCSV.isEmpty {
             _ = LxmfClient.messageSetGroupEntry(handle, .relaySeen, .str(seenCSV))
+        }
+        guard setPostIdAndReaction(handle, postId: postId, reaction: reaction, for: relayer) else {
+            LxmfClient.messageDestroy(handle)
+            return
         }
         destroyAfterSend(client: client, handle: handle)
     }
@@ -296,6 +315,8 @@ final class GroupChatManager {
         requester: String,
         allAcceptedMembers: [String],
         selfHash: String,
+        postId: String? = nil,
+        reaction: (to: Data, content: String)? = nil,
         via client: LxmfClient
     ) {
         let seenSet = Set(alreadySeen + [requester, selfHash, originalSender])
@@ -314,6 +335,12 @@ final class GroupChatManager {
             _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(originalSender))
             _ = LxmfClient.messageSetGroupEntry(handle, .relayFor, .str(originalSender))
             _ = LxmfClient.messageSetGroupEntry(handle, .relaySeen, .str(newSeen.joined(separator: ",")))
+            // REACTIONS-DESIGN.md §4: the relayer copies the post id and the reaction onto each
+            // relayed copy.
+            guard setPostIdAndReaction(handle, postId: postId, reaction: reaction, for: target) else {
+                LxmfClient.messageDestroy(handle)
+                continue
+            }
             destroyAfterSend(client: client, handle: handle)
         }
 
@@ -335,6 +362,21 @@ final class GroupChatManager {
     }
 
     // MARK: - Private helpers
+
+    /// GROUP_POST_ID (key 11) and the reaction (0x40) on a group envelope, each when given
+    /// (REACTIONS-DESIGN.md §4). False, logged, when the library refuses either.
+    private func setPostIdAndReaction(_ handle: UInt64, postId: String?,
+                                      reaction: (to: Data, content: String)?, for target: String) -> Bool {
+        if let postId, !LxmfClient.messageSetGroupPostId(handle, postId) {
+            print("[GroupChat] the post id for \(target.prefix(8)) could not be set, not sent: \(LxmfClient.lastError ?? "unknown")")
+            return false
+        }
+        if let reaction, !LxmfClient.messageSetReaction(handle, to: reaction.to, content: reaction.content) {
+            print("[GroupChat] the reaction for \(target.prefix(8)) could not be set, not sent: \(LxmfClient.lastError ?? "unknown")")
+            return false
+        }
+        return true
+    }
 
     private func destroyAfterSend(client: LxmfClient, handle: UInt64) {
         if client.sendMessageViaAppLinks(handle) {

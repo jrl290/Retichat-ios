@@ -424,8 +424,10 @@ final class DistroOutboxRuntime: ObservableObject {
     /// The §17.11 sent copy of a message this device just sent as the distro to
     /// `recipient`: the same text, from D to D, with the recipient (0xFC) and this
     /// device's address (0xFD), packed and signed once and owed until the node proves
-    /// it. Never throws.
-    func oweSentCopy(recipient: Data, title: String, content: String) async {
+    /// it. REACTIONS-DESIGN.md §5.2: also M's own LXMF hash `sentHash` (64 hex) as
+    /// SENT_HASH (0xD1 key 12), and M's 0x40 unchanged when M is a reaction. Never throws.
+    func oweSentCopy(recipient: Data, title: String, content: String, sentHash: String,
+                     reaction: (to: Data, content: String)? = nil) async {
         guard let (distro, signer) = DistroManager.shared.signing() else { return }
         guard let outbox = ensureOutbox() else { return }
         refreshNode()
@@ -441,6 +443,8 @@ final class DistroOutboxRuntime: ObservableObject {
             DistroMessageFFI.addField(handle, key: LxmfFieldKey.customType, value: DistroSent.customType)
                 && DistroMessageFFI.addField(handle, key: LxmfFieldKey.customData, value: recipientHex)
                 && DistroMessageFFI.addField(handle, key: LxmfFieldKey.customMeta, value: deviceHex)
+                && LxmfClient.messageSetSentHash(handle, sentHash)
+                && (reaction.map { LxmfClient.messageSetReaction(handle, to: $0.to, content: $0.content) } ?? true)
         }) else {
             fail("A sent message was not copied to the distro: the copy could not be made")
             return
