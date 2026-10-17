@@ -1088,7 +1088,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             }
 
             // REACTIONS-DESIGN.md §3, as on the router's path: never a bubble, chat or contact.
-            if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: msg.timestamp, path: "importNSEMessages") {
+            // Never notified here, as a message from the NSE is not: the NSE decided (nseShows).
+            if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: msg.timestamp, path: "importNSEMessages",
+                            notify: false) {
                 continue
             }
 
@@ -1683,44 +1685,71 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     // MARK: - Reactions (REACTIONS-DESIGN.md, approved by James 2026-10-17)
 
     /// §3, on every receive path: true when `fields` make the message a reaction, which the
-    /// caller then stops on: no bubble, no notification, no unread, the chat list order unchanged,
-    /// and never a new chat or contact. A reaction is applied to its target in `chatId` (the chat
-    /// it came in on) as `reactor`'s at `timestamp`; one this client refuses, or whose target is
-    /// not in that chat, is dropped with one log line.
+    /// caller then stops on: no bubble, no unread, the chat list order unchanged, and never a new
+    /// chat or contact. A reaction is applied to its target in `chatId` (the chat it came in on)
+    /// as `reactor`'s at `timestamp`; one this client refuses, or whose target is not in that
+    /// chat, is dropped with one log line. When it changed something it is notified
+    /// (notifyReaction) unless `notify` is false: the NSE decided it already, or it is the user's
+    /// own. `countedHash`: the LXMF hash the NSE records a Group message it showed under.
     private func tookReaction(_ fields: LxmfFields, chatId: String, inGroup: Bool = false, reactor: String,
-                              timestamp: Double, path: String) -> Bool {
+                              timestamp: Double, path: String, notify: Bool, countedHash: String? = nil) -> Bool {
         switch fields.reaction {
         case nil:
             return false
         case .refused(let why)?:
             print("[Reactions] \(path): reaction from \(reactor.prefix(8)) in \(chatId.prefix(8)) dropped: \(why)")
         case .react(let to, let content)?:
-            applyReaction(to: to, content: content, chatId: chatId, inGroup: inGroup, reactor: reactor,
-                          timestamp: timestamp, path: path)
+            if let target = applyReaction(to: to, content: content, chatId: chatId, inGroup: inGroup,
+                                          reactor: reactor, timestamp: timestamp, path: path), notify {
+                notifyReaction(target, emoji: content, chatId: chatId, reactor: reactor, countedHash: countedHash)
+            }
         }
         return true
     }
 
+    /// §3 "Notifications" (James, 2026-10-17): someone else's `emoji` on the user's own message
+    /// `target` is notified as a message from `reactor` in `chatId` would be, worded with it
+    /// (ReactionNotice). Not a take-back, not on someone else's message, not from an address the
+    /// user sends this chat as; not a Group reaction the NSE already showed (`countedHash`).
+    private func notifyReaction(_ target: MessageEntity, emoji: String, chatId: String, reactor: String,
+                                countedHash: String?) {
+        guard !emoji.isEmpty, target.isOutgoing, let ctx = modelContext else { return }
+        let byId = FetchDescriptor<ChatEntity>(predicate: #Predicate { $0.id == chatId })
+        guard let chat = try? ctx.fetch(byId).first, !reactionSelf(chat).contains(reactor) else { return }
+        if let countedHash, PendingNotification.takeNSECountedGroupHash(countedHash) {
+            print("[Reactions] reaction \(countedHash.prefix(8)) was shown by the notification service: not notified again")
+            return
+        }
+        let name = contactDisplayName(for: reactor)
+        notifManager.postMessageNotification(
+            chatId: chatId,
+            senderName: chat.isGroup ? "\(name) (\(chat.groupName ?? "Group"))" : name,
+            content: ReactionNotice.text(emoji: emoji, quote: ReactionNotice.quote(target.content)))
+    }
+
     /// apply_reaction (§3) to the message `to` names in `chatId`: a newer reaction from `reactor`
     /// replaces theirs, an older or repeated one changes nothing, and "" is kept as a removal.
+    /// Returns the target when it changed, so a repeat is never notified twice.
+    @discardableResult
     private func applyReaction(to: Data, content: String, chatId: String, inGroup: Bool, reactor: String,
-                               timestamp: Double, path: String) {
+                               timestamp: Double, path: String) -> MessageEntity? {
         guard let ctx = modelContext else {
             print("[Reactions] \(path): reaction from \(reactor.prefix(8)) dropped: modelContext is nil")
-            return
+            return nil
         }
         let toHex = Reactions.hex(to)
         guard let target = reactionTarget(chatId: chatId, inGroup: inGroup, toHex: toHex) else {
             print("[Reactions] \(path): reaction dropped: target \(toHex.prefix(16)) not in \(chatId.prefix(8))")
-            return
+            return nil
         }
         guard let json = Reactions.apply(target.reactionsJson, reactor: reactor, emoji: content,
                                          atMs: Reactions.ms(timestamp)) else {
             print("[Reactions] \(path): reaction from \(reactor.prefix(8)) on \(toHex.prefix(8)) not applied: one as new or newer is held")
-            return
+            return nil
         }
         target.reactionsJson = json
         try? ctx.save()
+        return target
     }
 
     /// find_target (§3): the message `toHex` names, looked for in `chatId` only, so a reactor
@@ -2469,8 +2498,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         print("[Retichat] handleIncomingMessage: ACCEPTED reason=\(allowlist.debugLabel) src=\(srcHex.prefix(8))")
 
         // REACTIONS-DESIGN.md §3: a reaction is applied to its target in this chat, or dropped
-        // with its log line; never a bubble, a notification, unread, or a new chat or contact.
-        if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: timestamp, path: "handleIncomingMessage") {
+        // with its log line; never a bubble, unread, or a new chat or contact.
+        if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: timestamp, path: "handleIncomingMessage",
+                        notify: true) {
             return
         }
 
@@ -2565,7 +2595,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // REACTIONS-DESIGN.md §3: a reaction to the distro names a message of the chat with its
         // source; it is never stored, and makes no contact.
         let fields = LxmfFieldsDecoder.decode(m.fields ?? Data())
-        if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: m.timestamp, path: "handleDistroMessage") {
+        if tookReaction(fields, chatId: srcHex, reactor: srcHex, timestamp: m.timestamp, path: "handleDistroMessage",
+                        notify: !m.shownByNSE) {
             return
         }
         let (content, attachments) = DistroMessageStore.stored(m)
@@ -2605,7 +2636,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // (reactor the distro) to its target in the chat with the recipient; no bubble.
         let fields = LxmfFieldsDecoder.decode(c.fields ?? Data())
         if tookReaction(fields, chatId: c.recipientHex, reactor: distroHex, timestamp: c.timestamp,
-                        path: "handleDistroSentCopy") {
+                        path: "handleDistroSentCopy", notify: false) {
             return
         }
         var content = c.content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2709,7 +2740,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             let author = groupAuthor(fields: fields, sourceHex: srcHex, standing: standing, signature: signature)
             // REACTIONS-DESIGN.md §4: a Group reaction is attributed as a post is (GROUP_SENDER
             // when relayed, the same member rules) and names its target by post id, in this group.
-            if tookReaction(fields, chatId: chat.id, inGroup: true, reactor: author, timestamp: timestamp, path: "group") {
+            if tookReaction(fields, chatId: chat.id, inGroup: true, reactor: author, timestamp: timestamp, path: "group",
+                            notify: true, countedHash: hash.hexString) {
                 return
             }
             handleGroupChatMessage(hash: hash, content: content, timestamp: timestamp, fields: fields,
@@ -3631,6 +3663,31 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // GROUPS-DISTRO-DESIGN.md §6.7: the groups, the filter, the inviters it lets through and
         // the closed ids, for the NSE's group notifications, on every change.
         writeNSEGroupsNow()
+        writeNSESentQuotes(groups: Set(chatEntities.filter(\.isGroup).map(\.id)))
+    }
+
+    /// REACTIONS-DESIGN.md §3 "Notifications": nse_sent_quotes.json, the user's newest sends a
+    /// reaction can name (ReactionNotice.sentQuotesLimit), quoted, so the NSE can word a reaction
+    /// to one. Written when they change (file I/O off the main actor). `groups`: the Group chats.
+    private var lastNSESentQuotes: [String: String]? = nil
+
+    private func writeNSESentQuotes(groups: Set<String>) {
+        guard let ctx = modelContext else { return }
+        var desc = FetchDescriptor<MessageEntity>(predicate: #Predicate { $0.isOutgoing == true },
+                                                  sortBy: [SortDescriptor(\.timestamp, order: .reverse)])
+        desc.fetchLimit = ReactionNotice.sentQuotesLimit
+        guard let sent = try? ctx.fetch(desc) else { return }
+        var quotes: [String: String] = [:]
+        for m in sent {
+            guard let target = Reactions.target(isGroup: groups.contains(m.chatId), id: m.id,
+                                                lxmfHash: m.lxmfHash, postId: m.postId) else { continue }
+            quotes[ReactionNotice.key(chatId: m.chatId, target: Reactions.hex(target))] = ReactionNotice.quote(m.content)
+        }
+        guard quotes != lastNSESentQuotes else { return }
+        lastNSESentQuotes = quotes
+        Task.detached(priority: .utility) {
+            PendingNotification.writeNSESentQuotes(quotes)
+        }
     }
 
     /// §6.7: nse_groups.json, written now (file I/O off the main actor). Every refresh writes it,

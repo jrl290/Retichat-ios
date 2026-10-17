@@ -9,10 +9,12 @@
 //  - apply_reaction's ordering (a newer t wins, an equal or older one is ignored, a removal is kept
 //    as "e": ""), the chips, the toggle, the target a message names and the Group post id;
 //  - the `react` group sync's form check, its step and its writer JSON;
-//  - an NSE run that stores a reaction for the app but never shows it;
+//  - a reaction's notification (§3 "Notifications"): its words, the quote and where the NSE finds
+//    it; an NSE run that stores every reaction for the app and shows only one it can word;
 //  - the wiring, on the source: every receive path checks for a reaction before anything is stored,
-//    notified, counted or reordered; the target is looked for only in the chat the reaction came
-//    in on; the NSE never shows one; the sends carry what §4 and §5 say.
+//    counted or reordered; the target is looked for only in the chat the reaction came in on;
+//    someone else's reaction to the user's own message is notified once, by the app or the NSE;
+//    the sends carry what §4 and §5 say.
 // tests/ReactionsFFITests.swift runs the same fields through the real library.
 //
 // Run from the workspace root with:
@@ -286,7 +288,46 @@ func theReactGroupSyncIsCheckedAppliedOnlyInAJoinedGroupAndWritten() {
 
 // MARK: - The NSE
 
-func anNSERunStoresAReactionButNeverShowsIt() {
+func aReactionsNotificationCitesTheUsersMessage() {
+    checkEqual(ReactionNotice.text(emoji: "👍", quote: "Hi there"), "Reacted 👍 to \"Hi there\"", "the words")
+    checkEqual(ReactionNotice.text(emoji: "😂", quote: ""), "Reacted 😂 to your attachment", "a message with no text")
+    checkEqual(ReactionNotice.quote("  See you\nat 6\n\ttomorrow "), "See you at 6 tomorrow", "the quote is one line")
+    let exact = String(repeating: "x", count: ReactionNotice.quoteMax)
+    checkEqual(ReactionNotice.quote(exact), exact, "kept whole at its length")
+    checkEqual(ReactionNotice.quote(exact + "y"), exact + "…", "and cut past it")
+    let family = "👨‍👩‍👧"
+    checkEqual(ReactionNotice.quote(String(repeating: family, count: ReactionNotice.quoteMax + 1)),
+               String(repeating: family, count: ReactionNotice.quoteMax) + "…", "an emoji counts as one, never split")
+    checkEqual(ReactionNotice.quote(String(repeating: "a", count: ReactionNotice.quoteMax - 1) + " bc"),
+               String(repeating: "a", count: ReactionNotice.quoteMax - 1) + "…", "no space before the …")
+
+    // Where the NSE finds it: the chat the reaction came in on, and the target it names.
+    let peer = String(repeating: "a", count: 32), gid = String(repeating: "b", count: 32)
+    let hash = Data(repeating: 0xef, count: 32), postId = Data(repeating: 0x0f, count: 16)
+    let quotes = [ReactionNotice.key(chatId: peer.uppercased(), target: String(repeating: "EF", count: 32)): "Hi there",
+                  ReactionNotice.key(chatId: gid, target: String(repeating: "0f", count: 16)): ""]
+    checkEqual(ReactionNotice.text(for: .react(to: hash, content: "👍"), chatId: peer, quotes: quotes),
+               "Reacted 👍 to \"Hi there\"", "a direct chat's, by its LXMF hash")
+    checkEqual(ReactionNotice.text(for: .react(to: postId, content: "❤️"), chatId: gid, quotes: quotes),
+               "Reacted ❤️ to your attachment", "a Group's, by its post id")
+    check(ReactionNotice.text(for: .react(to: hash, content: ""), chatId: peer, quotes: quotes) == nil, "never a take-back")
+    check(ReactionNotice.text(for: .react(to: hash, content: "👍"), chatId: gid, quotes: quotes) == nil,
+          "only in the chat it came in on")
+    check(ReactionNotice.text(for: .react(to: Data(repeating: 1, count: 32), content: "👍"), chatId: peer, quotes: quotes) == nil,
+          "not a message among the user's newest sends")
+    check(ReactionNotice.text(for: .refused("x"), chatId: peer, quotes: quotes) == nil
+            && ReactionNotice.text(for: nil, chatId: peer, quotes: quotes) == nil, "nor anything but a reaction")
+
+    // The app keeps the quotes for the NSE, its newest sends, when they change.
+    let write = body(repo, "private func writeNSESentQuotes(")
+    check(write.contains("#Predicate { $0.isOutgoing == true }") && write.contains("desc.fetchLimit = ReactionNotice.sentQuotesLimit")
+            && write.contains("Reactions.target(isGroup: groups.contains(m.chatId)")
+            && write.contains("ReactionNotice.key(chatId: m.chatId, target: Reactions.hex(target))] = ReactionNotice.quote(m.content)")
+            && write.contains("guard quotes != lastNSESentQuotes else { return }"), "the quotes the app writes")
+    check(body(repo, "func refreshChats()").contains("writeNSESentQuotes(groups:"), "on every refresh")
+}
+
+func anNSERunStoresEveryReactionAndShowsOnlyOneItCanWord() {
     func message(_ n: Int, _ t: Double, quiet: Bool) -> PendingNotification.NSEMessage {
         PendingNotification.NSEMessage(messageHash: String(format: "%032x", n), senderHash: String(format: "%032x", n + 100),
                                        destHash: String(repeating: "d", count: 32), title: "", content: quiet ? "" : "m\(n)",
@@ -314,14 +355,24 @@ func anNSERunStoresAReactionButNeverShowsIt() {
           "the NSE drops a refused reaction, as the app does")
     check(nse.contains("PendingNotification.NSERun(prepare: nseHandOffForm, shows: nseShows)"), "every run asks nseShows")
     let shows = body(nse, "private func nseShows(")
-    check(shows.contains(".reaction == nil else {") && shows.contains("return false"), "nseShows: never a reaction")
+    check(shows.contains("guard fields.reaction != nil else { return true }")
+            && before(shows, "guard let notice = nseReactionNotice(msg, fields: fields) else {", "return false"),
+          "nseShows: a reaction only as nseReactionNotice words it")
+    check(shows.contains("if notice.group != nil { PendingNotification.recordNSECountedGroupHashes([msg.messageHash]) }"),
+          "a Group reaction shown is counted, so the app does not notify it again")
+    let notice = body(nse, "private func nseReactionNotice(")
+    check(before(notice, "guard case .post(let id, let name) = outcome else { return nil }", "ReactionNotice.text(for: fields.reaction, chatId: group?.id ?? msg.senderHash,"),
+          "in a Group only where a post from its source would show, and in that Group")
+    check(nse.contains("if decoded.reaction != nil, let notice = nseReactionNotice(m, fields: decoded) {")
+            && nse.contains("notice.group?.id ?? m.senderHash,") && nse.contains("notice.group.map { \"\\(title) (\\($0.name))\" } ?? title))"),
+          "the newest, a reaction, in its words, a Group's titled and threaded as a post")
     check(nse.contains("} else if summary.dropped > 0 || summary.quiet > 0 || distro.pulled > 0 || channelPull.pulled > 0 {"),
-          "reactions alone suppress the alert")
+          "reactions not shown, alone, suppress the alert")
     let pull = body(source("NotificationService/NSEDistroPull.swift"), "private static func unwrapToShow(")
-    check(before(pull, "if fields.reaction != nil {", "shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: false"),
-          "the distro pull never shows a Group reaction")
-    check(before(pull, ").reaction != nil {", "return Shown(senderHash: m.source_hash.lowercased(), title: m.title ?? \"\","),
-          "nor a direct one")
+    check(before(pull, "} else if let text = ReactionNotice.text(for: fields.reaction, chatId: groupId,", "group reaction from %@ not shown"),
+          "the distro pull shows a Group reaction only as ReactionNotice words it")
+    check(before(pull, "guard let text = ReactionNotice.text(for: reaction, chatId: m.source_hash,", "return Shown(senderHash: m.source_hash.lowercased(), title: m.title ?? \"\","),
+          "and a direct one")
 }
 
 // MARK: - The wiring
@@ -339,8 +390,8 @@ func everyReceivePathChecksForAReactionBeforeItStoresAnything() {
     check(incoming.contains("let nameField = fields.reaction == nil ? LxmfClient.decodeDisplayName(fieldsRaw: fieldsRaw) : .absent"),
           "and never takes a name from a reaction")
     let distro = body(repo, "private func handleDistroMessage(")
-    check(before(distro, "path: \"handleDistroMessage\")", "DistroMessageStore.stored(m)")
-            && before(distro, "path: \"handleDistroMessage\")", "storeIncomingDirect("), "handleDistroMessage")
+    check(before(distro, "path: \"handleDistroMessage\",", "DistroMessageStore.stored(m)")
+            && before(distro, "path: \"handleDistroMessage\",", "storeIncomingDirect("), "handleDistroMessage")
     let sent = body(repo, "private func handleDistroSentCopy(")
     check(before(sent, "if tookReaction(fields, chatId: c.recipientHex, reactor: distroHex,", "MessageEntity("),
           "handleDistroSentCopy: reactor D, in the chat with the recipient, before it stores")
@@ -363,6 +414,29 @@ func everyReceivePathChecksForAReactionBeforeItStoresAnything() {
     check(relay.contains("let postId = fields.groupPostId") && relay.contains("postId: postId,")
             && relay.contains("reaction: reaction,"), "a relay carries the post id and the reaction")
     check(relay.contains("not relayed: reaction dropped:"), "a reaction this client refuses is not relayed")
+}
+
+func someoneElsesReactionToTheUsersMessageIsNotifiedOnce() {
+    let took = body(repo, "private func tookReaction(")
+    check(took.contains("reactor: reactor, timestamp: timestamp, path: path), notify {")
+            && took.contains("notifyReaction(target, emoji: content, chatId: chatId, reactor: reactor, countedHash: countedHash)"),
+          "notified only when applied (a repeat changes nothing) and asked for")
+    let notify = body(repo, "private func notifyReaction(")
+    check(notify.contains("guard !emoji.isEmpty, target.isOutgoing, let ctx = modelContext else { return }"),
+          "never a take-back, never on someone else's message")
+    check(notify.contains("!reactionSelf(chat).contains(reactor) else { return }"), "never the user's own")
+    check(before(notify, "PendingNotification.takeNSECountedGroupHash(countedHash)", "notifManager.postMessageNotification("),
+          "never a Group reaction the NSE showed")
+    check(notify.contains("senderName: chat.isGroup ? \"\\(name) (\\(chat.groupName ?? \"Group\"))\" : name,")
+            && notify.contains("content: ReactionNotice.text(emoji: emoji, quote: ReactionNotice.quote(target.content)))"),
+          "titled as a message from the reactor would be, worded with the message")
+    // Each path says whether the app notifies: the NSE decided what it delivered.
+    check(body(repo, "private func handleIncomingMessage(").contains("path: \"handleIncomingMessage\",\n                        notify: true)"), "live: notified")
+    check(body(repo, "private func handleDistroMessage(").contains("notify: !m.shownByNSE)"), "the distro: unless the NSE pulled it")
+    check(body(repo, "private func handleDistroSentCopy(").contains("path: \"handleDistroSentCopy\", notify: false)"), "the user's own: never")
+    check(body(repo, "func importNSEMessages()").contains("path: \"importNSEMessages\",\n                            notify: false)"), "from the NSE: never")
+    check(body(repo, "private func handleGroupMessage(").contains("notify: true, countedHash: hash.hexString)"),
+          "a Group: unless the NSE counted it")
 }
 
 func theTargetIsLookedForOnlyInTheChatTheReactionCameIn() {
@@ -412,7 +486,9 @@ let allTests: [(String, () -> Void)] = [
     ("the chips are grouped, counted and marked mine", theChipsAreGroupedCountedAndMarkedMine),
     ("the target is the post id in a Group and the LXMF hash in a direct chat", theTargetIsThePostIdInAGroupAndTheLxmfHashInADirectChat),
     ("the react group sync is checked, applied only in a joined group, and written", theReactGroupSyncIsCheckedAppliedOnlyInAJoinedGroupAndWritten),
-    ("an NSE run stores a reaction but never shows it", anNSERunStoresAReactionButNeverShowsIt),
+    ("a reaction's notification cites the user's message", aReactionsNotificationCitesTheUsersMessage),
+    ("an NSE run stores every reaction and shows only one it can word", anNSERunStoresEveryReactionAndShowsOnlyOneItCanWord),
+    ("someone else's reaction to the user's message is notified once", someoneElsesReactionToTheUsersMessageIsNotifiedOnce),
     ("every receive path checks for a reaction before it stores anything", everyReceivePathChecksForAReactionBeforeItStoresAnything),
     ("the target is looked for only in the chat the reaction came in", theTargetIsLookedForOnlyInTheChatTheReactionCameIn),
     ("the sends carry what §4 and §5 say", theSendsCarryWhatSectionsFourAndFiveSay),

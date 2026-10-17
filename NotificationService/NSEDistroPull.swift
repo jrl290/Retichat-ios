@@ -326,13 +326,18 @@ enum NSEDistroPull {
                 shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: true, hash: m.hash ?? "")
                 content = "Group invitation: \(groupName)"
             case .post(let groupId, let groupName):
-                // REACTIONS-DESIGN.md §5: a reaction to a post is never shown; the app applies it.
-                if fields.reaction != nil {
+                shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: false, hash: m.hash ?? "")
+                if fields.reaction == nil {
+                    content = m.content ?? ""
+                } else if let text = ReactionNotice.text(for: fields.reaction, chatId: groupId,
+                                                         quotes: PendingNotification.readNSESentQuotes()) {
+                    // REACTIONS-DESIGN.md §3 "Notifications": someone else's reaction to one of the
+                    // user's posts, worded with it. The app applies every one when it pulls.
+                    content = text
+                } else {
                     NSLog("[NSE] distro pull: group reaction from %@ not shown", String(m.source_hash.prefix(8)))
                     return nil
                 }
-                shownGroup = ShownGroup(groupId: groupId, groupName: groupName, isInvite: false, hash: m.hash ?? "")
-                content = m.content ?? ""
             }
             return Shown(senderHash: m.source_hash.lowercased(), title: "", content: content, timestamp: m.timestamp,
                          displayName: DisplayNames.distroNameField(state: m.display_name_state, name: m.display_name),
@@ -345,13 +350,21 @@ enum NSEDistroPull {
         if m.sent_by != nil || !(m.distro_transfer_key ?? "").isEmpty || m.is_delivery_notification {
             return nil
         }
-        // REACTIONS-DESIGN.md §5: a reaction is never shown; the app applies it when it pulls.
-        if LxmfFieldsDecoder.decode(m.fields.flatMap { Data(base64Encoded: $0) } ?? Data()).reaction != nil {
-            NSLog("[NSE] distro pull: reaction from %@ not shown", String(m.source_hash.prefix(8)))
-            return nil
+        // REACTIONS-DESIGN.md §3 "Notifications": a reaction is shown only as someone else's to one
+        // of the user's own messages in the chat with its source, worded with it. The app applies
+        // every one when it pulls.
+        var content = m.content ?? ""
+        let reaction = LxmfFieldsDecoder.decode(m.fields.flatMap { Data(base64Encoded: $0) } ?? Data()).reaction
+        if reaction != nil {
+            guard let text = ReactionNotice.text(for: reaction, chatId: m.source_hash,
+                                                 quotes: PendingNotification.readNSESentQuotes()) else {
+                NSLog("[NSE] distro pull: reaction from %@ not shown", String(m.source_hash.prefix(8)))
+                return nil
+            }
+            content = text
         }
         return Shown(senderHash: m.source_hash.lowercased(), title: m.title ?? "",
-                     content: m.content ?? "", timestamp: m.timestamp,
+                     content: content, timestamp: m.timestamp,
                      displayName: DisplayNames.distroNameField(state: m.display_name_state, name: m.display_name),
                      unverifiedReason: DisplayNames.distroReason(validated: m.signature_validated,
                                                                  unverifiedReason: m.unverified_reason))

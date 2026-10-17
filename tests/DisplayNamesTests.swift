@@ -825,7 +825,7 @@ func testTheSurfaces() {
     let service = source("NotificationService/NotificationService.swift")
     check(service.contains("DisplayNames.notificationName(") && !service.contains("senderName = msg.title"),
           "NSE titles use the resolver order and never the LXMF title (audit M3)")
-    check(service.contains("messageTime: timestamp,") && service.contains("reason,\n                                            m.timestamp)))")
+    check(service.contains("messageTime: timestamp,") && service.contains("reason,\n                                     m.timestamp)")
             && service.contains("let title = contactTitle($0.senderHash, $0.displayName, $0.unverifiedReason, $0.timestamp)"),
           "each NSE title is decided with its message's timestamp, from the sync and the distro pull")
     check(service.contains("PendingNotification.readChannelSenderNames()[channelPull.channelHex]"),

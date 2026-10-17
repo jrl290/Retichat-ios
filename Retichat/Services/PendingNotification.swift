@@ -870,6 +870,32 @@ nonisolated enum PendingNotification {
         }
     }
 
+    // MARK: - The user's sends, for reaction notifications (REACTIONS-DESIGN.md §3 "Notifications")
+
+    private static let nseSentQuotesFile = "nse_sent_quotes.json"
+
+    /// App side: the user's newest sends as ReactionNotice quotes them, under ReactionNotice.key,
+    /// for the NSE's reaction notifications (ChatRepository.refreshChats, when they change).
+    @discardableResult
+    static func writeNSESentQuotes(_ quotes: [String: String], in dir: URL? = nil) -> Bool {
+        guard let dir = dir ?? containerURL, let data = try? JSONEncoder().encode(quotes) else { return false }
+        do {
+            try data.write(to: dir.appendingPathComponent(nseSentQuotesFile), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// NSE side: empty when the app has not written it (an older build): the NSE then shows no
+    /// reaction, and the app decides when it runs.
+    static func readNSESentQuotes(in dir: URL? = nil) -> [String: String] {
+        guard let dir = dir ?? containerURL,
+              let data = try? Data(contentsOf: dir.appendingPathComponent(nseSentQuotesFile)),
+              let quotes = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return quotes
+    }
+
     /// App side: whether the NSE counted the group message `hash` in a notification; taken
     /// (forgotten) when it did, so each is asked once.
     static func takeNSECountedGroupHash(_ hash: String, in dir: URL? = nil) -> Bool {
@@ -973,5 +999,45 @@ nonisolated enum NSEGroupShow {
         default:
             return .nothing
         }
+    }
+}
+
+/// A reaction's notification (REACTIONS-DESIGN.md §3 "Notifications"; James, 2026-10-17): someone
+/// else's reaction to one of the user's own messages, worded with the message it was given to.
+/// The app and the NSE word it alike; the NSE finds the message among the user's newest sends,
+/// which the app keeps for it (nse_sent_quotes.json).
+nonisolated enum ReactionNotice {
+    /// How many characters of the message a notification quotes.
+    static let quoteMax = 80
+    /// How many of the user's newest sends the NSE can quote.
+    static let sentQuotesLimit = 200
+
+    /// `content` as a notification quotes it: on one line, cut to quoteMax characters as a
+    /// reader counts them (an emoji is one), with "…" when cut.
+    static func quote(_ content: String) -> String {
+        let line = content.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard line.count > quoteMax else { return line }
+        return String(line.prefix(quoteMax)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// `Reacted 👍 to "Hi there"`, or `Reacted 👍 to your attachment` for a message with no text.
+    static func text(emoji: String, quote: String) -> String {
+        quote.isEmpty ? "Reacted \(emoji) to your attachment" : "Reacted \(emoji) to \"\(quote)\""
+    }
+
+    /// Where a quote is kept: the chat a reaction to it comes in on (the peer, or the Group id)
+    /// and the target the reaction names (the LXMF hash, or the post id), as lowercase hex.
+    static func key(chatId: String, target: String) -> String {
+        chatId.lowercased() + " " + target.lowercased()
+    }
+
+    /// The NSE's text for `reaction` arriving in `chatId`, or nil when it shows none: not a
+    /// reaction, a take-back, or a message not among the user's newest sends in `quotes` (so
+    /// not theirs, or too old to quote).
+    static func text(for reaction: Reaction?, chatId: String, quotes: [String: String]) -> String? {
+        guard case .react(let to, let emoji)? = reaction, !emoji.isEmpty else { return nil }
+        let target = to.map { String(format: "%02x", $0) }.joined()
+        guard let quote = quotes[key(chatId: chatId, target: target)] else { return nil }
+        return text(emoji: emoji, quote: quote)
     }
 }

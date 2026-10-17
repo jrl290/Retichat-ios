@@ -94,15 +94,41 @@ private func nseHandOffForm(_ msg: PendingNotification.NSEMessage) -> PendingNot
     return msg.strippedForDistroTransfer(.lost)
 }
 
-/// Whether a stored message may be the notification: a reaction never is (REACTIONS-DESIGN.md
-/// §5). It is stored for the app, which applies it to its message on import.
+/// Whether a stored message may be the notification: a reaction only as nseReactionNotice words
+/// it (REACTIONS-DESIGN.md §3 "Notifications"). Every reaction is stored for the app, which
+/// applies it to its message on import. A Group reaction shown is recorded as counted, as the
+/// distro pull's posts are, so the app does not notify it again.
 private func nseShows(_ msg: PendingNotification.NSEMessage) -> Bool {
-    guard LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data()).reaction == nil else {
+    let fields = LxmfFieldsDecoder.decode(Data(base64Encoded: msg.fieldsRawBase64) ?? Data())
+    guard fields.reaction != nil else { return true }
+    guard let notice = nseReactionNotice(msg, fields: fields) else {
         NSLog("[NSE] reaction %@ from %@ stored for the app, not shown",
               String(msg.messageHash.prefix(8)), String(msg.senderHash.prefix(8)))
         return false
     }
+    if notice.group != nil { PendingNotification.recordNSECountedGroupHashes([msg.messageHash]) }
     return true
+}
+
+/// A synced reaction as its notification (REACTIONS-DESIGN.md §3 "Notifications"): someone
+/// else's reaction to one of the user's newest sends, worded with it (ReactionNotice). In a Group
+/// only where NSEGroupShow would show a post from its source, in that Group. Nil when it is not
+/// shown.
+private func nseReactionNotice(_ msg: PendingNotification.NSEMessage, fields: LxmfFields)
+    -> (text: String, group: (id: String, name: String)?)? {
+    var group: (id: String, name: String)? = nil
+    if fields.groupId != nil {
+        let outcome = NSEGroupShow.decide(
+            isGroupSync: false, groupId: fields.groupId, action: fields.groupAction, groupName: nil,
+            members: [], source: msg.senderHash, groupSender: fields.groupSender,
+            signatureValidated: msg.signatureValid, unverifiedReason: msg.unverifiedReason, distro: "",
+            file: PendingNotification.readNSEGroups())
+        guard case .post(let id, let name) = outcome else { return nil }
+        group = (id, name)
+    }
+    guard let text = ReactionNotice.text(for: fields.reaction, chatId: group?.id ?? msg.senderHash,
+                                         quotes: PendingNotification.readNSESentQuotes()) else { return nil }
+    return (text, group)
 }
 
 // MARK: - C callback trampoline
@@ -395,9 +421,17 @@ class NotificationService: UNNotificationServiceExtension {
         if let m = summary.newest {
             let fields = Data(base64Encoded: m.fieldsRawBase64) ?? Data()
             let reason = m.unverifiedReason ?? (m.signatureValid ? 0 : 2)
-            candidates.append((m.senderHash, m.content, m.timestamp, m.messageHash, m.senderHash,
-                               contactTitle(m.senderHash, LxmfClient.decodeDisplayName(fieldsRaw: fields), reason,
-                                            m.timestamp)))
+            let title = contactTitle(m.senderHash, LxmfClient.decodeDisplayName(fieldsRaw: fields), reason,
+                                     m.timestamp)
+            // A reaction nseShows let through, in its words; a Group's titled and threaded as a post.
+            let decoded = LxmfFieldsDecoder.decode(fields)
+            if decoded.reaction != nil, let notice = nseReactionNotice(m, fields: decoded) {
+                candidates.append((m.senderHash, notice.text, m.timestamp, m.messageHash,
+                                   notice.group?.id ?? m.senderHash,
+                                   notice.group.map { "\(title) (\($0.name))" } ?? title))
+            } else {
+                candidates.append((m.senderHash, m.content, m.timestamp, m.messageHash, m.senderHash, title))
+            }
         }
         // A group message from the distro pull (GROUPS-DISTRO-DESIGN.md §6.7) opens its group:
         // its thread and chatId are the group id; a post is titled "<sender> (<group name>)" as
@@ -489,7 +523,7 @@ class NotificationService: UNNotificationServiceExtension {
             NSLog("[NSE] channel pull incomplete — showing generic alert after %ds", elapsed)
 
         } else if summary.dropped > 0 || summary.quiet > 0 || distro.pulled > 0 || channelPull.pulled > 0 {
-            // Only distro sent copies, transfers, receipts or reactions, or channel
+            // Only distro sent copies, transfers, receipts or reactions not shown, or channel
             // messages that are not to be shown (the channel's Notifications
             // toggle is off, or no signature verified), arrived: nothing to
             // show (the app files them on import).

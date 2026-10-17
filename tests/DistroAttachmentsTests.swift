@@ -231,7 +231,7 @@ func testTheWiring() {
     let nse = source("NotificationService/NSEDistroPull.swift")
     let show = body(nse, "private static func unwrapToShow(")
     check(show.contains("if m.sent_by != nil || !(m.distro_transfer_key ?? \"\").isEmpty || m.is_delivery_notification {")
-            && show.contains("content: m.content ?? \"\""),
+            && show.contains("var content = m.content ?? \"\"") && show.contains("content: content, timestamp: m.timestamp,"),
           "the NSE shows a captionless photo (not a delivery notification since 06c40e1), its body the empty text")
     let service = source("NotificationService/NotificationService.swift")
     check(service.contains("let body = others == 0 ? msg.content")
