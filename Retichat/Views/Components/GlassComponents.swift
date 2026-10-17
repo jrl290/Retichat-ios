@@ -155,12 +155,19 @@ struct ChatBubble: View {
         .contextMenu {
             if offersReactions, let onReact {
                 // The quick reactions as one row at the top of the menu (§7).
+                // A palette draws only each button's image, never its text, so each
+                // emoji goes as an image too; the text stays for VoiceOver.
                 ControlGroup {
                     ForEach(Reactions.quick, id: \.self) { emoji in
                         Button {
                             onReact(emoji)
                         } label: {
-                            Text(emoji)
+                            Label {
+                                Text(emoji)
+                            } icon: {
+                                Image(uiImage: paletteImage(emoji))
+                                    .renderingMode(.original)
+                            }
                         }
                     }
                 }
@@ -184,6 +191,16 @@ struct ChatBubble: View {
         .sheet(item: $sharedAttachment) { attachment in
             ShareSheet(items: shareItems(for: attachment))
         }
+    }
+
+    /// `emoji` drawn as an image for the reaction palette, in its own colours (a menu would
+    /// otherwise tint it as a template, one solid shape).
+    private func paletteImage(_ emoji: String) -> UIImage {
+        let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 28)]
+        let text = emoji as NSString
+        return UIGraphicsImageRenderer(size: text.size(withAttributes: attributes)).image { _ in
+            text.draw(at: .zero, withAttributes: attributes)
+        }.withRenderingMode(.alwaysOriginal)
     }
 
     /// The chips under the bubble (§3 "Display"): each reaction with how many gave it, marked when
