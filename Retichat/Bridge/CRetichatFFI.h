@@ -501,6 +501,14 @@ int32_t lxmf_message_set_retichat_string(uint64_t msg, int32_t key, const char *
 /// As lxmf_message_set_retichat_string, for a bool entry; `value` non-zero
 /// is true.
 int32_t lxmf_message_set_retichat_bool(uint64_t msg, int32_t key, int32_t value);
+/// Make a message a reaction (upstream FIELD_REACTION 0x40,
+/// REACTIONS-DESIGN.md): the fields get {0x40: {0x00: bin to, 0x01: bin
+/// content}}. `to` is `to_len` bytes: the target's 32-byte LXMF hash or, in a
+/// Group, its 16-byte post id. `content` is non-NULL UTF-8, at most 64 bytes;
+/// "" removes the sender's reaction.
+/// Returns 0 on success, -1 on error (lxmf_last_error), changing nothing.
+int32_t lxmf_message_set_reaction(uint64_t msg, const uint8_t *to, uint32_t to_len,
+                                  const char *content);
 int32_t lxmf_message_add_attachment(uint64_t msg, const char *filename,
                                      const uint8_t *data, uint32_t data_len);
 /// Clone an existing message as a fresh PROPAGATED message, preserving fields

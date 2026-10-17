@@ -2338,6 +2338,24 @@ mod display_name_bridge_tests {
         assert_eq!(lxmf_message_set_retichat_string(0, 0, value.as_ptr()), -1);
         assert_eq!(lxmf_message_set_retichat_bool(0, 0, 1), -1);
     }
+
+    /// REACTIONS-DESIGN.md §2, §4: the reaction setter is declared with the
+    /// signature the library exports (LXMF-rust 600ed00), re-exported from
+    /// lxmf_rust::cffi like the Retichat field setters.
+    #[test]
+    fn the_header_declares_the_reaction_setter() {
+        let header = include_str!("../../../Retichat/Bridge/CRetichatFFI.h");
+        let flat = header.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(
+            "int32_t lxmf_message_set_reaction(uint64_t msg, const uint8_t *to, uint32_t to_len, const char *content);"
+        ));
+        let _: extern "C" fn(u64, *const u8, u32, *const std::os::raw::c_char) -> i32 = lxmf_message_set_reaction;
+        // NULL arguments are refused before the handle is looked up.
+        let content = std::ffi::CString::new("x").unwrap();
+        assert_eq!(lxmf_message_set_reaction(0, std::ptr::null(), 0, content.as_ptr()), -1);
+        let to = [0u8; 32];
+        assert_eq!(lxmf_message_set_reaction(0, to.as_ptr(), 32, std::ptr::null()), -1);
+    }
 }
 
 #[cfg(test)]
