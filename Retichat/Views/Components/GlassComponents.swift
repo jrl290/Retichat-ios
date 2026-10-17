@@ -154,16 +154,18 @@ struct ChatBubble: View {
             if offersReactions, let onReact {
                 // The quick reactions as one row at the top of the menu (§7).
                 // A palette draws only each button's image, never its text, so each
-                // emoji goes as an image too; the text stays for VoiceOver.
+                // emoji goes as an image too; the text stays for VoiceOver. The one I
+                // hold is ringed: picking it again takes it back (§3).
+                let held = message.reactions.first(where: \.mine)?.emoji
                 ControlGroup {
                     ForEach(Reactions.quick, id: \.self) { emoji in
                         Button {
                             onReact(emoji)
                         } label: {
                             Label {
-                                Text(emoji)
+                                Text(emoji == held ? "\(emoji), yours" : emoji)
                             } icon: {
-                                Image(uiImage: paletteImage(emoji))
+                                Image(uiImage: paletteImage(emoji, held: emoji == held))
                                     .renderingMode(.original)
                             }
                         }
@@ -192,12 +194,20 @@ struct ChatBubble: View {
     }
 
     /// `emoji` drawn as an image for the reaction palette, in its own colours (a menu would
-    /// otherwise tint it as a template, one solid shape).
-    private func paletteImage(_ emoji: String) -> UIImage {
+    /// otherwise tint it as a template, one solid shape), on a tinted circle when it is the
+    /// one I hold.
+    private func paletteImage(_ emoji: String, held: Bool) -> UIImage {
         let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 28)]
         let text = emoji as NSString
-        return UIGraphicsImageRenderer(size: text.size(withAttributes: attributes)).image { _ in
-            text.draw(at: .zero, withAttributes: attributes)
+        let glyph = text.size(withAttributes: attributes)
+        let side = max(glyph.width, glyph.height) + 8
+        return UIGraphicsImageRenderer(size: CGSize(width: side, height: side)).image { _ in
+            if held {
+                UIColor.tintColor.withAlphaComponent(0.3).setFill()
+                UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: side, height: side)).fill()
+            }
+            text.draw(at: CGPoint(x: (side - glyph.width) / 2, y: (side - glyph.height) / 2),
+                      withAttributes: attributes)
         }.withRenderingMode(.alwaysOriginal)
     }
 
