@@ -809,7 +809,7 @@ func testTheSurfaces() {
     let bubble = source("Retichat/Views/Components/GlassComponents.swift")
     check(bubble.contains("if let secondary = message.senderSecondary {"),
           "the bubble shows the secondary text, hash or channel name")
-    check(bubble.contains(".font(message.senderSecondaryIsHash\n                                      ? .system(.caption2, design: .monospaced) : .caption2)"),
+    check(bubble.contains(".font(message.senderSecondaryIsHash\n                                  ? .system(.caption2, design: .monospaced) : .caption2)"),
           "a hash in monospace, a channel name in the plain caption font")
     let channelClient = source("Retichat/Services/RfedChannelClient.swift")
     check(channelClient.contains("contact: contactEntry?(senderHashHex))")

@@ -52,7 +52,7 @@ final class ConversationViewModel: ObservableObject {
         let currentNames = sent ?? repository.namesVersion
         let namesChanged = currentNames != namesVersion
         let changed = namesChanged || page.count != messages.count
-            || zip(page, messages).contains(where: { $0.0 != $1.id || $0.1 != $1.deliveryState })
+            || zip(page, messages).contains(where: { $0.0 != $1.id || $0.1 != $1.deliveryState || $0.2 != $1.reactionsJson })
         if changed {
             if namesChanged {
                 namesVersion = currentNames

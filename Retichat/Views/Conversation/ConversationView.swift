@@ -493,7 +493,11 @@ struct ConversationView: View {
                             if let marker = row.marker {
                                 DayMarkerView(label: marker)
                             }
-                            ChatBubble(message: row.item, isGroup: viewModel.isGroup)
+                            ChatBubble(message: row.item, isGroup: viewModel.isGroup) { emoji in
+                                // REACTIONS-DESIGN.md §7: applied at once, sent off the main actor.
+                                repository.react(messageId: row.item.id, chatId: chatId, emoji: emoji)
+                                viewModel.refreshMessages(chatId: chatId, repository: repository)
+                            }
                         }
                         .id(row.id)
                     }
