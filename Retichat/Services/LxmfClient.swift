@@ -965,6 +965,37 @@ extension LxmfClient {
         lxmf_message_set_retichat_bool(msgHandle, Int32(key), value ? 1 : 0) == 0
     }
 
+    /// GROUP_POST_ID, key 11 of the Retichat field (REACTIONS-DESIGN.md §4): a Group post's id,
+    /// 32 lowercase hex, on every member's copy of the post. Always in the Retichat field (it has
+    /// no old top-level form). nonisolated: the fan-out makes its envelopes on ffiQueue.
+    @discardableResult
+    nonisolated static func messageSetGroupPostId(_ msgHandle: UInt64, _ postId: String) -> Bool {
+        postId.withCString { lxmf_message_set_retichat_string(msgHandle, Int32(RetichatField.groupPostIdKey), $0) == 0 }
+    }
+
+    /// SENT_HASH, key 12 of the Retichat field (REACTIONS-DESIGN.md §5.2): on the Distro Sync of
+    /// a send, the LXMF hash (64 lowercase hex) of the message it copies, so a reaction to that
+    /// message names it on the user's other devices. nonisolated: the outbox packs on a task.
+    @discardableResult
+    nonisolated static func messageSetSentHash(_ msgHandle: UInt64, _ hashHex: String) -> Bool {
+        hashHex.withCString { lxmf_message_set_retichat_string(msgHandle, Int32(RetichatField.sentHashKey), $0) == 0 }
+    }
+
+    /// Make an outbound message a reaction (upstream FIELD_REACTION 0x40, REACTIONS-DESIGN.md
+    /// §2, §4): `to` is the target's LXMF hash (32 bytes) or, in a Group, its post id (16
+    /// bytes); `content` the reaction, at most 64 bytes, "" to remove the sender's. False, with
+    /// nothing changed, when the library refuses it (lxmf_last_error). nonisolated: the sends
+    /// make their messages on ffiQueue and the outbox on a detached task.
+    @discardableResult
+    nonisolated static func messageSetReaction(_ msgHandle: UInt64, to: Data, content: String) -> Bool {
+        content.withCString { cContent in
+            to.withUnsafeBytes { buf -> Bool in
+                guard let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+                return lxmf_message_set_reaction(msgHandle, p, UInt32(to.count), cContent) == 0
+            }
+        }
+    }
+
     /// Set a group entry on an outbound message: the one way group entries
     /// are written (DISPLAY_NAMES.md §10). The form is
     /// RetichatField.groupEntriesInRetichatField's: the old top-level field

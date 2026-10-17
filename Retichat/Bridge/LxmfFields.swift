@@ -52,6 +52,13 @@ nonisolated enum RetichatField {
     /// and written there in both forms (a released build, which reads only the old fields,
     /// skips it). RFed-spec Group.md "Member statuses and keys"; DISPLAY_NAMES.md §10.
     static let groupStatusesKey: UInt8 = 10
+    /// GROUP_POST_ID, key 11 (REACTIONS-DESIGN.md §4): a str of 32 hex, the id of a Group post,
+    /// on every member copy of it, its relay request and the relayed copies. No old top-level
+    /// field: read from and written to the Retichat field only.
+    static let groupPostIdKey: UInt8 = 11
+    /// SENT_HASH, key 12 (REACTIONS-DESIGN.md §5.2): a str of 64 hex on the Distro Sync of a
+    /// send, the LXMF hash of the message it reports.
+    static let sentHashKey: UInt8 = 12
 
     /// §10, GROUP_ENTRIES_IN_RETICHAT_FIELD in Rust, Kotlin and JS: where
     /// this client writes group entries. false until the switch (around
@@ -113,6 +120,34 @@ nonisolated enum GroupFieldWrite: Equatable {
         return inRetichatField ? .retichat(key: entry.key, value: value)
                                : .topLevel(field: entry.legacyField, value: value)
     }
+}
+
+// MARK: - Reactions (REACTIONS-DESIGN.md §1, §3)
+//
+// Upstream LXMF 1.2.0's FIELD_REACTION: {0x00 REACTION_TO: bytes, 0x01 REACTION_CONTENT: bytes},
+// in an otherwise-empty message. REACTION_TO is the target's LXMF hash (32 bytes) or, in a Group,
+// its post id (16 bytes); REACTION_CONTENT is UTF-8, at most 64 bytes, and "" removes the
+// sender's reaction (Retichat's convention). Both may come as bin or str; the keys as an integer
+// of any width.
+
+nonisolated enum ReactionField {
+    /// FIELD_REACTION.
+    static let field: UInt8 = 0x40
+    /// REACTION_TO.
+    static let toKey: UInt64 = 0x00
+    /// REACTION_CONTENT.
+    static let contentKey: UInt64 = 0x01
+    /// The longest REACTION_CONTENT taken, in bytes.
+    static let maxContentBytes = 64
+}
+
+/// What a message's 0x40 map says.
+nonisolated enum Reaction: Equatable {
+    /// A reaction to `to` (the raw REACTION_TO bytes); `content` "" removes the sender's.
+    case react(to: Data, content: String)
+    /// A 0x40 map that is not a reaction this client takes: the reason, for the one log line.
+    /// The message is still never a bubble.
+    case refused(String)
 }
 
 // MARK: - Distro identity transfer
@@ -203,6 +238,16 @@ struct LxmfFields {
     /// array. Each element is a packed message (Data) or whatever else the sender put there
     /// (nil), and a reader checks each on its own. Never read from a top-level field.
     var groupStatuses: [Data?]?
+    /// Key 11 of the Retichat field, GROUP_POST_ID: kept only when it is a str of 32 hex
+    /// characters, lowercased; nil otherwise (REACTIONS-DESIGN.md §4).
+    var groupPostId: String?
+    /// Key 12 of the Retichat field, SENT_HASH: kept only when it is a str of 64 hex characters,
+    /// lowercased; nil otherwise (REACTIONS-DESIGN.md §5.2).
+    var sentHash: String?
+    /// The 0x40 field (REACTIONS-DESIGN.md §3): nil when the message has none or it is not a
+    /// map (then it is not a reaction); else what it says. Any non-nil value means the message
+    /// is never stored as a bubble.
+    var reaction: Reaction?
     // Custom-type fields
     var customType: String?          // FIELD_CUSTOM_TYPE (0xFB)
     var customData: String?          // FIELD_CUSTOM_DATA (0xFC), decoded from msgpack str OR bin (UTF-8)
@@ -274,6 +319,7 @@ final class LxmfFieldsDecoder {
         var legacyGroup: [GroupEntry: Scalar] = [:]
         var retichatGroup: [GroupEntry: Scalar] = [:]
         var sawRetichatField = false
+        var sawReaction = false
         var statuses: [Data?]?
 
         for _ in 0..<mapCount {
@@ -298,6 +344,18 @@ final class LxmfFieldsDecoder {
                     let read = readRetichatGroupEntries(bytes, &offset)
                     retichatGroup = read.entries
                     statuses = read.statuses
+                    fields.groupPostId = read.postId.flatMap(groupIdHex)
+                    fields.sentHash = read.sentHash.flatMap(messageHashHex)
+                }
+                continue
+            }
+            if field == ReactionField.field {
+                // The first 0x40 only, as the Retichat field's first copy is the one read.
+                if sawReaction {
+                    skipValue(bytes, &offset)
+                } else {
+                    sawReaction = true
+                    fields.reaction = readReaction(bytes, &offset)
                 }
                 continue
             }
@@ -365,6 +423,77 @@ final class LxmfFieldsDecoder {
         at = pos
         let fileData = readBin(bytes, &at) ?? Data()
         return (filename, fileData)
+    }
+
+    // MARK: - Reactions (REACTIONS-DESIGN.md §3)
+
+    /// The 0x40 value, consuming exactly that one value whatever it is. Not a map: nil (the
+    /// message is not a reaction). A map: its REACTION_TO and REACTION_CONTENT (keys 0 and 1, an
+    /// integer of any width; the first of each), each a bin or a str holding the raw bytes; a
+    /// missing one, one of another type, content over 64 bytes or content that is not UTF-8 is
+    /// refused with the reason.
+    static func readReaction(_ bytes: [UInt8], _ offset: inout Int) -> Reaction? {
+        var end = offset
+        skipValue(bytes, &end)
+        defer { offset = end }
+        var at = offset
+        guard let count = readMapLength(bytes, &at) else { return nil }
+        var to: Data?, content: Data?
+        var sawTo = false, sawContent = false
+        for _ in 0..<count {
+            guard at < end else { break }
+            let key = readKey(bytes, &at)
+            var next = at
+            skipValue(bytes, &next)
+            if key == ReactionField.toKey, !sawTo {
+                sawTo = true
+                to = readRawBytes(bytes, at, end: next)
+            } else if key == ReactionField.contentKey, !sawContent {
+                sawContent = true
+                content = readRawBytes(bytes, at, end: next)
+            }
+            at = next
+        }
+        guard sawTo else { return .refused("REACTION_TO is missing") }
+        guard let to else { return .refused("REACTION_TO is not a bin or a str") }
+        guard sawContent else { return .refused("REACTION_CONTENT is missing") }
+        guard let content else { return .refused("REACTION_CONTENT is not a bin or a str") }
+        guard content.count <= ReactionField.maxContentBytes else {
+            return .refused("REACTION_CONTENT is \(content.count) bytes, more than \(ReactionField.maxContentBytes)")
+        }
+        guard let text = String(data: content, encoding: .utf8) else {
+            return .refused("REACTION_CONTENT is not UTF-8")
+        }
+        return .react(to: to, content: text)
+    }
+
+    /// The bytes of the bin or str at `at`, whose value ends at `end`; nil for any other type
+    /// or a length that does not fit.
+    private static func readRawBytes(_ bytes: [UInt8], _ at: Int, end: Int) -> Data? {
+        guard at < bytes.count else { return nil }
+        let b = bytes[at]
+        let lenBytes: Int
+        if b & 0xE0 == 0xA0 { lenBytes = 0 }                        // fixstr
+        else if b == 0xC4 || b == 0xD9 { lenBytes = 1 }             // bin8, str8
+        else if b == 0xC5 || b == 0xDA { lenBytes = 2 }             // bin16, str16
+        else if b == 0xC6 || b == 0xDB { lenBytes = 4 }             // bin32, str32
+        else { return nil }
+        let start = at + 1 + lenBytes
+        guard start <= end, end <= bytes.count else { return nil }
+        var len = lenBytes == 0 ? Int(b & 0x1F) : 0
+        for i in 0..<lenBytes { len = (len << 8) | Int(bytes[at + 1 + i]) }
+        // A length running past the buffer (skipValue then ends at the buffer's end) is no value.
+        guard start + len == end else { return nil }
+        return Data(bytes[start..<end])
+    }
+
+    /// A SENT_HASH str (key 12): exactly 64 ASCII hex characters, either case, lowercased; nil
+    /// for anything else.
+    nonisolated static func messageHashHex(_ raw: String) -> String? {
+        guard raw.utf8.count == 64, raw.utf8.allSatisfy({
+            (0x30...0x39).contains($0) || (0x41...0x46).contains($0) || (0x61...0x66).contains($0)
+        }) else { return nil }
+        return raw.lowercased()
     }
 
     // MARK: - Group entries (§10)
@@ -463,18 +592,21 @@ final class LxmfFieldsDecoder {
     }
 
     /// The Retichat field's value: its group entries (keys 1-9, first of
-    /// each) and key 10, a status's GROUP_STATUSES (first of it), consuming
-    /// exactly the one value. A value that is not a map is ignored whole
-    /// (§2.1); keys that are not integers 1-10 are ignored. Key 0, the name,
-    /// is the Rust side's (lxmf_display_name_decode).
+    /// each), key 10, a status's GROUP_STATUSES (first of it), and keys 11
+    /// (GROUP_POST_ID) and 12 (SENT_HASH) when each is a str (first of each),
+    /// consuming exactly the one value. A value that is not a map is ignored
+    /// whole (§2.1); keys that are not integers 1-12 are ignored. Key 0, the
+    /// name, is the Rust side's (lxmf_display_name_decode).
     private static func readRetichatGroupEntries(_ bytes: [UInt8], _ offset: inout Int)
-        -> (entries: [GroupEntry: Scalar], statuses: [Data?]?) {
+        -> (entries: [GroupEntry: Scalar], statuses: [Data?]?, postId: String?, sentHash: String?) {
         var entries: [GroupEntry: Scalar] = [:]
         var statuses: [Data?]?
         var sawStatuses = false
+        var postId: Scalar?, sentHash: Scalar?
+        func str(_ s: Scalar?) -> String? { if case .str(let v)? = s { return v }; return nil }
         guard let count = readMapLength(bytes, &offset) else {
             skipValue(bytes, &offset)
-            return (entries, nil)
+            return (entries, nil, nil, nil)
         }
         for _ in 0..<count {
             guard offset < bytes.count else { break }
@@ -507,12 +639,16 @@ final class LxmfFieldsDecoder {
                 continue
             }
             let value = readScalar(bytes, &offset)
-            if let key, key <= UInt64(RetichatField.maxKey),
+            if key == UInt64(RetichatField.groupPostIdKey) {
+                if postId == nil { postId = value }
+            } else if key == UInt64(RetichatField.sentHashKey) {
+                if sentHash == nil { sentHash = value }
+            } else if let key, key <= UInt64(RetichatField.maxKey),
                let entry = GroupEntry(rawValue: UInt8(key)), entries[entry] == nil {
                 entries[entry] = value
             }
         }
-        return (entries, statuses)
+        return (entries, statuses, str(postId), str(sentHash))
     }
 
     /// One map key, consuming exactly one value: the integer when it is one
