@@ -217,6 +217,7 @@ struct ChatBubble: View {
     private var reactionMarks: some View {
         Text(message.reactions.map(\.emoji).joined())
             .font(.footnote)
+            .padding(.leading, 4) // on top of the footer's spacing: a little apart from the time
             .accessibilityLabel(message.reactions
                 .map { "\($0.emoji) \($0.count)\($0.mine ? ", including yours" : "")" }
                 .joined(separator: ", "))
