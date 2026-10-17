@@ -58,7 +58,7 @@ struct ChatBubble: View {
     let message: ChatMessage
     let isGroup: Bool
     /// Sends the user's reaction (REACTIONS-DESIGN.md §7): a quick reaction from the context
-    /// menu, or a chip tapped to toggle it. Nil where reactions are not offered (channel posts).
+    /// menu, the one already held taking it back. Nil where reactions are not offered (channel posts).
     var onReact: ((String) -> Void)? = nil
 
     @State private var sharedAttachment: Attachment?
@@ -68,12 +68,7 @@ struct ChatBubble: View {
         HStack {
             if message.isOutgoing { Spacer(minLength: 48) }
 
-            VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 2) {
-                bubble
-                if !message.reactions.isEmpty {
-                    reactionChips
-                }
-            }
+            bubble
             .sheet(isPresented: $selectingText) {
                 SelectableTextSheet(text: message.content)
             }
@@ -134,14 +129,17 @@ struct ChatBubble: View {
                     .foregroundColor(.retichatOnSurface)
             }
 
-            // Timestamp + delivery status
+            // Timestamp + delivery status; the reactions take the checkmark's place (§7)
             HStack(spacing: 4) {
                 Text(formatTime(message.timestamp))
                     .font(.caption2)
                     .foregroundColor(.retichatOnSurfaceVariant)
 
-                if message.isOutgoing {
+                if message.isOutgoing && (message.reactions.isEmpty || !showsCheckmark) {
                     deliveryIcon
+                }
+                if !message.reactions.isEmpty {
+                    reactionMarks
                 }
             }
         }
@@ -203,40 +201,21 @@ struct ChatBubble: View {
         }.withRenderingMode(.alwaysOriginal)
     }
 
-    /// The chips under the bubble (§3 "Display"): each reaction with how many gave it, marked when
-    /// one of them is the user's; a tap gives that reaction, or takes it back when it is the user's.
-    private var reactionChips: some View {
-        HStack(spacing: 4) {
-            ForEach(message.reactions) { chip in
-                Button {
-                    onReact?(chip.emoji)
-                } label: {
-                    HStack(spacing: 3) {
-                        Text(chip.emoji)
-                            .font(.callout)
-                        Text("\(chip.count)")
-                            .font(.caption2)
-                            .fontWeight(chip.mine ? .semibold : .regular)
-                            .foregroundColor(chip.mine ? .retichatPrimary : .retichatOnSurfaceVariant)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(
-                        Capsule()
-                            .fill(chip.mine ? Color.retichatPrimary.opacity(0.22) : Color.glassBackground)
-                            .overlay(
-                                Capsule()
-                                    .stroke(chip.mine ? Color.retichatPrimary.opacity(0.8) : Color.glassBorder,
-                                            lineWidth: chip.mine ? 1 : 0.5)
-                            )
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(!offersReactions)
-                .accessibilityLabel("\(chip.emoji) \(chip.count)\(chip.mine ? ", including yours" : "")")
-            }
-        }
-        .padding(.horizontal, 6)
+    /// The reactions in the bubble's footer, in the checkmark's place (§3 "Display", §7; James,
+    /// 2026-10-17): each one given, once, with no count and no chip. Reacting, replacing and
+    /// taking one back are in the context menu; VoiceOver still reads how many gave each.
+    private var reactionMarks: some View {
+        Text(message.reactions.map(\.emoji).joined())
+            .font(.footnote)
+            .accessibilityLabel(message.reactions
+                .map { "\($0.emoji) \($0.count)\($0.mine ? ", including yours" : "")" }
+                .joined(separator: ", "))
+    }
+
+    /// Whether the delivery icon is the sent or delivered checkmark, which reactions replace;
+    /// pending, queued and failed keep their icon beside the reactions.
+    private var showsCheckmark: Bool {
+        message.deliveryState == DeliveryState.sent || message.deliveryState == DeliveryState.delivered
     }
 
     @ViewBuilder
