@@ -182,8 +182,8 @@ nonisolated enum DistroGroupRoute: Equatable, Sendable {
 /// a photo sent to the distro shows as the same bubble as one sent to this
 /// device. The placeholder stands in only when there is neither text nor an
 /// attachment to store: fields the decoder does not read as attachments
-/// (FIELD_IMAGE 0x06 and FIELD_AUDIO 0x07 are not read for any message on
-/// iOS), or an unwrap from an FFI build without "fields".
+/// (it reads 0x05, FIELD_IMAGE 0x06 and FIELD_AUDIO 0x07), or an unwrap from
+/// an FFI build without "fields".
 ///
 /// Main actor in the app (the module's default isolation), where
 /// LxmfFieldsDecoder runs.

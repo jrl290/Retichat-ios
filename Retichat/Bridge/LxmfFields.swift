@@ -16,6 +16,8 @@ import CryptoKit
 
 enum LxmfFieldKey {
     static let fileAttachments: UInt8 = 0x05
+    static let image: UInt8 = 0x06
+    static let audio: UInt8 = 0x07
     // 0x10 (FIELD_SENDER_NAME) is retired (DISPLAY_NAMES.md §2.1): never sent,
     // never read, skipped like any unknown field. MeshChatX and Columba put
     // dicts there. The sender's name is key 0 of the Retichat field 0xD1
@@ -321,6 +323,10 @@ final class LxmfFieldsDecoder {
         var sawRetichatField = false
         var sawReaction = false
         var statuses: [Data?]?
+        // The first FIELD_IMAGE and FIELD_AUDIO, put after the file attachments once the walk
+        // is done, whatever order the map holds them in.
+        var image: (String, Data)??
+        var audio: (String, Data)??
 
         for _ in 0..<mapCount {
             guard offset < bytes.count else { break }
@@ -380,6 +386,14 @@ final class LxmfFieldsDecoder {
                     skipValue(bytes, &offset)
                 }
 
+            case LxmfFieldKey.image:
+                let read = readTypedAttachment(bytes, &offset) { b, at in imageName(readStringOrBin(b, &at)) }
+                if image == nil { image = .some(read) }
+
+            case LxmfFieldKey.audio:
+                let read = readTypedAttachment(bytes, &offset) { b, at in audioName(readKey(b, &at)) }
+                if audio == nil { audio = .some(read) }
+
             case LxmfFieldKey.customType:
                 fields.customType = readStringOrBin(bytes, &offset)
 
@@ -396,6 +410,8 @@ final class LxmfFieldsDecoder {
             }
         }
 
+        if let read = image ?? nil { fields.attachments.append(read) }
+        if let read = audio ?? nil { fields.attachments.append(read) }
         fields.groupEntries = resolveGroupEntries(retichat: retichatGroup, legacy: legacyGroup)
         fields.hasGroupId = retichatGroup[.id] != nil || legacyGroup[.id] != nil
         applyGroupEntries(&fields)
@@ -423,6 +439,48 @@ final class LxmfFieldsDecoder {
         at = pos
         let fileData = readBin(bytes, &at) ?? Data()
         return (filename, fileData)
+    }
+
+    /// A FIELD_IMAGE (0x06, `[image_type, data]`, how MeshChat and Sideband send a picture) or
+    /// FIELD_AUDIO (0x07, `[audio_mode, data]`) value as an attachment, as the web and Android
+    /// read them (Retichat-js lxmf.js attachmentsFromFields, LxmfFields.getAttachments): ALWAYS
+    /// consumed whole, nil unless it is an array of at least 2 whose second entry is a bin.
+    /// `name` makes the filename from the first entry. Until 2026-10-17 neither was read, and a
+    /// picture from MeshChat arrived as its text alone (Retichat-ios #8).
+    private static func readTypedAttachment(_ bytes: [UInt8], _ offset: inout Int,
+                                            name: ([UInt8], inout Int) -> String) -> (String, Data)? {
+        var end = offset
+        skipValue(bytes, &end)
+        defer { offset = end }
+        var pos = offset
+        guard let count = readArrayLength(bytes, &pos), count >= 2 else { return nil }
+        var at = pos
+        let filename = name(bytes, &at)
+        skipValue(bytes, &pos)
+        guard pos < end, [0xC4, 0xC5, 0xC6].contains(bytes[pos]) else { return nil }
+        return readBin(bytes, &pos).map { (filename, $0) }
+    }
+
+    /// The image types a FIELD_IMAGE is named for (the ones `Attachment.isImage` shows).
+    static let imageTypes: Set<String> = ["jpg", "jpeg", "png", "gif", "webp", "heic"]
+
+    /// A FIELD_IMAGE's filename from the sender's type ("webp", "png", "image/jpeg", any case):
+    /// "image.<type>" for one of `imageTypes`, else "image", offered as a file. The type is the
+    /// sender's string, so it never makes a name by itself.
+    static func imageName(_ type: String?) -> String {
+        var ext = (type ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if ext.hasPrefix("image/") { ext.removeFirst("image/".count) }
+        return imageTypes.contains(ext) ? "image.\(ext)" : "image"
+    }
+
+    /// A FIELD_AUDIO's filename from its mode (LXMF/LXMF.py AM_*): Opus in OGG (0x10-0x19)
+    /// "audio.ogg", Codec2 (0x01-0x09) "audio.c2", anything else "audio.bin". Offered as a file.
+    static func audioName(_ mode: UInt64?) -> String {
+        switch mode {
+        case .some(0x10...0x19): return "audio.ogg"
+        case .some(0x01...0x09): return "audio.c2"
+        default: return "audio.bin"
+        }
     }
 
     // MARK: - Reactions (REACTIONS-DESIGN.md §3)

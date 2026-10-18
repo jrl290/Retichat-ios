@@ -91,6 +91,8 @@ let olderFFI = #"{"source_hash":"c789ebe5a0c0b2c377e967896a386810","timestamp":1
 
 let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0xFF, 0xD9])
 let notes = Data("file bytes\n".utf8)
+/// The 0x06 image in the golden lines ("RIFF", size, "WEBPVP8 "), read since 2026-10-17 (Retichat-ios #8).
+let webp = Data("RIFF".utf8) + Data([0x0C, 0, 0, 0]) + Data("WEBPVP8 ".utf8)
 /// The fields map in the golden lines, as the sender packed it.
 let fieldsHex = "83059292b1706978656c2d70686f746f2d312e6a7067c40effd8ffe000104a4649460001ffd992a96e6f7465732e747874c40b66696c652062797465730a0692a477656270c410524946460c00000057454250565038200c92cb41daaca340000000c410abababababababababababababababab"
 
@@ -123,8 +125,8 @@ func testACaptionlessPhotoStoresItsAttachments() {
     check(m.fields.map(hex) == fieldsHex, "the DistroMessage the client builds carries those bytes")
 
     let stored = DistroMessageStore.stored(m)
-    check(same(stored.attachments, [("pixel-photo-1.jpg", jpeg), ("notes.txt", notes)]),
-          "both 0x05 attachments reach the store path, in order, bytes intact")
+    check(same(stored.attachments, [("pixel-photo-1.jpg", jpeg), ("notes.txt", notes), ("image.webp", webp)]),
+          "both 0x05 attachments reach the store path, in order, bytes intact, then the 0x06 image")
     check(stored.content == "", "no text and attachments stored: no placeholder")
     // "Exactly as a normal message does": the decoder a direct message's
     // fields go through gives the same attachments from the same bytes.
@@ -139,7 +141,7 @@ func testACaptionedPhotoKeepsItsCaptionAndPhoto() {
     }
     let stored = DistroMessageStore.stored(m)
     check(stored.content == "pixel-photo-1", "the caption is the text")
-    check(same(stored.attachments, [("pixel-photo-1.jpg", jpeg), ("notes.txt", notes)]),
+    check(same(stored.attachments, [("pixel-photo-1.jpg", jpeg), ("notes.txt", notes), ("image.webp", webp)]),
           "and the photo is stored with it (the iPad showed the caption alone)")
 }
 
@@ -159,14 +161,14 @@ func testThePlaceholderIsOnlyForNothingToStore() {
               "no text and no attachment: the placeholder")
     }
 
-    // iOS reads attachments from 0x05 only, for direct messages too: an
-    // image in 0x06 alone is not an attachment it can store.
+    // An image in 0x06 alone (how MeshChat and Sideband send a picture) is an
+    // attachment since 2026-10-17 (Retichat-ios #8), for direct messages too.
     let image = message(imageOnly)
     check(image?.fields.map(hex) == "8106" + "92a477656270c403010203", "\"fields\" carries the 0x06 map")
     if let image {
         let stored = DistroMessageStore.stored(image)
-        check(stored.attachments.isEmpty && stored.content == DistroMessageStore.unavailablePlaceholder,
-              "an image in 0x06 alone (not read on iOS) gets the placeholder, not an empty bubble")
+        check(same(stored.attachments, [("image.webp", Data([1, 2, 3]))]) && stored.content == "",
+              "an image in 0x06 alone is stored as the picture, with no placeholder")
     }
 
     let spaces = DistroMessage(sourceHash: Data(count: 16), title: "", content: "  \n", timestamp: 1,
