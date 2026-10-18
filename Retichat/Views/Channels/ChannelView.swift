@@ -54,7 +54,7 @@ struct ChannelInfoSheet: View {
                                     UIPasteboard.general.string = shareName
                                     copiedName = true
                                 } label: {
-                                    Label(copiedName ? "Copied!" : "Copy name", systemImage: "doc.on.doc")
+                                    CopyLabel("Copy name", systemImage: "doc.on.doc", copied: copiedName)
                                 }
                                 .buttonStyle(.bordered)
                                 .tint(.retichatPrimary)

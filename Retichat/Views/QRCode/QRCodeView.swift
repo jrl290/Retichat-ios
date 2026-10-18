@@ -142,7 +142,7 @@ struct QRCodeView: View {
                     UIPasteboard.general.string = hash
                     copiedHash = true
                 } label: {
-                    Label(copiedHash ? "Copied!" : "Copy Hash", systemImage: "doc.on.doc")
+                    CopyLabel("Copy Hash", systemImage: "doc.on.doc", copied: copiedHash)
                 }
                 .buttonStyle(.bordered)
                 .tint(.retichatPrimary)
@@ -151,7 +151,7 @@ struct QRCodeView: View {
                     UIPasteboard.general.string = shareUri
                     copiedUri = true
                 } label: {
-                    Label(copiedUri ? "Copied!" : "Copy Contact URI", systemImage: "link")
+                    CopyLabel("Copy Contact URI", systemImage: "link", copied: copiedUri)
                 }
                 .buttonStyle(.bordered)
                 .tint(.retichatPrimary)

@@ -107,7 +107,8 @@ func testCopyNameAndShare() {
     let view = source("Retichat/Views/Channels/ChannelView.swift")
     check(view.contains("UIPasteboard.general.string = shareName"), "Copy name copies exactly the full name")
     check(!view.contains("UIPasteboard.general.string = channel.id"), "Copy does not copy the hash")
-    check(view.contains("copiedName ? \"Copied!\" : \"Copy name\""), "Copy name confirms with Copied!")
+    check(view.contains("CopyLabel(\"Copy name\", systemImage: \"doc.on.doc\", copied: copiedName)"),
+          "Copy name confirms with Copied!")
     check(view.contains(".task(id: copiedName)") && view.contains("copiedName = false"),
           "the Copied! confirmation goes away")
     check(view.contains("ShareLink(item: shareName)"), "Share hands over exactly the full name")

@@ -329,6 +329,36 @@ struct DayMarkerView: View {
     }
 }
 
+// MARK: - Copy label
+
+/// A copy button's label: `title`, or "Copied!" for a moment after a copy
+/// (L83). Both are laid out and only one is shown, so the button keeps the
+/// width of the wider, nothing beside it moves, and the switch is not
+/// animated, so the two never crossfade over each other.
+struct CopyLabel: View {
+    let title: String
+    let systemImage: String
+    let copied: Bool
+
+    init(_ title: String, systemImage: String, copied: Bool) {
+        self.title = title
+        self.systemImage = systemImage
+        self.copied = copied
+    }
+
+    var body: some View {
+        ZStack {
+            Label(title, systemImage: systemImage)
+                .opacity(copied ? 0 : 1)
+                .accessibilityHidden(copied)
+            Label("Copied!", systemImage: systemImage)
+                .opacity(copied ? 1 : 0)
+                .accessibilityHidden(!copied)
+        }
+        .animation(nil, value: copied)
+    }
+}
+
 // MARK: - Status dot
 
 struct StatusDot: View {
