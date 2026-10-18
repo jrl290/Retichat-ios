@@ -130,11 +130,13 @@ struct ChatBubble: View {
             }
 
             // Timestamp + delivery status; the reactions take the checkmark's place (§7).
-            // Last, so BubbleStack puts it at the trailing edge, sent or received.
+            // Last, so BubbleStack gives it the bubble's width: the time at its leading
+            // edge, the delivery icon and reactions at its trailing edge, sent or received.
             HStack(spacing: 4) {
                 Text(formatTime(message.timestamp))
                     .font(.caption2)
                     .foregroundColor(.retichatOnSurfaceVariant)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 if message.isOutgoing && (message.reactions.isEmpty || !showsCheckmark) {
                     deliveryIcon
@@ -218,7 +220,7 @@ struct ChatBubble: View {
     private var reactionMarks: some View {
         Text(message.reactions.map(\.emoji).joined())
             .font(.footnote)
-            .padding(.leading, 4) // on top of the footer's spacing: a little apart from the time
+            .padding(.leading, 4) // on top of the footer's spacing: a little apart from an icon, or the time
             .accessibilityLabel(message.reactions
                 .map { "\($0.emoji) \($0.count)\($0.mine ? ", including yours" : "")" }
                 .joined(separator: ", "))
@@ -310,25 +312,30 @@ struct ChatBubble: View {
 
 /// A chat bubble's stack: its subviews one under another [spacing] apart, as a VStack places
 /// them, on the sender's side ([contentTrailing] for a sent message), except the last, the
-/// footer, which is at the trailing edge in every bubble (James, 2026-10-17). A VStack aligns
-/// every subview alike, and a footer stretched to the edge would widen every bubble.
+/// footer, which is given the bubble's width (James, 2026-10-17). The bubble is as wide as its
+/// widest subview, the footer's own width included: a footer filling the width it is offered
+/// would widen every bubble, and a VStack offers it all.
 struct BubbleStack: Layout {
     var contentTrailing: Bool
     var spacing: CGFloat
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let sizes = subviews.map { $0.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil)) }
-        return CGSize(width: sizes.map(\.width).max() ?? 0,
-                      height: sizes.map(\.height).reduce(0, +) + spacing * CGFloat(max(sizes.count - 1, 0)))
+        guard let footer = subviews.last else { return .zero }
+        let body = subviews.dropLast().map { $0.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil)) }
+        var width = max(body.map(\.width).max() ?? 0, footer.sizeThatFits(.unspecified).width)
+        if let limit = proposal.width { width = min(width, limit) }
+        let footerHeight = footer.sizeThatFits(ProposedViewSize(width: width, height: nil)).height
+        return CGSize(width: width, height: body.map(\.height).reduce(footerHeight, +) + spacing * CGFloat(body.count))
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         var y = bounds.minY
         for (index, subview) in subviews.enumerated() {
+            let footer = index == subviews.count - 1
             let size = subview.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
-            let trailing = contentTrailing || index == subviews.count - 1
-            subview.place(at: CGPoint(x: trailing ? bounds.maxX - size.width : bounds.minX, y: y),
-                          proposal: ProposedViewSize(size))
+            let x = contentTrailing && !footer ? bounds.maxX - size.width : bounds.minX
+            subview.place(at: CGPoint(x: x, y: y),
+                          proposal: ProposedViewSize(width: footer ? bounds.width : size.width, height: size.height))
             y += size.height + spacing
         }
     }

@@ -15,7 +15,8 @@
 //    counted or reordered; the target is looked for only in the chat the reaction came in on;
 //    someone else's reaction to the user's own message is notified once, by the app or the NSE;
 //    the sends carry what §4 and §5 say;
-//  - the bubble's footer (time, delivery icon, reactions) at its trailing edge, sent or received.
+//  - the bubble's footer across it, sent or received: the time leading, the delivery icon and
+//    reactions trailing.
 // tests/ReactionsFFITests.swift runs the same fields through the real library.
 //
 // Run from the workspace root with:
@@ -478,7 +479,7 @@ func theSendsCarryWhatSectionsFourAndFiveSay() {
           "no reaction on a system message or a message that names no target")
 }
 
-func theFooterIsAtTheBubblesTrailingEdgeSentOrReceived() {
+func theFooterSpansTheBubbleTheTimeLeadingTheRestTrailing() {
     let components = source("Retichat/Views/Components/GlassComponents.swift")
     let bubble = body(components, "private var bubble: some View {")
     check(bubble.contains("BubbleStack(contentTrailing: message.isOutgoing, spacing: 4) {"),
@@ -486,11 +487,14 @@ func theFooterIsAtTheBubblesTrailingEdgeSentOrReceived() {
     check(before(bubble, "Text(message.content)", "Text(formatTime(message.timestamp))")
             && bubble.contains("                    reactionMarks\n                }\n            }\n        }\n        .padding(.horizontal, 12)"),
           "the footer (time, delivery icon, reactions) is its last subview")
+    check(bubble.contains("Text(formatTime(message.timestamp))\n                    .font(.caption2)\n                    .foregroundColor(.retichatOnSurfaceVariant)\n                    .frame(maxWidth: .infinity, alignment: .leading)"),
+          "the time takes the footer's width at its leading edge, the icon and reactions after it at the trailing edge")
     let stack = body(components, "struct BubbleStack: Layout {")
-    check(stack.contains("let trailing = contentTrailing || index == subviews.count - 1")
-            && stack.contains("x: trailing ? bounds.maxX - size.width : bounds.minX"),
-          "which it places at the trailing edge in every bubble")
-    check(stack.contains("width: sizes.map(\\.width).max() ?? 0"), "and the bubble is as wide as its widest subview, no wider")
+    check(stack.contains("var width = max(body.map(\\.width).max() ?? 0, footer.sizeThatFits(.unspecified).width)"),
+          "the bubble is as wide as its widest subview, the footer's own width included, no wider")
+    check(stack.contains("let x = contentTrailing && !footer ? bounds.maxX - size.width : bounds.minX")
+            && stack.contains("proposal: ProposedViewSize(width: footer ? bounds.width : size.width, height: size.height)"),
+          "and the footer is given the bubble's width, in every bubble")
 }
 
 let allTests: [(String, () -> Void)] = [
@@ -508,7 +512,7 @@ let allTests: [(String, () -> Void)] = [
     ("every receive path checks for a reaction before it stores anything", everyReceivePathChecksForAReactionBeforeItStoresAnything),
     ("the target is looked for only in the chat the reaction came in", theTargetIsLookedForOnlyInTheChatTheReactionCameIn),
     ("the sends carry what §4 and §5 say", theSendsCarryWhatSectionsFourAndFiveSay),
-    ("the footer is at the bubble's trailing edge, sent or received", theFooterIsAtTheBubblesTrailingEdgeSentOrReceived),
+    ("the footer spans the bubble, the time leading and the rest trailing", theFooterSpansTheBubbleTheTimeLeadingTheRestTrailing),
 ]
 
 @main
