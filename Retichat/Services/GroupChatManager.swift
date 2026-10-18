@@ -405,24 +405,20 @@ final class GroupChatManager {
             return false
         }
 
-        if state == 0x10 {
-            let shouldStart = fallbackStarted.insert(handle).inserted
-            stateLock.unlock()
-            if shouldStart {
-                startPropagationFallback(from: handle, client: client)
-            }
-            return true
-        }
-
-        let terminal = state == 0x04 || state == 0x08 || state == 0xFD ||
-            state == 0xFE || state == 0xFF
-        if terminal {
+        // The copy starts on 0x10 or on the DIRECT send's own failure, once (GroupEnvelopeReport).
+        let startCopy = GroupEnvelopeReport.startsCopy(state) && fallbackStarted.insert(handle).inserted
+        let ended = GroupEnvelopeReport.ends(state)
+        if ended {
             trackedHandles.removeValue(forKey: hashHex)
             fallbackStarted.remove(handle)
         }
         stateLock.unlock()
 
-        if terminal {
+        // The copy is cloned from the DIRECT handle, so the handle goes after it.
+        if startCopy {
+            startPropagationFallback(from: handle, client: client)
+        }
+        if ended {
             LxmfClient.messageDestroy(handle)
         }
         return true

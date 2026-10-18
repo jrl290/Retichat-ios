@@ -313,6 +313,37 @@ func testChatRepositoryWiring() {
           "a propagating row is not denied its bar by the row's state")
 }
 
+// MARK: - Group envelopes (L72)
+
+func testGroupEnvelopeCopyStartsOnFallbackRequestOrDirectFailure() {
+    // Until 2026-10-18 only 0x10 started a Group envelope's copy: one whose DIRECT send failed
+    // first reached no offline member.
+    for state: UInt8 in [0x10, 0xFD, 0xFE, 0xFF] {
+        check(GroupEnvelopeReport.startsCopy(state), "an envelope's copy starts on \(state)")
+    }
+    for state: UInt8 in [0x00, 0x01, 0x02, 0x04, 0x08] {
+        check(!GroupEnvelopeReport.startsCopy(state), "no copy on \(state)")
+    }
+    for state: UInt8 in [0x04, 0x08, 0xFD, 0xFE, 0xFF] {
+        check(GroupEnvelopeReport.ends(state), "an envelope's send ends on \(state)")
+    }
+    for state: UInt8 in [0x00, 0x01, 0x02, 0x10] {
+        check(!GroupEnvelopeReport.ends(state), "the send keeps running on \(state)")
+    }
+
+    let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("Retichat/Services/GroupChatManager.swift")
+    let source = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    let handle = method("func handleMessageState(hashHex: String, state: UInt8, client: LxmfClient) -> Bool", in: source)
+    check(handle.contains("let startCopy = GroupEnvelopeReport.startsCopy(state) && fallbackStarted.insert(handle).inserted"),
+          "GroupChatManager starts the copy by the rule, once per envelope")
+    check(handle.contains("let ended = GroupEnvelopeReport.ends(state)"), "and ends the send by it")
+    check(inOrder(["stateLock.unlock()", "startPropagationFallback(from: handle, client: client)",
+                   "LxmfClient.messageDestroy(handle)"], in: handle),
+          "a failure clones the copy before the DIRECT handle is released")
+    check(!handle.contains("state == 0x10"), "no report starts the copy outside the rule")
+}
+
 @main
 enum OutboundAttemptsTests {
     static func main() {
@@ -328,6 +359,7 @@ enum OutboundAttemptsTests {
         testDeliveredFirstEndsIt()
         testOneCopyWhicheverComesFirst()
         testChatRepositoryWiring()
+        testGroupEnvelopeCopyStartsOnFallbackRequestOrDirectFailure()
 
         if failures.isEmpty {
             print("all outbound-attempt tests passed")

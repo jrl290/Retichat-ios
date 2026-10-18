@@ -130,3 +130,19 @@ struct OutboundAttempts {
         succeeded ? nil : shown
     }
 }
+
+/// A Group envelope's DIRECT send (GroupChatManager.handleMessageState): what one report of the
+/// router does to it. Its propagated copy starts as a 1:1 message's does: on 0x10, or when the
+/// DIRECT attempt failed (0xFD, 0xFE, 0xFF) with no 0x10 before it; once per envelope, which the
+/// caller keeps. Until 2026-10-18 only 0x10 started it, so an envelope whose DIRECT send failed
+/// first reached no offline member (L72). An envelope has no bubble to keep up, so it is followed
+/// until its first terminal report, and its handle is released after any copy is cloned from it.
+nonisolated enum GroupEnvelopeReport {
+    static func startsCopy(_ state: UInt8) -> Bool {
+        state == 0x10 || state == 0xFD || state == 0xFE || state == 0xFF
+    }
+
+    static func ends(_ state: UInt8) -> Bool {
+        state == 0x04 || state == 0x08 || state == 0xFD || state == 0xFE || state == 0xFF
+    }
+}
