@@ -42,7 +42,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     // MARK: - Handles
 
-    private(set) var lxmfClient: LxmfClient?
+    private(set) var lxmfClient: LxmfClient? { didSet { pushClient.set(lxmfClient) } }
+    /// `lxmfClient` for the rfed.link push handlers, which run on a link
+    /// worker thread that rfed waits on: they must never wait for the main
+    /// thread (staging 2026-10-18, a busy main thread left every push
+    /// unanswered and rfed deferred them).
+    nonisolated private let pushClient = PushClientBox()
     private(set) var ownHash: Data = Data()
 
     // MARK: - Dependencies
@@ -908,10 +913,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
            data.prefix(16) == distroHash {
             return RfedDistroClient.ingestBlobAnswering(Data(data))
         }
-        // The link worker holds no lock while it waits (Reticulum-rust
-        // link.rs runs each request handler on its own thread).
-        let client = DispatchQueue.main.sync { MainActor.assumeIsolated { self.lxmfClient } }
-        guard let client else { return false }
+        // Never the main thread: rfed waits for this answer, and the UI can
+        // keep the main thread for seconds.
+        guard let client = pushClient.get() else { return false }
         let accepted = ffiQueue.sync { client.ingestPropagated(data) }
         if !accepted {
             print("[Retichat] /lxmf/delivery push refused len=\(data.count)")
@@ -5058,4 +5062,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             client.announce()
         }
     }
+}
+
+/// The LXMF client, read and written from any thread under a lock.
+nonisolated final class PushClientBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var client: LxmfClient?
+    func set(_ client: LxmfClient?) { lock.lock(); self.client = client; lock.unlock() }
+    func get() -> LxmfClient? { lock.lock(); defer { lock.unlock() }; return client }
 }

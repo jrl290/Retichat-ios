@@ -311,8 +311,9 @@ final class LxmfClient: @unchecked Sendable {
     }
 
     /// Feed raw propagated `lxmf_data` into the normal client delivery path.
+    /// Thread-free: the rfed.link push handler calls it on a link worker.
     @discardableResult
-    func ingestPropagated(_ lxmfData: Data) -> Bool {
+    nonisolated func ingestPropagated(_ lxmfData: Data) -> Bool {
         lxmfData.withUnsafeBytes { buf -> Bool in
             let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return lxmf_client_ingest_propagated(handle, p, UInt32(lxmfData.count)) == 1
