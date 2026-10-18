@@ -290,6 +290,70 @@ func testMarkersAreNotMessages() {
     check(rows.allSatisfy { $0.marker != nil }, "ten days, ten markers")
 }
 
+/// A message whose status changes while its id and time do not.
+struct Sent: Identifiable {
+    let id: String
+    let t: TimeInterval
+    let status: String
+}
+
+func testTheMemo() {
+    // 1000 messages, five a day, across the 200 days before now.
+    let now = date(at(ny, 2026, 9, 30, 12))
+    let start = at(ny, 2026, 3, 14, 9)
+    let msgs = (0..<1000).map { Msg(id: "m\($0)", t: start + Double($0) * 86_400 / 5) }
+    let memo = DayMarkers.Memo()
+    func ask(_ list: [Msg], now: Date = now, tz: String = ny, locale: Locale = enUS,
+             calendar: Calendar = gregorian) -> [String?] {
+        memo.rows(list, timestamp: \.t, now: now, calendar: calendar, timeZone: zone(tz),
+                  locale: locale).map(\.marker)
+    }
+    func plain(_ list: [Msg], now: Date = now, tz: String = ny, locale: Locale = enUS,
+               calendar: Calendar = gregorian) -> [String?] {
+        DayMarkers.rows(list, timestamp: \.t, now: now, calendar: calendar, timeZone: zone(tz),
+                        locale: locale).map(\.marker)
+    }
+
+    check(ask(msgs) == plain(msgs), "the memo gives the markers rows gives")
+    for _ in 0..<10 { _ = ask(msgs) }
+    check(memo.computed == 1, "asked again for the same list, it works nothing out again",
+          "worked out \(memo.computed) times")
+
+    let added = msgs + [Msg(id: "new", t: msgs[msgs.count - 1].t + 60)]
+    check(ask(added) == plain(added) && memo.computed == 2, "a new message works them out again")
+    let paged = [Msg(id: "old", t: start - 3 * 86_400)] + added
+    check(ask(paged) == plain(paged) && memo.computed == 3, "and so does a page of older ones")
+    let midnight = date(at(ny, 2026, 10, 1, 0, 5))
+    check(ask(paged, now: midnight) == plain(paged, now: midnight) && memo.computed == 4,
+          "and the clock moving, so Today becomes Yesterday")
+    check(ask(paged, now: midnight, tz: "Asia/Tokyo") == plain(paged, now: midnight, tz: "Asia/Tokyo")
+          && memo.computed == 5, "and the time zone changing, on the same clock")
+    let fr = Locale(identifier: "fr_FR")
+    check(ask(paged, now: midnight, tz: "Asia/Tokyo", locale: fr)
+          == plain(paged, now: midnight, tz: "Asia/Tokyo", locale: fr) && memo.computed == 6,
+          "and the locale changing")
+    let buddhist = Calendar(identifier: .buddhist)
+    check(ask(paged, now: midnight, tz: "Asia/Tokyo", locale: fr, calendar: buddhist)
+          == plain(paged, now: midnight, tz: "Asia/Tokyo", locale: fr, calendar: buddhist)
+          && memo.computed == 7, "and the calendar changing")
+
+    let t = at(ny, 2026, 9, 30, 9)
+    let statuses = DayMarkers.Memo()
+    _ = statuses.rows([Sent(id: "a", t: t, status: "sending")], timestamp: \.t, now: now,
+                      calendar: gregorian, timeZone: zone(ny), locale: enUS)
+    let delivered = statuses.rows([Sent(id: "a", t: t, status: "delivered")], timestamp: \.t, now: now,
+                                  calendar: gregorian, timeZone: zone(ny), locale: enUS)
+    check(statuses.computed == 1 && delivered.map(\.item.status) == ["delivered"]
+          && delivered.map(\.marker) == ["Today"],
+          "a row carries its item as it is now, though its marker was kept")
+
+    // What a render costs: rows works every day out, a kept list does not.
+    let clock = ContinuousClock()
+    let fresh = clock.measure { for _ in 0..<10 { _ = plain(paged, now: midnight) } } / 10
+    let kept = clock.measure { for _ in 0..<100 { _ = ask(paged, now: midnight) } } / 100
+    print("info  - 1002 messages: rows \(fresh), the memo on an unchanged list \(kept)")
+}
+
 // MARK: - Wiring
 
 /// The body of `signature` in `text`, up to its closing brace at the same indent.
@@ -338,6 +402,10 @@ func testTheWiring() {
     // The device's calendar, time zone and locale, on a clock that moves.
     let rows = body(of: "private func dayRows<Item: Identifiable>(", in: view)
     check(rows.contains("now: markerNow"), "labels read on the markers' clock")
+    check(rows.contains("markerMemo.rows(items, timestamp: timestamp,") && !rows.contains("DayMarkers.rows("),
+          "the rows come through the memo, so a keystroke works out no markers (L83)")
+    check(view.contains("@State private var markerMemo = DayMarkers.Memo()"),
+          "and the memo is kept in the view's state, across renders")
     check(rows.contains("calendar: .autoupdatingCurrent, timeZone: .autoupdatingCurrent")
           && rows.contains("locale: .autoupdatingCurrent"),
           "in the device's current calendar, time zone and locale")
@@ -373,6 +441,7 @@ enum DayMarkersTests {
         testOutOfOrder()
         testLocalizedLabels()
         testMarkersAreNotMessages()
+        testTheMemo()
         testTheWiring()
         if failures.isEmpty {
             print("all day marker tests passed")
