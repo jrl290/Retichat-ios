@@ -508,6 +508,10 @@ struct ConversationView: View {
                 .padding(.vertical, 8)
             }
             .defaultScrollAnchor(.bottom)
+            // Never animated (tests/DMScrollTests.swift): an animated scroll
+            // to the bottom of this LazyVStack, with rows from one line to
+            // thousands of points tall, froze the main thread for good in one
+            // SwiftUI update (staging 2026-10-18; 1.28 too).
             .onChange(of: viewModel.messages.count) { oldCount, newCount in
                 if let lastId = viewModel.messages.last?.id {
                     if oldCount == 0 {
@@ -515,18 +519,14 @@ struct ConversationView: View {
                             proxy.scrollTo(lastId, anchor: .bottom)
                         }
                     } else if newCount > oldCount {
-                        withAnimation {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                        proxy.scrollTo(lastId, anchor: .bottom)
                     }
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
                 if let lastId = viewModel.messages.last?.id {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        withAnimation {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                        proxy.scrollTo(lastId, anchor: .bottom)
                     }
                 }
             }
@@ -863,8 +863,9 @@ struct ConversationView: View {
             pendingAttachments = []
             viewModel.refreshMessages(chatId: id, repository: repository)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                // Not animated: see the DM list's onChange.
                 if let lastId = viewModel.messages.last?.id {
-                    withAnimation { scrollProxy?.scrollTo(lastId, anchor: .bottom) }
+                    scrollProxy?.scrollTo(lastId, anchor: .bottom)
                 }
             }
         case .channel(let ch):
