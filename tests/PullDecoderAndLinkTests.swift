@@ -585,10 +585,7 @@ struct AppLinkRequestModel {
         if segments.first == normalizedApp {
             segments.removeFirst()
         }
-        return normalizedApp == "rfed" && (
-            segments == ["channel", "stream"] ||
-            segments == ["propagation", "stream"]
-        )
+        return normalizedApp == "rfed" && segments == ["link"]
     }
 
     static func requestOpenMode(usePersistentLink: Bool, currentStatus: Int) -> RequestOpenMode {
@@ -599,18 +596,23 @@ struct AppLinkRequestModel {
 }
 
 func testLiveStreamsPreferPersistentAppLinks() {
+    // Since 2026-10-18 every RFed operation and both pushes go on one held
+    // rfed.link (RFed-spec Link.md; RfedLink.swift).
     check(
-        AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["channel", "stream"]),
-        "channel.stream MUST prefer persistent AppLinks"
+        AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["link"]),
+        "rfed.link MUST prefer persistent AppLinks"
     )
     check(
-        AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["propagation", "stream"]),
-        "propagation.stream MUST prefer persistent AppLinks"
+        !AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["channel", "stream"]),
+        "the retired rfed.channel.stream is not held"
     )
     check(
-        !AppLinkRequestModel.prefersPersistent(app: "rfed", aspects: ["channel", "pull"]),
-        "channel.pull MUST stay on the ephemeral AppLinks path"
+        !AppLinkRequestModel.prefersPersistent(app: "apns", aspects: ["register"]),
+        "apns.register stays on the ephemeral AppLinks path"
     )
+    let csm = (try? String(contentsOfFile: "Retichat-ios/Retichat/Services/ConnectionStateManager.swift", encoding: .utf8)) ?? ""
+    check(csm.contains("return normalizedApp == \"rfed\" && segments == [\"link\"]"),
+          "the model above mirrors ConnectionStateManager.prefersPersistentAppLink")
 }
 
 func testPersistentRequestStillUpgradesReadyOnlyActiveToHeldLink() {
@@ -647,8 +649,8 @@ func testChannelPullSourceUsesSplitDestinationAndAddressedPayload() {
         }
 
         check(
-            fragment.contains("aspects: [\"channel\", \"pull\"]"),
-            "channel pull uses rfed.channel.pull"
+            fragment.contains("RfedLink.shared.request(nodeHex: nodeKey, path: \"/channel/pull\""),
+            "channel pull goes on rfed.link as /channel/pull"
         )
         check(
             fragment.contains("payload: Self.msgpackBin(channelHashData)"),

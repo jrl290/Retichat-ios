@@ -2,19 +2,17 @@
 //  RfedNotifyRegistrar.swift
 //  Retichat
 //
-//  Registers this device's push-notification relay with rfed via a signed
-//  plain DATA packet on the ephemeral `rfed.notify.register` /
-//  `rfed.notify.unregister` AppLinks (split per REFACTOR.md step 1).
+//  Registers this device's push-notification relay with rfed: a signed
+//  request on the node's rfed.link (RFed-spec Link.md; RfedLink.swift).
 //
 //  Architecture:
-//    iOS app ──APP_LINK DATA──▶ rfed.notify.{register|unregister}
+//    iOS app ──request──▶ rfed.link /notify/register | /notify/unregister
 //      payload: signed msgpack [op, relay_hex, channel_hash|nil]
-//      success: Reticulum LRPROOF for that packet
+//               (byte-identical to the old rfed.notify.* DATA packets)
+//      success: the answer true
 //
-//  Required UserPreferences:
-//    rfedNotifyHash  — rfed's rfed.notify.register destination hash
-//                       (UI status probe; the unregister hash is derived
-//                        on demand from the rfed identity hash).
+//  Until 2026-10-18 these went as DATA on rfed.notify.register and
+//  rfed.notify.unregister, a link each.
 //
 //  The relay hash (apns-bridge's `apns.relay` destination) is loaded from
 //  PushBridgeConfig.plist via `ApnsBridgeHashes.effectiveRelayHex`.
@@ -28,18 +26,27 @@ final class RfedNotifyRegistrar {
     private let bridge = RetichatBridge.shared
     private let prefs  = UserPreferences.shared
 
-    /// One per `rfed.notify.register` destination (it changes with the node).
+    /// One per RFed node (it changes with the node's identity in Settings).
     @MainActor private var registrations: [String: HeldLinkRegistrations] = [:]
 
     private init() {}
 
+    /// The registrations owed to `nodeHex`, nil for a bad node hash.
     @MainActor
-    private func registrations(for rfedHash: Data) -> HeldLinkRegistrations {
-        if let existing = registrations[rfedHash.hexString] { return existing }
-        let created = HeldLinkRegistrations(destHash: rfedHash, app: "rfed", aspects: ["notify", "register"],
-                                            ops: LiveHeldLinkOps.shared)
-        registrations[rfedHash.hexString] = created
+    private func registrations(forNode nodeHex: String) -> HeldLinkRegistrations? {
+        let node = nodeHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let existing = registrations[node] { return existing }
+        guard let dest = RfedLink.destHash(nodeHex: node) else { return nil }
+        let created = HeldLinkRegistrations(destHash: dest, app: "rfed", aspects: ["link"],
+                                            ops: RfedLinkHeldOps(nodeHex: node, path: "/notify/register"))
+        registrations[node] = created
         return created
+    }
+
+    /// One unregister on `nodeHex`'s rfed.link. True when rfed answered true.
+    @MainActor
+    private func unregisterOnce(nodeHex: String, payload: Data) async -> Bool {
+        await RfedLink.shared.request(nodeHex: nodeHex, path: "/notify/unregister", payload: payload) == Data([0xc3])
     }
 
     private static func channelKey(_ channelHash: Data, relayHex: String, identityHandle: UInt64) -> String {
@@ -51,15 +58,15 @@ final class RfedNotifyRegistrar {
     /// Register this subscriber's relay hash with rfed.
     /// `identityHandle` is the Rust FFI handle for the local identity.
     ///
-    /// Owed to the node: sent on a held link to `rfed.notify.register` once
-    /// it is established, with its delivery proof, and owed until then (see
+    /// Owed to the node: sent on its rfed.link once it is established, with
+    /// rfed's answer as the proof, and owed until then (see
     /// `HeldLinkRegistrations`). Already registered in this run: not sent.
     @MainActor
     func registerIfNeeded(identityHandle: UInt64) {
-        let rfedDestHex = prefs.effectiveRfedNotifyHash
-        guard !rfedDestHex.isEmpty else { return }
-        guard let rfedHash = Data(hexString: rfedDestHex) else {
-            print("[RfedNotify] Invalid rfedNotifyHash — not 32 hex chars")
+        let node = prefs.effectiveRfedNodeIdentityHash
+        guard !node.isEmpty else { return }
+        guard let registrations = registrations(forNode: node) else {
+            print("[RfedNotify] Invalid RFed node identity hash — not 32 hex chars")
             return
         }
         guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else {
@@ -80,19 +87,14 @@ final class RfedNotifyRegistrar {
         }
 
         let key = "lxmf relay=\(relayHex.prefix(8)) identity=\(identityHandle)"
-        registrations(for: rfedHash).owe(key: key, payload: payload)
+        registrations.owe(key: key, payload: payload)
     }
 
-    /// Best-effort deregistration from a previous rfed node.
-    /// Sends a single signed DATA packet over the ephemeral
-    /// `rfed.notify.unregister` AppLink derived from `oldRfedIdentityHashHex`.
+    /// Best-effort deregistration from a previous rfed node: one signed
+    /// `/notify/unregister` request on `oldRfedIdentityHashHex`'s rfed.link.
     func deregisterFrom(oldRfedIdentityHashHex: String, identityHandle: UInt64) {
         let trimmed = oldRfedIdentityHashHex.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let unregisterHex = RfedChannelClient.rfedDestHash(
-            identityHashHex: trimmed, app: "rfed", aspects: ["notify", "unregister"])
-        guard !unregisterHex.isEmpty,
-              let rfedHash = Data(hexString: unregisterHex) else { return }
+        guard !trimmed.isEmpty, RfedLink.destHash(nodeHex: trimmed) != nil else { return }
         guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else { return }
 
         guard let payload = buildSignedPayload(
@@ -102,16 +104,11 @@ final class RfedNotifyRegistrar {
             identityHandle: identityHandle
         ) else { return }
 
-        Task.detached(priority: .background) {
-            let delivered = await ConnectionStateManager.shared.appLinkSendData(
-                destHash: rfedHash,
-                app: "rfed", aspects: ["notify", "unregister"],
-                payload: payload
-            )
-            if delivered {
+        Task { @MainActor in
+            if await self.unregisterOnce(nodeHex: trimmed, payload: payload) {
                 print("[RfedNotify] Delivered unregister to old rfed node")
             } else {
-                print("[RfedNotify] Unregister: no delivery proof within budget")
+                print("[RfedNotify] Unregister: rfed did not answer true within budget")
             }
         }
     }
@@ -119,9 +116,8 @@ final class RfedNotifyRegistrar {
     /// Register for per-channel push notification wakeups.
     /// Sends `[relay_hex, channel_hash_bin16]` as the value so the rfed node
     /// wakes this device when a message arrives on that specific channel.
-    func registerForChannel(channelHash: Data, rfedNotifyHashHex: String, identityHandle: UInt64) {
-        guard !rfedNotifyHashHex.isEmpty,
-              let rfedHash = Data(hexString: rfedNotifyHashHex) else { return }
+    func registerForChannel(channelHash: Data, nodeHex: String, identityHandle: UInt64) {
+        guard !nodeHex.isEmpty, RfedLink.destHash(nodeHex: nodeHex) != nil else { return }
         guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else {
             print("[RfedNotify] PushBridgeConfig.plist missing — skipping channel notify registration")
             return
@@ -135,38 +131,24 @@ final class RfedNotifyRegistrar {
         }
         let key = Self.channelKey(channelHash, relayHex: relayHex, identityHandle: identityHandle)
         Task { @MainActor in
-            self.registrations(for: rfedHash).owe(key: key, payload: payload)
+            self.registrations(forNode: nodeHex)?.owe(key: key, payload: payload)
         }
     }
 
     /// Deregister this device from per-channel push notifications (best-effort, no retry).
     /// Call when the user leaves / unsubscribes from a channel.
-    func deregisterForChannel(channelHash: Data, rfedNotifyHashHex: String, identityHandle: UInt64) {
-        // `rfedNotifyHashHex` is the register-op hash; derive the unregister
-        // hash by re-routing through the rfed identity. Pulling it from the
-        // register hex is not reversible.
-        let identityHex = prefs.effectiveRfedNodeIdentityHash
-        let unregisterHex = RfedChannelClient.rfedDestHash(
-            identityHashHex: identityHex, app: "rfed", aspects: ["notify", "unregister"])
-        guard !unregisterHex.isEmpty,
-              let rfedHash = Data(hexString: unregisterHex) else { return }
+    func deregisterForChannel(channelHash: Data, nodeHex: String, identityHandle: UInt64) {
+        guard !nodeHex.isEmpty, RfedLink.destHash(nodeHex: nodeHex) != nil else { return }
         guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else { return }
         guard let payload = buildSignedPayload(operation: "unregister",
                                                relayHex: relayHex,
                                                channelHash: channelHash,
                                                identityHandle: identityHandle) else { return }
         // A registration still owed must not go out after this.
-        if let registerHash = Data(hexString: rfedNotifyHashHex) {
-            let key = Self.channelKey(channelHash, relayHex: relayHex, identityHandle: identityHandle)
-            Task { @MainActor in self.registrations(for: registerHash).forget(key: key) }
-        }
-        Task.detached(priority: .background) {
-            let delivered = await ConnectionStateManager.shared.appLinkSendData(
-                destHash: rfedHash,
-                app: "rfed", aspects: ["notify", "unregister"],
-                payload: payload
-            )
-            if delivered {
+        let key = Self.channelKey(channelHash, relayHex: relayHex, identityHandle: identityHandle)
+        Task { @MainActor in
+            self.registrations(forNode: nodeHex)?.forget(key: key)
+            if await self.unregisterOnce(nodeHex: nodeHex, payload: payload) {
                 print("[RfedNotify] Delivered channel deregister (channel=\(channelHash.hexString.prefix(8))…)")
             }
         }

@@ -166,7 +166,7 @@ func applyingASiblingsChangeSendsNothingAndSubscribesWithTheDevicesKey() {
     let handle = body(channelClient, "func handleDistroChannelSync(", "/// §17.12 rule 6")
     check(handle.contains("guard didLoadPersistedState, modelContext != nil, !ownHashHex.isEmpty else {\n            pendingChannelSync.append("),
           "a membership message before the list is loaded is held, not lost")
-    check(before(channelClient, "drainPendingChannelSync()\n\n        guard identityHandle != 0 else { return }", "scheduleResubscribeOnRfedChannelActive()"),
+    check(before(channelClient, "drainPendingChannelSync()\n        installRfedLinkHandlers()\n\n        guard identityHandle != 0 else { return }", "scheduleResubscribeOnRfedChannelActive()"),
           "and judged at start")
 }
 

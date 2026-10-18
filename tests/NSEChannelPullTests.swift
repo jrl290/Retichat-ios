@@ -170,8 +170,8 @@ func testAPostSignedByTheUsersOwnDistroIsNeverShown() {
 func testTheWiring() {
     let pull = source("NotificationService/NSEChannelPull.swift")
     check(before(pull, "NSEDistroPull.ensurePath(to: dest", "NSEDistroPull.linkRequest("),
-          "the NSE has a confirmed path to rfed.channel.pull before its request (the distro lesson)")
-    check(pull.contains("aspects: \"channel,pull\", path: \"/rfed/pull\""), "it pulls /rfed/pull on rfed.channel.pull")
+          "the NSE has a confirmed path to rfed.link before its request (the distro lesson)")
+    check(pull.contains("aspects: \"link\", path: \"/channel/pull\""), "it pulls /channel/pull on rfed.link")
     check(before(pull, "PendingNotification.saveNSEChannelBlobs(", "unpackToShow(name: entry.name"),
           "every pulled blob is saved before any is unpacked (the pull drained RFed)")
     check(pull.contains("if entry.notify {"), "nothing is unpacked to show when the channel's Notifications are off")
@@ -204,8 +204,8 @@ func testTheWiring() {
     let client = source("Retichat/Services/RfedChannelClient.swift")
     let disable = client.range(of: "func disableChannelPush(channelHashHex: String) {")
         .map { String(client[$0.lowerBound...].prefix(1200)) } ?? ""
-    check(disable.contains("aspects: [\"notify\", \"register\"])") && !disable.contains("aspects: [\"notify\", \"unregister\"])"),
-          "disable passes the register hash, so switching push back on sends again")
+    check(disable.contains("nodeHex: notifyNode,") && !disable.contains("aspects: [\"notify\""),
+          "disable passes the node the registration was owed to, so switching push back on sends again")
     check(client.components(separatedBy: "publishPushDirectory()").count >= 5,
           "the directory is rewritten on enable, disable, leave and load")
     check(client.contains("guard didLoadPersistedState, !ownHashHex.isEmpty, !channels.isEmpty else { return }\n        let pairs = PendingNotification.readAndClearNSEChannelBlobs()"),

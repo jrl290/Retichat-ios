@@ -15,6 +15,7 @@
 #define CRetichatFFI_h
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // ===========================================================================
 //  Reticulum Transport API — universal, language-bridge-friendly
@@ -352,6 +353,29 @@ int32_t lxmf_app_link_register_packet_callback(uint64_t client,
                                                 uint32_t dest_len,
                                                 lxmf_app_link_packet_callback_t callback,
                                                 void *context);
+
+/// A request the node sends on a held outbound APP_LINK (rfed.link's
+/// `/delivery` and `/lxmf/delivery` pushes, RFed-spec Link.md). Return true only
+/// when the app now holds the blob: the answer goes back as msgpack bool and is
+/// the delivery proof. Runs on a link worker thread, which waits for it.
+typedef bool (*lxmf_app_link_inbound_request_callback_t)(
+    void *context,
+    const char *path,
+    const uint8_t *data,
+    uint32_t data_len);
+
+/// Set up every held outbound link to `dest_hash` from now on: identify as this
+/// client once established (`identify` != 0), and answer the node's requests on
+/// each path in `paths_csv` (comma-separated) with `callback`. Call before
+/// opening the link; an open link keeps its setup until it re-opens.
+/// Returns 0 on success, -1 on error.
+int32_t lxmf_app_link_set_outbound_setup(uint64_t client,
+                                         const uint8_t *dest_hash,
+                                         uint32_t dest_len,
+                                         int32_t identify,
+                                         const char *paths_csv,
+                                         lxmf_app_link_inbound_request_callback_t callback,
+                                         void *context);
 
 /// Notify the router that the host's network reachability state has
 /// changed (interface up/down, Wi-Fi <-> cellular, VPN flipped, etc.).

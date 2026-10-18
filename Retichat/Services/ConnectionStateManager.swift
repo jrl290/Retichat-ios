@@ -110,33 +110,13 @@ final class ConnectionStateManager {
     func register(lxmfClient: LxmfClient) {
         self.lxmfClient = lxmfClient
 
-        // Register reconnect handlers for every rfed aspect this app uses
-        // and the apns relay, so the LXMF router re-establishes app-links
-        // to those destinations on announce. (The built-in delivery_announce
-        // _handler only covers lxmf.delivery.)
-        //
-        // Per REFACTOR.md step 4: rfed.channel and rfed.notify are split
-        // into per-op aspects; the legacy rfed.channel/rfed.notify aspects
-        // remain registered because mixed-version servers still announce and
-        // serve them for compatibility. apns.notifyRelay is renamed apns.relay.
-        // Live receive paths now use rfed.channel.stream and
-        // rfed.propagation.stream.
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.subscribe")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.unsubscribe")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.publish")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.pull")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.channel.stream")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.propagation.stream")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify.register")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.notify.unregister")
-        // Distro (RFed SPEC §17): the rfed.distro.register ACTIVE edge is what
-        // re-runs a pending RfedDistroClient registration. Android
-        // ConnectionStateManager.kt:138-140.
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.distro.register")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.distro.unregister")
-        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.distro.list")
+        // Register reconnect handlers for the RFed node's one link and the
+        // apns relay, so the LXMF router re-establishes app-links to those
+        // destinations on announce. (The built-in delivery_announce_handler
+        // only covers lxmf.delivery.) Every RFed operation goes on rfed.link
+        // since 2026-10-18 (RfedLink.swift); its ACTIVE edge is what re-binds
+        // the streams and sends what registrations are owed.
+        lxmfClient.appLinkRegisterReconnect(aspect: "rfed.link")
         lxmfClient.appLinkRegisterReconnect(aspect: "apns.relay")
         lxmfClient.appLinkRegisterReconnect(aspect: "apns.register")
         lxmfClient.appLinkRegisterReconnect(aspect: "apns.unregister")
@@ -199,6 +179,17 @@ final class ConnectionStateManager {
         } else {
             essentialReadyHandlers.removeValue(forKey: key)
         }
+    }
+
+    /// Set up every held link to `destHash` from now on: identify as this
+    /// device once established, and answer the node's requests on `paths`
+    /// (LxmfClient.setAppLinkOutboundSetup). False with no stack.
+    @discardableResult
+    func setAppLinkOutboundSetup(destHash: Data, identify: Bool, paths: [String],
+                                 callback: @escaping @Sendable (String, Data) -> Bool) -> Bool {
+        guard let client = lxmfClient else { return false }
+        return client.setAppLinkOutboundSetup(destHash: destHash, identify: identify,
+                                              paths: paths, callback: callback)
     }
 
     @discardableResult
@@ -502,10 +493,7 @@ final class ConnectionStateManager {
     private func prefersPersistentAppLink(app: String, aspects: [String]) -> Bool {
         let normalizedApp = app.trimmingCharacters(in: .whitespacesAndNewlines)
         let segments = normalizedAspectSegments(app: app, aspects: aspects)
-        return normalizedApp == "rfed" && (
-            segments == ["channel", "stream"] ||
-            segments == ["propagation", "stream"]
-        )
+        return normalizedApp == "rfed" && segments == ["link"]
     }
 
     private func requestOpenMode(usePersistentLink: Bool, currentStatus: Int32) -> RequestOpenMode {
@@ -660,10 +648,10 @@ final class ConnectionStateManager {
             && bridge.transportPathVerifiedThisSession(destHash: destData)
     }
 
-    /// Wait for the rfed.channel.subscribe route to become reachable.
+    /// Wait for the rfed.link route to become reachable.
     func waitForRfedReachable(timeoutSecs: Double) async -> Bool {
         guard let destData = rfedServiceDestData(includeHiddenDefault: true,
-                                                 aspects: ["channel", "subscribe"]) else {
+                                                 aspects: ["link"]) else {
             return false
         }
         let bridge = RetichatBridge.shared
@@ -779,31 +767,11 @@ final class ConnectionStateManager {
             rfedCloneSources.append(("lxmf.propagation", derivedPropHash))
         }
 
-        // The 6 split rfed aspects (subscribe/unsubscribe/publish/pull and
-        // notify register/unregister) are derived per-op and pre-warmed here
-        // so app-links can come up immediately after network reconnect.
-        if !identityHex.isEmpty {
-            let splitAspects: [(String, [String])] = [
-                ("rfed.notify.register",   ["notify", "register"]),
-                ("rfed.notify.unregister", ["notify", "unregister"]),
-                ("rfed.channel.subscribe",   ["channel", "subscribe"]),
-                ("rfed.channel.unsubscribe", ["channel", "unsubscribe"]),
-                ("rfed.channel.publish",     ["channel", "publish"]),
-                ("rfed.channel.pull",        ["channel", "pull"]),
-                ("rfed.channel.stream",      ["channel", "stream"]),
-                ("rfed.propagation.stream",  ["propagation", "stream"]),
-                // Distro destinations (Android ConnectionStateManager.kt:697-699).
-                ("rfed.distro.register",   ["distro", "register"]),
-                ("rfed.distro.unregister", ["distro", "unregister"]),
-                ("rfed.distro.list",       ["distro", "list"]),
-            ]
-            for (label, aspects) in splitAspects {
-                let hex = RfedChannelClient.rfedDestHash(
-                    identityHashHex: identityHex, app: "rfed", aspects: aspects)
-                guard !hex.isEmpty, let hash = Data(hexString: hex) else { continue }
-                appendDestination(label, hash)
-                rfedServiceTargets.append((label, hash))
-            }
+        // rfed.link, which carries every RFed operation, pre-warmed here so
+        // its held link can come up immediately after network reconnect.
+        if !identityHex.isEmpty, let hash = RfedLink.destHash(nodeHex: identityHex) {
+            appendDestination("rfed.link", hash)
+            rfedServiceTargets.append(("rfed.link", hash))
         }
 
         // Also refresh identity for every propagation node candidate whose

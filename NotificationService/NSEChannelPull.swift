@@ -5,8 +5,9 @@ import Foundation
 // A channel with "Push All Messages" on is woken like LXMF, and the push names
 // the channel (userInfo["rfed"]["channel"], apns-bridge apns.rs build_payload).
 // The blob waits in RFed's deferred queue under this device's identity; only
-// /rfed/pull on the channel node's rfed.channel.pull, over a link identified as
-// this device, hands it over. Until 2026-09-26 the NSE ran only a propagation
+// /channel/pull on the channel node's rfed.link, over a link identified as
+// this device, hands it over (until 2026-10-18: /rfed/pull on
+// rfed.channel.pull; RFed-spec Link.md). Until 2026-09-26 the NSE ran only a propagation
 // sync and a distro pull, found nothing, and hid the notification (and RFed
 // woke channel subscribers under a key no push token was registered under, so
 // the push never came at all: RFed-rust 7225295).
@@ -76,8 +77,8 @@ enum NSEChannelPull {
         result.channelHex = key
 
         guard NSEDistroPull.ensurePath(to: dest, from: entry.sources.compactMap(NSEDistroPull.hexData),
-                                       deadline: deadline, label: "rfed.channel.pull") else {
-            NSLog("[NSE-Channel] no path to rfed.channel.pull %@", String(entry.pull.prefix(8)))
+                                       deadline: deadline, label: "rfed.link") else {
+            NSLog("[NSE-Channel] no path to rfed.link %@", String(entry.pull.prefix(8)))
             result.failed = true
             return result
         }
@@ -95,7 +96,7 @@ enum NSEChannelPull {
                 break
             }
             guard let response = NSEDistroPull.linkRequest(
-                dest: dest, aspects: "channel,pull", path: "/rfed/pull", payload: payload,
+                dest: dest, aspects: "link", path: "/channel/pull", payload: payload,
                 identityHandle: identityHandle, timeoutSecs: min(left, 10), ceilingSecs: left) else {
                 NSLog("[NSE-Channel] pull round %d: RFed not reachable", round)
                 result.failed = true

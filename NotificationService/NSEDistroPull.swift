@@ -5,7 +5,8 @@ import Foundation
 // RFed pushes a device for a distro message the way it pushes for a message
 // to the device's own address (RFed SPEC §17.3), but a distro message is not
 // in the propagation node's store: it waits in RFed's deferred queue, and only
-// /rfed/pull on rfed.distro.register hands it over. Until 2026-09-26 the NSE
+// /distro/pull on the node's rfed.link hands it over (until 2026-10-18:
+// /rfed/pull on rfed.distro.register; RFed-spec Link.md). Until 2026-09-26 the NSE
 // only synced from the propagation node, found nothing, and suppressed the
 // notification: a distro message showed no push on iOS.
 //
@@ -87,7 +88,7 @@ enum NSEDistroPull {
         // A link request with no path leaves on no route and is never
         // answered (the iPad, 2026-09-26: 10 s, nothing reached RFed).
         guard ensurePath(to: dest, from: route.sources.compactMap(hexData), deadline: deadline) else {
-            NSLog("[NSE-Distro] no path to rfed.distro.register %@", String(route.destination.prefix(8)))
+            NSLog("[NSE-Distro] no path to rfed.link %@", String(route.destination.prefix(8)))
             result.failed = true
             return result
         }
@@ -163,7 +164,7 @@ enum NSEDistroPull {
     /// (the propagation sync's), else use what is stored.
     /// Shared with NSEChannelPull; `label` names the destination in the log.
     static func ensurePath(to dest: Data, from sources: [Data], deadline: Date,
-                           label: String = "rfed.distro.register") -> Bool {
+                           label: String = "rfed.link") -> Bool {
         requestPath(dest)
         let budget = min(5, max(deadline.timeIntervalSinceNow - 1, 0))
         if waitForVerifiedPath(dest, budget: budget) {
@@ -228,7 +229,7 @@ enum NSEDistroPull {
     private static func pullRequest(dest: Data, identityHandle: UInt64, timeoutSecs: Double,
                                     ceilingSecs: Double) -> Data? {
         // msgpack nil: a distro pull carries no data
-        linkRequest(dest: dest, aspects: "distro,register", path: "/rfed/pull", payload: Data([0xC0]),
+        linkRequest(dest: dest, aspects: "link", path: "/distro/pull", payload: Data([0xC0]),
                     identityHandle: identityHandle, timeoutSecs: timeoutSecs, ceilingSecs: ceilingSecs)
     }
 
@@ -387,7 +388,7 @@ enum NSEDistroPull {
 // BEGIN NSEDistroPullDecoder
 // Foundation only: tests/NSEDistroPullTests.swift compiles this block on its own.
 
-/// The `/rfed/pull` response: msgpack [ [[bin distro_hash, bin blob], …], bool more ].
+/// The `/distro/pull` and `/channel/pull` response: msgpack [ [[bin distro_hash, bin blob], …], bool more ].
 enum NSEDistroPullDecoder {
 
     /// The blobs and the more-pending flag; nil for an error code (a bare

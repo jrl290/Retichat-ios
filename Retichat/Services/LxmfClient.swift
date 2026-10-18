@@ -88,6 +88,20 @@ fileprivate final class AppLinkPacketCallbackBox {
     init(callback: @escaping @Sendable (Data) -> Void) { self.callback = callback }
 }
 
+nonisolated fileprivate final class AppLinkInboundRequestBox {
+    let callback: @Sendable (String, Data) -> Bool
+    init(callback: @escaping @Sendable (String, Data) -> Bool) { self.callback = callback }
+}
+
+/// Top-level trampoline for `lxmf_app_link_set_outbound_setup`.
+nonisolated fileprivate let _appLinkInboundRequestTrampoline: lxmf_app_link_inbound_request_callback_t = {
+    (ctx, pathPtr, dataPtr, dataLen) -> Bool in
+    guard let ctx = ctx, let pathPtr = pathPtr else { return false }
+    let box = Unmanaged<AppLinkInboundRequestBox>.fromOpaque(ctx).takeUnretainedValue()
+    let data = (dataPtr != nil && dataLen > 0) ? Data(bytes: dataPtr!, count: Int(dataLen)) : Data()
+    return box.callback(String(cString: pathPtr), data)
+}
+
 /// Top-level C-compatible trampoline for `lxmf_app_link_request_async`.
 /// Cannot be a `@_cdecl` func — Swift forbids forming a C function pointer
 /// from such a func in property contexts. Closure form works.
@@ -464,6 +478,42 @@ final class LxmfClient: @unchecked Sendable {
         context: UnsafeMutableRawPointer? = nil
     ) -> Bool {
         lxmf_app_link_register_status_callback(handle, callback, context) == 0
+    }
+
+    /// Set up every held outbound link to `destHash` from now on (rfed.link,
+    /// RFed-spec Link.md): identify as this client once established, and answer
+    /// the node's requests on `paths` with `callback` (true only when the app
+    /// now holds the blob: the delivery proof). Call before opening the link.
+    /// The callback runs on a link worker thread, which waits for its answer.
+    ///
+    /// Its box is never released: the link library keeps the setup for the
+    /// life of the process, across stacks, and a push may still arrive on a
+    /// link this client opened after the client is gone.
+    @discardableResult
+    nonisolated func setAppLinkOutboundSetup(
+        destHash: Data,
+        identify: Bool,
+        paths: [String],
+        callback: @escaping @Sendable (String, Data) -> Bool
+    ) -> Bool {
+        let box = Unmanaged.passRetained(AppLinkInboundRequestBox(callback: callback))
+        let csv = paths.joined(separator: ",")
+        let ok = destHash.withUnsafeBytes { buf -> Bool in
+            let ptr = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return csv.withCString { cPaths in
+                lxmf_app_link_set_outbound_setup(
+                    handle,
+                    ptr,
+                    UInt32(destHash.count),
+                    identify ? 1 : 0,
+                    cPaths,
+                    _appLinkInboundRequestTrampoline,
+                    box.toOpaque()
+                ) == 0
+            }
+        }
+        if !ok { box.release() }
+        return ok
     }
 
     /// Register a callback for DATA packets received on a persistent APP_LINK.

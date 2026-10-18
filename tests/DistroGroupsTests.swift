@@ -149,7 +149,7 @@ func anInviteToDIsRoutedToTheGroupBranchAndNeverBecomesADirectMessage() {
             && before(unwrap, "switch parsed.groupRoute {", "inbound = .message(DistroMessage(unwrapped: parsed,"),
           "the group branch comes before the generic seen key and the DM path")
     let group = span(unwrap, from: "case .group(let hash, let groupId):", to: "case .dropped(let why):")
-    check(group.contains("RfedDistroClient.shared.deliver(.group(arrival))") && group.contains("            return\n"),
+    check(group.contains("RfedDistroClient.shared.deliver(.group(arrival))") && group.contains("            return true\n"),
           "a group message is delivered to the group sink and goes no further")
     check(repo.contains("RfedDistroClient.shared.onGroup = { [weak self] arrival in\n            self?.handleDistroGroupArrival(arrival) ?? false"),
           "the app routes it to handleDistroGroupArrival")
@@ -612,7 +612,7 @@ func theGroupSyncRules() {
     // The wiring: rule 0 silent; each G judged in order; nothing applied sends anything.
     let unwrap = body(distroClient, "nonisolated private static func unwrapAndDeliver(")
     let sync = span(unwrap, from: "case .groupSync(let hash):", to: "case .group(let hash, let groupId):")
-    check(sync.contains("let key = DistroGroupSync.syncSeenKey(hashHex: hash)") && sync.contains("guard !seen.contains(key) else { return }")
+    check(sync.contains("let key = DistroGroupSync.syncSeenKey(hashHex: hash)") && sync.contains("guard !seen.contains(key) else { return true }")
             && sync.contains("if kept { blobQueue.async { seen.record(key) } }"),
           "rule 0: a repeat is dropped silently; a G is recorded only when kept")
     let handle = body(repo, "private func handleDistroGroupSync(")

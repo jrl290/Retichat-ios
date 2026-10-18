@@ -223,21 +223,18 @@ nonisolated struct DistroSentCopy: Sendable {
 ///
 /// Mirrors Android service/RfedDistroClient.kt and the web client's
 /// `_registerDistro`, `_publishDistroAnnounce`, `_unregisterDistro`,
-/// `_pullDistroMessages` and `_handleDistroBlob` (Retichat-js app.js). Link
-/// management and requests go through `ConnectionStateManager.appLinkSend`;
-/// every payload and the blob decrypt come from `lxmf_rust::distro` via the
-/// FFI — those are wire formats shared with Android, not rewritten here.
+/// `_pullDistroMessages` and `_handleDistroBlob` (Retichat-js app.js). Every
+/// request is one on the node's rfed.link (RfedLink.swift, RFed-spec Link.md):
+/// `/distro/register`, `/distro/announce`, `/distro/pull` and
+/// `/distro/unregister`. Every payload and the blob decrypt come from
+/// `lxmf_rust::distro` via the FFI — those are wire formats shared with
+/// Android, not rewritten here.
 ///
-/// Split-aspect destinations (SPEC §17):
-///   - `rfed.distro.register` carries `/rfed/distro/register`,
-///     `/rfed/distro/announce` and `/rfed/pull` (reusing the register link
-///     avoids a second LINKREQUEST a busy relay may drop, SPEC §17.8);
-///   - `rfed.distro.unregister` carries `/rfed/distro/unregister`.
-///
-/// Where fan-out arrives on iOS: iOS never starts `rfed.delivery`, so live
-/// fan-out arrives on the `rfed.propagation.stream` link (RFed `distro_fanout`
-/// tier 2 — ChatRepository routes it here), and anything RFed deferred is
-/// drained by `/rfed/pull`.
+/// Where fan-out arrives: pushed on the same rfed.link, as `/lxmf/delivery`
+/// (ChatRepository routes it here) or `/delivery` with the distro's prefix
+/// (RfedChannelClient), answered with whether it is held; a `/notify` wake
+/// and every fresh link's stream open drain what RFed deferred with
+/// `/distro/pull`.
 ///
 /// No retry loops and no timers (DESIGN_PRINCIPLES.md §3-§5): a registration
 /// that cannot run is re-tried once when `rfed.distro.register`'s AppLink
@@ -341,6 +338,7 @@ final class RfedDistroClient: ObservableObject {
     private var pullTaskKey: RegKey?
     /// Destination whose ACTIVE edge re-runs registerIfNeeded, if armed.
     private var armedRetryDest: Data?
+    private var armedRetryNode: String?
     private var protectedDataObserver: NSObjectProtocol?
 
     private init() {
@@ -366,14 +364,20 @@ final class RfedDistroClient: ObservableObject {
 
     // MARK: - Destinations
 
-    private var registerDestHex: String {
-        RfedChannelClient.rfedDestHash(
-            identityHashHex: UserPreferences.shared.effectiveRfedNodeIdentityHash,
-            app: "rfed", aspects: ["distro", "register"])
+    /// The RFed node: every distro operation is a request on its rfed.link
+    /// (RFed-spec Link.md; RfedLink.swift).
+    private var rfedNode: String {
+        UserPreferences.shared.effectiveRfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    /// The RFed node's destinations the NSE can seed its path to
-    /// rfed.distro.register from, as ConnectionStateManager does for the app.
+    /// The node's rfed.link destination, where the distro registers, pulls and
+    /// unregisters, and where the NSE pulls.
+    private var registerDestHex: String {
+        RfedChannelClient.rfedDestHash(identityHashHex: rfedNode, app: "rfed", aspects: ["link"])
+    }
+
+    /// The RFed node's destinations the NSE can seed its path to rfed.link
+    /// from, as ConnectionStateManager does for the app.
     private var pullRouteSources: [String] {
         let identityHex = UserPreferences.shared.effectiveRfedNodeIdentityHash
         guard !identityHex.isEmpty else { return [] }
@@ -383,11 +387,7 @@ final class RfedDistroClient: ObservableObject {
         ].filter { $0.count == 32 }
     }
 
-    private var unregisterDestHex: String {
-        RfedChannelClient.rfedDestHash(
-            identityHashHex: UserPreferences.shared.effectiveRfedNodeIdentityHash,
-            app: "rfed", aspects: ["distro", "unregister"])
-    }
+    private var unregisterDestHex: String { registerDestHex }
 
     // MARK: - Helpers
 
@@ -495,18 +495,15 @@ final class RfedDistroClient: ObservableObject {
         // Arm before the attempt (RfedNotifyRegistrar.swift:77-98 pattern) so
         // an ACTIVE edge that lands while we check cannot be missed.
         armRetryOnActive(dest)
-        ConnectionStateManager.shared.appLinkPrime(
-            destHash: dest, app: "rfed", aspects: ["distro", "register"])
+        RfedLink.shared.ensure(nodeHex: rfedNode)
         guard ConnectionStateManager.shared.appLinkStatus(destHash: dest) == 3 else {
             // Not an error: the armed handler drives the next attempt when the
             // link reaches ACTIVE. Status stays "Not yet registered".
-            print("[Distro] register waits for rfed.distro.register ACTIVE")
+            print("[Distro] register waits for rfed.link ACTIVE")
             return
         }
 
-        let resp = await ConnectionStateManager.shared.appLinkSend(
-            destHash: dest, app: "rfed", aspects: ["distro", "register"],
-            path: "/rfed/distro/register", payload: payload)
+        let resp = await RfedLink.shared.request(nodeHex: rfedNode, path: "/distro/register", payload: payload)
         guard isCurrent(k) else {
             print("[Distro] register result dropped: superseded")
             return
@@ -559,9 +556,7 @@ final class RfedDistroClient: ObservableObject {
             print("[Distro] \(status.lastError ?? "")")
             return false
         }
-        let aresp = await ConnectionStateManager.shared.appLinkSend(
-            destHash: dest, app: "rfed", aspects: ["distro", "register"],
-            path: "/rfed/distro/announce", payload: announce)
+        let aresp = await RfedLink.shared.request(nodeHex: rfedNode, path: "/distro/announce", payload: announce)
         guard isCurrent(k) else {
             print("[Distro] announce result dropped: superseded")
             return false
@@ -595,23 +590,28 @@ final class RfedDistroClient: ObservableObject {
         }
     }
 
-    /// One-shot: re-run registerIfNeeded on the next ACTIVE (3) edge of
-    /// `dest`, then remove itself (fixes Android quirk 3, whose handler was
-    /// never removed and re-registered on every later edge).
+    /// One-shot: re-run registerIfNeeded on the next ACTIVE (3) edge of the
+    /// node's rfed.link, then remove itself (fixes Android quirk 3, whose
+    /// handler was never removed and re-registered on every later edge). A
+    /// listener of RfedLink's: the link's one status handler is RfedLink's.
     private func armRetryOnActive(_ dest: Data) {
+        let node = rfedNode
         armedRetryDest = dest
-        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: dest) { [weak self] s in
+        armedRetryNode = node
+        RfedLink.shared.setStatusListener(nodeHex: node, owner: "distro") { [weak self] s in
             guard s == 3 else { return }
-            ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: dest, handler: nil)
+            RfedLink.shared.setStatusListener(nodeHex: node, owner: "distro", nil)
             self?.armedRetryDest = nil
+            self?.armedRetryNode = nil
             self?.registerIfNeeded()
         }
     }
 
     private func disarm() {
-        guard let dest = armedRetryDest else { return }
-        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: dest, handler: nil)
+        guard armedRetryDest != nil else { return }
+        if let node = armedRetryNode { RfedLink.shared.setStatusListener(nodeHex: node, owner: "distro", nil) }
         armedRetryDest = nil
+        armedRetryNode = nil
     }
 
     /// Android RfedDistroClient.kt:119-130. Same payload as register, on the
@@ -626,11 +626,7 @@ final class RfedDistroClient: ObservableObject {
             print("[Distro] unregister payload: \(RetichatBridge.shared.rnsLastError() ?? "unknown error")")
             return false
         }
-        ConnectionStateManager.shared.appLinkPrime(
-            destHash: dest, app: "rfed", aspects: ["distro", "unregister"])
-        let resp = await ConnectionStateManager.shared.appLinkSend(
-            destHash: dest, app: "rfed", aspects: ["distro", "unregister"],
-            path: "/rfed/distro/unregister", payload: payload)
+        let resp = await RfedLink.shared.request(nodeHex: rfedNode, path: "/distro/unregister", payload: payload)
         return DistroCodec.isAffirmative(resp)
     }
 
@@ -695,9 +691,9 @@ final class RfedDistroClient: ObservableObject {
         }
     }
 
-    /// Rounds are sequential and awaited, never concurrent. Each round is
-    /// still its own one-shot link request (ConnectionStateManager's
-    /// ephemeral design for non-stream RFed aspects).
+    /// Rounds are sequential and awaited, never concurrent, each a request
+    /// on rfed.link, which identified as this device (the pull
+    /// authenticates by link identity, Link.md "Identify").
     private func runPull(_ k: RegKey, _ dest: Data) async -> DistroFirst.PullOutcome {
         var total = 0
         var unfinished: String?
@@ -709,9 +705,8 @@ final class RfedDistroClient: ObservableObject {
                 print("[Distro] pull \(unfinished ?? "")")
                 break
             }
-            let resp = await ConnectionStateManager.shared.appLinkSend(
-                destHash: dest, app: "rfed", aspects: ["distro", "register"],
-                path: "/rfed/pull", payload: DistroCodec.msgpackNil)
+            let resp = await RfedLink.shared.request(nodeHex: rfedNode, path: "/distro/pull",
+                                                     payload: DistroCodec.msgpackNil)
             guard isCurrent(k) else {
                 // A stop (Settings, the stack's restart), a forget or an adopt while
                 // the round waited: cancelled by it, not failed (the truth rule), and
@@ -809,6 +804,15 @@ final class RfedDistroClient: ObservableObject {
         blobQueue.async { unwrapAndDeliver(blob, shownByNSE: shownByNSE) }
     }
 
+    /// A blob pushed on rfed.link, on its link worker thread, which waits for
+    /// the answer: true when this device now holds it (unwrapped and handed
+    /// on, or held already), false when it was refused or rejected, is
+    /// another distro's, or no distro is loaded. In order with the other
+    /// blobs: the same serial queue. Android RfedDistroClient.handleBlob.
+    nonisolated static func ingestBlobAnswering(_ blob: Data) -> Bool {
+        blobQueue.sync { unwrapAndDeliver(blob, shownByNSE: false) }
+    }
+
     /// Distro blobs the NSE pulled for a push while the app was not running
     /// (PendingNotification "Distro, for the NSE"): ingested as a pull of our
     /// own, so dedupe, sent copies and transfers are handled once, here. Left
@@ -822,11 +826,14 @@ final class RfedDistroClient: ObservableObject {
         for blob in blobs { ingestBlob(blob, shownByNSE: true) }
     }
 
-    nonisolated private static func unwrapAndDeliver(_ blob: Data, shownByNSE: Bool) {
+    /// True when the blob is held now (handed on, or seen already), false
+    /// when it was refused, rejected, another distro's, or unreadable.
+    @discardableResult
+    nonisolated private static func unwrapAndDeliver(_ blob: Data, shownByNSE: Bool) -> Bool {
         let h = DistroManager.shared.handle
         guard h != 0 else {
             print("[Distro] blob dropped: no distro loaded")
-            return
+            return false
         }
         let distroHex = DistroManager.shared.deliveryHashHex ?? ""
         var outLen: UInt32 = 0
@@ -843,18 +850,18 @@ final class RfedDistroClient: ObservableObject {
             if !RepeatedKeys.isRefusal(error) {
                 print("[Distro] unwrap rejected blob: \(error)")
             }
-            return
+            return false
         }
         let json = Data(bytes: ptr, count: Int(outLen))
         rns_free_bytes(ptr, outLen)
 
         // Zero length is not an error: the blob was addressed to a different
         // distro, which a node may legitimately hand over.
-        guard !json.isEmpty else { return }
+        guard !json.isEmpty else { return false }
         guard let parsed = try? JSONDecoder().decode(DistroUnwrapped.self, from: json),
               let src = Data(hexString: parsed.source_hash), src.count == 16 else {
             print("[Distro] unwrap returned unreadable JSON (\(json.count) bytes)")
-            return
+            return false
         }
         let srcHex = src.hexString
 
@@ -869,7 +876,7 @@ final class RfedDistroClient: ObservableObject {
             let key = DistroChannelSync.repeatKey(sourceHex: srcHex, timestamp: parsed.timestamp, marker: marker)
             guard !seen.contains(key) else {
                 print("[Distro] duplicate membership message from \(srcHex.prefix(8)) — skipped")
-                return
+                return true
             }
             let fromDistro = !distroHex.isEmpty && srcHex == distroHex
             let candidate = ChannelSyncCandidate(marker: marker, fromDistro: fromDistro,
@@ -879,7 +886,7 @@ final class RfedDistroClient: ObservableObject {
                 // Only a message held is recorded as seen: a dropped one is judged again.
                 if held { blobQueue.async { seen.record(key) } }
             }
-            return
+            return true
         }
 
         // GROUPS-DISTRO-DESIGN.md §6.1-§6.2: the group sync (SPEC §17.14) and group
@@ -892,7 +899,7 @@ final class RfedDistroClient: ObservableObject {
         case .groupSync(let hash):
             let key = DistroGroupSync.syncSeenKey(hashHex: hash)
             // §11.1 rule 0: a repeat is dropped silently.
-            guard !seen.contains(key) else { return }
+            guard !seen.contains(key) else { return true }
             let arrival = DistroGroupSyncArrival(
                 blob: blob, hash: hash, sourceHex: srcHex, distroHex: distroHex,
                 signatureValidated: parsed.signature_validated ?? false,
@@ -901,12 +908,12 @@ final class RfedDistroClient: ObservableObject {
                 let kept = RfedDistroClient.shared.deliver(.groupSync(arrival))
                 if kept { blobQueue.async { seen.record(key) } }
             }
-            return
+            return true
         case .group(let hash, let groupId):
             let key = DistroGroupSync.groupSeenKey(hashHex: hash)
             guard !seen.contains(key) else {
                 print("[Distro] duplicate group message \(hash.prefix(8)) from \(srcHex.prefix(8)) — skipped")
-                return
+                return true
             }
             let arrival = DistroGroupArrival(
                 blob: blob, hash: hash, sourceHex: srcHex, groupId: groupId,
@@ -918,16 +925,16 @@ final class RfedDistroClient: ObservableObject {
                 let kept = RfedDistroClient.shared.deliver(.group(arrival))
                 if kept { blobQueue.async { seen.record(key) } }
             }
-            return
+            return true
         case .dropped(let why):
             print("[Distro] group message from \(srcHex.prefix(8)) dropped: \(why) (never a direct message)")
-            return
+            return false
         case .other:
             break
         }
 
         let key = DistroCodec.seenKey(sourceHex: srcHex, timestamp: parsed.timestamp)
-        guard !seen.contains(key) else { return }
+        guard !seen.contains(key) else { return true }
 
         let inbound: Inbound
         if let transfer = parsed.distro_transfer_key, !transfer.isEmpty {
@@ -956,6 +963,7 @@ final class RfedDistroClient: ObservableObject {
             let handed = RfedDistroClient.shared.deliver(inbound)
             if handed { blobQueue.async { seen.record(key) } }
         }
+        return true
     }
 
     private func deliver(_ inbound: Inbound) -> Bool {

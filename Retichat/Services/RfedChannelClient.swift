@@ -99,6 +99,7 @@ final class RfedChannelClient: ObservableObject {
 
     private var linkStatusTimer: AnyCancellable?
     private var trackedChannelStreamNodes: Set<String> = []
+    private var didInstallRfedLinkHandlers = false
     /// Runtime-only set of channel hashes whose conversation view has been
     /// opened in this app process. `rfed.channel.stream` filters are derived
     /// from this set so the persistent link only streams channels the user has
@@ -173,6 +174,7 @@ final class RfedChannelClient: ObservableObject {
         }
 
         drainPendingChannelSync()
+        installRfedLinkHandlers()
 
         guard identityHandle != 0 else { return }
         stopsAtLastStart = RfedDistroClient.shared.stackStops
@@ -445,11 +447,9 @@ final class RfedChannelClient: ObservableObject {
     @discardableResult
     private func leaveHere(channelHashHex: String) -> Bool {
         guard let channel = channels.first(where: { $0.id == channelHashHex }) else { return false }
-        let unsubscribeDestHex = Self.rfedDestHash(identityHashHex: channel.rfedNodeHash,
-                                app: "rfed",
-                                aspects: ["channel"])
+        let rfedNode = channel.rfedNodeHash
         guard let channelHashData = Data(hexString: channelHashHex),
-              let rfedDest = Data(hexString: unsubscribeDestHex) else { return false }
+              RfedLink.destHash(nodeHex: rfedNode) != nil else { return false }
 
         let pubkey = bridge.identityPublicKey(handle: identityHandle)
         let sig    = pubkey != nil ? bridge.identitySign(handle: identityHandle, data: channelHashData) : nil
@@ -459,21 +459,15 @@ final class RfedChannelClient: ObservableObject {
         } else {
             payload = Self.msgpackBin(channelHashData)
         }
-        Task.detached(priority: .background) {
-            _ = await ConnectionStateManager.shared.appLinkSend(
-                destHash: rfedDest,
-                app: "rfed", aspects: ["channel"],
-                path: "/rfed/unsubscribe",
-                payload: payload
-            )
+        Task(priority: .background) {
+            _ = await RfedLink.shared.request(nodeHex: rfedNode, path: "/channel/unsubscribe", payload: payload)
         }
 
         // Deregister per-channel push notification wakeup.
-        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                                                  app: "rfed", aspects: ["notify", "register"])
-        if let channelHashForNotify = Data(hexString: channelHashHex), !rfedNotifyHashHex.isEmpty {
+        let notifyNode = prefs.effectiveRfedNodeIdentityHash
+        if let channelHashForNotify = Data(hexString: channelHashHex), !notifyNode.isEmpty {
             RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashForNotify,
-                                                            rfedNotifyHashHex: rfedNotifyHashHex,
+                                                            nodeHex: notifyNode,
                                                             identityHandle: identityHandle)
         }
 
@@ -660,14 +654,14 @@ final class RfedChannelClient: ObservableObject {
 
     /// Share with the NSE, per channel with push on, what its pull needs
     /// (PendingNotification.ChannelPushEntry): the name the message key
-    /// derives from, the rfed.channel.pull destination of the channel's node
+    /// derives from, the rfed.link destination of the channel's node
     /// and the node destinations its path can be seeded from, and the
     /// channel's Notifications toggle. Written whenever one of those changes.
     func publishPushDirectory() {
         let entries: [PendingNotification.ChannelPushEntry] = channels.compactMap { channel in
             guard UserPreferences.shared.isChannelPushEnabled(channel.id) else { return nil }
             let node = channel.rfedNodeHash
-            let pull = Self.rfedDestHash(identityHashHex: node, app: "rfed", aspects: ["channel", "pull"])
+            let pull = Self.rfedDestHash(identityHashHex: node, app: "rfed", aspects: ["link"])
             guard pull.count == 32 else { return nil }
             let sources = [
                 Self.rfedDestHash(identityHashHex: node, app: "rfed", aspects: ["node"]),
@@ -705,11 +699,10 @@ final class RfedChannelClient: ObservableObject {
         UserPreferences.shared.enableChannelPush(channelHashHex)
         publishPushDirectory()
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
-        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                                                   app: "rfed", aspects: ["notify", "register"])
-        guard !rfedNotifyHashHex.isEmpty else { return }
+        let notifyNode = prefs.effectiveRfedNodeIdentityHash
+        guard !notifyNode.isEmpty else { return }
         RfedNotifyRegistrar.shared.registerForChannel(channelHash: channelHashData,
-                                                       rfedNotifyHashHex: rfedNotifyHashHex,
+                                                       nodeHex: notifyNode,
                                                        identityHandle: identityHandle)
     }
 
@@ -718,16 +711,14 @@ final class RfedChannelClient: ObservableObject {
         UserPreferences.shared.disableChannelPush(channelHashHex)
         publishPushDirectory()
         guard let channelHashData = Data(hexString: channelHashHex) else { return }
-        // The REGISTER hash: deregisterForChannel forgets the owed or
-        // delivered registration under it, and derives the unregister
-        // destination itself. Until 2026-09-26 this passed the unregister
-        // hash, so the registration was never forgotten and switching push
-        // back on in the same run sent nothing (leaveChannel was right).
-        let rfedNotifyHashHex = Self.rfedDestHash(identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                                                   app: "rfed", aspects: ["notify", "register"])
-        guard !rfedNotifyHashHex.isEmpty else { return }
+        // The node the registration was owed to: deregisterForChannel
+        // forgets the owed or delivered registration under it, so switching
+        // push back on in the same run sends it again (until 2026-09-26 the
+        // wrong hash was passed here and nothing was forgotten).
+        let notifyNode = prefs.effectiveRfedNodeIdentityHash
+        guard !notifyNode.isEmpty else { return }
         RfedNotifyRegistrar.shared.deregisterForChannel(channelHash: channelHashData,
-                                                         rfedNotifyHashHex: rfedNotifyHashHex,
+                                                         nodeHex: notifyNode,
                                                          identityHandle: identityHandle)
     }
 
@@ -949,21 +940,17 @@ final class RfedChannelClient: ObservableObject {
             print("[RfedChannel] stamp computed (cost=\(cost), stamp_bytes=\(stamp.count), payload_bytes=\(payload.count))")
         }
 
-        let publishDestHex = Self.rfedDestHash(identityHashHex: channel.rfedNodeHash,
-                                                app: "rfed",
-                                                aspects: ["channel"])
-        guard let publishDest = Data(hexString: publishDestHex) else {
-            print("[RfedChannel] Send failed: invalid publish dest derived from \(channel.rfedNodeHash)")
+        guard RfedLink.destHash(nodeHex: channel.rfedNodeHash) != nil else {
+            print("[RfedChannel] Send failed: invalid rfed.link dest derived from \(channel.rfedNodeHash)")
             return false
         }
-        let ok = await ConnectionStateManager.shared.appLinkSendData(
-            destHash: publishDest,
-            app: "rfed",
-            aspects: ["channel"],
-            payload: payload
-        )
-        if !ok {
-            print("[RfedChannel] Send failed: AppLinks DATA delivery failed")
+        // A request on rfed.link, answered [ok, reason] (RFed-spec Link.md):
+        // until 2026-10-18 the post went as DATA on rfed.channel, whose proof
+        // said only that the packet arrived, never whether rfed took it.
+        let answer = await RfedLink.shared.request(nodeHex: channel.rfedNodeHash, path: "/channel/publish",
+                                                   payload: payload)
+        if let refusal = Self.publishRefusal(answer) {
+            print("[RfedChannel] Send failed: rfed answered \(refusal)")
             return false
         }
         // Handed to RFed: record what this post carried (§4.2).
@@ -1055,10 +1042,7 @@ final class RfedChannelClient: ObservableObject {
             return false
         }
 
-        guard let rfedPullDest = Data(hexString: Self.rfedDestHash(
-            identityHashHex: nodeKey,
-            app: "rfed", aspects: ["channel", "pull"]
-        )) else {
+        guard RfedLink.destHash(nodeHex: nodeKey) != nil else {
             await MainActor.run { self.pullInFlight[channelKey] = false }
             return false
         }
@@ -1067,15 +1051,14 @@ final class RfedChannelClient: ObservableObject {
             Task { @MainActor in self.pullInFlight[channelKey] = false }
         }
 
-        let response = await ConnectionStateManager.shared.appLinkSend(
-            destHash: rfedPullDest,
-            app: "rfed", aspects: ["channel", "pull"],
-            path: "/rfed/pull",
-            payload: Self.msgpackBin(channelHashData)
-        )
+        // On rfed.link, which identified as this device before ACTIVE (the
+        // pull authenticates by link identity, Link.md "Identify").
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let response = await RfedLink.shared.request(nodeHex: nodeKey, path: "/channel/pull",
+                                                     payload: Self.msgpackBin(channelHashData))
 
         guard let data = response else {
-            print("[RfedChannel] PULL: rfed.channel.pull request failed or no response within 5 s")
+            print("[RfedChannel] PULL: rfed.link /channel/pull failed or no response within 5 s")
             return false
         }
 
@@ -1088,7 +1071,7 @@ final class RfedChannelClient: ObservableObject {
 
         for (channelHashData, blob) in pairs {
             await MainActor.run {
-                self.dispatchBlob(channelHashHex: channelHashData.hexString, blob: blob)
+                _ = self.dispatchBlob(channelHashHex: channelHashData.hexString, blob: blob)
             }
         }
 
@@ -1098,46 +1081,51 @@ final class RfedChannelClient: ObservableObject {
 
     // MARK: - Live channel stream receive
 
-    /// Called on a background thread by the rfed.channel.stream AppLink callback.
-    nonisolated func onRfedBlob(_ blob: Data) {
+    /// A `/delivery` push on rfed.link, on its link worker thread, which waits
+    /// for the answer: true when this device now holds the post (stored, or
+    /// held already), false when it was dropped (RFed-spec Link.md "The
+    /// response is the delivery proof").
+    nonisolated func onRfedBlob(_ blob: Data) -> Bool {
         // Blob format from server: channel_hash(16) | inner_blob(*)
         print("[RfedChannel] onRfedBlob total_bytes=\(blob.count)")
         guard blob.count > 16 else {
             print("[RfedChannel] onRfedBlob DROPPED: too short (\(blob.count) bytes)")
-            return
+            return false
         }
         let channelHashData = blob.prefix(16)
         let innerBlob = blob.dropFirst(16)
 
-        // Distro fan-out shares rfed.delivery with channels, told apart only by
+        // Distro fan-out shares /delivery with channels, told apart only by
         // the 16-byte prefix: the distro's lxmf.delivery hash instead of a
         // channel hash (RFed distro_fanout tier 3). Mirrors Android
-        // RfedChannelClient.kt:848-855 and web _handleChannelPacket →
-        // _handleDistroBlob. INERT on iOS today: onRfedBlob is fed only by
-        // rfed.channel.stream and iOS does not start rfed.delivery — live
-        // distro fan-out arrives on rfed.propagation.stream and is routed in
-        // ChatRepository.configurePropagationStream. Kept for parity.
+        // RfedChannelClient.dispatchInboundBlob and web _handleChannelPacket →
+        // _handleDistroBlob.
         if let distroHash = DistroManager.shared.deliveryHash, channelHashData == distroHash {
             print("[RfedChannel] onRfedBlob distro prefix → RfedDistroClient inner_bytes=\(innerBlob.count)")
-            RfedDistroClient.ingestBlob(Data(innerBlob))
-            return
+            return RfedDistroClient.ingestBlobAnswering(Data(innerBlob))
         }
         let channelHashHex = channelHashData.hexString
         print("[RfedChannel] onRfedBlob channel_hash=\(channelHashHex) inner_bytes=\(innerBlob.count)")
 
-        Task { @MainActor in
-            self.dispatchBlob(channelHashHex: channelHashHex, blob: Data(innerBlob))
+        // The link worker waits here for the main actor: it holds no lock
+        // (Reticulum-rust link.rs runs each request handler on its own thread).
+        let inner = Data(innerBlob)
+        return DispatchQueue.main.sync {
+            MainActor.assumeIsolated { self.dispatchBlob(channelHashHex: channelHashHex, blob: inner) }
         }
     }
 
     // MARK: - Private
 
-    private func dispatchBlob(channelHashHex: String, blob: Data, notify: Bool = true) {
+    /// True when this device now holds the post (stored, or held already),
+    /// false when it was dropped: rfed.link's delivery proof.
+    @discardableResult
+    private func dispatchBlob(channelHashHex: String, blob: Data, notify: Bool = true) -> Bool {
         // Skip if this channel is not known
         guard let channel = channels.first(where: { $0.id == channelHashHex }) else {
             let known = channels.map { $0.id.prefix(8) }.joined(separator: ", ")
             print("[RfedChannel] dispatchBlob NO MATCH channel=\(channelHashHex.prefix(16)) known=[\(known)]")
-            return
+            return false
         }
 
         // Pre-decryption dedup. Same encrypted blob from the propagation node
@@ -1146,7 +1134,7 @@ final class RfedChannelClient: ObservableObject {
         let blobKey = channelHashHex.hashValue &+ blob.hashValue
         if seenBlobKeys.contains(blobKey) {
             print("[RfedChannel] dispatchBlob PRE-DEDUP channel=\(channelHashHex.prefix(16)) blob_bytes=\(blob.count)")
-            return
+            return true
         }
         seenBlobKeys.insert(blobKey)
         seenBlobOrder.append(blobKey)
@@ -1163,7 +1151,7 @@ final class RfedChannelClient: ObservableObject {
         // destinations cache. If the sender hasn't been seen via an announce
         // (signatureValidated == false, reason == SOURCE_UNKNOWN) we drop the
         // message — we cannot prove who it's from.
-        guard let channelHashData = Data(hexString: channelHashHex) else { return }
+        guard let channelHashData = Data(hexString: channelHashHex) else { return false }
         let lxmfData = channelHashData + blob
 
         guard let result = bridge.channelLxmUnpack(name: channel.channelName, lxmfData: lxmfData) else {
@@ -1177,7 +1165,7 @@ final class RfedChannelClient: ObservableObject {
                     print("[RfedChannel] dispatchBlob LXMF unpack FAILED (lxmf_bytes=\(lxmfData.count), err=\(error ?? "?"), suppressing repeats)")
                 }
             }
-            return
+            return false
         }
 
         guard result.signatureValidated else {
@@ -1188,29 +1176,30 @@ final class RfedChannelClient: ObservableObject {
             default: reasonStr = "code=\(result.unverifiedReason)"
             }
             print("[RfedChannel] dispatchBlob REJECTED unsigned message: \(reasonStr) sender=\(result.sourceHash.hexString.prefix(8))")
-            return
+            return false
         }
 
         print("[RfedChannel] dispatchBlob unpack OK source=\(result.sourceHash.hexString.prefix(8)) ts_ms=\(result.timestampMs) content_bytes=\(result.content.count) sig_ok=true")
-        dispatchVerifiedLxmf(channelHashHex: channelHashHex, result: result, notify: notify)
+        return dispatchVerifiedLxmf(channelHashHex: channelHashHex, result: result, notify: notify)
     }
 
     /// Dispatch a successfully signature-verified LXMF channel message.
     /// `notify` is false for blobs the NSE pulled: it already showed them.
+    /// True when the post is stored, or was already.
     private func dispatchVerifiedLxmf(channelHashHex: String, result: RetichatBridge.ChannelLxmUnpackResult,
-                                      notify: Bool = true) {
+                                      notify: Bool = true) -> Bool {
         let senderHashHex = result.sourceHash.hexString
         let tsMs = result.timestampMs
         guard let content = String(data: result.content, encoding: .utf8) else {
             print("[RfedChannel] dispatchVerifiedLxmf DROPPED: content not valid UTF-8")
-            return
+            return false
         }
 
         let msgId = senderHashHex + String(format: "%016llx", tsMs)
         let existingForChannel = messages[channelHashHex]?.contains(where: { $0.id == msgId }) ?? false
         guard !existingForChannel else {
             print("[RfedChannel] dispatchVerifiedLxmf DEDUP: msgId=\(msgId.prefix(16))")
-            return
+            return true
         }
         print("[RfedChannel] dispatchVerifiedLxmf DELIVERING sender=\(senderHashHex.prefix(8)) content='\(content.prefix(40))'")
 
@@ -1267,6 +1256,32 @@ final class RfedChannelClient: ObservableObject {
                 content: content
             )
         }
+        return true
+    }
+
+    /// rfed's answer to `/channel/publish` (RFed-spec Link.md): `[true, nil]`
+    /// is accepted, stored and fanned out (nil here); `[false, reason]` gives
+    /// the reason; no answer, or one that isn't either, says so. Android
+    /// RfedChannelClient.publishRefusal.
+    nonisolated static func publishRefusal(_ answer: Data?) -> String? {
+        guard let answer else { return "nothing within 5 s" }
+        let a = [UInt8](answer)
+        if a.count >= 2, a[0] == 0x92, a[1] == 0xc3 { return nil }
+        if a.count >= 2, a[0] == 0x92, a[1] == 0xc2 {
+            let tag = a.count > 2 ? Int(a[2]) : -1
+            let len: Int
+            if (0xa0...0xbf).contains(tag) {
+                len = tag - 0xa0
+            } else if tag == 0xd9, a.count > 3 {
+                len = Int(a[3])
+            } else {
+                return "a refusal"
+            }
+            let start = tag == 0xd9 ? 4 : 3
+            guard a.count >= start + len else { return "a refusal" }
+            return String(decoding: a[start..<(start + len)], as: UTF8.self)
+        }
+        return "an unreadable answer \(answer.hexString)"
     }
 
     private func appendMessage(_ msg: ChannelMessage, toChannelHash hash: String) {
@@ -1310,31 +1325,18 @@ final class RfedChannelClient: ObservableObject {
         }
         let payload = Self.msgpackSigned(value: channelHashData, pubkey: pubkey, sig: sig)
 
-        let channelDestHex = Self.rfedDestHash(
-            identityHashHex: rfedNodeIdentityHashHex,
-            app: "rfed",
-            aspects: ["channel"]
-        )
-        guard let rfedChannelDest = Data(hexString: channelDestHex) else {
+        guard RfedLink.destHash(nodeHex: rfedNodeIdentityHashHex) != nil else {
             throw ChannelError.invalidRfedNode
         }
 
-        // Route subscribe over the legacy rfed.channel compatibility destination.
-        // Mixed-version rfed nodes still serve /rfed/subscribe on rfed.channel
-        // even when the newer split destination hashes are absent. AppLinks
-        // still owns the path race and link establishment, so this preserves
-        // the stale-path fix without assuming split-destination support.
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        let response = await ConnectionStateManager.shared.appLinkSend(
-            destHash: rfedChannelDest,
-            app: "rfed", aspects: ["channel"],
-            path: "/rfed/subscribe",
-            payload: payload
-        )
+        // On rfed.link (RFed-spec Link.md). AppLinks owns the path race and
+        // link establishment. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let response = await RfedLink.shared.request(nodeHex: rfedNodeIdentityHashHex,
+                                                     path: "/channel/subscribe", payload: payload)
 
         guard let resp = response else {
             throw ChannelError.subscribeFailed(
-                "rfed.channel.subscribe request failed or no response within 5 s")
+                "rfed.link /channel/subscribe failed or no response within 5 s")
         }
         let stampCost: Int? = Self.parseSubscribeResponse(resp)
         guard stampCost != nil || resp.first == 0xc3 || resp.first == 0x92 || resp.first == 0x91 else {
@@ -1454,7 +1456,7 @@ final class RfedChannelClient: ObservableObject {
                     return
                 }
                 self.didResubscribeOnActive = true
-                print("[RfedChannel] rfed.channel reachable → re-subscribing persisted channels")
+                print("[RfedChannel] rfed.link reachable → re-subscribing persisted channels")
                 self.resubscribePersistedChannels()
             }
             if !went { self.startEnded() }
@@ -1504,12 +1506,9 @@ final class RfedChannelClient: ObservableObject {
                     // Re-register per-channel notify so wakeups resume after app restart,
                     // but only if the user has push enabled for this channel.
                     if UserPreferences.shared.isChannelPushEnabled(channel.id) {
-                        let rfedNotifyHashHex = Self.rfedDestHash(
-                            identityHashHex: prefs.effectiveRfedNodeIdentityHash,
-                            app: "rfed", aspects: ["notify", "register"])
                         RfedNotifyRegistrar.shared.registerForChannel(
                             channelHash: channelHashData,
-                            rfedNotifyHashHex: rfedNotifyHashHex,
+                            nodeHex: prefs.effectiveRfedNodeIdentityHash,
                             identityHandle: identityHandle)
                     }
                 } catch {
@@ -1530,67 +1529,34 @@ final class RfedChannelClient: ObservableObject {
             .union(trackedChannelStreamNodes)
 
         for nodeIdentityHashHex in nodes {
-            let streamDestHex = Self.rfedDestHash(
-                identityHashHex: nodeIdentityHashHex,
-                app: "rfed",
-                aspects: ["channel", "stream"])
-            guard let streamDest = Data(hexString: streamDestHex) else { continue }
-
-            ensureChannelStreamTracked(nodeIdentityHashHex: nodeIdentityHashHex, streamDest: streamDest)
-
-            let filters = liveStreamFilterHashes(nodeIdentityHashHex: nodeIdentityHashHex)
-            let status = ConnectionStateManager.shared.appLinkStatus(destHash: streamDest)
-
-            if filters.isEmpty {
-                if status == 3 {
-                    sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex,
-                                            streamDest: streamDest,
-                                            filters: filters)
-                }
-                continue
-            }
-
-            if status == 3 {
-                sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex,
-                                        streamDest: streamDest,
-                                        filters: filters)
-            } else {
-                _ = ConnectionStateManager.shared.appLinkPrime(
-                    destHash: streamDest,
-                    app: "rfed",
-                    aspects: ["channel", "stream"])
+            // The stream is bound on rfed.link: RfedLink runs this client's
+            // binder (sendChannelStreamConfigForNode) on every ACTIVE edge.
+            trackedChannelStreamNodes.insert(nodeIdentityHashHex)
+            guard RfedLink.shared.ensure(nodeHex: nodeIdentityHashHex) != nil else { continue }
+            // Not up yet: the binder sends the filters on its ACTIVE edge.
+            if RfedLink.shared.status(nodeHex: nodeIdentityHashHex) == 3 {
+                sendChannelStreamConfigForNode(nodeIdentityHashHex: nodeIdentityHashHex)
             }
         }
     }
 
-    private func ensureChannelStreamTracked(nodeIdentityHashHex: String, streamDest: Data) {
-        let inserted = trackedChannelStreamNodes.insert(nodeIdentityHashHex).inserted
-        guard inserted else { return }
-
-        _ = ConnectionStateManager.shared.registerAppLinkPacketCallback(destHash: streamDest) { [weak self] data in
-            Task { @MainActor in
-                self?.onRfedBlob(data)
-            }
+    /// Take channel pushes on rfed.link (`/delivery`) and bind each fresh
+    /// link for them. Once per process: the client outlives the stack.
+    private func installRfedLinkHandlers() {
+        guard !didInstallRfedLinkHandlers else { return }
+        didInstallRfedLinkHandlers = true
+        RfedLink.setPushHandler(path: RfedLink.pushDelivery) { [weak self] blob in
+            self?.onRfedBlob(blob) ?? false
         }
-
-        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: streamDest) { [weak self] status in
-            guard status == 3 else { return }
-            Task { @MainActor in
-                self?.sendChannelStreamConfigForNode(nodeIdentityHashHex: nodeIdentityHashHex)
-            }
+        RfedLink.shared.setBinder(owner: "channel") { [weak self] node in
+            guard let self, self.trackedChannelStreamNodes.contains(node) else { return }
+            self.sendChannelStreamConfigForNode(nodeIdentityHashHex: node)
         }
     }
 
     private func sendChannelStreamConfigForNode(nodeIdentityHashHex: String) {
-        let streamDestHex = Self.rfedDestHash(
-            identityHashHex: nodeIdentityHashHex,
-            app: "rfed",
-            aspects: ["channel", "stream"])
-        guard let streamDest = Data(hexString: streamDestHex) else { return }
         let filters = liveStreamFilterHashes(nodeIdentityHashHex: nodeIdentityHashHex)
-        sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex,
-                                streamDest: streamDest,
-                                filters: filters)
+        sendChannelStreamConfig(nodeIdentityHashHex: nodeIdentityHashHex, filters: filters)
     }
 
     private func liveStreamFilterHashes(nodeIdentityHashHex: String) -> [Data] {
@@ -1605,7 +1571,6 @@ final class RfedChannelClient: ObservableObject {
     }
 
     private func sendChannelStreamConfig(nodeIdentityHashHex: String,
-                                         streamDest: Data,
                                          filters: [Data]) {
         guard let payload = buildChannelStreamPayload(filters: filters) else {
             print("[RfedChannel] channel.stream config build failed for node=\(nodeIdentityHashHex)")
@@ -1613,12 +1578,8 @@ final class RfedChannelClient: ObservableObject {
         }
 
         Task {
-            let response = await ConnectionStateManager.shared.appLinkSend(
-                destHash: streamDest,
-                app: "rfed",
-                aspects: ["channel", "stream"],
-                path: "/rfed/channel/stream/open",
-                payload: payload)
+            let response = await RfedLink.shared.request(nodeHex: nodeIdentityHashHex,
+                                                         path: "/channel/stream/open", payload: payload)
             if !Self.channelStreamResponseOk(response) {
                 print("[RfedChannel] channel.stream config rejected for node=\(nodeIdentityHashHex) filters=\(filters.count) resp=\(response?.hexString ?? "nil")")
             }

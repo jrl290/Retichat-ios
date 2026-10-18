@@ -207,6 +207,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// Destination tracked for the live rfed.propagation.stream APP_LINK.
     private var propagationStreamDest: Data?
+    private var propagationStreamNode: String?
+    private var didInstallPropagationLinkHandlers = false
 
     /// Serial queue for all FFI calls into the Rust LXMF library.
     /// Keeps the main thread responsive while crypto, link establishment,
@@ -597,6 +599,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         completedHashes.removeAll()
         completedHashSet.removeAll()
         propagationStreamDest = nil
+        propagationStreamNode = nil
         lastPollTime = .distantPast
         psyncNeededOnForeground = false
 
@@ -617,6 +620,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // start registers them again.
         DistroOutboxRuntime.shared.stop()
         ConnectionStateManager.shared.deregister()
+        // The next stack sets rfed.link up again (its push handlers, with that stack's identity).
+        RfedLink.shared.reset()
         NetworkMonitor.shared.onConnect = nil
 
         ffiQueue.async {
@@ -854,87 +859,83 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
     }
 
+    /// Bind this device's LXMF pushes on the RFed node's rfed.link
+    /// (`/propagation/stream/open`, RFed-spec Link.md): sent now when the
+    /// link is up, else by the binder on its ACTIVE edge, and again on every
+    /// fresh link.
     private func configurePropagationStream() {
-        guard let client = lxmfClient else { return }
-        let identityHex = prefs.effectiveRfedNodeIdentityHash
-        guard !identityHex.isEmpty else {
+        guard lxmfClient != nil else { return }
+        let identityHex = prefs.effectiveRfedNodeIdentityHash.lowercased()
+        guard !identityHex.isEmpty, let linkDest = RfedLink.destHash(nodeHex: identityHex) else {
             propagationStreamDest = nil
+            propagationStreamNode = nil
             return
         }
 
-        let streamHex = RfedChannelClient.rfedDestHash(
-            identityHashHex: identityHex,
-            app: "rfed",
-            aspects: ["propagation", "stream"])
-        guard let streamDest = Data(hexString: streamHex) else {
-            propagationStreamDest = nil
-            return
-        }
+        propagationStreamDest = linkDest
+        propagationStreamNode = identityHex
+        installPropagationLinkHandlers()
 
-        propagationStreamDest = streamDest
-
-        _ = ConnectionStateManager.shared.registerAppLinkPacketCallback(destHash: streamDest) { [weak self] data in
-            // Distro fan-out. iOS never starts rfed.delivery, so RFed's
-            // distro_fanout (RFed-rust/rfed/src/distro.rs) reaches us on tier 2,
-            // this propagation stream: the bare LXMF blob, whose first 16 bytes
-            // are the distro's lxmf.delivery address. ingestPropagated would
-            // drop it silently (we hold no inbound destination for it), so
-            // route it to the distro client first.
-            // Known RFed gap, not fixed here: PropagationStreamRegistry::dispatch
-            // (stream_registry.rs:135-166) counts send_packet Ok as delivered, so
-            // a blob sent while iOS is suspended and before RFed marks this link
-            // stale is neither deferred nor stored.
-            if data.count > 16, let distroHash = DistroManager.shared.deliveryHash,
-               data.prefix(16) == distroHash {
-                RfedDistroClient.ingestBlob(Data(data))
-                return
-            }
-            guard let self else { return }
-            self.ffiQueue.async { [weak self] in
-                guard let self, let client = self.lxmfClient else { return }
-                let accepted = client.ingestPropagated(data)
-                if !accepted {
-                    print("[Retichat] propagation.stream packet ignored len=\(data.count)")
-                }
-            }
-        }
-
-        ConnectionStateManager.shared.setAppLinkStatusHandler(destHash: streamDest) { [weak self] status in
-            guard status == 3 else { return }
-            self?.sendPropagationStreamOpen()
-        }
-
-        if ConnectionStateManager.shared.appLinkStatus(destHash: streamDest) == 3 {
+        guard RfedLink.shared.ensure(nodeHex: identityHex) != nil else { return }
+        if RfedLink.shared.status(nodeHex: identityHex) == 3 {
             sendPropagationStreamOpen()
-        } else {
-            _ = ConnectionStateManager.shared.appLinkPrime(
-                destHash: streamDest,
-                app: "rfed",
-                aspects: ["propagation", "stream"])
         }
+    }
+
+    /// Take `/lxmf/delivery` pushes and bind each fresh rfed.link for them.
+    /// Once per process: the repository outlives the stack.
+    private func installPropagationLinkHandlers() {
+        guard !didInstallPropagationLinkHandlers else { return }
+        didInstallPropagationLinkHandlers = true
+        RfedLink.setPushHandler(path: RfedLink.pushLxmf) { [weak self] data in
+            self?.onLxmfPush(data) ?? false
+        }
+        RfedLink.shared.setBinder(owner: "propagation") { [weak self] node in
+            guard let self, node == self.propagationStreamNode else { return }
+            self.sendPropagationStreamOpen()
+        }
+    }
+
+    /// A `/lxmf/delivery` push on rfed.link, on its link worker thread, which
+    /// waits for the answer: true only when this device now holds the
+    /// message (RFed-spec Link.md "The response is the delivery proof").
+    nonisolated private func onLxmfPush(_ data: Data) -> Bool {
+        // Distro fan-out (RFed distro_fanout tier 2): the bare LXMF blob,
+        // whose first 16 bytes are the distro's lxmf.delivery address.
+        // ingestPropagated would refuse it (we hold no inbound destination
+        // for it), so it goes to the distro client.
+        if data.count > 16, let distroHash = DistroManager.shared.deliveryHash,
+           data.prefix(16) == distroHash {
+            return RfedDistroClient.ingestBlobAnswering(Data(data))
+        }
+        // The link worker holds no lock while it waits (Reticulum-rust
+        // link.rs runs each request handler on its own thread).
+        let client = DispatchQueue.main.sync { MainActor.assumeIsolated { self.lxmfClient } }
+        guard let client else { return false }
+        let accepted = ffiQueue.sync { client.ingestPropagated(data) }
+        if !accepted {
+            print("[Retichat] /lxmf/delivery push refused len=\(data.count)")
+        }
+        return accepted
     }
 
     private func sendPropagationStreamOpen() {
         guard let client = lxmfClient,
-              let streamDest = propagationStreamDest,
+              let node = propagationStreamNode,
               let pubkey = bridge.identityPublicKey(handle: client.identityHandle),
               let sig = bridge.identitySign(handle: client.identityHandle, data: ownHash)
         else { return }
 
         let payload = RfedChannelClient.msgpackSigned(value: ownHash, pubkey: pubkey, sig: sig)
         Task {
-            let response = await ConnectionStateManager.shared.appLinkSend(
-                destHash: streamDest,
-                app: "rfed",
-                aspects: ["propagation", "stream"],
-                path: "/rfed/propagation/stream/open",
-                payload: payload)
+            let response = await RfedLink.shared.request(nodeHex: node, path: "/propagation/stream/open",
+                                                         payload: payload)
             guard Self.streamOpenResponseOk(response) else {
                 print("[Retichat] propagation.stream open rejected resp=\(response?.hexString ?? "nil")")
                 return
             }
             // What rfed pushed down this device's previous link while it was
-            // dead went unproven and waits in its queue for /rfed/pull, and
+            // dead went unproven and waits in its queue for /distro/pull, and
             // without a wake nothing fetches it. Pull once per fresh link, as
             // the web does after its binding (Retichat-js
             // _bindRfedLinkForDistroPush, then /distro/pull) and Android does

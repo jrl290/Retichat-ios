@@ -845,8 +845,8 @@ func testTheChannelSend() {
     let send = body(client, "private func trySend(")
     check(before(send, "let postName = channelPostName(for: channel, postingHex: postingHex)", "displayName: postName)"),
           "the pack gets the §4.2 decision, for the posting identity")
-    check(before(send, "let ok = await ConnectionStateManager.shared.appLinkSendData(", "recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)")
-            && before(send, "if !ok {", "recordPostName(postName"),
+    check(before(send, "let answer = await RfedLink.shared.request(nodeHex: channel.rfedNodeHash, path: \"/channel/publish\"", "recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)")
+            && before(send, "if let refusal = Self.publishRefusal(answer) {", "recordPostName(postName"),
           "the name is recorded only after RFed took the post")
     let note = body(client, "private func noteSender(")
     check(note.contains("guard DisplayNames.isNewer(postMs, than: row.channelNameAtMs) else {")
