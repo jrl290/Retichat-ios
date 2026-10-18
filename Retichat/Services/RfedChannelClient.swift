@@ -946,9 +946,12 @@ final class RfedChannelClient: ObservableObject {
         }
         // A request on rfed.link, answered [ok, reason] (RFed-spec Link.md):
         // until 2026-10-18 the post went as DATA on rfed.channel, whose proof
-        // said only that the packet arrived, never whether rfed took it.
+        // said only that the packet arrived, never whether rfed took it. The
+        // request's data is a msgpack value, so the post goes as a bin: bare,
+        // its bytes are read as msgpack and re-encoded (Reticulum-rust
+        // link.rs keeps only a bin's bytes), and rfed gets a changed post.
         let answer = await RfedLink.shared.request(nodeHex: channel.rfedNodeHash, path: "/channel/publish",
-                                                   payload: payload)
+                                                   payload: Self.msgpackBin(payload))
         if let refusal = Self.publishRefusal(answer) {
             print("[RfedChannel] Send failed: rfed answered \(refusal)")
             return false
@@ -1812,9 +1815,18 @@ final class RfedChannelClient: ObservableObject {
         return segments
     }
 
-    /// Encode a value as msgpack bin8: 0xc4 | len | bytes
+    /// Encode a value as msgpack bin: bin8, bin16 or bin32 by its length
+    /// (a channel post is often over 255 bytes).
     nonisolated static func msgpackBin(_ data: Data) -> Data {
-        var out = Data([0xc4, UInt8(data.count)])
+        let n = data.count
+        var out: Data
+        if n <= 0xff {
+            out = Data([0xc4, UInt8(n)])
+        } else if n <= 0xffff {
+            out = Data([0xc5, UInt8(n >> 8), UInt8(n & 0xff)])
+        } else {
+            out = Data([0xc6, UInt8((n >> 24) & 0xff), UInt8((n >> 16) & 0xff), UInt8((n >> 8) & 0xff), UInt8(n & 0xff)])
+        }
         out.append(data)
         return out
     }
