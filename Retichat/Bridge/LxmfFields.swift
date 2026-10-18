@@ -14,6 +14,25 @@ import CryptoKit
 // Key numbers are aligned with the Android implementation to ensure
 // cross-platform interoperability.
 
+/// Which outgoing attachment leaves as FIELD_IMAGE (0x06), which MeshChat and Sideband show
+/// inline (James, 2026-10-17; Retichat-ios #8), and its type: the LAST one whose extension is one
+/// of `types`, lower case. The field holds one picture, so any others stay FIELD_FILE_ATTACHMENTS.
+/// The last one because a receiver that lists 0x05 and then 0x06 (Retichat, the web) then shows
+/// several photos in the order they were sent. Android: LxmfFields.outgoingImage.
+nonisolated enum OutgoingImage {
+    /// The types MeshChat (a browser's <img>) and Sideband (Kivy) show inline; heic is not one.
+    static let types: Set<String> = ["jpg", "jpeg", "png", "gif", "webp"]
+
+    static func pick(_ filenames: [String]) -> (index: Int, type: String)? {
+        for i in filenames.indices.reversed() {
+            guard let dot = filenames[i].lastIndex(of: ".") else { continue }
+            let ext = filenames[i][filenames[i].index(after: dot)...].lowercased()
+            if types.contains(ext) { return (i, ext) }
+        }
+        return nil
+    }
+}
+
 enum LxmfFieldKey {
     static let fileAttachments: UInt8 = 0x05
     static let image: UInt8 = 0x06

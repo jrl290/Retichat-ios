@@ -1017,9 +1017,34 @@ extension LxmfClient {
         return ok
     }
 
+    /// A message's outgoing attachments, the one way every send writes them: the picture
+    /// `OutgoingImage.pick` chooses as FIELD_IMAGE, the rest as FIELD_FILE_ATTACHMENTS, in
+    /// order (James, 2026-10-17: photos go as 0x06, which MeshChat and Sideband show inline; as
+    /// 0x05 they were a download there). If the image field cannot be written the picture goes
+    /// as a file, as before. nonisolated: the sends make their messages on ffiQueue.
+    nonisolated static func messageAddAttachments(_ msgHandle: UInt64, _ attachments: [(String, Data)]) {
+        let image = OutgoingImage.pick(attachments.map { $0.0 })
+        for (i, (filename, data)) in attachments.enumerated() {
+            if let image, i == image.index, messageSetImage(msgHandle, type: image.type, data: data) { continue }
+            messageAddAttachment(msgHandle, filename: filename, data: data)
+        }
+    }
+
+    /// FIELD_IMAGE (0x06): `[type, data]`, one per message. The type is 1 to 16 ASCII letters
+    /// or digits ("jpg"); anything else, or no data, is false with nothing changed.
+    @discardableResult
+    nonisolated static func messageSetImage(_ msgHandle: UInt64, type: String, data: Data) -> Bool {
+        type.withCString { cType in
+            data.withUnsafeBytes { buf -> Bool in
+                guard let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+                return lxmf_message_set_image(msgHandle, cType, p, UInt32(data.count)) == 0
+            }
+        }
+    }
+
     /// Add a file attachment to an outbound message.
     @discardableResult
-    static func messageAddAttachment(_ msgHandle: UInt64, filename: String, data: Data) -> Bool {
+    nonisolated static func messageAddAttachment(_ msgHandle: UInt64, filename: String, data: Data) -> Bool {
         filename.withCString { cName in
             data.withUnsafeBytes { buf -> Bool in
                 let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)

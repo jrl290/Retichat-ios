@@ -240,9 +240,7 @@ final class GroupChatManager {
             let handle = create(to: destData, content: content, as: signer)
             guard handle != 0 else { continue }
 
-            for (filename, data) in attachments {
-                _ = LxmfClient.messageAddAttachment(handle, filename: filename, data: data)
-            }
+            LxmfClient.messageAddAttachments(handle, attachments)
             _ = LxmfClient.messageSetGroupEntry(handle, .id, .str(groupId))
             _ = LxmfClient.messageSetGroupEntry(handle, .name, .str(groupName))
             _ = LxmfClient.messageSetGroupEntry(handle, .sender, .str(signer.hex))

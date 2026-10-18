@@ -7,6 +7,9 @@
 // LxmfImageAudioFieldsTest). Until 2026-10-17 only 0x05 was read and such a message arrived as
 // its text alone.
 //
+// And the other way: a photo leaves as FIELD_IMAGE (OutgoingImage, LxmfClient.messageAddAttachments,
+// James 2026-10-17), which MeshChat and Sideband show inline; as 0x05 it was a download there.
+//
 // Run from the workspace root with:
 //
 //   swiftc -parse-as-library -o /private/tmp/claude-501/meshchat-image \
@@ -135,6 +138,38 @@ func testEveryReceivePathReadsTheDecodersAttachments() {
           "a distro message stores the decoder's attachments")
 }
 
+func testAPhotoLeavesAsTheImageWithItsExtensionAsTheType() {
+    func pick(_ names: String...) -> String? { OutgoingImage.pick(names).map { "\($0.index) \($0.type)" } }
+    checkEqual(pick("photo_1.jpg"), "0 jpg", "jpg")
+    checkEqual(pick("IMG_0001.JPG"), "0 jpg", "upper case")
+    checkEqual(pick("a.jpeg"), "0 jpeg", "jpeg")
+    checkEqual(pick("a.png"), "0 png", "png")
+    checkEqual(pick("a.gif"), "0 gif", "gif")
+    checkEqual(pick("a.webp"), "0 webp", "webp")
+    checkEqual(pick(), nil, "no attachments")
+    // heic: neither a browser's <img> nor Sideband shows it (iOS sends a photo as jpg anyway).
+    checkEqual(pick("a.heic", "b.mov", "jpg", "c.jpg.zip"), nil, "anything else stays a file")
+    // Retichat and the web list 0x05 and then 0x06: [a, b] as 0x05 [a] + 0x06 b reads a, b.
+    checkEqual(pick("a.jpg", "b.png", "c.mov"), "1 png", "the last picture")
+    checkEqual(pick("a.jpg", "b.jpg", "c.webp"), "2 webp", "the last picture")
+}
+
+func testEverySendWritesAttachmentsOneWay() {
+    let client = source("Retichat/Services/LxmfClient.swift")
+    check(client.contains("let image = OutgoingImage.pick(attachments.map { $0.0 })"), "the client picks the image")
+    check(client.contains("if let image, i == image.index, messageSetImage(msgHandle, type: image.type, data: data) { continue }\n            messageAddAttachment(msgHandle, filename: filename, data: data)"),
+          "a picture the field refuses still goes, as a file")
+    check(client.contains("return lxmf_message_set_image(msgHandle, cType, p, UInt32(data.count)) == 0"), "through lxmf_message_set_image")
+    check(source("Retichat/Bridge/CRetichatFFI.h").contains("int32_t lxmf_message_set_image(uint64_t msg, const char *image_type,"),
+          "the header declares it")
+    let repo = source("Retichat/Services/ChatRepository.swift")
+    let groups = source("Retichat/Services/GroupChatManager.swift")
+    check(repo.contains("LxmfClient.messageAddAttachments(msgHandle, attachmentsCopy)"), "a direct send")
+    check(groups.contains("LxmfClient.messageAddAttachments(handle, attachments)"), "a Group post")
+    check(!repo.contains("messageAddAttachment(") && !groups.contains("messageAddAttachment("),
+          "no send adds an attachment any other way")
+}
+
 let allTests: [(String, () -> Void)] = [
     ("testAMeshChatImageIsAnAttachmentNamedForAnInlineType", testAMeshChatImageIsAnAttachmentNamedForAnInlineType),
     ("testATypeNotShownInlineIsAFileAndNeverMakesTheName", testATypeNotShownInlineIsAFileAndNeverMakesTheName),
@@ -143,6 +178,8 @@ let allTests: [(String, () -> Void)] = [
     ("testTheFileAttachmentsComeFirstThenTheImageThenTheAudio", testTheFileAttachmentsComeFirstThenTheImageThenTheAudio),
     ("testTheNamesAreOnesTheAppShowsInline", testTheNamesAreOnesTheAppShowsInline),
     ("testEveryReceivePathReadsTheDecodersAttachments", testEveryReceivePathReadsTheDecodersAttachments),
+    ("testAPhotoLeavesAsTheImageWithItsExtensionAsTheType", testAPhotoLeavesAsTheImageWithItsExtensionAsTheType),
+    ("testEverySendWritesAttachmentsOneWay", testEverySendWritesAttachmentsOneWay),
 ]
 
 @main

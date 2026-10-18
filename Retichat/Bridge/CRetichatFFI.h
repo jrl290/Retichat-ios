@@ -511,6 +511,12 @@ int32_t lxmf_message_set_reaction(uint64_t msg, const uint8_t *to, uint32_t to_l
                                   const char *content);
 int32_t lxmf_message_add_attachment(uint64_t msg, const char *filename,
                                      const uint8_t *data, uint32_t data_len);
+/// Set FIELD_IMAGE (0x06) to [image_type, data], how MeshChat and Sideband send
+/// a picture and show it inline. One per message. `image_type` is 1 to 16
+/// ASCII letters or digits ("jpg", no "image/"); `data` is not empty.
+/// Returns 0 on success, -1 on error (lxmf_last_error), changing nothing.
+int32_t lxmf_message_set_image(uint64_t msg, const char *image_type,
+                               const uint8_t *data, uint32_t data_len);
 /// Clone an existing message as a fresh PROPAGATED message, preserving fields
 /// and attachments. Returns 0 on error.
 uint64_t lxmf_message_clone_propagated(uint64_t msg);

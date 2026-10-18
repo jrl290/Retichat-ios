@@ -1337,9 +1337,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 return
             }
 
-            for (filename, data) in attachmentsCopy {
-                _ = LxmfClient.messageAddAttachment(msgHandle, filename: filename, data: data)
-            }
+            LxmfClient.messageAddAttachments(msgHandle, attachmentsCopy)
 
             // pack() + AppLinks::send() run here, off the main thread.
             guard client.sendMessageViaAppLinks(msgHandle) else {
