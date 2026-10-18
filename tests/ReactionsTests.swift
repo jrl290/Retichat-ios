@@ -14,9 +14,7 @@
 //  - the wiring, on the source: every receive path checks for a reaction before anything is stored,
 //    counted or reordered; the target is looked for only in the chat the reaction came in on;
 //    someone else's reaction to the user's own message is notified once, by the app or the NSE;
-//    the sends carry what §4 and §5 say;
-//  - the bubble's footer across it, sent or received: the time leading, the delivery icon and
-//    reactions trailing.
+//    the sends carry what §4 and §5 say.
 // tests/ReactionsFFITests.swift runs the same fields through the real library.
 //
 // Run from the workspace root with:
@@ -479,24 +477,6 @@ func theSendsCarryWhatSectionsFourAndFiveSay() {
           "no reaction on a system message or a message that names no target")
 }
 
-func theFooterSpansTheBubbleTheTimeLeadingTheRestTrailing() {
-    let components = source("Retichat/Views/Components/GlassComponents.swift")
-    let bubble = body(components, "private var bubble: some View {")
-    check(bubble.contains("BubbleStack(contentTrailing: message.isOutgoing, spacing: 4) {"),
-          "the bubble is a BubbleStack, its content on the sender's side (James, 2026-10-17)")
-    check(before(bubble, "Text(message.content)", "Text(formatTime(message.timestamp))")
-            && bubble.contains("                    reactionMarks\n                }\n            }\n        }\n        .padding(.horizontal, 12)"),
-          "the footer (time, delivery icon, reactions) is its last subview")
-    check(bubble.contains("Text(formatTime(message.timestamp))\n                    .font(.caption2)\n                    .foregroundColor(.retichatOnSurfaceVariant)\n                    .frame(maxWidth: .infinity, alignment: .leading)"),
-          "the time takes the footer's width at its leading edge, the icon and reactions after it at the trailing edge")
-    let stack = body(components, "struct BubbleStack: Layout {")
-    check(stack.contains("var width = max(body.map(\\.width).max() ?? 0, footer.sizeThatFits(.unspecified).width)"),
-          "the bubble is as wide as its widest subview, the footer's own width included, no wider")
-    check(stack.contains("let x = contentTrailing && !footer ? bounds.maxX - size.width : bounds.minX")
-            && stack.contains("proposal: ProposedViewSize(width: footer ? bounds.width : size.width, height: size.height)"),
-          "and the footer is given the bubble's width, in every bubble")
-}
-
 let allTests: [(String, () -> Void)] = [
     ("the reaction field is read as upstream and Columba write it", theReactionFieldIsReadAsUpstreamAndColumbaWriteIt),
     ("a reaction missing a key or over 64 bytes is refused with a reason", aReactionMissingAKeyOrOverSixtyFourBytesIsRefusedWithAReason),
@@ -512,7 +492,6 @@ let allTests: [(String, () -> Void)] = [
     ("every receive path checks for a reaction before it stores anything", everyReceivePathChecksForAReactionBeforeItStoresAnything),
     ("the target is looked for only in the chat the reaction came in", theTargetIsLookedForOnlyInTheChatTheReactionCameIn),
     ("the sends carry what §4 and §5 say", theSendsCarryWhatSectionsFourAndFiveSay),
-    ("the footer spans the bubble, the time leading and the rest trailing", theFooterSpansTheBubbleTheTimeLeadingTheRestTrailing),
 ]
 
 @main

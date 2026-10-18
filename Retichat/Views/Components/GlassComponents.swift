@@ -81,7 +81,7 @@ struct ChatBubble: View {
     private var offersReactions: Bool { onReact != nil && message.reactable }
 
     private var bubble: some View {
-        BubbleStack(contentTrailing: message.isOutgoing, spacing: 4) {
+        VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 4) {
             // Sender name in group chats and channels, and in a channel
             // the grey secondary text beside it (DISPLAY_NAMES.md §5.3):
             // the channel name beside a local name, or the short hash
@@ -129,14 +129,11 @@ struct ChatBubble: View {
                     .foregroundColor(.retichatOnSurface)
             }
 
-            // Timestamp + delivery status; the reactions take the checkmark's place (§7).
-            // Last, so BubbleStack gives it the bubble's width: the time at its leading
-            // edge, the delivery icon and reactions at its trailing edge, sent or received.
+            // Timestamp + delivery status; the reactions take the checkmark's place (§7)
             HStack(spacing: 4) {
                 Text(formatTime(message.timestamp))
                     .font(.caption2)
                     .foregroundColor(.retichatOnSurfaceVariant)
-                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 if message.isOutgoing && (message.reactions.isEmpty || !showsCheckmark) {
                     deliveryIcon
@@ -220,7 +217,7 @@ struct ChatBubble: View {
     private var reactionMarks: some View {
         Text(message.reactions.map(\.emoji).joined())
             .font(.footnote)
-            .padding(.leading, 4) // on top of the footer's spacing: a little apart from an icon, or the time
+            .padding(.leading, 4) // on top of the footer's spacing: a little apart from the time
             .accessibilityLabel(message.reactions
                 .map { "\($0.emoji) \($0.count)\($0.mine ? ", including yours" : "")" }
                 .joined(separator: ", "))
@@ -307,37 +304,6 @@ struct ChatBubble: View {
             formatter.dateFormat = "MMM d, HH:mm"
         }
         return formatter.string(from: date)
-    }
-}
-
-/// A chat bubble's stack: its subviews one under another [spacing] apart, as a VStack places
-/// them, on the sender's side ([contentTrailing] for a sent message), except the last, the
-/// footer, which is given the bubble's width (James, 2026-10-17). The bubble is as wide as its
-/// widest subview, the footer's own width included: a footer filling the width it is offered
-/// would widen every bubble, and a VStack offers it all.
-struct BubbleStack: Layout {
-    var contentTrailing: Bool
-    var spacing: CGFloat
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        guard let footer = subviews.last else { return .zero }
-        let body = subviews.dropLast().map { $0.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil)) }
-        var width = max(body.map(\.width).max() ?? 0, footer.sizeThatFits(.unspecified).width)
-        if let limit = proposal.width { width = min(width, limit) }
-        let footerHeight = footer.sizeThatFits(ProposedViewSize(width: width, height: nil)).height
-        return CGSize(width: width, height: body.map(\.height).reduce(footerHeight, +) + spacing * CGFloat(body.count))
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var y = bounds.minY
-        for (index, subview) in subviews.enumerated() {
-            let footer = index == subviews.count - 1
-            let size = subview.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
-            let x = contentTrailing && !footer ? bounds.maxX - size.width : bounds.minX
-            subview.place(at: CGPoint(x: x, y: y),
-                          proposal: ProposedViewSize(width: footer ? bounds.width : size.width, height: size.height))
-            y += size.height + spacing
-        }
     }
 }
 
