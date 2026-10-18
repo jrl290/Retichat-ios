@@ -14,7 +14,8 @@
 //  - the wiring, on the source: every receive path checks for a reaction before anything is stored,
 //    counted or reordered; the target is looked for only in the chat the reaction came in on;
 //    someone else's reaction to the user's own message is notified once, by the app or the NSE;
-//    the sends carry what §4 and §5 say.
+//    the sends carry what §4 and §5 say;
+//  - the bubble's footer (time, delivery icon, reactions) at its trailing edge, sent or received.
 // tests/ReactionsFFITests.swift runs the same fields through the real library.
 //
 // Run from the workspace root with:
@@ -477,6 +478,21 @@ func theSendsCarryWhatSectionsFourAndFiveSay() {
           "no reaction on a system message or a message that names no target")
 }
 
+func theFooterIsAtTheBubblesTrailingEdgeSentOrReceived() {
+    let components = source("Retichat/Views/Components/GlassComponents.swift")
+    let bubble = body(components, "private var bubble: some View {")
+    check(bubble.contains("BubbleStack(contentTrailing: message.isOutgoing, spacing: 4) {"),
+          "the bubble is a BubbleStack, its content on the sender's side (James, 2026-10-17)")
+    check(before(bubble, "Text(message.content)", "Text(formatTime(message.timestamp))")
+            && bubble.contains("                    reactionMarks\n                }\n            }\n        }\n        .padding(.horizontal, 12)"),
+          "the footer (time, delivery icon, reactions) is its last subview")
+    let stack = body(components, "struct BubbleStack: Layout {")
+    check(stack.contains("let trailing = contentTrailing || index == subviews.count - 1")
+            && stack.contains("x: trailing ? bounds.maxX - size.width : bounds.minX"),
+          "which it places at the trailing edge in every bubble")
+    check(stack.contains("width: sizes.map(\\.width).max() ?? 0"), "and the bubble is as wide as its widest subview, no wider")
+}
+
 let allTests: [(String, () -> Void)] = [
     ("the reaction field is read as upstream and Columba write it", theReactionFieldIsReadAsUpstreamAndColumbaWriteIt),
     ("a reaction missing a key or over 64 bytes is refused with a reason", aReactionMissingAKeyOrOverSixtyFourBytesIsRefusedWithAReason),
@@ -492,6 +508,7 @@ let allTests: [(String, () -> Void)] = [
     ("every receive path checks for a reaction before it stores anything", everyReceivePathChecksForAReactionBeforeItStoresAnything),
     ("the target is looked for only in the chat the reaction came in", theTargetIsLookedForOnlyInTheChatTheReactionCameIn),
     ("the sends carry what §4 and §5 say", theSendsCarryWhatSectionsFourAndFiveSay),
+    ("the footer is at the bubble's trailing edge, sent or received", theFooterIsAtTheBubblesTrailingEdgeSentOrReceived),
 ]
 
 @main
