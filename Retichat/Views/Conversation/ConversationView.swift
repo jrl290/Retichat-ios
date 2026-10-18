@@ -47,6 +47,8 @@ struct ConversationView: View {
     /// app comes back, so a screen left open across midnight relabels
     /// "Today" as "Yesterday".
     @State private var markerNow = Date()
+    /// The markers of the list on screen, kept between renders (DayMarkers.Memo).
+    @State private var markerMemo = DayMarkers.Memo()
 
     // DM-only state
     @State private var showAttachmentPicker = false
@@ -225,7 +227,7 @@ struct ConversationView: View {
     /// the item's bubble shows.
     private func dayRows<Item: Identifiable>(_ items: [Item],
                                              timestamp: (Item) -> TimeInterval) -> [DayMarkers.Row<Item>] {
-        DayMarkers.rows(items, timestamp: timestamp, now: markerNow,
+        markerMemo.rows(items, timestamp: timestamp, now: markerNow,
                         calendar: .autoupdatingCurrent, timeZone: .autoupdatingCurrent,
                         locale: .autoupdatingCurrent)
     }

@@ -33,12 +33,64 @@ enum DayMarkers {
                                          calendar: Calendar,
                                          timeZone: TimeZone,
                                          locale: Locale) -> [Row<Item>] {
+        let markers = markers(timestamps: items.map(timestamp), now: now, calendar: calendar,
+                              timeZone: timeZone, locale: locale)
+        return zip(items, markers).map { Row(item: $0, marker: $1) }
+    }
+
+    /// For each timestamp in display order, the label of the marker above
+    /// it, nil for none: the markers `rows` gives its items.
+    static func markers(timestamps: [TimeInterval],
+                        now: Date,
+                        calendar: Calendar,
+                        timeZone: TimeZone,
+                        locale: Locale) -> [String?] {
         var calendar = calendar
         calendar.timeZone = timeZone
         calendar.locale = locale
-        let days = days(timestamps: items.map(timestamp), calendar: calendar)
-        return zip(items, days).map { item, day in
-            Row(item: item, marker: day.map { label(day: $0, now: now, calendar: calendar, locale: locale) })
+        return days(timestamps: timestamps, calendar: calendar).map { day in
+            day.map { label(day: $0, now: now, calendar: calendar, locale: locale) }
+        }
+    }
+
+    /// `rows`, keeping the markers of the last list it was given (L83). A
+    /// list's rows are asked for at every render, and the conversation
+    /// renders at every keystroke in the compose field, where working out
+    /// every message's day again took ~6 ms at 1000 messages. The markers
+    /// are worked out again only when a timestamp, the clock, the calendar,
+    /// the time zone or the locale is not what it was. Only the markers are
+    /// kept, never the items, so each row carries its item as it is now: a
+    /// message's status changes, its id and time do not.
+    final class Memo {
+        private struct Key: Equatable {
+            let timestamps: [TimeInterval]
+            let now: Date
+            let calendar: Calendar.Identifier
+            let timeZone: String
+            let locale: String
+        }
+
+        private var key: Key?
+        private var markers: [String?] = []
+        /// How many times the markers have been worked out.
+        private(set) var computed = 0
+
+        func rows<Item: Identifiable>(_ items: [Item],
+                                      timestamp: (Item) -> TimeInterval,
+                                      now: Date,
+                                      calendar: Calendar,
+                                      timeZone: TimeZone,
+                                      locale: Locale) -> [Row<Item>] {
+            let timestamps = items.map(timestamp)
+            let key = Key(timestamps: timestamps, now: now, calendar: calendar.identifier,
+                          timeZone: timeZone.identifier, locale: locale.identifier)
+            if key != self.key {
+                markers = DayMarkers.markers(timestamps: timestamps, now: now, calendar: calendar,
+                                             timeZone: timeZone, locale: locale)
+                self.key = key
+                computed += 1
+            }
+            return zip(items, markers).map { Row(item: $0, marker: $1) }
         }
     }
 
