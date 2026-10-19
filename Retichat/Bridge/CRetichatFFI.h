@@ -611,6 +611,8 @@ int32_t retichat_transport_save_paths(void);
 #pragma mark - Settings
 
 void    retichat_set_drop_announces(int32_t enabled);
+/// How many devices the AutoInterface has found on the local network (its peers online).
+int32_t retichat_auto_interface_peer_count(void);
 void    retichat_watch_announce(const uint8_t *dest_hash, uint32_t len);
 void    retichat_unwatch_announce(const uint8_t *dest_hash, uint32_t len);
 int32_t retichat_set_keepalive_interval(double secs);

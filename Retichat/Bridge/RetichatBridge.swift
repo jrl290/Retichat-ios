@@ -318,6 +318,11 @@ final class RetichatBridge: @unchecked Sendable {
         }
     }
 
+    /// How many devices the AutoInterface has found on the local network.
+    nonisolated func autoInterfacePeerCount() -> Int {
+        Int(retichat_auto_interface_peer_count())
+    }
+
     // MARK: - Settings
 
     func setDropAnnounces(enabled: Bool) {

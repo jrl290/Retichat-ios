@@ -402,6 +402,18 @@ pub extern "C" fn retichat_set_drop_announces(enabled: i32) {
     rns::set_drop_announces(enabled != 0);
 }
 
+/// How many devices the AutoInterface has found on the local network: its
+/// peers online, each an interface of its own in Transport
+/// (`AutoInterfacePeer[if/addr]`). Settings' Local network card shows it.
+#[no_mangle]
+pub extern "C" fn retichat_auto_interface_peer_count() -> i32 {
+    Transport::online_interface_names()
+        .iter()
+        .filter(|name| name.starts_with("AutoInterfacePeer["))
+        .count()
+        .min(i32::MAX as usize) as i32
+}
+
 /// Add a destination hash to the announce watchlist.
 /// Announces from watchlisted destinations always pass through, even when
 /// drop_announces is enabled.  `dest_hash` must be exactly 16 bytes.

@@ -37,6 +37,7 @@ class SettingsViewModel: ObservableObject {
     @Published var filterStrangers: Bool
     @Published var defaultTcpEnabled: Bool
     @Published var rtnodeBluetoothEnabled: Bool
+    @Published var autoInterfaceEnabled: Bool
     @Published var pendingInterfaces: [PendingInterface]
 
     // Baseline captured at init; updated after Apply so hasChanges resets.
@@ -49,6 +50,7 @@ class SettingsViewModel: ObservableObject {
     private var persistedFilterStrangers: Bool
     private var originalDefaultTcpEnabled: Bool
     private var originalRtnodeBluetoothEnabled: Bool
+    private var originalAutoInterfaceEnabled: Bool
     private var originalInterfaces: [PendingInterface]
 
     /// True when any setting differs from the values present when the screen opened (or last Apply).
@@ -74,6 +76,7 @@ class SettingsViewModel: ObservableObject {
         rfedLxmfPropOverride != originalRfedLxmfPropOverride ||
         defaultTcpEnabled != originalDefaultTcpEnabled ||
         rtnodeBluetoothEnabled != originalRtnodeBluetoothEnabled ||
+        autoInterfaceEnabled != originalAutoInterfaceEnabled ||
         pendingInterfaces != originalInterfaces
     }
 
@@ -100,6 +103,7 @@ class SettingsViewModel: ObservableObject {
         self.filterStrangers = prefs.filterStrangers
         self.defaultTcpEnabled = prefs.defaultTcpEnabled
         self.rtnodeBluetoothEnabled = prefs.rtnodeBluetoothEnabled
+        self.autoInterfaceEnabled = prefs.autoInterfaceEnabled
         self.originalAnnounceDisplayName = prefs.announceDisplayName
         self.originalMessageDisplayName = prefs.messageDisplayName
         self.originalChannelDisplayName = prefs.channelDisplayName
@@ -109,6 +113,7 @@ class SettingsViewModel: ObservableObject {
         self.persistedFilterStrangers = prefs.filterStrangers
         self.originalDefaultTcpEnabled = prefs.defaultTcpEnabled
         self.originalRtnodeBluetoothEnabled = prefs.rtnodeBluetoothEnabled
+        self.originalAutoInterfaceEnabled = prefs.autoInterfaceEnabled
         self.pendingInterfaces = []
         self.originalInterfaces = []
     }
@@ -138,6 +143,7 @@ class SettingsViewModel: ObservableObject {
         prefs.channelDisplayName = channelDisplayName
         prefs.defaultTcpEnabled = defaultTcpEnabled
         prefs.rtnodeBluetoothEnabled = rtnodeBluetoothEnabled
+        prefs.autoInterfaceEnabled = autoInterfaceEnabled
         prefs.rfedNodeIdentityHash = rfedNodeIdentityHash
         // rfed.notify and lxmf.propagation are derived from the node when they
         // are used (UserPreferences); only the explicit override is saved.
@@ -199,6 +205,8 @@ class SettingsViewModel: ObservableObject {
         UserPreferences.shared.defaultTcpEnabled = originalDefaultTcpEnabled
         rtnodeBluetoothEnabled = originalRtnodeBluetoothEnabled
         UserPreferences.shared.rtnodeBluetoothEnabled = originalRtnodeBluetoothEnabled
+        autoInterfaceEnabled = originalAutoInterfaceEnabled
+        UserPreferences.shared.autoInterfaceEnabled = originalAutoInterfaceEnabled
         pendingInterfaces = originalInterfaces
     }
 
@@ -208,6 +216,14 @@ class SettingsViewModel: ObservableObject {
     func rtnodeBluetoothDenied() {
         rtnodeBluetoothEnabled = false
         originalRtnodeBluetoothEnabled = false
+    }
+
+    /// iOS refused local network access. The switch is shown and saved off,
+    /// and a running stack that has the interface restarts without it on the
+    /// next Apply (needsRestart, against the saved baseline).
+    func autoInterfaceDenied() {
+        autoInterfaceEnabled = false
+        UserPreferences.shared.autoInterfaceEnabled = false
     }
 
     /// Reset the dirty baseline to current values (call after Apply).
@@ -222,6 +238,7 @@ class SettingsViewModel: ObservableObject {
         persistedFilterStrangers = filterStrangers
         originalDefaultTcpEnabled = defaultTcpEnabled
         originalRtnodeBluetoothEnabled = rtnodeBluetoothEnabled
+        originalAutoInterfaceEnabled = autoInterfaceEnabled
         originalInterfaces = pendingInterfaces
     }
 

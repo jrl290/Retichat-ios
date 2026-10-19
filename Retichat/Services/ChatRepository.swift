@@ -756,15 +756,23 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         lines.append("")
         lines.append("[interfaces]")
 
-        // No AutoInterface on any build for now (James, 2026-10-12). Its peer
-        // discovery is IPv6 multicast, which iOS allows only with Apple's
-        // com.apple.developer.networking.multicast entitlement; the app does
-        // not carry it, so on iOS the interface could only fail. Mac Catalyst
-        // had it until then, and there it also took utun2, a VPN tunnel that
-        // carries no multicast, and logged "No multicast echoes received" as
-        // an error. TCP to a local address needs just the Local Network
-        // permission, which Info.plist declares. The NSE copies this config,
-        // so it follows.
+        // The built-in AutoInterface, when Settings' Local network switch is
+        // on (James, 2026-10-19; off by default). Its peer discovery is IPv6
+        // multicast, which iOS on a device allows only with Apple's
+        // com.apple.developer.networking.multicast entitlement, so it is
+        // written only where it can work (LocalNetworkPermission
+        // .multicastAvailable: Mac Catalyst, the simulator, or a build with
+        // the entitlement). On 2026-10-12 Mac Catalyst took utun2, a VPN
+        // tunnel; Reticulum-rust skips tunnels on iOS and Catalyst since
+        // 35207c0. Reticulum's defaults, so it finds Sideband, MeshChat and
+        // rnsd. The NSE's copy of this config leaves it out
+        // (PendingNotification.copyConfigToAppGroup).
+        if UserPreferences.shared.autoInterfaceEnabled && LocalNetworkPermission.multicastAvailable {
+            lines.append("")
+            lines.append("  [[\(PendingNotification.autoInterfaceName)]]")
+            lines.append("    type = AutoInterface")
+            lines.append("    enabled = yes")
+        }
 
         // Get user-configured interfaces from database (TCP client only —
         // RNode rows are realised through the BLE bridge + rns_rnode_iface_*

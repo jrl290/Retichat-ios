@@ -377,7 +377,29 @@ nonisolated enum PendingNotification {
         guard let nseDir = nseReticulumDir() else { return }
         let dest = URL(fileURLWithPath: nseDir).appendingPathComponent("config")
         try? FileManager.default.removeItem(at: dest)
-        try? FileManager.default.copyItem(atPath: sourcePath, toPath: dest.path)
+        guard let text = try? String(contentsOfFile: sourcePath, encoding: .utf8) else { return }
+        try? withoutAutoInterface(text).write(to: dest, atomically: true, encoding: .utf8)
+    }
+
+    /// The config section name of the built-in AutoInterface (ChatRepository.generateConfig).
+    static let autoInterfaceName = "Local network"
+
+    /// `config` with the AutoInterface's section left out: the NSE wakes for
+    /// a few seconds to fetch one message over the network it already has,
+    /// and a multicast discovery that needs seconds to find anyone would only
+    /// cost it time and memory. The section runs from its `[[...]]` line to
+    /// the next section or the end.
+    static func withoutAutoInterface(_ config: String) -> String {
+        var kept: [Substring] = []
+        var skipping = false
+        for line in config.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") {
+                skipping = trimmed == "[[\(autoInterfaceName)]]"
+            }
+            if !skipping { kept.append(line) }
+        }
+        return kept.joined(separator: "\n")
     }
 
     /// The NSE stack's storage directory in the App Group.

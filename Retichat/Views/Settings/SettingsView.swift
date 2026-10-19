@@ -22,6 +22,9 @@ struct SettingsView: View {
     /// re-created.
     @StateObject private var rnodeCoord = RNodeInterfaceCoordinator.shared
     @StateObject private var rtnodeBle = RTNodeBluetoothCoordinator.shared
+    @StateObject private var localNetwork = LocalNetworkPermission.shared
+    /// Devices the AutoInterface has found, read with the interface status.
+    @State private var autoInterfacePeers = 0
     @Environment(\.dismiss) private var dismiss
     /// Back from iOS Settings: Bluetooth may have been allowed or denied there.
     @Environment(\.scenePhase) private var scenePhase
@@ -123,6 +126,7 @@ struct SettingsView: View {
                 }
                 refreshNotificationStatus()
                 rtnodeBle.recheckAuthorization()
+                if vm.autoInterfaceEnabled { localNetwork.check() }
                 channelClient.startRfedLinkMonitor()
                 refreshInterfaceStatus()
                 interfaceStatusTimer?.invalidate()
@@ -131,6 +135,7 @@ struct SettingsView: View {
                 }
             }
             .onDisappear {
+                localNetwork.stop()
                 channelClient.stopRfedLinkMonitor()
                 interfaceStatusTimer?.invalidate()
                 interfaceStatusTimer = nil
@@ -144,6 +149,14 @@ struct SettingsView: View {
             .onChange(of: rtnodeBle.status) { _, status in
                 // Not allowed: the coordinator saved the switch off; show it off.
                 if status == .denied { vm.rtnodeBluetoothDenied() }
+            }
+            .onChange(of: vm.autoInterfaceEnabled) { _, on in
+                // The first time it's turned on is when iOS asks for Local
+                // Network access (LocalNetworkPermission.check).
+                if on { localNetwork.check() } else if localNetwork.status != .denied { localNetwork.stop() }
+            }
+            .onChange(of: localNetwork.status) { _, status in
+                if status == .denied { vm.autoInterfaceDenied() }
             }
         }
     }
@@ -447,11 +460,17 @@ struct SettingsView: View {
                 if vm.pendingInterfaces.isEmpty {
                     defaultTcpCard
                     rtnodeBluetoothCard
+                    if LocalNetworkPermission.multicastAvailable {
+                        localNetworkCard
+                    }
                 } else {
                     // Show the default-endpoints row alongside user interfaces
                     // so it's always visible with the same visual weight.
                     defaultTcpCard
                     rtnodeBluetoothCard
+                    if LocalNetworkPermission.multicastAvailable {
+                        localNetworkCard
+                    }
 
                     // NOTE: We deliberately use ForEach on the *value* collection (not
                     // ForEach($vm.pendingInterfaces)) and synthesize the Toggle binding
@@ -622,6 +641,84 @@ struct SettingsView: View {
         .padding(.vertical, 4)
     }
 
+    /// On/off for the built-in AutoInterface (James, 2026-10-19): finds
+    /// other Reticulum devices on the same Wi-Fi or Ethernet network and talks
+    /// to them directly. Can't be removed, off by default; shown only where it
+    /// can work (LocalNetworkPermission.multicastAvailable). Turning it on
+    /// makes iOS ask for Local Network access if it hasn't, and Apply restarts
+    /// the stack with the interface (needsRestart). Refused, the switch goes
+    /// off and the card links to iOS Settings. The last line is the live
+    /// status: how many devices it has found.
+    private var localNetworkCard: some View {
+        HStack {
+            Circle()
+                .fill(localNetworkDotColor)
+                .frame(width: 8, height: 8)
+
+            Image(systemName: "wifi")
+                .font(.body)
+                .foregroundColor(.retichatOnSurfaceVariant)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Local network")
+                    .font(.subheadline)
+                    .foregroundColor(.retichatOnSurface)
+                Text("AutoInterface")
+                    .font(.caption)
+                    .foregroundColor(.retichatPrimary)
+                Text(localNetworkStatusText)
+                    .font(.caption)
+                    .foregroundColor(.retichatOnSurfaceVariant)
+                if localNetwork.status == .denied {
+                    Button {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Open Settings")
+                            Image(systemName: "arrow.up.right.square")
+                        }
+                        .font(.caption)
+                    }
+                    .tint(.retichatPrimary)
+                }
+            }
+
+            Spacer()
+
+            Toggle("", isOn: $vm.autoInterfaceEnabled)
+                .tint(.retichatPrimary)
+                .labelsHidden()
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Whether the running stack has the AutoInterface: it was saved on when
+    /// the stack started, or the last Apply restarted it so.
+    private var localNetworkRunning: Bool {
+        repository.serviceRunning && UserPreferences.shared.autoInterfaceEnabled && !vm.needsRestart
+    }
+
+    private var localNetworkStatusText: String {
+        if localNetwork.status == .denied { return "Allow Local Network for Retichat in iOS Settings" }
+        guard vm.autoInterfaceEnabled else { return "Off" }
+        guard localNetworkRunning else { return "On after Apply" }
+        switch autoInterfacePeers {
+        case 0: return "Looking for Reticulum devices on this network"
+        case 1: return "1 device found on this network"
+        default: return "\(autoInterfacePeers) devices found on this network"
+        }
+    }
+
+    /// Grey off, yellow looking, green with a device found, red refused.
+    private var localNetworkDotColor: Color {
+        if localNetwork.status == .denied { return .retichatError }
+        guard vm.autoInterfaceEnabled, localNetworkRunning else { return .retichatOnSurfaceVariant }
+        return autoInterfacePeers > 0 ? .retichatSuccess : .orange
+    }
+
     private var rtnodeStatusText: String {
         switch (rtnodeBle.status, vm.rtnodeBluetoothEnabled) {
         // Whatever the switch: it is off, and this is how to turn it on.
@@ -743,9 +840,12 @@ struct SettingsView: View {
         let names = vm.pendingInterfaces.map(\.name)
         guard repository.serviceRunning else {
             if !interfaceOnlineStatus.isEmpty { interfaceOnlineStatus = [:] }
+            if autoInterfacePeers != 0 { autoInterfacePeers = 0 }
             return
         }
         let bridge = RetichatBridge.shared
+        let peers = bridge.autoInterfacePeerCount()
+        if peers != autoInterfacePeers { autoInterfacePeers = peers }
         var next: [String: Bool] = [:]
         for name in names {
             if let online = bridge.interfaceOnline(name: name) {

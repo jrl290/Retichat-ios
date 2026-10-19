@@ -53,6 +53,7 @@ final class UserPreferences {
         static let distroLeftIds = "distro_left_ids"
         static let defaultTcpEnabled = "default_tcp_enabled"
         static let rtnodeBluetoothEnabled = "rtnode_bluetooth_enabled"
+        static let autoInterfaceEnabled = "auto_interface_enabled"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
         /// No longer written; removed at init (see init).
@@ -162,6 +163,22 @@ final class UserPreferences {
     static func rtnodeBluetoothEnabled(_ defaults: UserDefaults) -> Bool {
         defaults.object(forKey: Keys.rtnodeBluetoothEnabled) != nil
             ? defaults.bool(forKey: Keys.rtnodeBluetoothEnabled) : false
+    }
+
+    /// When true, the stack runs an AutoInterface: it finds other Reticulum
+    /// devices on the same Wi-Fi or Ethernet network and talks to them
+    /// directly (James, 2026-10-19). A built-in interface that can't be
+    /// removed, off by default; read at stack start (generateConfig), only
+    /// where it can work (LocalNetworkPermission.multicastAvailable).
+    var autoInterfaceEnabled: Bool {
+        get { Self.autoInterfaceEnabled(defaults) }
+        set { defaults.set(newValue, forKey: Keys.autoInterfaceEnabled) }
+    }
+
+    /// The saved switch; false when it was never set.
+    static func autoInterfaceEnabled(_ defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: Keys.autoInterfaceEnabled) != nil
+            ? defaults.bool(forKey: Keys.autoInterfaceEnabled) : false
     }
 
     var dropAnnounces: Bool {
