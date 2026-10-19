@@ -290,6 +290,11 @@ struct RetichatApp: App {
                     // → publish → polling → notify → channelClient.start).
                 }
         }
+        // Whether a chat open on screen is seen (NotificationManager.chatOnScreen);
+        // `initial`, so it holds from launch, not from the first phase change.
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            NotificationManager.shared.appActive = phase == .active
+        }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:

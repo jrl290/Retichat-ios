@@ -23,8 +23,24 @@ extension Notification.Name {
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
-    /// The currently-active chat ID — suppress notifications for this chat.
+    /// The chat whose conversation is open (a DM, Group or channel id), set
+    /// by ConversationView. It notifies nothing while the app is active
+    /// (chatOnScreen).
     var activeChatId: String?
+
+    /// The app is in the foreground (scenePhase .active), set by RetichatApp.
+    /// An open chat behind the home screen is not on screen.
+    var appActive = false
+
+    /// Whether `chatId` is on screen: the open chat, with the app active. Ids
+    /// compare without case: a channel's is its hash in hex, lowercased by the
+    /// NSE. Until 2026-10-19 a channel never marked itself open, so its posts
+    /// notified over it, and an open DM behind the home screen stayed silent
+    /// (James, 2026-10-19).
+    static func chatOnScreen(appActive: Bool, openChatId: String?, chatId: String) -> Bool {
+        guard appActive, let openChatId else { return false }
+        return openChatId.lowercased() == chatId.lowercased()
+    }
 
     /// Badge counts per chat — cleared when user opens the conversation.
     private var badgeCounts: [String: Int] = [:]
@@ -81,9 +97,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     func postMessageNotification(chatId: String, senderName: String, content: String) {
         // Don't notify if user is viewing this chat
-        if chatId == activeChatId { return }
+        if Self.chatOnScreen(appActive: appActive, openChatId: activeChatId, chatId: chatId) {
+            print("[Notify] chat \(chatId.prefix(8)) is on screen — not notified")
+            return
+        }
         // Don't notify if user has muted this chat
         if UserPreferences.shared.isChatMuted(chatId) { return }
+        print("[Notify] chat \(chatId.prefix(8)): notified")
 
         postLocalNotification(chatId: chatId, senderName: senderName, content: content)
     }
@@ -185,8 +205,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         let chatId = notification.request.content.userInfo["chatId"] as? String
         let body = notification.request.content.body
 
-        // Suppress if user is viewing this chat
-        if let chatId = chatId, chatId == activeChatId {
+        // Suppress if user is viewing this chat (willPresent comes only in the foreground)
+        if let chatId = chatId, Self.chatOnScreen(appActive: true, openChatId: activeChatId, chatId: chatId) {
+            print("[Notify] banner for chat \(chatId.prefix(8)) not shown: it is on screen")
             completionHandler([])
             return
         }

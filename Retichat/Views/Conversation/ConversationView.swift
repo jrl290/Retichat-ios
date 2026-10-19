@@ -417,8 +417,12 @@ struct ConversationView: View {
             // Channel chats need live link-status updates so the auto-PULL
             // can fire on each fresh link establishment.  Refcounted so it
             // composes with SettingsView's own monitor retain.
-            if case .channel = mode {
+            if case .channel(let channel) = mode {
                 channelClient.retainRfedLinkMonitor()
+                // The channel open here is the chat on screen, as an open DM
+                // is: its posts notify nothing while the app is active.
+                NotificationManager.shared.activeChatId = channel.id
+                NotificationManager.shared.clearNotifications(forChatId: channel.id)
             }
             advanceMarkerClock()
             isTextFieldFocused = true
@@ -426,12 +430,13 @@ struct ConversationView: View {
         .onDisappear {
             if case .dm(let id) = mode {
                 print("[DIAG][onDisappear] chatId=\(id.prefix(8))")
-                NotificationManager.shared.activeChatId = nil
+                if NotificationManager.shared.activeChatId == id { NotificationManager.shared.activeChatId = nil }
                 repository.closeConversation(chatId: id)
                 print("[DIAG][onDisappear] closeConversation done")
             }
-            if case .channel = mode {
+            if case .channel(let channel) = mode {
                 channelClient.releaseRfedLinkMonitor()
+                if NotificationManager.shared.activeChatId == channel.id { NotificationManager.shared.activeChatId = nil }
             }
         }
         .onChange(of: scenePhase) { _, phase in
