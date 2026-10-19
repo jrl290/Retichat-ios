@@ -88,8 +88,8 @@ func testConfigOnlyWhenOnAndWhereMulticastWorks() {
 
 func testSettingsOffersItAndAsksForLocalNetwork() {
     let view = read(["Retichat", "Views", "Settings", "SettingsView.swift"])
-    check(view.components(separatedBy: "if LocalNetworkPermission.multicastAvailable {\n                        localNetworkCard").count == 3,
-          "the card is shown beside Nearby RTNode, with or without other interfaces, where it can work")
+    check(view.components(separatedBy: "defaultTcpCard\n                    // Second (James, 2026-10-19).\n                    if LocalNetworkPermission.multicastAvailable {\n                        localNetworkCard\n                    }\n                    rtnodeBluetoothCard").count == 3,
+          "the card is second, after Default TCP and before Nearby RTNode, with or without other interfaces, where it can work")
     check(view.contains("if on { localNetwork.check() }"), "turning it on is when iOS asks for Local Network access")
     check(view.contains("if status == .denied { vm.autoInterfaceDenied() }"), "refused, the switch goes off")
     let model = read(["Retichat", "Views", "Settings", "SettingsViewModel.swift"])

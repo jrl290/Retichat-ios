@@ -41,6 +41,9 @@ struct ConversationView: View {
     /// per link establishment per channel.  `nil` means "never auto-pulled
     /// while this view was on screen".
     @State private var lastAutoPullGeneration: Int?
+    /// Entries to the channel on screen after the first: each return from
+    /// the background adds one, and the entry steps and auto-pull run again.
+    @State private var channelEntries = 0
     @FocusState private var isTextFieldFocused: Bool
     /// The clock the date markers are labelled on (DayMarkers). Moved to the
     /// present when the day turns, the time zone or locale changes, or the
@@ -433,13 +436,13 @@ struct ConversationView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { advanceMarkerClock() }
-            guard phase == .active, let channel else { return }
-            let channelKey = channel.id.lowercased()
-            guard !(channelClient.pullInFlight[channelKey] ?? false) else { return }
-            channelClient.canPullMore[channelKey] = nil
-            Task {
-                await channelClient.pullDeferred(channel: channel)
-            }
+            // Coming back to a channel from the background is another entry
+            // (James, 2026-10-19): the same steps as opening it from the chat
+            // list, so the earlier messages load once the link is up, now or
+            // when it comes back. It pulled at once before, link up or not.
+            guard phase == .active, channel != nil else { return }
+            lastAutoPullGeneration = nil
+            channelEntries &+= 1
         }
         .onReceive(Timer.publish(every: 3, on: .main, in: .common).autoconnect()) { _ in
             if case .dm(let id) = mode {
@@ -663,6 +666,11 @@ struct ConversationView: View {
                     scrollChannelToBottom(proxy: proxy, animated: false)
                 }
             }
+            .onChange(of: channelEntries) { _, _ in
+                // A return from the background: the entry steps again.
+                channelClient.markChannelOpenedForStreaming(channelHashHex: channel.id)
+                channelClient.canPullMore[channelKey] = nil
+            }
             // Automatic PULL on each fresh rfed link establishment, scoped
             // to the channel chat being open. The `.task(id:)` re-runs
             // whenever `rfedLinkGeneration` changes; we only fire a pull if
@@ -672,13 +680,17 @@ struct ConversationView: View {
             //   - Link drops and re-establishes while viewing a channel: pull.
             //   - First open after a link establishment that happened before
             //     the screen was shown: pull (generation differs from nil).
-            .task(id: channelClient.rfedLinkGeneration) {
+            //   - Back from the background: an entry, so pull as on the
+            //     first open (channelEntries, James 2026-10-19).
+            // The pull is its own Task so a later generation or entry
+            // doesn't cancel it part way.
+            .task(id: "\(channelClient.rfedLinkGeneration)/\(channelEntries)") {
                 guard channelClient.rfedNodeStatus == .connected else { return }
                 let gen = channelClient.rfedLinkGeneration
                 guard lastAutoPullGeneration != gen else { return }
                 guard !(channelClient.pullInFlight[channelKey] ?? false) else { return }
                 lastAutoPullGeneration = gen
-                await channelClient.pullDeferred(channel: channel)
+                Task { await channelClient.pullDeferred(channel: channel) }
             }
         }
     }

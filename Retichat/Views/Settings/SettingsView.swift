@@ -459,18 +459,20 @@ struct SettingsView: View {
 
                 if vm.pendingInterfaces.isEmpty {
                     defaultTcpCard
-                    rtnodeBluetoothCard
+                    // Second (James, 2026-10-19).
                     if LocalNetworkPermission.multicastAvailable {
                         localNetworkCard
                     }
+                    rtnodeBluetoothCard
                 } else {
                     // Show the default-endpoints row alongside user interfaces
                     // so it's always visible with the same visual weight.
                     defaultTcpCard
-                    rtnodeBluetoothCard
+                    // Second (James, 2026-10-19).
                     if LocalNetworkPermission.multicastAvailable {
                         localNetworkCard
                     }
+                    rtnodeBluetoothCard
 
                     // NOTE: We deliberately use ForEach on the *value* collection (not
                     // ForEach($vm.pendingInterfaces)) and synthesize the Toggle binding
