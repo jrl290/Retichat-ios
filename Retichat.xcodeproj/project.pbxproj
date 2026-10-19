@@ -6,6 +6,20 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXAggregateTarget section */
+		4847DF1C3A0D9542AECF060E /* RustLibrary */ = {
+			isa = PBXAggregateTarget;
+			buildConfigurationList = 674BED55CCAD4B60A9165DB6 /* Build configuration list for PBXAggregateTarget "RustLibrary" */;
+			buildPhases = (
+				99E9A4C81FE370DE19296B24 /* Build Rust library */,
+			);
+			dependencies = (
+			);
+			name = RustLibrary;
+			productName = RustLibrary;
+		};
+/* End PBXAggregateTarget section */
+
 /* Begin PBXBuildFile section */
 		1A9E6A0F2F4D890000E5C137 /* CoreBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A9E6A0E2F4D890000E5C137 /* CoreBluetooth.framework */; };
 		1A9E6A112F4D890100E5C137 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A9E6A102F4D890100E5C137 /* IOKit.framework */; };
@@ -25,6 +39,20 @@
 			proxyType = 1;
 			remoteGlobalIDString = 1AE372962F81A1CF005F533B;
 			remoteInfo = NotificationService;
+		};
+		346E381DFE024ECF962C35B3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A9E696F2F4D80E100E5C137 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4847DF1C3A0D9542AECF060E;
+			remoteInfo = RustLibrary;
+		};
+		45DB72F847ADCF58D2523ABE /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A9E696F2F4D80E100E5C137 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4847DF1C3A0D9542AECF060E;
+			remoteInfo = RustLibrary;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -64,11 +92,17 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Bridge/LxmfFields.swift,
-				RetichatFFI.xcframework,
 				Services/LxmfClient.swift,
 				Services/PendingNotification.swift,
 			);
 			target = 1AE372962F81A1CF005F533B /* NotificationService */;
+		};
+		62C632582AE4FA8B702F59AE /* Exceptions for "Retichat" folder in "Retichat" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				RetichatFFI.xcframework,
+			);
+			target = 1A9E69762F4D80E100E5C137 /* Retichat */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -76,6 +110,7 @@
 		1A9E69792F4D80E100E5C137 /* Retichat */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
+				62C632582AE4FA8B702F59AE /* Exceptions for "Retichat" folder in "Retichat" target */,
 				1AE372A52F81A243005F533B /* Exceptions for "Retichat" folder in "NotificationService" target */,
 			);
 			path = Retichat;
@@ -163,6 +198,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				616B5DCEC9835817BE6A0128 /* PBXTargetDependency */,
 				1AE3729D2F81A1CF005F533B /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
@@ -186,6 +222,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				F10A3DF897C4CB1131E5FB1C /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				1AE372982F81A1CF005F533B /* NotificationService */,
@@ -214,6 +251,9 @@
 					1AE372962F81A1CF005F533B = {
 						CreatedOnToolsVersion = 26.4;
 					};
+					4847DF1C3A0D9542AECF060E = {
+						CreatedOnToolsVersion = 26.4;
+					};
 				};
 			};
 			buildConfigurationList = 1A9E69722F4D80E100E5C137 /* Build configuration list for PBXProject "Retichat" */;
@@ -232,6 +272,7 @@
 			targets = (
 				1A9E69762F4D80E100E5C137 /* Retichat */,
 				1AE372962F81A1CF005F533B /* NotificationService */,
+				4847DF1C3A0D9542AECF060E /* RustLibrary */,
 			);
 		};
 /* End PBXProject section */
@@ -252,6 +293,30 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		99E9A4C81FE370DE19296B24 /* Build Rust library */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust library";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/libretichat_ffi.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/xcode_build_rust.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		1A9E69732F4D80E100E5C137 /* Sources */ = {
@@ -276,6 +341,16 @@
 			platformFilter = ios;
 			target = 1AE372962F81A1CF005F533B /* NotificationService */;
 			targetProxy = 1AE3729C2F81A1CF005F533B /* PBXContainerItemProxy */;
+		};
+		616B5DCEC9835817BE6A0128 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4847DF1C3A0D9542AECF060E /* RustLibrary */;
+			targetProxy = 346E381DFE024ECF962C35B3 /* PBXContainerItemProxy */;
+		};
+		F10A3DF897C4CB1131E5FB1C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4847DF1C3A0D9542AECF060E /* RustLibrary */;
+			targetProxy = 45DB72F847ADCF58D2523ABE /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -443,6 +518,10 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.28;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lretichat_ffi",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.newendian.Retichat;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -497,6 +576,10 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.28;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lretichat_ffi",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.newendian.Retichat;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -529,6 +612,10 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 1.27;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lretichat_ffi",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.newendian.Retichat.NotificationService;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -561,6 +648,10 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 1.27;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lretichat_ffi",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.newendian.Retichat.NotificationService;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -572,6 +663,24 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		FB663E090FAF8DD495DD0A6F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTS_MACCATALYST = YES;
+			};
+			name = Debug;
+		};
+		7DD4D619E8F3869FFF99452B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTS_MACCATALYST = YES;
 			};
 			name = Release;
 		};
@@ -601,6 +710,15 @@
 			buildConfigurations = (
 				1AE372A02F81A1CF005F533B /* Debug */,
 				1AE372A12F81A1CF005F533B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		674BED55CCAD4B60A9165DB6 /* Build configuration list for PBXAggregateTarget "RustLibrary" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FB663E090FAF8DD495DD0A6F /* Debug */,
+				7DD4D619E8F3869FFF99452B /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

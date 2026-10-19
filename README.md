@@ -17,7 +17,8 @@ implementation, refactoring, and documentation.
 
 ```
 Retichat-ios/
-├── build_rust.sh              # Cross-compiles Rust → XCFramework
+├── xcode_build_rust.sh        # Run by Xcode on every build: Rust → libretichat_ffi.a
+├── build_rust.sh              # Cross-compiles every slice → XCFramework (optional)
 ├── rust/retichat-ffi/         # Rust C FFI bridge (staticlib)
 │   ├── Cargo.toml
 │   └── src/lib.rs
@@ -71,17 +72,7 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 rustup target add aarch64-apple-ios-macabi x86_64-apple-ios-macabi
 ```
 
-### 2. Build the Rust XCFramework
-
-```bash
-cd Retichat-ios
-./build_rust.sh release
-```
-
-This cross-compiles for device, simulator, and Mac Catalyst, producing
-`Frameworks/RetichatFFI.xcframework`.
-
-### 3. Open in Xcode & build
+### 2. Open in Xcode & build
 
 ```bash
 open Retichat.xcodeproj
@@ -89,6 +80,13 @@ open Retichat.xcodeproj
 
 Select a signing team under **Signing & Capabilities**, pick a device or
 simulator, and build.
+
+Every build first runs the `RustLibrary` target (`xcode_build_rust.sh`), which
+builds the Rust crate (always `--release`) for the device, simulator or Mac
+Catalyst architectures being built, and the app links that library. cargo only
+recompiles what changed, so an unchanged crate adds a second or two. There is
+no separate Rust step to remember; `build_rust.sh` still builds the full
+XCFramework if you want every slice at once.
 
 ### Optional: private push bridge configuration
 
