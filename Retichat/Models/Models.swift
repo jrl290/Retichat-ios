@@ -339,6 +339,11 @@ enum DeliveryState {
     /// Direct delivery failed; message has been handed to a propagation node
     /// for store-and-forward delivery.
     static let propagating = 4
+    /// A channel post waiting to be sent: no stack yet, or its rfed.link not
+    /// up (back from the background, connections coming back). Shows the
+    /// pending clock; sent when the stack starts or the link comes up
+    /// (RfedChannelClient.queuePost, James 2026-10-19).
+    static let queued = 5
 }
 
 // MARK: - Channel SwiftData Models

@@ -268,7 +268,7 @@ struct ChatBubble: View {
     @ViewBuilder
     private var deliveryIcon: some View {
         switch message.deliveryState {
-        case DeliveryState.pending:
+        case DeliveryState.pending, DeliveryState.queued:
             Image(systemName: "clock")
                 .font(.caption2)
                 .foregroundColor(.retichatOnSurfaceVariant)

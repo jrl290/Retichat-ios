@@ -683,12 +683,21 @@ func testConversationSourcePullsChannelOnForeground() {
             return
         }
 
+        // Since 2026-10-19 (8faf945) app active is another entry: it counts
+        // one, and the entry's steps and its auto-pull (once the rfed link is
+        // up) run again, as on opening the channel (ChannelResumeEntryTests).
         check(
-            fragment.contains("channelClient.canPullMore[channelKey] = nil"),
+            fragment.contains("channelEntries &+= 1") && fragment.contains("lastAutoPullGeneration = nil"),
+            "app active counts an entry to the channel on screen"
+        )
+        let entry = sourceFragment(source, start: ".onChange(of: channelEntries)", end: "}") ?? ""
+        check(
+            entry.contains("channelClient.canPullMore[channelKey] = nil"),
             "foreground channel pull re-enables the paging affordance before requesting"
         )
         check(
-            fragment.contains("await channelClient.pullDeferred(channel: channel)"),
+            source.contains(".task(id: \"\\(channelClient.rfedLinkGeneration)/\\(channelEntries)\")")
+                && source.contains("Task { await channelClient.pullDeferred(channel: channel) }"),
             "foreground channel pull requests channel backlog on app active"
         )
     } catch {

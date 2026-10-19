@@ -123,8 +123,9 @@ final class RfedChannelClient: ObservableObject {
     /// `start()` once it is (handleDistroChannelSync).
     private var pendingChannelSync: [(marker: DistroChannelSync.Marker, fromDistro: Bool, signedByDistro: Bool)] = []
 
+    /// A pull asked for before the stack could issue it. Posts wait in the
+    /// store instead, queued (queuePost), so they outlive the process.
     private enum PendingRfedOperation {
-        case send(content: String, channel: Channel, optimisticId: String)
         case pull(channel: Channel)
     }
 
@@ -188,6 +189,7 @@ final class RfedChannelClient: ObservableObject {
         }
 
         drainPendingRfedOperationsIfReady()
+        releaseQueuedPosts()
         importNSEBlobs()
     }
 
@@ -220,11 +222,6 @@ final class RfedChannelClient: ObservableObject {
         return channels.first { Self.normalizedHex($0.id) == normalized }
     }
 
-    private func enqueuePendingSend(content: String, channel: Channel, optimisticId: String) {
-        pendingRfedOperations.append(.send(content: content, channel: channel, optimisticId: optimisticId))
-        print("[RfedChannel] queued SEND until RFed stack is ready channel=\(channel.channelName) pending=\(pendingRfedOperations.count)")
-    }
-
     private func enqueuePendingPull(channel: Channel) {
         let normalized = Self.normalizedHex(channel.id)
         guard pendingPullChannelHashes.insert(normalized).inserted else { return }
@@ -243,12 +240,6 @@ final class RfedChannelClient: ObservableObject {
 
         for operation in queued {
             switch operation {
-            case .send(let content, let channel, let optimisticId):
-                guard let live = liveChannel(channelHashHex: channel.id) else {
-                    markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
-                    continue
-                }
-                Task { await self.sendMessageAsync(content: content, toChannel: live, optimisticId: optimisticId) }
             case .pull(let channel):
                 guard let live = liveChannel(channelHashHex: channel.id) else {
                     pullInFlight[channel.id] = false
@@ -827,8 +818,12 @@ final class RfedChannelClient: ObservableObject {
             )
         }
 
-        guard canIssueRfedOperations else {
-            enqueuePendingSend(content: content, channel: channel, optimisticId: optimisticId)
+        // A post that cannot go now waits, queued, as Android's does (James,
+        // 2026-10-19): with no stack yet, or with its rfed.link not up, back
+        // from the background while the connections come back. Until then it
+        // waited 5 s for the link, then 5 s more, and failed (the red mark).
+        guard canIssueRfedOperations, Self.linkUp(RfedLink.shared.status(nodeHex: channel.rfedNodeHash)) else {
+            queuePost(optimisticId: optimisticId, channel: channel)
             return
         }
 
@@ -848,9 +843,20 @@ final class RfedChannelClient: ObservableObject {
             }
         }
 
-        if await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId,
-                         postingHex: postingHex, postingHandle: postingHandle) {
+        switch await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId,
+                             postingHex: postingHex, postingHandle: postingHandle) {
+        case .sent:
+            releaseQueuedPosts()
             return
+        case .unanswered:
+            // The link read ACTIVE and nothing came back: a link that died in
+            // the background reads ACTIVE until its own request timeout tears
+            // it down, and AppLinks then opens it again (its re-open arm).
+            // The post waits for that link's ACTIVE edge, not the red mark.
+            queuePost(optimisticId: optimisticId, channel: liveChannel)
+            return
+        case .failed:
+            if requeueIfLinkDown(optimisticId: optimisticId, channel: liveChannel) { return }
         }
 
         // Step 2: a single retry after forcing a stampCost refresh.  This
@@ -864,12 +870,91 @@ final class RfedChannelClient: ObservableObject {
             }
         } catch {
             print("[RfedChannel] stampCost refresh on retry failed: \(error)")
+            if requeueIfLinkDown(optimisticId: optimisticId, channel: liveChannel) { return }
             markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
             return
         }
-        if !(await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId,
-                           postingHex: postingHex, postingHandle: postingHandle)) {
+        switch await trySend(content: content, toChannel: liveChannel, optimisticId: optimisticId,
+                             postingHex: postingHex, postingHandle: postingHandle) {
+        case .sent:
+            releaseQueuedPosts()
+        case .unanswered:
+            queuePost(optimisticId: optimisticId, channel: liveChannel)
+        case .failed:
+            if requeueIfLinkDown(optimisticId: optimisticId, channel: liveChannel) { return }
             markOptimisticFailed(optimisticId: optimisticId, channelHash: channel.id)
+        }
+    }
+
+    // MARK: - Queued posts
+
+    /// rfed.link status 3 is ACTIVE (AppLinks).
+    nonisolated static func linkUp(_ status: Int32) -> Bool { status == 3 }
+
+    /// One release of the queued posts at a time (releaseQueuedPosts); one
+    /// asked for meanwhile runs after it, reading the queue afresh.
+    private var releasingQueuedPosts = false
+    private var releaseQueuedPostsAgain = false
+
+    /// Keep a post that cannot go now, queued: stored with the pending clock
+    /// (DeliveryState.queued), and sent by releaseQueuedPosts when the stack
+    /// starts or its rfed.link comes up. Opening the link starts here, so its
+    /// ACTIVE edge comes.
+    private func queuePost(optimisticId: String, channel: Channel) {
+        setOutgoingState(optimisticId: optimisticId, channelHash: channel.id, state: DeliveryState.queued)
+        if canIssueRfedOperations { RfedLink.shared.ensure(nodeHex: channel.rfedNodeHash) }
+        print("[RfedChannel] SEND queued until \(canIssueRfedOperations ? "rfed.link is up" : "the stack is ready") channel=\(channel.channelName) id=\(optimisticId)")
+    }
+
+    /// A send that failed with its rfed.link down (it went while the post was
+    /// sent) is queued again, for the link's return, rather than failed.
+    private func requeueIfLinkDown(optimisticId: String, channel: Channel) -> Bool {
+        guard !Self.linkUp(RfedLink.shared.status(nodeHex: channel.rfedNodeHash)) else { return false }
+        queuePost(optimisticId: optimisticId, channel: channel)
+        return true
+    }
+
+    /// Send the queued posts, oldest first: when the stack starts (start) and
+    /// on every ACTIVE edge of an rfed.link (the "channel-queue" binder),
+    /// Android's releaseQueuedPosts. Each is taken from the queue (queued →
+    /// pending) before it is sent, so a release sends it once; one whose link
+    /// is not up waits for that link's edge, and one whose link goes while it
+    /// is sent, or whose send is not answered, is queued again. A post rfed
+    /// took releases the rest too: that link is up. Ordering, not a retry: no
+    /// timer, each release follows a signal.
+    private func releaseQueuedPosts() {
+        guard canIssueRfedOperations, let ctx = modelContext else { return }
+        if releasingQueuedPosts {
+            releaseQueuedPostsAgain = true
+            return
+        }
+        releasingQueuedPosts = true
+        Task { @MainActor in
+            repeat {
+                releaseQueuedPostsAgain = false
+                let queued = DeliveryState.queued
+                let rows = (try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
+                    predicate: #Predicate { $0.isOutgoing == true && $0.deliveryState == queued },
+                    sortBy: [SortDescriptor(\.timestamp)]
+                ))) ?? []
+                if !rows.isEmpty { print("[RfedChannel] SEND: releasing \(rows.count) queued post(s)") }
+                for row in rows {
+                    guard row.deliveryState == DeliveryState.queued else { continue }
+                    let (id, content, channelHash) = (row.id, row.content, row.channelHash)
+                    guard let channel = liveChannel(channelHashHex: channelHash) else {
+                        print("[RfedChannel] SEND: queued \(id) has no channel \(channelHash) — failed")
+                        markOptimisticFailed(optimisticId: id, channelHash: channelHash)
+                        continue
+                    }
+                    guard Self.linkUp(RfedLink.shared.status(nodeHex: channel.rfedNodeHash)) else {
+                        RfedLink.shared.ensure(nodeHex: channel.rfedNodeHash)
+                        continue
+                    }
+                    setOutgoingState(optimisticId: id, channelHash: channelHash, state: DeliveryState.pending)
+                    await sendMessageAsync(content: content, toChannel: channel, optimisticId: id)
+                }
+            } while releaseQueuedPostsAgain
+            releasingQueuedPosts = false
         }
     }
 
@@ -877,30 +962,41 @@ final class RfedChannelClient: ObservableObject {
     /// Called from any terminal SEND error path so the user sees the red
     /// xmark indicator instead of an indefinite “sending” clock.
     private func markOptimisticFailed(optimisticId: String, channelHash: String) {
+        setOutgoingState(optimisticId: optimisticId, channelHash: channelHash, state: DeliveryState.failed)
+    }
+
+    /// Set an outgoing post's state in the store and on screen.
+    private func setOutgoingState(optimisticId: String, channelHash: String, state: Int) {
         if let ctx = modelContext,
            let temp = try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
                predicate: { let oid = optimisticId; return #Predicate { $0.id == oid } }()
            )).first {
-            temp.deliveryState = DeliveryState.failed
+            temp.deliveryState = state
             try? ctx.save()
         }
         if var list = messages[channelHash],
            let idx = list.firstIndex(where: { $0.id == optimisticId }) {
-            list[idx].deliveryState = DeliveryState.failed
+            list[idx].deliveryState = state
             messages[channelHash] = list
         }
     }
 
+    /// How a trySend ended: rfed took the post, the post was refused or
+    /// could not be built (failed), or the link read ACTIVE and nothing came
+    /// back (unanswered).
+    private enum SendOutcome { case sent, failed, unanswered }
+
     /// Build the wire payload, compute the stamp, and ship it.  Returns
-    /// false if any step that would produce a server-rejected packet fails
-    /// (so the caller can refresh stampCost and retry).  On a successful
+    /// .failed if any step that would produce a server-rejected packet fails
+    /// (so the caller can refresh stampCost and retry), and .unanswered when
+    /// rfed's answer did not come.  On a successful
     /// transmission the optimistic entity identified by `optimisticId` is
     /// upgraded in place to the canonical `sender_hex+lxmf_ts` id with
     /// `deliveryState = sent` (so the echo from RFed dedupes against it
     /// in `dispatchVerifiedLxmf`).
     private func trySend(content: String, toChannel channel: Channel,
                           optimisticId: String,
-                          postingHex: String, postingHandle: UInt64) async -> Bool {
+                          postingHex: String, postingHandle: UInt64) async -> SendOutcome {
         // Build the wire payload as an LXMF-authenticated channel message.
         // The FFI returns both the on-wire bytes AND the LXMF timestamp it
         // baked into the signed body — we use the same timestamp as the
@@ -916,7 +1012,7 @@ final class RfedChannelClient: ObservableObject {
                                                   title: Data(),
                                                   displayName: postName) else {
             print("[RfedChannel] LXMF pack failed: \(bridge.lastError() ?? "unknown")")
-            return false
+            return .failed
         }
         let lxmfData = packed.wirePayload
         let tsMs = packed.timestampMs
@@ -924,7 +1020,7 @@ final class RfedChannelClient: ObservableObject {
         guard lxmfData.count >= 16,
               lxmfData.prefix(16).hexString.lowercased() == channel.id.lowercased() else {
             print("[RfedChannel] LXMF pack produced wrong channel_id_hash prefix")
-            return false
+            return .failed
         }
 
         var payload = lxmfData
@@ -934,7 +1030,7 @@ final class RfedChannelClient: ObservableObject {
             // refuse to ship a packet we know will be rejected.
             guard let stamp = bridge.channelComputeStamp(payload: payload, cost: Int32(cost)) else {
                 print("[RfedChannel] STAMP COMPUTE FAILED for cost=\(cost): \(bridge.lastError() ?? "unknown") — aborting send")
-                return false
+                return .failed
             }
             payload += stamp
             print("[RfedChannel] stamp computed (cost=\(cost), stamp_bytes=\(stamp.count), payload_bytes=\(payload.count))")
@@ -942,7 +1038,7 @@ final class RfedChannelClient: ObservableObject {
 
         guard RfedLink.destHash(nodeHex: channel.rfedNodeHash) != nil else {
             print("[RfedChannel] Send failed: invalid rfed.link dest derived from \(channel.rfedNodeHash)")
-            return false
+            return .failed
         }
         // A request on rfed.link, answered [ok, reason] (RFed-spec Link.md):
         // until 2026-10-18 the post went as DATA on rfed.channel, whose proof
@@ -954,7 +1050,7 @@ final class RfedChannelClient: ObservableObject {
                                                    payload: Self.msgpackBin(payload))
         if let refusal = Self.publishRefusal(answer) {
             print("[RfedChannel] Send failed: rfed answered \(refusal)")
-            return false
+            return answer == nil ? .unanswered : .failed
         }
         // Handed to RFed: record what this post carried (§4.2).
         recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)
@@ -1012,7 +1108,7 @@ final class RfedChannelClient: ObservableObject {
             }
         }
         updateChannelLastMessage(channelHashHex: channel.id, postMs: tsMs)
-        return true
+        return .sent
     }
 
     // MARK: - Pull deferred blobs (user-initiated paging)
@@ -1555,6 +1651,10 @@ final class RfedChannelClient: ObservableObject {
             guard let self, self.trackedChannelStreamNodes.contains(node) else { return }
             self.sendChannelStreamConfigForNode(nodeIdentityHashHex: node)
         }
+        // The posts that waited for a link go on each fresh one.
+        RfedLink.shared.setBinder(owner: "channel-queue") { [weak self] _ in
+            self?.releaseQueuedPosts()
+        }
     }
 
     private func sendChannelStreamConfigForNode(nodeIdentityHashHex: String) {
@@ -1592,6 +1692,19 @@ final class RfedChannelClient: ObservableObject {
     private func loadPersistedMessages() {
         guard let ctx = modelContext else { return }
         let entities = (try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>())) ?? []
+        // A post still being sent when an earlier process ended is failed
+        // (the red mark), as Android's failStaleOutboundSendingMessages: it
+        // stayed on the clock for good.
+        // Queued posts stay queued: they go when the stack starts.
+        var staleSends = 0
+        for e in entities where e.isOutgoing && e.deliveryState == DeliveryState.pending {
+            e.deliveryState = DeliveryState.failed
+            staleSends += 1
+        }
+        if staleSends > 0 {
+            try? ctx.save()
+            print("[RfedChannel] \(staleSends) post(s) left sending by an earlier process — failed")
+        }
         var grouped: [String: [ChannelMessage]] = [:]
         for e in entities {
             let msg = ChannelMessage(id: e.id, channelHash: e.channelHash,

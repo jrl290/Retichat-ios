@@ -385,7 +385,9 @@ func aReceivedPostIsOwnByTheSharedRuleAndOwnPostsAreNeverNotifiedOrCountedAsSend
     check(dispatch.contains("let msgId = senderHashHex + String(format: \"%016llx\", tsMs)")
             && before(dispatch, "guard !existingForChannel else {", "modelContext?.insert(entity)"),
           "a post whose (source, timestamp) is held is dropped before it is stored")
-    check(channelClient.contains("let entities = (try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>())) ?? []\n        var grouped"),
+    // (A post left sending by an earlier process is failed between the two, 2026-10-19.)
+    check(channelClient.contains("let entities = (try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>())) ?? []\n")
+            && channelClient.contains("var grouped: [String: [ChannelMessage]] = [:]\n        for e in entities {\n            let msg = ChannelMessage("),
           "every stored post is loaded at start, so the dedupe holds after a restart")
     // Its name teaches the state only from the posting identity.
     check(dispatch.contains("if isOutgoing && senderHashHex.lowercased() == postingHex.lowercased() {"),
