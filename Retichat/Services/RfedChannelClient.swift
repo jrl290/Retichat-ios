@@ -98,6 +98,9 @@ final class RfedChannelClient: ObservableObject {
     var contactEntry: (@MainActor (String) -> DisplayNames.SharedName?)?
 
     private var linkStatusTimer: AnyCancellable?
+    /// The distro this device holds, watched so posts it made before this
+    /// device held it become the user's own (claimDistroPosts).
+    private var heldDistroWatch: AnyCancellable?
     private var trackedChannelStreamNodes: Set<String> = []
     private var didInstallRfedLinkHandlers = false
     /// Runtime-only set of channel hashes whose conversation view has been
@@ -172,6 +175,15 @@ final class RfedChannelClient: ObservableObject {
             loadPersistedMessages()
             loadSenderNames()
             didLoadPersistedState = true
+            // Now, with the distro the device holds at launch, and at every
+            // later load or adopt (a transfer accepted, an import).
+            heldDistroWatch = RfedDistroClient.shared.$distro
+                .map { $0?.deliveryHashHex }
+                .removeDuplicates()
+                .sink { [weak self] hex in
+                    guard let hex else { return }
+                    self?.claimDistroPosts(distroHex: hex)
+                }
         }
 
         drainPendingChannelSync()
@@ -1718,6 +1730,40 @@ final class RfedChannelClient: ObservableObject {
             grouped[key]?.sort { $0.timestamp < $1.timestamp }
         }
         messages = grouped
+    }
+
+    /// Channel.md "Own posts" decides at arrival, against the distro the
+    /// device holds then. A post from the distro that arrived while this
+    /// device did not hold it (before a transfer or import, or while the
+    /// Keychain could not be read) was stored as another poster's, with the
+    /// distro's hash as its sender label, and stayed so (James, 2026-10-20:
+    /// "iOS doesn't recognize that a Channel message sent from Distro on one
+    /// device belongs to the same Distro on another device"). Once the device
+    /// holds the distro, every post from it is the user's own: outgoing,
+    /// SENT, as a post that arrives now is stored.
+    private func claimDistroPosts(distroHex: String) {
+        guard let ctx = modelContext else { return }
+        let hex = distroHex.lowercased()
+        guard !hex.isEmpty else { return }
+        let rows = (try? ctx.fetch(FetchDescriptor<ChannelMessageEntity>(
+            predicate: #Predicate { $0.senderHash == hex && $0.isOutgoing == false }
+        ))) ?? []
+        guard !rows.isEmpty else { return }
+        for e in rows {
+            e.isOutgoing = true
+            e.deliveryState = Self.verifiedChannelMessageDeliveryState(isOutgoing: true)
+        }
+        try? ctx.save()
+        for (channel, list) in messages where list.contains(where: { !$0.isOutgoing && $0.senderHash.lowercased() == hex }) {
+            messages[channel] = list.map { msg in
+                guard !msg.isOutgoing, msg.senderHash.lowercased() == hex else { return msg }
+                var own = msg
+                own.isOutgoing = true
+                own.deliveryState = Self.verifiedChannelMessageDeliveryState(isOutgoing: true)
+                return own
+            }
+        }
+        print("[RfedChannel] \(rows.count) post(s) from distro \(hex.prefix(8)) stored before this device held it — now the user's own")
     }
 
     /// Helper: trim/lowercase a hex string and reject obvious non-hex input.
