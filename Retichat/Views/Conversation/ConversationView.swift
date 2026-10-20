@@ -660,6 +660,14 @@ struct ConversationView: View {
             // content end (showing a blank screen until the user scrolls
             // back up).  We anchor explicitly to a zero-height sentinel
             // pinned to the very last position with multiple retries.
+            //
+            // The anchor for size changes alone (iOS 18, the role apart
+            // from the initial offset above) keeps the end in place when the
+            // window or the content changes size: a Mac window resized at the
+            // end of a channel stranded the list past its last post, the
+            // screen blank below it (James, 2026-10-20: "doesn't handle
+            // window resizing well when at the recent scrolling").
+            .modifier(BottomAnchoredOnSizeChanges())
             .onChange(of: msgs.count) { oldCount, newCount in
                 guard !msgs.isEmpty else { return }
                 if oldCount == 0 {
@@ -910,6 +918,20 @@ struct ConversationView: View {
                     withAnimation { scrollProxy?.scrollTo(lastId, anchor: .bottom) }
                 }
             }
+        }
+    }
+}
+
+/// A scroll view kept where it is relative to its bottom when its content or
+/// its container changes size: at the end, it stays at the end. iOS 18's
+/// size-change role only, never the initial offset (the channel list's
+/// scrollChannelToBottom sets that). On iOS 17 it does nothing.
+private struct BottomAnchoredOnSizeChanges: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.defaultScrollAnchor(.bottom, for: .sizeChanges)
+        } else {
+            content
         }
     }
 }

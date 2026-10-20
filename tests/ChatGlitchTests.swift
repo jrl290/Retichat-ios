@@ -14,6 +14,11 @@
 //    bubble beside the placeholder until the answer removed the placeholder.
 //    The echo of a post awaiting its answer now becomes the post's bubble.
 //
+// 3. "It also doesn't handle window resizing well when at the recent
+//    scrolling." A taller or wider window, or posts that wrapped anew, left
+//    the list past its last post with a blank screen below. The channel list
+//    now keeps its end in place when it changes size (iOS 18).
+//
 // Run from the workspace root with:
 //
 //     swift Retichat-ios/tests/ChatGlitchTests.swift
@@ -85,6 +90,23 @@ check(view.contains("@ScaledMetric(relativeTo: .caption) private var loadEarlier
 check(inOrder(body(view, "var body: some View")[...], [
     ".onChange(of: scenePhase) { _, phase in", "lastAutoPullGeneration = nil", "channelEntries &+= 1",
 ]), "a return to the channel is still an entry")
+
+// ---- 1b. A resized window at the end of a channel ----
+// (James, 2026-10-20: "doesn't handle window resizing well when at the recent
+// scrolling": the list stranded past its last post, blank below it.)
+
+check(inOrder(channelList, [
+    ".id(\"CHANNEL_LIST_BOTTOM\")",
+    ".modifier(BottomAnchoredOnSizeChanges())",
+    ".onChange(of: msgs.count)",
+]), "the channel list keeps its end in place when it changes size")
+check(inOrder(view[...], [
+    "private struct BottomAnchoredOnSizeChanges: ViewModifier {",
+    "if #available(iOS 18.0, *) {",
+    "content.defaultScrollAnchor(.bottom, for: .sizeChanges)",
+]), "for size changes only, never the initial offset")
+check(!channelList.contains(".defaultScrollAnchor(.bottom)\n"),
+      "the initial offset stays scrollChannelToBottom's")
 
 // ---- 2. The echo of a post awaiting rfed's answer ----
 
