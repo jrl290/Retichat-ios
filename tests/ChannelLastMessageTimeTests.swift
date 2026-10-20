@@ -101,7 +101,9 @@ func testTheWiring() {
 
     let calls = matches(#"updateChannelLastMessage\([^)]*\)"#, in: client)
         .filter { !$0.contains("postMs: UInt64") }
-    check(calls.count == 2, "two call sites: send and receive", "\(calls)")
+    // Send, receive, and the echo of a post awaiting rfed's answer
+    // (ChatGlitchTests, 2026-10-20).
+    check(calls.count == 3, "three call sites: send, receive, an echo before the answer", "\(calls)")
     for call in calls {
         check(call.contains("postMs: tsMs"), "call passes the wire ms", call)
         check(!call.contains("time:"), "no call passes a pre-converted time", call)

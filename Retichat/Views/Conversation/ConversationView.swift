@@ -44,6 +44,9 @@ struct ConversationView: View {
     /// Entries to the channel on screen after the first: each return from
     /// the background adds one, and the entry steps and auto-pull run again.
     @State private var channelEntries = 0
+    /// The channel list's top row, button or not: the button's caption with
+    /// its padding, or "Loading…" beside a spinner, with room to spare.
+    @ScaledMetric(relativeTo: .caption) private var loadEarlierRowHeight: CGFloat = 36
     @FocusState private var isTextFieldFocused: Bool
     /// The clock the date markers are labelled on (DayMarkers). Moved to the
     /// present when the day turns, the time zone or locale changes, or the
@@ -560,30 +563,43 @@ struct ConversationView: View {
                     // next page of pending blobs from the rfed node's
                     // deferred queue.  Hidden once the server reports
                     // more_pending=false on the most recent pull.
-                    if canPull {
-                        Button {
-                            let firstId = msgs.first?.id
-                            Task {
-                                await channelClient.pullDeferred(channel: channel)
-                                if let fid = firstId {
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                        proxy.scrollTo(fid, anchor: .top)
+                    //
+                    // Its row keeps one height whether it shows the button,
+                    // "Loading…" or nothing. A row that came and went above
+                    // the posts moved every post below it: each return to the
+                    // channel (an entry) showed the button until the pull
+                    // answered, so the list slid down by the row and back
+                    // (James, 2026-10-20: "When the app foregrounds, the
+                    // bubbles momentarily scroll down 1-2 bubbles and then
+                    // back to the end of the chat").
+                    Color.clear
+                        .frame(height: loadEarlierRowHeight)
+                        .overlay {
+                            if canPull {
+                                Button {
+                                    let firstId = msgs.first?.id
+                                    Task {
+                                        await channelClient.pullDeferred(channel: channel)
+                                        if let fid = firstId {
+                                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                                proxy.scrollTo(fid, anchor: .top)
+                                            }
+                                        }
                                     }
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if pulling {
+                                            ProgressView().scaleEffect(0.7)
+                                        }
+                                        Text(pulling ? "Loading…" : "Load earlier messages")
+                                            .font(.caption)
+                                            .foregroundColor(.retichatPrimary)
+                                    }
+                                    .padding(.vertical, 8)
                                 }
+                                .disabled(pulling)
                             }
-                        } label: {
-                            HStack(spacing: 6) {
-                                if pulling {
-                                    ProgressView().scaleEffect(0.7)
-                                }
-                                Text(pulling ? "Loading…" : "Load earlier messages")
-                                    .font(.caption)
-                                    .foregroundColor(.retichatPrimary)
-                            }
-                            .padding(.vertical, 8)
                         }
-                        .disabled(pulling)
-                    }
 
                     ForEach(dayRows(msgs, timestamp: Self.channelSeconds)) { row in
                         // Reuse the direct/group ChatBubble so channels share

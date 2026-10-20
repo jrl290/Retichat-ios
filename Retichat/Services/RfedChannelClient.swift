@@ -779,6 +779,15 @@ final class RfedChannelClient: ObservableObject {
     /// from disk (e.g. operator bumped stamp_cost while the app was off).
     private var stampCostRefreshedThisSession: Set<String> = []
 
+    /// Posts this device has sent whose answer from rfed hasn't come: the
+    /// post's id, as its echo has it (sender_hex+lxmf_ts), to its bubble's
+    /// placeholder id. rfed sends a post to the channel's readers, this device
+    /// among them, before it answers, and the echo can come first: it then
+    /// becomes the post's bubble (showSent), not a second one beside the
+    /// placeholder until the answer removed one (James, 2026-10-20: "two
+    /// bubbles for the same message appear, then one is removed").
+    private var postsAwaitingAnswer: [String: String] = [:]
+
     func sendMessage(content: String, toChannel channel: Channel) {
         Task { await self.sendMessageAsync(content: content, toChannel: channel) }
     }
@@ -1052,27 +1061,46 @@ final class RfedChannelClient: ObservableObject {
             print("[RfedChannel] Send failed: invalid rfed.link dest derived from \(channel.rfedNodeHash)")
             return .failed
         }
+        // The post's id as its echo from RFed will have it: sender_hex+lxmf_ts,
+        // as `dispatchVerifiedLxmf` makes it.
+        let canonicalId = (Data(hexString: postingHex) ?? Data()).hexString
+            + String(format: "%016llx", tsMs)
         // A request on rfed.link, answered [ok, reason] (RFed-spec Link.md):
         // until 2026-10-18 the post went as DATA on rfed.channel, whose proof
         // said only that the packet arrived, never whether rfed took it. The
         // request's data is a msgpack value, so the post goes as a bin: bare,
         // its bytes are read as msgpack and re-encoded (Reticulum-rust
         // link.rs keeps only a bin's bytes), and rfed gets a changed post.
+        postsAwaitingAnswer[canonicalId] = optimisticId
         let answer = await RfedLink.shared.request(nodeHex: channel.rfedNodeHash, path: "/channel/publish",
                                                    payload: Self.msgpackBin(payload))
+        // An echo that came first took the entry: it came from RFed, so RFed
+        // has the post, whatever the answer says.
+        let echoed = postsAwaitingAnswer.removeValue(forKey: canonicalId) == nil
         if let refusal = Self.publishRefusal(answer) {
-            print("[RfedChannel] Send failed: rfed answered \(refusal)")
-            return answer == nil ? .unanswered : .failed
+            guard echoed else {
+                print("[RfedChannel] Send failed: rfed answered \(refusal)")
+                return answer == nil ? .unanswered : .failed
+            }
+            print("[RfedChannel] SEND: rfed answered \(refusal), but the post's echo came: sent")
         }
         // Handed to RFed: record what this post carried (§4.2).
         recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)
 
-        // SEND succeeded — upgrade the optimistic entity in place to the
-        // canonical id (sender_hex+lxmf_ts) and mark it `sent` (= published
-        // to RFed). Using the same id format as `dispatchVerifiedLxmf` so
-        // the inevitable echo from RFed is suppressed by dedup.
-        let canonicalId = (Data(hexString: postingHex) ?? Data()).hexString
-            + String(format: "%016llx", tsMs)
+        // SEND succeeded — the placeholder becomes the post, `sent`
+        // (= published to RFed), unless its echo did that first.
+        showSent(optimisticId: optimisticId, canonicalId: canonicalId,
+                 channelHash: channel.id, postingHex: postingHex, tsMs: tsMs)
+        updateChannelLastMessage(channelHashHex: channel.id, postMs: tsMs)
+        return .sent
+    }
+
+    /// The placeholder of a post this device sent becomes the post, in place,
+    /// in the store and on screen: the canonical id (sender_hex+lxmf_ts),
+    /// `sent`. From rfed's answer, or from the post's echo when that comes
+    /// first (dispatchVerifiedLxmf); whichever is second finds it done.
+    private func showSent(optimisticId: String, canonicalId: String, channelHash: String,
+                          postingHex: String, tsMs: UInt64) {
         if let ctx = modelContext {
             // If a previous trySend attempt already promoted this entity,
             // or if the echo from a prior send beat us here, just leave the
@@ -1099,28 +1127,25 @@ final class RfedChannelClient: ObservableObject {
                 try? ctx.save()
             }
         }
-        if var list = messages[channel.id] {
+        if var list = messages[channelHash] {
             if let idx = list.firstIndex(where: { $0.id == optimisticId }) {
                 if list.contains(where: { $0.id == canonicalId }) {
-                    // Echo already arrived; drop optimistic placeholder.
+                    // The post is already shown; drop the placeholder.
                     list.remove(at: idx)
                 } else {
                     let upgraded = list[idx]
-                    list.remove(at: idx)
-                    list.append(ChannelMessage(
+                    list[idx] = ChannelMessage(
                         id: canonicalId, channelHash: upgraded.channelHash,
                         senderHash: postingHex.isEmpty ? upgraded.senderHash : postingHex,
                         content: upgraded.content, timestamp: Double(tsMs),
                         isOutgoing: true,
                         deliveryState: DeliveryState.sent
-                    ))
+                    )
                     list.sort { $0.timestamp < $1.timestamp }
                 }
-                messages[channel.id] = list
+                messages[channelHash] = list
             }
         }
-        updateChannelLastMessage(channelHashHex: channel.id, postMs: tsMs)
-        return .sent
     }
 
     // MARK: - Pull deferred blobs (user-initiated paging)
@@ -1307,6 +1332,16 @@ final class RfedChannelClient: ObservableObject {
         }
 
         let msgId = senderHashHex + String(format: "%016llx", tsMs)
+        // The echo of a post this device is sending, back before rfed's
+        // answer: it becomes that post's bubble, SENT (it came from RFed, so
+        // RFed has it), rather than a second bubble beside the placeholder.
+        if let optimisticId = postsAwaitingAnswer.removeValue(forKey: msgId) {
+            print("[RfedChannel] dispatchVerifiedLxmf ECHO before rfed's answer: msgId=\(msgId.prefix(16))")
+            showSent(optimisticId: optimisticId, canonicalId: msgId, channelHash: channelHashHex,
+                     postingHex: senderHashHex, tsMs: tsMs)
+            updateChannelLastMessage(channelHashHex: channelHashHex, postMs: tsMs)
+            return true
+        }
         let existingForChannel = messages[channelHashHex]?.contains(where: { $0.id == msgId }) ?? false
         guard !existingForChannel else {
             print("[RfedChannel] dispatchVerifiedLxmf DEDUP: msgId=\(msgId.prefix(16))")
