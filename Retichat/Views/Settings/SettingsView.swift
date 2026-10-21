@@ -569,12 +569,13 @@ struct SettingsView: View {
                 Text("TCP Client")
                     .font(.caption)
                     .foregroundColor(.retichatPrimary)
-                Text(DefaultEndpointManager.endpoints
-                    .prefix(DefaultEndpointManager.fallbackEndpointCount)
-                    .map { "\($0.host):\($0.port)" }
-                    .joined(separator: "\n"))
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(.retichatOnSurfaceVariant)
+                // The three the running stack uses, picked at its start;
+                // none when the user's own interfaces are in use.
+                if !repository.defaultBackbonesInUse.isEmpty {
+                    Text(repository.defaultBackbonesInUse.joined(separator: "\n"))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.retichatOnSurfaceVariant)
+                }
             }
 
             Spacer()

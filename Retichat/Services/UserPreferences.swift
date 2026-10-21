@@ -69,6 +69,7 @@ final class UserPreferences {
         static let channelPushEnabled = "channel_push_enabled"
         static let channelLastOpened = "channel_last_opened"
         static let distroContacts = "distro_contacts"
+        static let backboneSkipList = "default_backbone_skip_list"
     }
 
     // MARK: - Display names (LXMF-rust/DISPLAY_NAMES.md)
@@ -146,6 +147,14 @@ final class UserPreferences {
     var defaultTcpEnabled: Bool {
         get { defaults.object(forKey: Keys.defaultTcpEnabled) != nil ? defaults.bool(forKey: Keys.defaultTcpEnabled) : true }
         set { defaults.set(newValue, forKey: Keys.defaultTcpEnabled) }
+    }
+
+    /// Default backbones that failed their start-up test, by "host:port",
+    /// with when (seconds since 1970). DefaultEndpointManager skips them for
+    /// a day (FallbackBackbones.skipSeconds).
+    var backboneSkipList: [String: Double] {
+        get { (defaults.dictionary(forKey: Keys.backboneSkipList) as? [String: Double]) ?? [:] }
+        set { defaults.set(newValue, forKey: Keys.backboneSkipList) }
     }
 
     /// When true, Retichat links over Bluetooth to any RTNode in range, with

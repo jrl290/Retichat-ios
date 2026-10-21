@@ -59,37 +59,35 @@ struct DefaultEndpointManager {
         return endpoints.randomElement() ?? endpoints[0]
     }
 
-    /// Probe the shuffled public endpoint list in serial order and return up to
-    /// `fallbackEndpointCount` hosts that accepted a TCP connection.
-    ///
-    /// If fewer than three probes succeed after the full list is exhausted,
-    /// pad from the same shuffled order so startup still has fallback targets
-    /// once the network comes back.
+    /// The backbones for this start: the shuffled list tested all at once,
+    /// the first `fallbackEndpointCount` to accept a TCP connection
+    /// (FallbackBackbones.pick). One that fails while another answers is
+    /// skipped for 24 hours, unless the rest can't make up three; one that
+    /// answers is cleared. Fewer answering are padded from the same order so
+    /// startup still has fallback targets once the network comes back.
     static func selectFallbackEndpoints() async -> [(host: String, port: Int)] {
-        let shuffledCandidates = shuffled()
-        var selected: [(host: String, port: Int)] = []
-
-        for endpoint in shuffledCandidates {
-            if await probeConnectability(of: endpoint, timeoutSecs: probeTimeoutSecs) {
-                selected.append(endpoint)
-                if selected.count == fallbackEndpointCount {
-                    break
+        let prefs = UserPreferences.shared
+        let started = Date()
+        let now = started.timeIntervalSince1970
+        let failedAt = prefs.backboneSkipList
+        let skipped = endpoints.filter { FallbackBackbones.isSkipped(failedAt, $0, now: now) }
+        let picked = await FallbackBackbones.pick(
+            order: shuffled(),
+            failedAt: failedAt,
+            now: now,
+            timeout: probeTimeoutSecs,
+            count: fallbackEndpointCount,
+            probe: { await probeConnectability(of: $0, timeoutSecs: probeTimeoutSecs) },
+            record: { next in
+                prefs.backboneSkipList = next
+                if Set(next.keys) != Set(failedAt.keys) {
+                    print("[DefaultEndpoint] skipped for 24 h after a failed test: \(next.keys.sorted().joined(separator: ", "))")
                 }
-            }
-        }
-
-        if selected.count < fallbackEndpointCount {
-            for endpoint in shuffledCandidates where !selected.contains(where: { endpointKey($0) == endpointKey(endpoint) }) {
-                selected.append(endpoint)
-                if selected.count == fallbackEndpointCount { break }
-            }
-        }
-
-        return Array(selected.prefix(fallbackEndpointCount))
-    }
-
-    private static func endpointKey(_ endpoint: (host: String, port: Int)) -> String {
-        "\(endpoint.host):\(endpoint.port)"
+            })
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        print("[DefaultEndpoint] picked \(picked.map(FallbackBackbones.key).joined(separator: ", ")) in \(ms) ms"
+              + (skipped.isEmpty ? "" : "; skipped (failed before): \(skipped.map(FallbackBackbones.key).joined(separator: ", "))"))
+        return picked
     }
 
     private static func probeConnectability(of endpoint: (host: String, port: Int), timeoutSecs: TimeInterval) async -> Bool {

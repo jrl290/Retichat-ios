@@ -31,6 +31,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     @Published var serviceRunning = false
     @Published var ownHashHex: String = ""
     @Published var statusMessage: String = "Idle"
+    /// The default backbones in the running stack's config ("host:port"),
+    /// for Settings; empty when the user's own interfaces are in use.
+    @Published private(set) var defaultBackbonesInUse: [String] = []
     /// True only after the last start attempt failed (finishStartService's
     /// .failure branch); reset by startService(). Lets the chat-list status
     /// line show "Error" as Android does (ChatListScreen.kt:116-135).
@@ -801,6 +804,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             hasConfiguredInterfaces: addedInterfaces,
             probed: fallbackEndpoints,
             pool: { Array(DefaultEndpointManager.shuffled().prefix(DefaultEndpointManager.fallbackEndpointCount)) })
+        defaultBackbonesInUse = endpoints.map(FallbackBackbones.key)
         if !endpoints.isEmpty {
             print("[DefaultEndpoint] selected fallback endpoints: \(endpoints.map { "\($0.host):\($0.port)" }.joined(separator: ", "))")
             // Default: connect to the first reachable public backbone endpoints

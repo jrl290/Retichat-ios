@@ -97,32 +97,40 @@ func testIosDefaultEndpointsMatchAndroid() {
     }
 }
 
-func testIosSelectorProbesUntilThreeSuccesses() {
+// Both test the whole list at once and take the first three to answer, and
+// skip for a day a backbone that failed while others answered (James,
+// 2026-10-21: "probe all default backbones at once and take the first three
+// that answer", "Add a blacklist also"). Until then they tested one at a time
+// (b0d071f), each backbone down costing its whole 5 s. The behaviour itself is
+// tested in FallbackBackbonesTests.swift and Android's DefaultBackbonesTest.kt.
+
+func testIosSelectorTestsAllAtOnce() {
     do {
         let iosSource = try sourceFile(["Retichat", "Services", "DefaultEndpointManager.swift"])
+        let picker = try sourceFile(["Retichat", "Services", "FallbackBackbones.swift"])
 
         check(
             iosSource.contains("probeTimeoutSecs: TimeInterval = 5.0"),
             "iOS uses a 5-second probe success budget"
         )
         check(
-            !iosSource.contains("withTaskGroup"),
-            "iOS probes serially instead of fan-out"
+            iosSource.contains("await FallbackBackbones.pick("),
+            "iOS picks through FallbackBackbones.pick"
         )
         check(
-            iosSource.contains("for endpoint in shuffledCandidates"),
-            "iOS walks the shuffled fallback list when probing"
+            !iosSource.contains("for endpoint in shuffledCandidates"),
+            "iOS no longer walks the list one backbone at a time"
         )
         check(
-            iosSource.contains("if selected.count == fallbackEndpointCount"),
-            "iOS stops probing once three successful connections are found"
+            picker.contains("static let skipSeconds: TimeInterval = 24 * 60 * 60"),
+            "iOS skips a failed backbone for 24 hours"
         )
     } catch {
         check(false, "reads iOS selector source", String(describing: error))
     }
 }
 
-func testAndroidSelectorProbesUntilThreeSuccesses() {
+func testAndroidSelectorTestsAllAtOnce() {
     do {
         let androidSource = try sourceFile(["..", "Retichat-android", "app", "src", "main", "kotlin", "com", "newendian", "retichat", "service", "DefaultEndpointManager.kt"])
         let stackRuntime = try sourceFile(["..", "Retichat-android", "app", "src", "main", "kotlin", "com", "newendian", "retichat", "service", "StackRuntime.kt"])
@@ -132,24 +140,28 @@ func testAndroidSelectorProbesUntilThreeSuccesses() {
             "Android uses a 5-second probe success budget"
         )
         check(
-            androidSource.contains("suspend fun selectFallbackEndpoints()"),
+            androidSource.contains("suspend fun selectFallbackEndpoints(context: Context)"),
             "Android exposes a startup fallback selector"
         )
         check(
-            androidSource.contains("for (endpoint in shuffledEndpoints)"),
-            "Android walks the shuffled fallback list when probing"
+            androidSource.contains("internal suspend fun pick("),
+            "Android picks through DefaultEndpointManager.pick"
         )
         check(
-            androidSource.contains("if (selected.size == FALLBACK_ENDPOINT_COUNT)"),
-            "Android stops probing once three successful connections are found"
+            !androidSource.contains("for (endpoint in shuffledEndpoints)"),
+            "Android no longer walks the list one backbone at a time"
         )
         check(
-            stackRuntime.contains("DefaultEndpointManager.selectFallbackEndpoints()"),
-            "Android startup uses the probed fallback selector"
+            androidSource.contains("SKIP_MS = 24 * 60 * 60 * 1000L"),
+            "Android skips a failed backbone for 24 hours, as iOS"
         )
         check(
-            stackRuntime.contains("DefaultEndpointManager.fallbackInterfaceConfigs(endpoints)"),
-            "Android startup injects the probed fallback endpoints"
+            stackRuntime.contains("DefaultEndpointManager.selectFallbackEndpoints(app)"),
+            "Android startup uses the fallback selector"
+        )
+        check(
+            stackRuntime.contains("DefaultEndpointManager.fallbackInterfaceConfigs(defaultBackbones)"),
+            "Android startup injects the picked fallback endpoints"
         )
     } catch {
         check(false, "reads Android selector sources", String(describing: error))
@@ -157,8 +169,8 @@ func testAndroidSelectorProbesUntilThreeSuccesses() {
 }
 
 testIosDefaultEndpointsMatchAndroid()
-testIosSelectorProbesUntilThreeSuccesses()
-testAndroidSelectorProbesUntilThreeSuccesses()
+testIosSelectorTestsAllAtOnce()
+testAndroidSelectorTestsAllAtOnce()
 
 if failures.isEmpty {
     print("all default endpoint parity tests passed")
