@@ -28,21 +28,6 @@ import CoreBluetooth
 import Combine
 import os.log
 
-/// Public per-slot lifecycle state, used by the Settings UI to render the
-/// row's status indicator. Follows the project-wide convention:
-///   - .idle:        grey  (after reset / before first try)
-///   - .connecting,
-///     .configuring: yellow (in-progress)
-///   - .ready:       green  (configured and operational)
-///   - .failed:      red    (attempt made and failed)
-enum RNodeSlotStatus: Equatable {
-    case idle
-    case connecting
-    case configuring
-    case ready
-    case failed
-}
-
 /// Nordic UART Service UUIDs as used by RNode firmware.
 private enum NUS {
     static let service = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
@@ -92,6 +77,11 @@ private final class RNodeSlot {
     var pendingInboundBytes: [Data] = []
     var backoffSeconds: Int = 1     // doubles up to 60
     var pendingReconnect: DispatchWorkItem?
+    /// Set when we cancel the connection because something failed
+    /// (`dropAfterFailure`), for the disconnect that follows: it keeps
+    /// .failed and, if the failure scheduled its own retry, that retry.
+    var droppedAfterFailure: Bool = false
+    var failureScheduledRetry: Bool = false
 
     init(id: String, name: String, peripheralUUID: UUID, profile: RNodeInterfaceProfile) {
         self.id = id
@@ -255,7 +245,7 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
         for uuid in uuids where !known.contains(uuid) {
             log.warning("RNode peripheral \(uuid) unknown to system — re-pair via Scan & Pair")
             if let slot = slots[uuid] {
-                scheduleReconnect(slot: slot, after: 30)
+                scheduleReconnect(slot: slot, after: RNodeSlotRules.unknownPeripheralRetrySeconds)
             }
         }
     }
@@ -265,6 +255,8 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
         guard let central = central, let peripheral = slot.peripheral else { return }
         guard !slot.connecting else { return }
         slot.connecting = true
+        slot.droppedAfterFailure = false
+        slot.failureScheduledRetry = false
         log.info("Connecting to RNode '\(slot.name, privacy: .public)' (\(slot.peripheralUUID))")
         setStatus(.connecting, for: slot.id)
         central.connect(peripheral, options: nil)
@@ -273,7 +265,7 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
     /// Must be called on `queue`.
     private func scheduleReconnect(slot: RNodeSlot, after seconds: Int? = nil) {
         let delay = seconds ?? slot.backoffSeconds
-        slot.backoffSeconds = min(slot.backoffSeconds * 2, 60)
+        slot.backoffSeconds = RNodeSlotRules.nextBackoff(after: slot.backoffSeconds)
         slot.pendingReconnect?.cancel()
         let work = DispatchWorkItem { [weak self, weak slot] in
             guard let self = self, let slot = slot, self.started else { return }
@@ -306,13 +298,35 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
         slot.rxChar = nil
         if let err = error {
             log.warning("RNode '\(slot.name, privacy: .public)' disconnected: \(err.localizedDescription, privacy: .public)")
-            setStatus(.failed, for: slot.id)
         } else {
             log.info("RNode '\(slot.name, privacy: .public)' disconnected")
-            setStatus(.idle, for: slot.id)
         }
-        if started {
+        let outcome = RNodeSlotRules.afterDisconnect(
+            error: error != nil,
+            droppedAfterFailure: slot.droppedAfterFailure,
+            failureScheduledRetry: slot.failureScheduledRetry
+        )
+        slot.droppedAfterFailure = false
+        slot.failureScheduledRetry = false
+        setStatus(outcome.status, for: slot.id)
+        if started && outcome.scheduleBackoff {
             scheduleReconnect(slot: slot)
+        }
+    }
+
+    /// Must be called on `queue`. Something failed on a connected link: show
+    /// .failed and drop the link, and retry after `retryAfter` seconds if
+    /// given, else with the backoff when the disconnect arrives. Marks the
+    /// slot so that disconnect (which CoreBluetooth reports without an
+    /// error) keeps both rather than show .idle and reschedule.
+    private func dropAfterFailure(slot: RNodeSlot, peripheral: CBPeripheral?, retryAfter: Int? = nil) {
+        setStatus(.failed, for: slot.id)
+        guard let peripheral = peripheral else { return }
+        slot.droppedAfterFailure = true
+        slot.failureScheduledRetry = retryAfter != nil
+        central?.cancelPeripheralConnection(peripheral)
+        if let seconds = retryAfter {
+            scheduleReconnect(slot: slot, after: seconds)
         }
     }
 
@@ -394,10 +408,7 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
             unmanaged.release()
             slot.txContext = nil
             slot.registerInFlight = false
-            setStatus(.failed, for: slot.id)
-            if let p = slot.peripheral {
-                central?.cancelPeripheralConnection(p)
-            }
+            dropAfterFailure(slot: slot, peripheral: slot.peripheral)
             return
         }
         slot.ifaceHandle = handle
@@ -420,10 +431,7 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
                     let err = self.lastFFIError() ?? "unknown error"
                     self.log.error("rns_rnode_iface_configure('\(name, privacy: .public)') failed: \(err, privacy: .public)")
                     self.deregisterInterface(slot: slot)
-                    self.setStatus(.failed, for: slot.id)
-                    if let p = slot.peripheral {
-                        self.central?.cancelPeripheralConnection(p)
-                    }
+                    self.dropAfterFailure(slot: slot, peripheral: slot.peripheral)
                     return
                 }
                 slot.backoffSeconds = 1
@@ -501,12 +509,12 @@ extension RNodeInterfaceCoordinator: CBPeripheralDelegate {
         guard let slot = slots[peripheral.identifier] else { return }
         if let error = error {
             log.error("discoverServices error on '\(slot.name, privacy: .public)': \(error.localizedDescription, privacy: .public)")
-            central?.cancelPeripheralConnection(peripheral)
+            dropAfterFailure(slot: slot, peripheral: peripheral)
             return
         }
         guard let svc = peripheral.services?.first(where: { $0.uuid == NUS.service }) else {
             log.error("'\(slot.name, privacy: .public)' missing Nordic UART service")
-            central?.cancelPeripheralConnection(peripheral)
+            dropAfterFailure(slot: slot, peripheral: peripheral)
             return
         }
         peripheral.discoverCharacteristics([NUS.txChar, NUS.rxChar], for: svc)
@@ -516,7 +524,7 @@ extension RNodeInterfaceCoordinator: CBPeripheralDelegate {
         guard let slot = slots[peripheral.identifier] else { return }
         if let error = error {
             log.error("discoverCharacteristics error on '\(slot.name, privacy: .public)': \(error.localizedDescription, privacy: .public)")
-            central?.cancelPeripheralConnection(peripheral)
+            dropAfterFailure(slot: slot, peripheral: peripheral)
             return
         }
         guard let chars = service.characteristics else { return }
@@ -528,7 +536,7 @@ extension RNodeInterfaceCoordinator: CBPeripheralDelegate {
         }
         guard let tx = tx, let rx = rx else {
             log.error("'\(slot.name, privacy: .public)' missing UART characteristics")
-            central?.cancelPeripheralConnection(peripheral)
+            dropAfterFailure(slot: slot, peripheral: peripheral)
             return
         }
         slot.rxChar = rx
@@ -550,9 +558,7 @@ extension RNodeInterfaceCoordinator: CBPeripheralDelegate {
             // the Settings editor.
             log.error("setNotify failed on '\(slot.name, privacy: .public)': \(error.localizedDescription, privacy: .public) — pairing required?")
             deregisterInterface(slot: slot)
-            setStatus(.failed, for: slot.id)
-            central?.cancelPeripheralConnection(peripheral)
-            scheduleReconnect(slot: slot, after: 60)
+            dropAfterFailure(slot: slot, peripheral: peripheral, retryAfter: RNodeSlotRules.subscribeFailedRetrySeconds)
             return
         }
         // Subscription confirmed; only act on the TX characteristic (the
