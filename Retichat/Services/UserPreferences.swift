@@ -53,6 +53,7 @@ final class UserPreferences {
         static let distroLeftIds = "distro_left_ids"
         static let defaultTcpEnabled = "default_tcp_enabled"
         static let rtnodeBluetoothEnabled = "rtnode_bluetooth_enabled"
+        static let meshWakeRelayHex = "mesh_wake_relay_hex"
         static let autoInterfaceEnabled = "auto_interface_enabled"
         static let dropAnnounces = "drop_announces"
         static let identityPath = "identity_path"
@@ -172,6 +173,14 @@ final class UserPreferences {
     static func rtnodeBluetoothEnabled(_ defaults: UserDefaults) -> Bool {
         defaults.object(forKey: Keys.rtnodeBluetoothEnabled) != nil
             ? defaults.bool(forKey: Keys.rtnodeBluetoothEnabled) : false
+    }
+
+    /// The device's own RFed Notify relay (MeshWake.swift) as last registered
+    /// with the RFed node, so it can be unregistered once no Bluetooth radio
+    /// is configured or the node changes; nil when none is registered.
+    var meshWakeRelayHex: String? {
+        get { defaults.string(forKey: Keys.meshWakeRelayHex) }
+        set { defaults.set(newValue, forKey: Keys.meshWakeRelayHex) }
     }
 
     /// When true, the stack runs an AutoInterface: it finds other Reticulum

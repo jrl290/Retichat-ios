@@ -137,6 +137,21 @@ final class RetichatBridge: @unchecked Sendable {
         return ok
     }
 
+    /// Host this device's own RFed Notify relay (`rfed.notify`, MeshWake.swift).
+    /// Each wake is posted as `MeshWake.received`. The relay hash to register
+    /// with RFed, or nil when it could not start.
+    func meshWakeStart(identityHandle: UInt64) -> Data? {
+        var hash = [UInt8](repeating: 0, count: 16)
+        guard retichat_notify_relay_start(identityHandle, meshWakeTrampoline, nil, &hash) == 0 else {
+            return nil
+        }
+        return Data(hash)
+    }
+
+    func meshWakeStop() {
+        _ = retichat_notify_relay_stop()
+    }
+
     // MARK: - Last error
 
     func lastError() -> String? {
@@ -1171,5 +1186,16 @@ private func rfedBlobTrampoline(
 
     let blobData = blob.map { Data(bytes: $0, count: Int(blobLen)) } ?? Data()
     bridge.handleRfedBlob(blobData)
+}
+
+/// Called from Rust on a Transport thread when an RFed wake reaches this
+/// device's own `rfed.notify` (MeshWake.swift).
+private func meshWakeTrampoline(
+    context: UnsafeMutableRawPointer?,
+    payload: UnsafePointer<UInt8>?, payloadLen: UInt32
+) {
+    let data = payload.map { Data(bytes: $0, count: Int(payloadLen)) } ?? Data()
+    NotificationCenter.default.post(name: MeshWake.received, object: nil,
+                                    userInfo: [MeshWake.payloadKey: data])
 }
 

@@ -675,6 +675,24 @@ int32_t retichat_rfed_delivery_announce(void);
 /// Stop the legacy inbound `rfed.delivery` compatibility destination.
 int32_t retichat_rfed_delivery_stop(void);
 
+#pragma mark - Mesh wake (this device as its own RFed Notify relay)
+
+typedef void (*retichat_notify_wake_callback_t)(
+    void *context,
+    const uint8_t *payload, uint32_t payload_len
+);
+
+/// Host `rfed.notify` under the identity, hand each RFed wake's payload
+/// (RFed-spec Notify.md) to `callback` on a background thread, and publish
+/// it. Writes the 16-byte relay hash to register with RFed to `out_hash`.
+int32_t retichat_notify_relay_start(uint64_t identity_handle,
+                                    retichat_notify_wake_callback_t callback,
+                                    void *context,
+                                    uint8_t *out_hash);
+
+/// Stop hosting `rfed.notify` (a no-op when not started).
+int32_t retichat_notify_relay_stop(void);
+
 #pragma mark - Channel Crypto
 
 /// Encrypt `plaintext` for the named channel.

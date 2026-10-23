@@ -531,6 +531,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             _ = publishClient.publish(refreshSecs: 30 * 60)
         }
 
+        // This device as its own RFed Notify relay (MeshWake.swift), queued
+        // ahead of the RTNode below so an RTNode's up-edge announces it too.
+        setUpMeshWake(client: client)
+
         // Bluetooth to any RTNode in range, queued behind the publish above:
         // an RTNode's interface comes up the moment its link settles, and
         // that up-edge is when Transport announces the published destination
@@ -636,8 +640,37 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             // Bluetooth first: its RTNode interfaces leave Transport before
             // the stack shuts down (a no-op if it never started).
             RTNodeBluetoothCoordinator.shared.stop()
+            RetichatBridge.shared.meshWakeStop()
             _ = client?.unpublish()
             client?.shutdown()
+        }
+    }
+
+    /// With a Bluetooth radio configured, host this device's own RFed Notify
+    /// relay and owe its registration to the RFed node, beside the push
+    /// relay's (MeshWake.swift). With none, unregister the relay registered
+    /// before, if any.
+    private func setUpMeshWake(client: LxmfClient) {
+        let identityHandle = client.identityHandle
+        let prefs = UserPreferences.shared
+        guard MeshWake.wanted(savedRNode: hasEnabledRNode, rtnodeSwitchOn: prefs.rtnodeBluetoothEnabled) else {
+            if let relayHex = prefs.meshWakeRelayHex {
+                print("[MeshWake] no Bluetooth radio: unregistering own relay \(relayHex.prefix(8))")
+                RfedNotifyRegistrar.shared.unregisterMeshRelay(relayHex: relayHex, identityHandle: identityHandle)
+            }
+            return
+        }
+        ffiQueue.async {
+            guard let hash = RetichatBridge.shared.meshWakeStart(identityHandle: identityHandle) else {
+                print("[MeshWake] own relay did not start: \(RetichatBridge.shared.lastError() ?? "unknown error")")
+                return
+            }
+            Task { @MainActor in
+                let relayHex = hash.hexString
+                UserPreferences.shared.meshWakeRelayHex = relayHex
+                RfedNotifyRegistrar.shared.registerMeshRelay(relayHex: relayHex, identityHandle: identityHandle)
+                print("[MeshWake] own relay \(relayHex.prefix(8)) hosted; its registration is owed to RFed")
+            }
         }
     }
 

@@ -84,6 +84,25 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 self.beginBackgroundExecution(repository: self.repository)
             }
         }
+        // A wake RFed sent to this device's own relay over the mesh
+        // (MeshWake.swift): handled as a push is, so a suspended app reached
+        // only by Bluetooth collects its messages too.
+        NotificationCenter.default.addObserver(forName: MeshWake.received, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard let payload = note.userInfo?[MeshWake.payloadKey] as? Data,
+                      let wake = MeshWake.parse(payload) else {
+                    self.launchLog.notice("Mesh wake: unreadable, ignored")
+                    return
+                }
+                guard wake.receiver == self.repository.ownHash else {
+                    self.launchLog.notice("Mesh wake for another receiver, ignored")
+                    return
+                }
+                self.launchLog.notice("Mesh wake from RFed: collecting")
+                self.collectAfterWake(isActive: UIApplication.shared.applicationState == .active)
+            }
+        }
         if BluetoothRestoration.startsStackAtLaunch(savedRNode: repository.hasEnabledRNode,
                                                     rtnodeSwitchOn: UserPreferences.shared.rtnodeBluetoothEnabled) {
             launchLog.notice("Bluetooth radio configured: starting the stack at launch")
@@ -163,28 +182,34 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
             self.repository.importNSEMessages()
             self.channelClient.importNSEBlobs()
 
-            if isActive {
-                if self.repository.serviceRunning {
-                    self.repository.pollPropagationNode(force: true)
-                    // iOS has no rfed.delivery, so RFed's deferred distro queue
-                    // drains only through /rfed/pull (Android WakeWorker.kt:78-81).
-                    // pull() coalesces and is a no-op without a distro. A cold
-                    // start pulls after registering instead.
-                    Task { await RfedDistroClient.shared.pull() }
-                } else {
-                    self.repository.startService()
-                }
-            } else {
-                if !self.repository.serviceRunning {
-                    self.repository.startService()
-                } else {
-                    // See above: the distro's deferred queue drains only by pull.
-                    Task { await RfedDistroClient.shared.pull() }
-                }
-                self.beginBackgroundExecution(repository: self.repository, forcePoll: true)
-            }
+            self.collectAfterWake(isActive: isActive)
 
             completionHandler(.newData)
+        }
+    }
+
+    /// A wake from RFed, through APNs or over the mesh (MeshWake.swift):
+    /// collect what it holds for this device.
+    private func collectAfterWake(isActive: Bool) {
+        if isActive {
+            if repository.serviceRunning {
+                repository.pollPropagationNode(force: true)
+                // iOS has no rfed.delivery, so RFed's deferred distro queue
+                // drains only through /rfed/pull (Android WakeWorker.kt:78-81).
+                // pull() coalesces and is a no-op without a distro. A cold
+                // start pulls after registering instead.
+                Task { await RfedDistroClient.shared.pull() }
+            } else {
+                repository.startService()
+            }
+        } else {
+            if !repository.serviceRunning {
+                repository.startService()
+            } else {
+                // See above: the distro's deferred queue drains only by pull.
+                Task { await RfedDistroClient.shared.pull() }
+            }
+            beginBackgroundExecution(repository: repository, forcePoll: true)
         }
     }
 

@@ -726,6 +726,134 @@ pub extern "C" fn retichat_rfed_delivery_stop() -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh wake: this device as its own RFed Notify relay
+// ---------------------------------------------------------------------------
+//
+// RFed wakes a device through every notify relay it registered (RFed-spec
+// Notify.md). A relay the device hosts itself, `rfed.notify` under its own
+// identity, gets that wake over the mesh: through a Bluetooth RTNode or RNode
+// the packet wakes or relaunches a suspended Retichat, where APNs cannot
+// reach a phone with no internet. rfed records the device's key when it
+// registers the relay (RFed-rust notify/rns.rs remember_self_hosted_relay)
+// and sends the wake as one encrypted DATA packet, unproved.
+
+type NotifyWakeCallback = Option<extern "C" fn(*mut c_void, *const u8, u32)>;
+
+#[derive(Copy, Clone)]
+struct NotifyWakeCallbackState {
+    callback: NotifyWakeCallback,
+    ctx: usize,
+}
+
+static NOTIFY_RELAY: Mutex<Option<Destination>> = Mutex::new(None);
+static NOTIFY_RELAY_CB: Mutex<Option<NotifyWakeCallbackState>> = Mutex::new(None);
+
+/// This device's `rfed.notify`: the name rfed builds a self-hosted relay's
+/// wake under (RFed-rust notify/rns.rs RELAY_WAKE_NAMES).
+fn notify_relay_destination(identity: Identity) -> Result<Destination, String> {
+    Destination::new_inbound(
+        Some(identity),
+        DestinationType::Single,
+        "rfed".to_string(),
+        vec!["notify".to_string()],
+    )
+}
+
+/// Host `rfed.notify` under `identity_handle`'s identity, hand each wake's
+/// payload (RFed-spec Notify.md "Wake packet") to `callback` on a Transport
+/// thread, and publish it (announced at once, on every interface up-edge
+/// and every 30 minutes, SUBSYSTEMS.md §2) so rfed has a path to it. Writes
+/// the 16-byte destination hash, the relay hash to register, to `out_hash`.
+#[no_mangle]
+pub extern "C" fn retichat_notify_relay_start(
+    identity_handle: u64,
+    callback: NotifyWakeCallback,
+    context: *mut c_void,
+    out_hash: *mut u8,
+) -> i32 {
+    if out_hash.is_null() {
+        rns::set_error("out_hash is null".into());
+        return -1;
+    }
+    let identity: Identity = match rns::get_handle::<Identity>(identity_handle) {
+        Some(id) => id,
+        None => {
+            rns::set_error("invalid identity handle".into());
+            return -1;
+        }
+    };
+
+    let _ = retichat_notify_relay_stop();
+
+    let mut dest = match notify_relay_destination(identity) {
+        Ok(d) => d,
+        Err(e) => {
+            rns::set_error(e);
+            return -1;
+        }
+    };
+
+    *NOTIFY_RELAY_CB.lock().unwrap() = Some(NotifyWakeCallbackState {
+        callback,
+        ctx: context as usize,
+    });
+
+    let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> = Arc::new(move |data: &[u8], _pkt: &Packet| {
+        let guard = NOTIFY_RELAY_CB.lock().unwrap();
+        let Some(state) = guard.as_ref() else { return; };
+        let Some(callback) = state.callback else { return; };
+        callback(state.ctx as *mut c_void, data.as_ptr(), data.len() as u32);
+    });
+    dest.set_packet_callback(Some(packet_cb));
+    Transport::register_destination(dest.clone());
+    Transport::publish_destination(
+        dest.hash.clone(),
+        Some(std::time::Duration::from_secs(30 * 60)),
+        None,
+    );
+
+    unsafe { std::ptr::copy_nonoverlapping(dest.hash.as_ptr(), out_hash, 16) };
+    *NOTIFY_RELAY.lock().unwrap() = Some(dest);
+    0
+}
+
+/// Stop hosting `rfed.notify` (a no-op when not started).
+#[no_mangle]
+pub extern "C" fn retichat_notify_relay_stop() -> i32 {
+    if let Some(dest) = NOTIFY_RELAY.lock().unwrap().take() {
+        Transport::unpublish_destination(&dest.hash);
+        Transport::deregister_destination(&dest.hash);
+    }
+    *NOTIFY_RELAY_CB.lock().unwrap() = None;
+    0
+}
+
+#[cfg(test)]
+mod notify_relay_tests {
+    use super::*;
+
+    /// rfed wakes a self-hosted relay at the hash it derives from the key it
+    /// recorded at registration, under `rfed.notify`
+    /// (notify/rns.rs relay_wake_destination): the device must host exactly
+    /// that hash.
+    #[test]
+    fn the_hosted_relay_is_the_hash_rfed_derives_from_the_registrants_key() {
+        let device = Identity::new(true);
+        let public = Identity::from_public_key(&device.get_public_key().unwrap()).unwrap();
+        let hosted = notify_relay_destination(device).unwrap();
+        let derived = Destination::new_outbound(
+            Some(public),
+            DestinationType::Single,
+            "rfed".to_string(),
+            vec!["notify".to_string()],
+        )
+        .unwrap();
+        assert_eq!(hosted.hash.len(), 16);
+        assert_eq!(hosted.hash, derived.hash);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Channel crypto
 // ---------------------------------------------------------------------------
 

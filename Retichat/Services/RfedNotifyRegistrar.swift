@@ -90,11 +90,84 @@ final class RfedNotifyRegistrar {
         registrations.owe(key: key, payload: payload)
     }
 
+    // MARK: - Mesh wake (MeshWake.swift)
+
+    private static func meshKey(_ relayHex: String, identityHandle: UInt64) -> String {
+        "lxmf mesh relay=\(relayHex.prefix(8)) identity=\(identityHandle)"
+    }
+
+    /// Register this device's own relay (`rfed.notify` under its identity)
+    /// for its LXMF wakes, beside the push bridge's: RFed wakes every relay a
+    /// device registered, so this one gets the wake over the mesh. Owed to
+    /// the node like the push relay's registration.
+    @MainActor
+    func registerMeshRelay(relayHex: String, identityHandle: UInt64) {
+        let node = prefs.effectiveRfedNodeIdentityHash
+        guard !node.isEmpty, let registrations = registrations(forNode: node) else { return }
+        guard let payload = buildSignedPayload(operation: "register", relayHex: relayHex,
+                                               channelHash: nil, identityHandle: identityHandle) else {
+            print("[RfedNotify] Failed to sign the mesh relay payload")
+            return
+        }
+        registrations.owe(key: Self.meshKey(relayHex, identityHandle: identityHandle), payload: payload)
+    }
+
+    /// One per RFed node: the mesh relay's unregistration, owed like a
+    /// registration (sent on the established rfed.link, proved by rfed's true).
+    @MainActor private var meshUnregistrations: [String: HeldLinkRegistrations] = [:]
+
+    /// Unregister the mesh relay from the current node (no Bluetooth radio
+    /// is configured any more), owed until rfed answers true; then it is
+    /// forgotten (`UserPreferences.meshWakeRelayHex`).
+    @MainActor
+    func unregisterMeshRelay(relayHex: String, identityHandle: UInt64) {
+        let node = prefs.effectiveRfedNodeIdentityHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let dest = RfedLink.destHash(nodeHex: node),
+              let payload = buildSignedPayload(operation: "unregister", relayHex: relayHex,
+                                               channelHash: nil, identityHandle: identityHandle) else { return }
+        let key = Self.meshKey(relayHex, identityHandle: identityHandle)
+        registrations(forNode: node)?.forget(key: key)
+        let prefs = self.prefs
+        let unregistrations = meshUnregistrations[node] ?? HeldLinkRegistrations(
+            destHash: dest, app: "rfed", aspects: ["link"],
+            ops: ProvedOps(RfedLinkHeldOps(nodeHex: node, path: "/notify/unregister")) {
+                if prefs.meshWakeRelayHex == relayHex { prefs.meshWakeRelayHex = nil }
+            })
+        meshUnregistrations[node] = unregistrations
+        unregistrations.owe(key: key, payload: payload)
+    }
+
+    /// `HeldLinkOps` that also runs `proved` when a send is proved.
+    @MainActor
+    private final class ProvedOps: HeldLinkOps {
+        private let ops: HeldLinkOps
+        private let proved: () -> Void
+        init(_ ops: HeldLinkOps, proved: @escaping () -> Void) { self.ops = ops; self.proved = proved }
+        func status(_ destHash: Data) -> Int32 { ops.status(destHash) }
+        func openHeld(_ destHash: Data, app: String, aspects: [String]) { ops.openHeld(destHash, app: app, aspects: aspects) }
+        func close(_ destHash: Data) { ops.close(destHash) }
+        func setStatusHandler(_ destHash: Data, _ handler: @escaping (UInt8) -> Void) { ops.setStatusHandler(destHash, handler) }
+        func sendData(_ destHash: Data, app: String, aspects: [String], payload: Data) async -> Bool {
+            let ok = await ops.sendData(destHash, app: app, aspects: aspects, payload: payload)
+            if ok { proved() }
+            return ok
+        }
+    }
+
     /// Best-effort deregistration from a previous rfed node: one signed
-    /// `/notify/unregister` request on `oldRfedIdentityHashHex`'s rfed.link.
+    /// `/notify/unregister` request on `oldRfedIdentityHashHex`'s rfed.link,
+    /// and one for the mesh relay when one is registered (the next start
+    /// registers it with the new node).
     func deregisterFrom(oldRfedIdentityHashHex: String, identityHandle: UInt64) {
         let trimmed = oldRfedIdentityHashHex.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, RfedLink.destHash(nodeHex: trimmed) != nil else { return }
+        if let meshRelayHex = prefs.meshWakeRelayHex,
+           let payload = buildSignedPayload(operation: "unregister", relayHex: meshRelayHex,
+                                            channelHash: nil, identityHandle: identityHandle) {
+            Task { @MainActor in
+                _ = await self.unregisterOnce(nodeHex: trimmed, payload: payload)
+            }
+        }
         guard let relayHex = ApnsBridgeHashes.effectiveRelayHex else { return }
 
         guard let payload = buildSignedPayload(
