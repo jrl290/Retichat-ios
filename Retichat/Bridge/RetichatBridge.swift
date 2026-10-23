@@ -23,11 +23,15 @@ import Foundation
 /// (an accept or leave of at most 2144 bytes), what a creator keeps. Both are nil
 /// for every other message. Nothing is remembered: the group code remembers the
 /// key once the group rule has passed (GroupStatusEngine.onKept).
+///
+/// `transientId` is a propagated message's transient id (32 bytes), the id an
+/// RFed wake names it by (RFed-spec Notify.md), and so the id its notification
+/// is posted under (NotificationIds); nil for a message that came directly.
 protocol MessageCallback: AnyObject {
     @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
                               title: String, content: String, timestamp: Double,
                               signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
-                              senderKey: Data?, packed: Data?)
+                              senderKey: Data?, packed: Data?, transientId: Data?)
 }
 
 /// `displayName` is the announce's name cleaned by the Rust side with the
@@ -661,7 +665,7 @@ final class RetichatBridge: @unchecked Sendable {
     func handleDelivery(hash: Data, srcHash: Data, destHash: Data,
                         title: String, content: String, timestamp: Double,
                         signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
-                        senderKey: Data?, packed: Data?) {
+                        senderKey: Data?, packed: Data?, transientId: Data?) {
         // Capture the callback before hopping to MainActor so a transient
         // lifecycle change cannot nil out the weak reference after Rust has
         // already accepted the delivery.
@@ -675,7 +679,7 @@ final class RetichatBridge: @unchecked Sendable {
                 hash: hash, srcHash: srcHash, destHash: destHash,
                 title: title, content: content, timestamp: timestamp,
                 signatureValid: signatureValid, unverifiedReason: unverifiedReason,
-                fieldsRaw: fieldsRaw, senderKey: senderKey, packed: packed
+                fieldsRaw: fieldsRaw, senderKey: senderKey, packed: packed, transientId: transientId
             )
         }
     }
@@ -714,7 +718,8 @@ private func deliveryTrampoline(
     unverifiedReason: Int32,
     fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32,
     senderKey: UnsafePointer<UInt8>?, senderKeyLen: UInt32,
-    packed: UnsafePointer<UInt8>?, packedLen: UInt32
+    packed: UnsafePointer<UInt8>?, packedLen: UInt32,
+    transientId: UnsafePointer<UInt8>?, transientIdLen: UInt32
 ) {
     guard let context = context else { return }
     let bridge = Unmanaged<RetichatBridge>.fromOpaque(context).takeUnretainedValue()
@@ -727,12 +732,13 @@ private func deliveryTrampoline(
     let fieldsData = fieldsRaw.map { Data(bytes: $0, count: Int(fieldsLen)) } ?? Data()
     let keyData = senderKey.flatMap { senderKeyLen > 0 ? Data(bytes: $0, count: Int(senderKeyLen)) : nil }
     let packedData = packed.flatMap { packedLen > 0 ? Data(bytes: $0, count: Int(packedLen)) : nil }
+    let transientIdData = transientId.flatMap { transientIdLen > 0 ? Data(bytes: $0, count: Int(transientIdLen)) : nil }
 
     bridge.handleDelivery(
         hash: hashData, srcHash: srcData, destHash: destData,
         title: titleStr, content: contentStr, timestamp: timestamp,
         signatureValid: signatureValid != 0, unverifiedReason: Int(unverifiedReason),
-        fieldsRaw: fieldsData, senderKey: keyData, packed: packedData
+        fieldsRaw: fieldsData, senderKey: keyData, packed: packedData, transientId: transientIdData
     )
 }
 

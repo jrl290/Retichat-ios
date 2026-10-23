@@ -2440,19 +2440,19 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     @MainActor func onMessage(hash: Data, srcHash: Data, destHash: Data,
                                title: String, content: String, timestamp: Double,
                                signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
-                               senderKey: Data?, packed: Data?) {
+                               senderKey: Data?, packed: Data?, transientId: Data?) {
         handleIncomingMessage(
             hash: hash, srcHash: srcHash, destHash: destHash,
             title: title, content: content, timestamp: timestamp,
             signatureValid: signatureValid, unverifiedReason: unverifiedReason, fieldsRaw: fieldsRaw,
-            senderKey: senderKey, packed: packed
+            senderKey: senderKey, packed: packed, transientId: transientId
         )
     }
 
     private func handleIncomingMessage(hash: Data, srcHash: Data, destHash: Data,
                                         title: String, content: String, timestamp: Double,
                                         signatureValid: Bool, unverifiedReason: Int, fieldsRaw: Data,
-                                        senderKey: Data?, packed: Data?) {
+                                        senderKey: Data?, packed: Data?, transientId: Data?) {
         let content = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let srcHexForLog = srcHash.hexString
         let msgHashHexForLog = hash.hexString
@@ -2557,7 +2557,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         storeIncomingDirect(
             messageId: msgHashHex, srcHash: srcHash, title: title, content: content,
             timestamp: timestamp, signatureValid: signatureValid,
-            attachments: fields.attachments, lxmfHash: msgHashHex)
+            attachments: fields.attachments, lxmfHash: msgHashHex, transientId: transientId)
     }
 
     /// Store an accepted direct message and notify — the tail shared by the
@@ -2567,7 +2567,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                                      title: String, content: String, timestamp: Double,
                                      signatureValid: Bool,
                                      attachments: [(filename: String, data: Data)],
-                                     lxmfHash: String? = nil, notify: Bool = true) {
+                                     lxmfHash: String? = nil, notify: Bool = true,
+                                     transientId: Data? = nil) {
         guard let ctx = modelContext else { return }
         let srcHex = srcHash.hexString
 
@@ -2614,11 +2615,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         try? ctx.save()
 
         // Get sender name for notification (none for a message the NSE
-        // already showed).
+        // already showed). Posted under the message's transient id, the id
+        // RFed's wake and its push name it by (NotificationIds).
         if notify {
             let notifyName = contactDisplayName(for: srcHex)
             notifManager.postMessageNotification(
-                chatId: chatId, senderName: notifyName, content: content
+                chatId: chatId, senderName: notifyName, content: content, messageId: transientId
             )
         }
 
@@ -2663,7 +2665,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         storeIncomingDirect(
             messageId: msgId, srcHash: m.sourceHash, title: m.title, content: content,
             timestamp: m.timestamp, signatureValid: m.unverifiedReason == 0,
-            attachments: attachments, lxmfHash: DistroGroupSync.messageHash(m.hash), notify: !m.shownByNSE)
+            attachments: attachments, lxmfHash: DistroGroupSync.messageHash(m.hash), notify: !m.shownByNSE,
+            transientId: m.transientId)
     }
 
     /// A message another of our devices sent as the distro, reported by its

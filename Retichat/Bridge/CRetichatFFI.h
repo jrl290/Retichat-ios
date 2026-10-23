@@ -1194,8 +1194,10 @@ int32_t retichat_interface_came_up_since(uint64_t mark);
 /// under it, so `unverified_reason` is 0 or 2 for it, never 1 for want of a key.
 /// `packed` is the whole message as received (destination | source | signature |
 /// payload) for an accept or leave of at most 2144 bytes. Both are NULL, 0 for every
-/// other message. Nothing is remembered by the library. Pointers are valid only
-/// during the call; it runs on a background thread.
+/// other message. `transient_id` is a propagated message's transient id (32 bytes),
+/// which an RFed wake names the message by (RFed-spec Notify.md); NULL, 0 for a
+/// message that came directly. Nothing is remembered by the library. Pointers are
+/// valid only during the call; it runs on a background thread.
 typedef void (*retichat_group_delivery_callback_t)(void *context,
     const uint8_t *hash, uint32_t hash_len,
     const uint8_t *src_hash, uint32_t src_len,
@@ -1207,7 +1209,8 @@ typedef void (*retichat_group_delivery_callback_t)(void *context,
     int32_t unverified_reason,
     const uint8_t *fields_raw, uint32_t fields_len,
     const uint8_t *sender_key, uint32_t sender_key_len,
-    const uint8_t *packed, uint32_t packed_len);
+    const uint8_t *packed, uint32_t packed_len,
+    const uint8_t *transient_id, uint32_t transient_id_len);
 
 /// Register the client's delivery callback with the group receipt; it replaces
 /// lxmf_client_set_delivery_callback's. Returns 0, or -1 (rns_last_error).

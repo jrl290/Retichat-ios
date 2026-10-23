@@ -2088,6 +2088,7 @@ type GroupDeliveryFn = extern "C" fn(
     fields_raw: *const u8, fields_len: u32,
     sender_key: *const u8, sender_key_len: u32,
     packed: *const u8, packed_len: u32,
+    transient_id: *const u8, transient_id_len: u32,
 );
 type GroupDeliveryCallback = Option<GroupDeliveryFn>;
 
@@ -2116,8 +2117,11 @@ fn optional_bytes(data: Option<&[u8]>) -> (*const u8, u32) {
 /// as received (`destination | source | signature | payload`), for an accept or leave of at most
 /// 2144 bytes: what a creator keeps. Both are NULL, 0 for every other message. Nothing is
 /// remembered here: Swift remembers `sender_key` after the group rule has passed, never for a
-/// message it drops. The callback runs on a background thread and its pointers are valid only
-/// during the call. 0 on success, -1 with `rns_last_error`.
+/// message it drops. `transient_id` is a propagated message's transient id (32 bytes), the
+/// hash of the encrypted lxmf_data the node held, which an RFed wake names the message by
+/// (RFed-spec Notify.md); NULL, 0 for a message that came directly. The callback runs on a
+/// background thread and its pointers are valid only during the call. 0 on success, -1 with
+/// `rns_last_error`.
 #[no_mangle]
 pub extern "C" fn retichat_client_set_delivery_callback_receipt(
     client: u64,
@@ -2172,6 +2176,7 @@ fn deliver_with_receipt(callback: GroupDeliveryFn, context: &DeliveryContext, me
     let content = std::ffi::CString::new(snapshot.content.as_str()).unwrap_or_default();
     let (key, key_len) = optional_bytes(receipt.sender_key.as_deref());
     let (packed, packed_len) = optional_bytes(receipt.packed.as_deref());
+    let (transient_id, transient_id_len) = optional_bytes(message.transient_id.as_deref());
     callback(
         context.0 as *mut c_void,
         snapshot.hash.as_ptr(), snapshot.hash.len() as u32,
@@ -2185,7 +2190,69 @@ fn deliver_with_receipt(callback: GroupDeliveryFn, context: &DeliveryContext, me
         snapshot.fields_raw.as_ptr(), snapshot.fields_raw.len() as u32,
         key, key_len,
         packed, packed_len,
+        transient_id, transient_id_len,
     );
+}
+
+#[cfg(test)]
+mod delivery_transient_id_tests {
+    use super::*;
+
+    /// What the last delivery gave the host for `transient_id`: None, nothing delivered.
+    static SEEN: Mutex<Option<Option<Vec<u8>>>> = Mutex::new(None);
+
+    extern "C" fn record(
+        _context: *mut c_void,
+        _hash: *const u8, _hash_len: u32,
+        _src_hash: *const u8, _src_len: u32,
+        _dest_hash: *const u8, _dest_len: u32,
+        _title: *const c_char,
+        _content: *const c_char,
+        _timestamp: f64,
+        _signature_valid: i32,
+        _unverified_reason: i32,
+        _fields_raw: *const u8, _fields_len: u32,
+        _sender_key: *const u8, _sender_key_len: u32,
+        _packed: *const u8, _packed_len: u32,
+        transient_id: *const u8, transient_id_len: u32,
+    ) {
+        let id = (!transient_id.is_null())
+            .then(|| unsafe { std::slice::from_raw_parts(transient_id, transient_id_len as usize) }.to_vec());
+        *SEEN.lock().unwrap() = Some(id);
+    }
+
+    fn delivered(transient_id: Option<Vec<u8>>) -> Option<Vec<u8>> {
+        let source = Destination::new_inbound(
+            Some(Identity::new(true)), DestinationType::Single, "lxmf".to_string(), vec!["delivery".to_string()],
+        )
+        .unwrap();
+        let destination = Destination::new_outbound(
+            Some(Identity::new(true)), DestinationType::Single, "lxmf".to_string(), vec!["delivery".to_string()],
+        )
+        .unwrap();
+        let mut message = lxmf_rust::LXMessage::new(
+            None, Some(source.clone()), Some(b"hello".to_vec()), Some(Vec::new()), None,
+            Some(lxmf_rust::LXMessage::DIRECT), Some(destination.hash.clone()), Some(source.hash.clone()), None, false,
+        )
+        .unwrap();
+        message.pack(false).unwrap();
+        message.transient_id = transient_id;
+        *SEEN.lock().unwrap() = None;
+        deliver_with_receipt(record, &DeliveryContext(0), &message);
+        SEEN.lock().unwrap().take().expect("delivered")
+    }
+
+    /// The router sets a propagated message's transient id (LXMF-rust lxmf_propagation); the
+    /// host is given it, to name the message's notification by (RFed-spec Notify.md).
+    #[test]
+    fn the_host_is_given_a_propagated_message_s_transient_id() {
+        assert_eq!(delivered(Some(vec![0x22; 32])), Some(vec![0x22; 32]));
+    }
+
+    #[test]
+    fn a_message_without_a_transient_id_gives_null() {
+        assert_eq!(delivered(None), None);
+    }
 }
 
 /// An element of a `status` (a member's own packed accept or leave, as the creator received it)
@@ -3019,7 +3086,7 @@ mod distro_outbox_bridge_tests {
             "typedef void (*retichat_interface_up_t)(void *context, const uint8_t *name, uint32_t name_len);",
             "int32_t retichat_interface_up_register(retichat_interface_up_t callback, void *context);",
             "void retichat_interface_up_clear(void);",
-            "typedef void (*retichat_group_delivery_callback_t)(void *context, const uint8_t *hash, uint32_t hash_len, const uint8_t *src_hash, uint32_t src_len, const uint8_t *dest_hash, uint32_t dest_len, const char *title, const char *content, double timestamp, int32_t signature_valid, int32_t unverified_reason, const uint8_t *fields_raw, uint32_t fields_len, const uint8_t *sender_key, uint32_t sender_key_len, const uint8_t *packed, uint32_t packed_len);",
+            "typedef void (*retichat_group_delivery_callback_t)(void *context, const uint8_t *hash, uint32_t hash_len, const uint8_t *src_hash, uint32_t src_len, const uint8_t *dest_hash, uint32_t dest_len, const char *title, const char *content, double timestamp, int32_t signature_valid, int32_t unverified_reason, const uint8_t *fields_raw, uint32_t fields_len, const uint8_t *sender_key, uint32_t sender_key_len, const uint8_t *packed, uint32_t packed_len, const uint8_t *transient_id, uint32_t transient_id_len);",
             "int32_t retichat_client_set_delivery_callback_receipt(uint64_t client, retichat_group_delivery_callback_t callback, void *context);",
             "uint8_t *retichat_group_unpack_packed(const uint8_t *packed, uint32_t packed_len, uint32_t *out_len);",
             "int32_t retichat_message_set_retichat_statuses(uint64_t msg, const uint8_t *elements, uint32_t elements_len);",

@@ -71,6 +71,16 @@ func testParse() {
     check(MeshWake.parse(later)?.receiver == receiver,
           "fields RFed adds later (a 32-byte bin, an int) do not stop the wake")
 
+    // RFed-spec Notify.md 1cd0e63: the wake names its message by its
+    // transient id, and an LXMF wake names no sender.
+    let message = Data(repeating: 0x44, count: 32)
+    let named = Data([0x82]) + key("receiver") + bin(receiver) + key("message") + bin(message)
+    check(MeshWake.parse(named) == MeshWake.Wake(receiver: receiver, sender: nil, channel: nil, message: message),
+          "a wake names its message")
+    check(MeshWake.parse(Data([0x82]) + key("receiver") + bin(receiver) + key("message") + bin(hash(0x44)))?.message
+            == nil,
+          "a message id that is not 32 bytes is left out, and the wake goes on")
+
     check(MeshWake.parse(Data([0x81]) + key("sender") + bin(sender)) == nil, "no receiver: dropped")
     check(MeshWake.parse(Data([0x81]) + key("receiver") + bin(Data(repeating: 1, count: 8))) == nil,
           "a receiver that is not 16 bytes: dropped")

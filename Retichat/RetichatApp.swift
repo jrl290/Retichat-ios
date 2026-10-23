@@ -99,7 +99,10 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                     self.launchLog.notice("Mesh wake for another receiver, ignored")
                     return
                 }
-                self.launchLog.notice("Mesh wake from RFed: collecting")
+                // The message's notification is posted under this id when
+                // it arrives (NotificationIds), whichever wake brought it.
+                let message = wake.message.map { String(NotificationIds.requestIdentifier(messageId: $0).prefix(16)) } ?? "-"
+                self.launchLog.notice("Mesh wake from RFed for message \(message, privacy: .public): collecting")
                 self.collectAfterWake(isActive: UIApplication.shared.applicationState == .active)
             }
         }

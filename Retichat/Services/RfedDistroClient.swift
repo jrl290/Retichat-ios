@@ -56,6 +56,9 @@ nonisolated struct DistroMessage: Sendable {
     /// The message's LXMF hash, as the unwrap says it (64 hex): stored beside
     /// the derived id, so a reaction to it finds it (REACTIONS-DESIGN.md §5.1).
     var hash: String? = nil
+    /// The blob's transient id, the id RFed's wake names it by: its
+    /// notification is posted under it (NotificationIds).
+    var transientId: Data? = nil
 }
 
 nonisolated extension DistroMessage {
@@ -956,7 +959,9 @@ final class RfedDistroClient: ObservableObject {
             inbound = .notification
         } else {
             // Carries the fields: ChatRepository stores the attachments.
-            inbound = .message(DistroMessage(unwrapped: parsed, sourceHash: src, shownByNSE: shownByNSE))
+            var message = DistroMessage(unwrapped: parsed, sourceHash: src, shownByNSE: shownByNSE)
+            message.transientId = NotificationIds.transientId(of: blob)
+            inbound = .message(message)
         }
 
         Task { @MainActor in

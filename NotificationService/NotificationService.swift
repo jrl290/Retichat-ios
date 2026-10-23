@@ -145,7 +145,11 @@ private func nseDeliveryTrampoline(
     unverifiedReason: Int32,
     fieldsRaw: UnsafePointer<UInt8>?, fieldsLen: UInt32,
     senderKey: UnsafePointer<UInt8>?, senderKeyLen: UInt32,
-    packed: UnsafePointer<UInt8>?, packedLen: UInt32
+    packed: UnsafePointer<UInt8>?, packedLen: UInt32,
+    // Unused here: this notification's identifier is the push's, its
+    // apns-collapse-id, which is already the message's transient id
+    // (NotificationIds).
+    transientId: UnsafePointer<UInt8>?, transientIdLen: UInt32
 ) {
     let msgHash  = hash.map     { Data(bytes: $0, count: Int(hashLen)) }  ?? Data()
     let src      = srcHash.map  { Data(bytes: $0, count: Int(srcLen)) }   ?? Data()

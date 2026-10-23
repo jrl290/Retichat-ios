@@ -12,8 +12,10 @@
 //  identity, gets the wake as one encrypted packet over whatever reaches the
 //  device. Through a Bluetooth RTNode or RNode that packet wakes a suspended
 //  Retichat, or relaunches it (BluetoothRestoration.swift), with no internet
-//  needed; APNs cannot reach a phone without it. The wake names no message,
-//  so the app fetches as for a push: the distro pull and a propagation sync.
+//  needed; APNs cannot reach a phone without it. The app fetches as for a
+//  push: the distro pull and a propagation sync. The wake names its message
+//  by its transient id, and the message's notification is posted under that
+//  id (NotificationIds), so a push for it as well makes no second one.
 //
 //  Only with a Bluetooth radio configured (a saved, enabled RNode or the
 //  Nearby RTNode switch on): over Wi-Fi or cellular a suspended app's
@@ -39,15 +41,18 @@ nonisolated enum MeshWake {
     }
 
     /// What a wake says (RFed-spec Notify.md "Wake packet"): who it is for,
-    /// and, when RFed knows them, the sender and the channel.
+    /// the channel for a channel wake, and the transient id of the message it
+    /// is for. RFed sends no sender (it cannot read one), though the spec
+    /// allows a server that knows it to.
     struct Wake: Equatable {
         var receiver: Data
         var sender: Data?
         var channel: Data?
+        var message: Data? = nil
     }
 
-    /// The wake in `payload`: a msgpack map with string keys and 16-byte bin
-    /// values, `receiver` required. Keys it does not know are skipped, so a
+    /// The wake in `payload`: a msgpack map with string keys and bin values
+    /// (16 bytes, 32 for `message`), `receiver` required. Keys it does not know are skipped, so a
     /// field RFed adds later does not stop the wake. Nil for anything else,
     /// as a bridge drops it.
     static func parse(_ payload: Data) -> Wake? {
@@ -63,8 +68,9 @@ nonisolated enum MeshWake {
             }
         }
         guard reader.atEnd, let receiver = fields["receiver"], receiver.count == 16 else { return nil }
-        func hash(_ key: String) -> Data? { fields[key].flatMap { $0.count == 16 ? $0 : nil } }
-        return Wake(receiver: receiver, sender: hash("sender"), channel: hash("channel"))
+        func field(_ key: String, _ size: Int) -> Data? { fields[key].flatMap { $0.count == size ? $0 : nil } }
+        return Wake(receiver: receiver, sender: field("sender", 16), channel: field("channel", 16),
+                    message: field("message", 32))
     }
 
     /// Enough msgpack for a wake: map, str and bin headers, and skipping the

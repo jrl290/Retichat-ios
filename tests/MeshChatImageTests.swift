@@ -129,7 +129,7 @@ func testTheNamesAreOnesTheAppShowsInline() {
 func testEveryReceivePathReadsTheDecodersAttachments() {
     let repo = source("Retichat/Services/ChatRepository.swift")
     check(!repo.isEmpty, "reads ChatRepository.swift")
-    check(repo.contains("attachments: fields.attachments, lxmfHash: msgHashHex)"),
+    check(repo.contains("attachments: fields.attachments, lxmfHash: msgHashHex, transientId: transientId)"),
           "a direct message stores the decoder's attachments")
     checkEqual(repo.components(separatedBy: "for (filename, data) in fields.attachments {").count - 1, 2,
                "the NSE import and the group path store the decoder's attachments")

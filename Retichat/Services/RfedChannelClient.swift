@@ -1316,14 +1316,19 @@ final class RfedChannelClient: ObservableObject {
         }
 
         print("[RfedChannel] dispatchBlob unpack OK source=\(result.sourceHash.hexString.prefix(8)) ts_ms=\(result.timestampMs) content_bytes=\(result.content.count) sig_ok=true")
-        return dispatchVerifiedLxmf(channelHashHex: channelHashHex, result: result, notify: notify)
+        // The post's transient id, as RFed's wake names it: SHA-256 of the
+        // channel hash and the post (RFed-spec Channel.md "Stamp Contract").
+        let messageId = NotificationIds.transientId(of: lxmfData)
+        return dispatchVerifiedLxmf(channelHashHex: channelHashHex, result: result, notify: notify,
+                                    messageId: messageId)
     }
 
     /// Dispatch a successfully signature-verified LXMF channel message.
     /// `notify` is false for blobs the NSE pulled: it already showed them.
-    /// True when the post is stored, or was already.
+    /// `messageId` is the post's transient id, its notification's identifier
+    /// (NotificationIds). True when the post is stored, or was already.
     private func dispatchVerifiedLxmf(channelHashHex: String, result: RetichatBridge.ChannelLxmUnpackResult,
-                                      notify: Bool = true) -> Bool {
+                                      notify: Bool = true, messageId: Data? = nil) -> Bool {
         let senderHashHex = result.sourceHash.hexString
         let tsMs = result.timestampMs
         guard let content = String(data: result.content, encoding: .utf8) else {
@@ -1399,7 +1404,8 @@ final class RfedChannelClient: ObservableObject {
             NotificationManager.shared.postMessageNotification(
                 chatId: channelHashHex,
                 senderName: DisplayNames.channelNotificationTitle(channelName: channel.channelName, label: label),
-                content: content
+                content: content,
+                messageId: messageId
             )
         }
         return true

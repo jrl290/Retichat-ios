@@ -199,7 +199,8 @@ func testTheWiring() {
     let unwrap = body(client, "nonisolated private static func unwrapAndDeliver(")
     check(unwrap.contains("JSONDecoder().decode(DistroUnwrapped.self, from: json)"),
           "the client decodes the unwrap JSON with the tested type")
-    check(unwrap.contains("inbound = .message(DistroMessage(unwrapped: parsed, sourceHash: src, shownByNSE: shownByNSE))"),
+    check(unwrap.contains("var message = DistroMessage(unwrapped: parsed, sourceHash: src, shownByNSE: shownByNSE)")
+            && unwrap.contains("inbound = .message(message)"),
           "and builds the message with the tested initializer, fields included")
     check(before(client, "nonisolated static func importNSEBlobs()", "for blob in blobs { ingestBlob(blob, shownByNSE: true) }")
             && client.contains("blobQueue.async { unwrapAndDeliver(blob, shownByNSE: shownByNSE) }"),
@@ -211,12 +212,12 @@ func testTheWiring() {
     check(before(distro, "let (content, attachments) = DistroMessageStore.stored(m)",
                  "let msgId = DistroCodec.messageId(sourceHex: srcHex, timestamp: m.timestamp, content: content)"),
           "handleDistroMessage takes the text and attachments from the store rule, before its id")
-    check(distro.contains("attachments: attachments, lxmfHash: DistroGroupSync.messageHash(m.hash), notify: !m.shownByNSE)") && !distro.contains("attachments: []"),
+    check(distro.contains("attachments: attachments, lxmfHash: DistroGroupSync.messageHash(m.hash), notify: !m.shownByNSE,") && !distro.contains("attachments: []"),
           "and hands the attachments to storeIncomingDirect")
     check(!distro.contains("[Attachment not available via the distro address]"),
           "the placeholder is decided by the store rule alone")
     let incoming = body(repo, "private func handleIncomingMessage(")
-    check(incoming.contains("attachments: fields.attachments, lxmfHash: msgHashHex)"),
+    check(incoming.contains("attachments: fields.attachments, lxmfHash: msgHashHex, transientId: transientId)"),
           "the direct path stores the decoder's attachments through storeIncomingDirect too")
     let store = body(repo, "private func storeIncomingDirect(")
     check(before(store, "for (filename, data) in attachments {", "let att = AttachmentEntity(")

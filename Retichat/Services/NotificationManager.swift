@@ -95,7 +95,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     // MARK: - Post
 
-    func postMessageNotification(chatId: String, senderName: String, content: String) {
+    /// `messageId` is the message's transient id when it is known
+    /// (NotificationIds): the notification is posted under it.
+    func postMessageNotification(chatId: String, senderName: String, content: String, messageId: Data? = nil) {
         // Don't notify if user is viewing this chat
         if Self.chatOnScreen(appActive: appActive, openChatId: activeChatId, chatId: chatId) {
             print("[Notify] chat \(chatId.prefix(8)) is on screen — not notified")
@@ -105,11 +107,34 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         if UserPreferences.shared.isChatMuted(chatId) { return }
         print("[Notify] chat \(chatId.prefix(8)): notified")
 
-        postLocalNotification(chatId: chatId, senderName: senderName, content: content)
+        postLocalNotification(chatId: chatId, senderName: senderName, content: content, messageId: messageId)
     }
 
     /// Post a regular local notification (used when not already covered by an APNs push).
-    private func postLocalNotification(chatId: String, senderName: String, content: String) {
+    ///
+    /// With `messageId` it is posted under the message's transient id, the
+    /// identifier apns-bridge's push for the message has (its
+    /// apns-collapse-id), so a push that comes after it replaces it rather
+    /// than adding one. It is not posted when a notification with that id is
+    /// shown already: the push came first, or another copy of the message did
+    /// (RFed-spec Notify.md "One notification per message").
+    private func postLocalNotification(chatId: String, senderName: String, content: String, messageId: Data?) {
+        let identifier = NotificationIds.requestIdentifier(messageId: messageId)
+        guard messageId != nil else {
+            addLocalNotification(identifier: identifier, chatId: chatId, senderName: senderName, content: content)
+            return
+        }
+        Task { @MainActor in
+            let shown = await UNUserNotificationCenter.current().deliveredNotifications()
+            if shown.contains(where: { $0.request.identifier == identifier }) {
+                print("[Notify] message \(identifier.prefix(16)) is shown already — not notified again")
+                return
+            }
+            self.addLocalNotification(identifier: identifier, chatId: chatId, senderName: senderName, content: content)
+        }
+    }
+
+    private func addLocalNotification(identifier: String, chatId: String, senderName: String, content: String) {
         let notifContent = UNMutableNotificationContent()
         notifContent.title = senderName
         notifContent.body = content
@@ -123,7 +148,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         notifContent.badge = NSNumber(value: totalBadgeCount())
 
         let request = UNNotificationRequest(
-            identifier: UUID().uuidString,
+            identifier: identifier,
             content: notifContent,
             trigger: nil  // deliver immediately
         )

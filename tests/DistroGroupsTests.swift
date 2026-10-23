@@ -146,7 +146,7 @@ func anInviteToDIsRoutedToTheGroupBranchAndNeverBecomesADirectMessage() {
                "an invite listing D is the user's as D")
     let unwrap = body(distroClient, "nonisolated private static func unwrapAndDeliver(")
     check(before(unwrap, "switch parsed.groupRoute {", "let key = DistroCodec.seenKey(sourceHex: srcHex, timestamp: parsed.timestamp)")
-            && before(unwrap, "switch parsed.groupRoute {", "inbound = .message(DistroMessage(unwrapped: parsed,"),
+            && before(unwrap, "switch parsed.groupRoute {", "var message = DistroMessage(unwrapped: parsed,"),
           "the group branch comes before the generic seen key and the DM path")
     let group = span(unwrap, from: "case .group(let hash, let groupId):", to: "case .dropped(let why):")
     check(group.contains("RfedDistroClient.shared.deliver(.group(arrival))") && group.contains("            return true\n"),
