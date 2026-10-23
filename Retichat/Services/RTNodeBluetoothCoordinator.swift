@@ -424,6 +424,7 @@ nonisolated extension RTNodeBluetoothCoordinator: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
         restored = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
         say("relaunched for Bluetooth: \(restored.count) RTNode connection(s) kept")
+        NotificationCenter.default.post(name: BluetoothRestoration.restored, object: nil)
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {

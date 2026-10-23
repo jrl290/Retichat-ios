@@ -5041,6 +5041,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         return (try? ctx.fetch(descriptor)) ?? []
     }
 
+    /// A saved RNode the stack's start links to (finishStartService picks
+    /// them the same way). The app delegate starts the stack at launch when
+    /// there is one (BluetoothRestoration).
+    var hasEnabledRNode: Bool {
+        interfaces().contains { $0.enabled && $0.type == InterfaceKind.rnode.rawValue }
+    }
+
     func addInterface(_ iface: InterfaceConfigEntity) {
         guard let ctx = modelContext else { return }
         ctx.insert(iface)

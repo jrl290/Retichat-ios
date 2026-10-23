@@ -47,14 +47,17 @@ func testIdentifiers() {
           "the two centrals are restored apart")
 }
 
-func testRelaunch() {
-    let starts = BluetoothRestoration.startsStack(restoringCentrals:)
-    check(!starts(nil), "an ordinary launch starts nothing early")
-    check(!starts([]), "an empty list starts nothing early")
-    check(starts([BluetoothRestoration.rnodeCentral]), "relaunched for an RNode: the stack starts")
-    check(starts([BluetoothRestoration.rtnodeCentral]), "relaunched for an RTNode: the stack starts")
-    check(starts([BluetoothRestoration.rtnodeCentral, BluetoothRestoration.rnodeCentral]), "and for both")
-    check(!starts(["com.example.other"]), "a central that is not ours starts nothing")
+// On the iPad (2026-10-23) a Bluetooth relaunch reached didFinishLaunching
+// with no launch options at all and in the same application state as a
+// user's launch, so neither tells it apart: bluetoothd then gave up after
+// 15 s ("Session Resurrected by not live") and dropped the RNode. The stack
+// starts at every launch that has a Bluetooth radio to restore instead.
+func testStartAtLaunch() {
+    let starts = BluetoothRestoration.startsStackAtLaunch(savedRNode:rtnodeSwitchOn:)
+    check(!starts(false, false), "no Bluetooth radio: the stack starts as before, when the app comes up")
+    check(starts(true, false), "an enabled saved RNode: the stack starts at launch")
+    check(starts(false, true), "the Nearby RTNode switch on: the stack starts at launch")
+    check(starts(true, true), "and with both")
 }
 
 func testStrays() {
@@ -121,6 +124,8 @@ func testRNodeCoordinator() {
     check(restore.contains(".delegate = self"), "RNode: and becomes their delegate")
     check(!restore.contains("cancelPeripheralConnection(") && !restore.contains(".connect("),
           "RNode: and calls nothing on the central before it is powered on")
+    check(restore.contains("post(name: BluetoothRestoration.restored"),
+          "RNode: and says so, for the app delegate's background time")
 
     let flush = member(coord, "func flushPendingConnects(")
     check(flush.contains("BluetoothRestoration.strays("), "RNode: a kept connection no slot wants is found")
@@ -150,6 +155,8 @@ func testRTNodeCoordinator() {
           "RTNode: willRestoreState takes the connections iOS kept")
     check(!restore.contains("cancelPeripheralConnection("),
           "RTNode: and calls nothing on the central before it is powered on")
+    check(restore.contains("post(name: BluetoothRestoration.restored"),
+          "RTNode: and says so, for the app delegate's background time")
 
     // The engine starts new and has no link for a kept connection, and none
     // can be made for one (it dials only what it has seen advertise): each
@@ -165,20 +172,27 @@ func testAppDelegate() {
     guard let app = read(["Retichat", "RetichatApp.swift"]) else { return }
 
     let launch = member(app, "didFinishLaunchingWithOptions launchOptions:")
-    check(launch.contains("launchOptions?[.bluetoothCentrals]"),
-          "launch: a Bluetooth relaunch is recognised")
-    check(launch.contains("BluetoothRestoration.startsStack(restoringCentrals:"),
-          "launch: by the rules")
-    check(ordered(launch, ["repository.configure(modelContext:", "BluetoothRestoration.startsStack(",
-                           "repository.startService()", "beginBackgroundExecution(repository: repository)"]),
-          "launch: the stack starts (re-making both centrals) and is kept running, after the store is set up")
+    check(!launch.contains(".bluetoothCentrals"),
+          "launch: no reliance on the launch options, which a SwiftUI app does not get")
+    check(launch.contains("BluetoothRestoration.startsStackAtLaunch(savedRNode: repository.hasEnabledRNode"),
+          "launch: by the rules, from the saved interfaces")
+    check(ordered(launch, ["repository.configure(modelContext:", "BluetoothRestoration.startsStackAtLaunch(",
+                           "repository.startService()"]),
+          "launch: the stack starts (re-making both centrals) after the store is set up")
+    check(ordered(launch, ["forName: BluetoothRestoration.restored", "beginBackgroundExecution(repository:"]),
+          "launch: a restored central keeps the app running a while")
+
+    guard let repo = read(["Retichat", "Services", "ChatRepository.swift"]) else { return }
+    let enabled = member(repo, "var hasEnabledRNode:")
+    check(enabled.contains("$0.enabled") && enabled.contains("InterfaceKind.rnode.rawValue"),
+          "repository: an enabled saved RNode, as finishStartService picks them")
 }
 
 @main
 enum BluetoothRestorationTests {
     static func main() {
         testIdentifiers()
-        testRelaunch()
+        testStartAtLaunch()
         testStrays()
         testRNodeCoordinator()
         testRTNodeCoordinator()

@@ -10,12 +10,16 @@
 import SwiftUI
 import SwiftData
 import UserNotifications
+import os
 
 // MARK: - AppDelegate (early notification setup)
 
 class RetichatAppDelegate: NSObject, UIApplicationDelegate {
     /// OS-level background task token for immediate background execution.
     private var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+
+    /// Notice level: a launch iOS makes in the background has no console.
+    private let launchLog = Logger(subsystem: "com.retichat", category: "Launch")
 
     /// Shared repository — created in didFinishLaunching so it’s available
     /// by the time `didReceiveRemoteNotification` fires on cold launch.
@@ -65,17 +69,25 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         RfedDistroClient.shared.onChannelSync = { [weak channelClient = self.channelClient] marker, fromDistro, signedByDistro in
             channelClient?.handleDistroChannelSync(marker: marker, fromDistro: fromDistro, signedByDistro: signedByDistro) ?? false
         }
-        // Relaunched in the background for Bluetooth: iOS kept a saved
-        // RNode's or a nearby RTNode's link, pending connect or scan going
-        // after it ended the app, and something happened on it. Starting the
-        // stack makes both centrals again under their restore identifiers
-        // (BluetoothRestoration), and the background task keeps the app
-        // running while the links come back and messages are handled.
-        let centrals = launchOptions?[.bluetoothCentrals] as? [String]
-        if BluetoothRestoration.startsStack(restoringCentrals: centrals) {
-            print("[Retichat] relaunched for Bluetooth: \(centrals ?? [])")
+        // iOS relaunches the app in the background for a saved RNode or a
+        // nearby RTNode it kept linked after ending the app, and drops the
+        // radio unless the app makes that central again within 15 s. Nothing
+        // here says this is that launch (BluetoothRestoration), so with a
+        // Bluetooth radio to restore the stack, which makes both centrals,
+        // starts now rather than when the app comes up; when a central's
+        // state comes back, the background task keeps the app running while
+        // the link returns and messages are handled.
+        NotificationCenter.default.addObserver(forName: BluetoothRestoration.restored, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.launchLog.notice("Bluetooth state restored: keeping the app running")
+                self.beginBackgroundExecution(repository: self.repository)
+            }
+        }
+        if BluetoothRestoration.startsStackAtLaunch(savedRNode: repository.hasEnabledRNode,
+                                                    rtnodeSwitchOn: UserPreferences.shared.rtnodeBluetoothEnabled) {
+            launchLog.notice("Bluetooth radio configured: starting the stack at launch")
             repository.startService()
-            beginBackgroundExecution(repository: repository)
         }
         return true
     }

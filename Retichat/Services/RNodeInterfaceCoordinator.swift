@@ -187,7 +187,7 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
             } else if self.central?.state == .poweredOn {
                 self.flushPendingConnects()
             }
-            self.log.info("RNodeInterfaceCoordinator started with \(self.slots.count) slot(s)")
+            self.log.notice("RNodeInterfaceCoordinator started with \(self.slots.count) slot(s)")
         }
     }
 
@@ -246,7 +246,7 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
         restored.removeAll()
         for uuid in BluetoothRestoration.strays(restored: Array(kept.keys), saved: Set(slots.keys)) {
             if let p = kept[uuid] {
-                log.info("Dropping kept RNode connection \(uuid): no saved RNode wants it")
+                log.notice("Dropping kept RNode connection \(uuid): no saved RNode wants it")
                 central.cancelPeripheralConnection(p)
             }
         }
@@ -281,7 +281,7 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
         if peripheral.state == .connected {
             // Kept by iOS across a Bluetooth relaunch: already connected,
             // so it is set up as a new connection is (didConnect).
-            log.info("RNode '\(slot.name, privacy: .public)' still connected from before the relaunch")
+            log.notice("RNode '\(slot.name, privacy: .public)' still connected from before the relaunch")
             peripheral.discoverServices([NUS.service])
         } else {
             central.connect(peripheral, options: nil)
@@ -499,7 +499,8 @@ extension RNodeInterfaceCoordinator: CBCentralManagerDelegate {
         let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
         for p in peripherals { p.delegate = self }
         restored = peripherals
-        log.info("Relaunched for Bluetooth: \(peripherals.count) RNode connection(s) kept")
+        log.notice("Relaunched for Bluetooth: \(peripherals.count) RNode connection(s) kept")
+        NotificationCenter.default.post(name: BluetoothRestoration.restored, object: nil)
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
