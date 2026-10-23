@@ -136,9 +136,8 @@ func testChatRepositoryWiring() {
     }
 
     let polling = method("private func startPropagationPolling()", in: source)
-    check(inOrder(["client.setPropagationNode(nodeHash: nodeHash)", "DispatchQueue.main.asyncAfter"],
-                  in: polling),
-          "the router's propagation node is set at start, not only by the delayed first poll")
+    check(polling.contains("client.setPropagationNode(nodeHash: nodeHash)"),
+          "the router's propagation node is set at start, not only by the first poll after the link's binding")
 
     let send = method("func sendMessage(chatId: String", in: source)
     check(!send.contains("ABORT - lxmfClient is nil"),

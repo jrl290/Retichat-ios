@@ -882,10 +882,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 self?.pollPropagationNode()
             }
         }
-        // Initial poll after 1 second
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.pollPropagationNode()
-        }
+        // No first poll here: it runs once the RFed node's link is up and
+        // bound (sendPropagationStreamOpen). Until 2026-10-23 it ran a second
+        // after this, which on a Bluetooth relaunch is before the RTNode link
+        // is up, so it reached nothing and the next sync was 5 min away.
     }
 
     /// Write the full propagation node list to the App Group so the NSE can
@@ -976,9 +976,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         else { return }
 
         let payload = RfedChannelClient.msgpackSigned(value: ownHash, pubkey: pubkey, sig: sig)
-        Task {
+        Task { [weak self] in
             let response = await RfedLink.shared.request(nodeHex: node, path: "/propagation/stream/open",
                                                          payload: payload)
+            // The sync, once per fresh link and after its binding, whatever
+            // rfed answered: what rfed stores from now on is pushed down this
+            // link, and the sync fetches what it took before, a message
+            // pushed down the previous link included. That push went
+            // unanswered if this device died with it up, and the wake that
+            // follows can be lost while an RTNode has no route back yet
+            // (staging 2026-10-23: the message waited 3.5 min). Forced: a
+            // poll a minute ago does not cover what came in since. No answer
+            // at all means the link is gone, and the next one syncs.
+            if response != nil {
+                self?.pollPropagationNode(force: true)
+            }
             guard Self.streamOpenResponseOk(response) else {
                 print("[Retichat] propagation.stream open rejected resp=\(response?.hexString ?? "nil")")
                 return

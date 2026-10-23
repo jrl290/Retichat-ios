@@ -171,6 +171,54 @@ func testSourceHooksPropagationReadyPolling() {
     }
 }
 
+/// The start-up sync waits for the RFed node's link and its binding (James,
+/// 2026-10-23: "run the start-up propagation sync when the link to the RFed
+/// node comes up, after the delivery binding, instead of 1 s after the stack
+/// starts"). A second after the start, a Bluetooth relaunch has no RTNode link
+/// yet, so that sync reached nothing (staging: three relaunches, no sync).
+func testStartUpSyncFollowsTheBinding() {
+    do {
+        let repository = try sourceFile(["Retichat", "Services", "ChatRepository.swift"])
+        guard let polling = sourceFragment(repository, start: "private func startPropagationPolling()",
+                                           end: "private func syncPropagationNodesToAppGroup()") else {
+            check(false, "extracts startPropagationPolling")
+            return
+        }
+        check(polling.contains("_ = client.setPropagationNode(nodeHash: nodeHash)"),
+              "the stack's start still gives the router its propagation node")
+        check(polling.contains("Timer.scheduledTimer(withTimeInterval: 300, repeats: true)"),
+              "the 5-minute sync stays")
+        check(!polling.contains("asyncAfter") && !polling.contains("pollPropagationNode()\n        }\n    }"),
+              "no sync on a timer after the start")
+
+        guard let open = sourceFragment(repository, start: "private func sendPropagationStreamOpen()",
+                                        end: "private static func streamOpenResponseOk") else {
+            check(false, "extracts sendPropagationStreamOpen")
+            return
+        }
+        guard let request = open.range(of: "path: \"/propagation/stream/open\""),
+              let sync = open.range(of: "self?.pollPropagationNode(force: true)"),
+              let verdict = open.range(of: "guard Self.streamOpenResponseOk(response) else") else {
+            check(false, "the binding is followed by a forced sync")
+            return
+        }
+        check(request.upperBound < sync.lowerBound, "the sync comes after the binding's answer")
+        check(sync.lowerBound < verdict.lowerBound, "whatever the answer, accepted or refused")
+        check(open.contains("if response != nil {\n                self?.pollPropagationNode(force: true)"),
+              "but not when the link gave no answer: the next link syncs")
+
+        guard let binder = sourceFragment(repository, start: "RfedLink.shared.setBinder(owner: \"propagation\")",
+                                          end: "\n        }\n") else {
+            check(false, "extracts the propagation binder")
+            return
+        }
+        check(binder.contains("self.sendPropagationStreamOpen()"), "every fresh link is bound, so every fresh link syncs")
+    } catch {
+        check(false, "reads ChatRepository source", String(describing: error))
+    }
+}
+
+testStartUpSyncFollowsTheBinding()
 testRfedPropagationStreamKeepsPolling()
 testRfedPropagationFallbackStillPolls()
 testRfedPropagationStillUsesStream()
