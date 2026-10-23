@@ -96,6 +96,9 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
     /// The engine's last word on scanning (it wants to from the start).
     private var scanWanted = false
     private var nodes: [UInt64: Node] = [:]
+    /// Relaunched for Bluetooth (BluetoothRestoration): the connections iOS
+    /// kept, from willRestoreState until power on drops them (dropRestored).
+    private var restored: [CBPeripheral] = []
 
     // Under engineLock: start() and stop() come from ChatRepository's
     // ffiQueue, and a denial stops the engine from `queue`. The lock is
@@ -151,8 +154,11 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
                 bluetoothStateChanged(central)
             } else {
                 // No power alert: Bluetooth being off is shown in Settings.
+                // The restore identifier: iOS keeps the scan and links going
+                // after it ends the app, and relaunches it for them.
                 central = CBCentralManager(delegate: self, queue: queue,
-                                           options: [CBCentralManagerOptionShowPowerAlertKey: false])
+                                           options: [CBCentralManagerOptionShowPowerAlertKey: false,
+                                                     CBCentralManagerOptionRestoreIdentifierKey: BluetoothRestoration.rtnodeCentral])
             }
         }
     }
@@ -293,6 +299,7 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
     private func bluetoothStateChanged(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
+            dropRestored(central)
             applyScan()
             publishIdle()
         case .poweredOff:
@@ -341,6 +348,19 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
             _ = rns_prns_ble_link_closed(node.link)
         }
         nodes.removeAll()
+    }
+
+    /// The connections iOS kept across a Bluetooth relaunch. The engine
+    /// starts new and has no link for them, and makes one only for an
+    /// advertisement it has seen, so each is dropped: the RTNode advertises
+    /// again and the scan dials it as any other. What came in on the old
+    /// link (what woke the app) is lost with it.
+    private func dropRestored(_ central: CBCentralManager) {
+        for peripheral in restored {
+            say("dropping RTNode \(peripheral.identifier.uuidString) kept across the relaunch")
+            central.cancelPeripheralConnection(peripheral)
+        }
+        restored.removeAll()
     }
 
     private func node(for peripheral: CBPeripheral) -> Node? {
@@ -396,6 +416,15 @@ nonisolated final class RTNodeBluetoothCoordinator: NSObject, ObservableObject, 
 // MARK: - CBCentralManagerDelegate
 
 nonisolated extension RTNodeBluetoothCoordinator: CBCentralManagerDelegate {
+
+    /// Relaunched for Bluetooth (BluetoothRestoration). Before the power-on
+    /// state, so nothing is asked of the central here: dropRestored does
+    /// that once it is on. The scan iOS kept needs nothing: the engine asks
+    /// for one when it starts.
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        restored = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        say("relaunched for Bluetooth: \(restored.count) RTNode connection(s) kept")
+    }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         bluetoothStateChanged(central)

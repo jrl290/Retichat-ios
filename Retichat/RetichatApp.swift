@@ -65,6 +65,18 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         RfedDistroClient.shared.onChannelSync = { [weak channelClient = self.channelClient] marker, fromDistro, signedByDistro in
             channelClient?.handleDistroChannelSync(marker: marker, fromDistro: fromDistro, signedByDistro: signedByDistro) ?? false
         }
+        // Relaunched in the background for Bluetooth: iOS kept a saved
+        // RNode's or a nearby RTNode's link, pending connect or scan going
+        // after it ended the app, and something happened on it. Starting the
+        // stack makes both centrals again under their restore identifiers
+        // (BluetoothRestoration), and the background task keeps the app
+        // running while the links come back and messages are handled.
+        let centrals = launchOptions?[.bluetoothCentrals] as? [String]
+        if BluetoothRestoration.startsStack(restoringCentrals: centrals) {
+            print("[Retichat] relaunched for Bluetooth: \(centrals ?? [])")
+            repository.startService()
+            beginBackgroundExecution(repository: repository)
+        }
         return true
     }
 

@@ -143,6 +143,10 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
     private var started = false
     /// Slots discovered before BLE was powered on; connect once it is.
     private var pendingConnects: [UUID] = []
+    /// Relaunched for Bluetooth (BluetoothRestoration): the connections and
+    /// pending connects iOS kept for us, from willRestoreState until
+    /// flushPendingConnects takes them back.
+    private var restored: [CBPeripheral] = []
 
     // MARK: - Public API
 
@@ -174,9 +178,12 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
                 return
             }
 
-            // Lazily create the CBCentralManager on our queue.
+            // Lazily create the CBCentralManager on our queue, under its
+            // restore identifier: iOS then keeps its links going after it
+            // ends the app, and relaunches it for them.
             if self.central == nil {
-                self.central = CBCentralManager(delegate: self, queue: self.queue, options: nil)
+                self.central = CBCentralManager(delegate: self, queue: self.queue,
+                                                options: [CBCentralManagerOptionRestoreIdentifierKey: BluetoothRestoration.rnodeCentral])
             } else if self.central?.state == .poweredOn {
                 self.flushPendingConnects()
             }
@@ -232,7 +239,19 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
         guard let central = central, central.state == .poweredOn else { return }
         let uuids = pendingConnects
         pendingConnects.removeAll()
-        let peripherals = central.retrievePeripherals(withIdentifiers: uuids)
+        // Relaunched for Bluetooth: a saved RNode's kept connection is its
+        // slot's peripheral (connect() sets it up again); one no slot wants
+        // is dropped.
+        let kept = Dictionary(restored.map { ($0.identifier, $0) }, uniquingKeysWith: { first, _ in first })
+        restored.removeAll()
+        for uuid in BluetoothRestoration.strays(restored: Array(kept.keys), saved: Set(slots.keys)) {
+            if let p = kept[uuid] {
+                log.info("Dropping kept RNode connection \(uuid): no saved RNode wants it")
+                central.cancelPeripheralConnection(p)
+            }
+        }
+        let peripherals = uuids.compactMap { kept[$0] }
+            + central.retrievePeripherals(withIdentifiers: uuids.filter { kept[$0] == nil })
         for p in peripherals {
             guard let slot = slots[p.identifier], slot.peripheral == nil else { continue }
             slot.peripheral = p
@@ -259,7 +278,14 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
         slot.failureScheduledRetry = false
         log.info("Connecting to RNode '\(slot.name, privacy: .public)' (\(slot.peripheralUUID))")
         setStatus(.connecting, for: slot.id)
-        central.connect(peripheral, options: nil)
+        if peripheral.state == .connected {
+            // Kept by iOS across a Bluetooth relaunch: already connected,
+            // so it is set up as a new connection is (didConnect).
+            log.info("RNode '\(slot.name, privacy: .public)' still connected from before the relaunch")
+            peripheral.discoverServices([NUS.service])
+        } else {
+            central.connect(peripheral, options: nil)
+        }
     }
 
     /// Must be called on `queue`.
@@ -465,6 +491,17 @@ final class RNodeInterfaceCoordinator: NSObject, ObservableObject {
 
 extension RNodeInterfaceCoordinator: CBCentralManagerDelegate {
 
+    /// Relaunched for Bluetooth (BluetoothRestoration): iOS hands back the
+    /// connections and pending connects it kept while the app was not
+    /// running. Before the power-on state, so nothing is asked of the
+    /// central here; flushPendingConnects takes them back once it is on.
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        for p in peripherals { p.delegate = self }
+        restored = peripherals
+        log.info("Relaunched for Bluetooth: \(peripherals.count) RNode connection(s) kept")
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
@@ -544,8 +581,13 @@ extension RNodeInterfaceCoordinator: CBPeripheralDelegate {
         self.log.info("'\(slot.name, privacy: .public)' RX writeType=\(slot.rxWriteType == .withoutResponse ? "withoutResponse" : "withResponse", privacy: .public)")
         // Gate register on the firmware confirming the TX subscription —
         // we don't want to start writing DETECT bytes that the device may drop
-        // because notifications aren't yet active.
-        peripheral.setNotifyValue(true, for: tx)
+        // because notifications aren't yet active. A connection iOS kept
+        // across a Bluetooth relaunch is still subscribed.
+        if tx.isNotifying {
+            txSubscribed(slot: slot)
+        } else {
+            peripheral.setNotifyValue(true, for: tx)
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
@@ -564,6 +606,11 @@ extension RNodeInterfaceCoordinator: CBPeripheralDelegate {
         // Subscription confirmed; only act on the TX characteristic (the
         // notify one). Now it's safe to start the FFI register handshake.
         guard characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) else { return }
+        txSubscribed(slot: slot)
+    }
+
+    /// TX notifications are on: start the FFI register handshake, once.
+    private func txSubscribed(slot: RNodeSlot) {
         guard !slot.subscribed else { return }
         slot.subscribed = true
         log.info("'\(slot.name, privacy: .public)' TX notifications subscribed; starting register")

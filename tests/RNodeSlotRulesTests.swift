@@ -98,9 +98,14 @@ func testCoordinatorFollowsTheRules() {
     check(!disconnect.contains("setStatus(.idle"), "handleDisconnect sets no status of its own")
 
     // Every link dropped after a failure goes through dropAfterFailure, which
-    // marks it for handleDisconnect; stop() and stopSlot() drop the others.
+    // marks it for handleDisconnect; stop() and stopSlot() drop the others,
+    // and flushPendingConnects a connection kept across a Bluetooth relaunch
+    // that no slot wants (BluetoothRestorationTests.swift).
     let drops = coordinator.components(separatedBy: "cancelPeripheralConnection(").count - 1
-    check(drops == 3, "cancelPeripheralConnection only in stop, stopSlot and dropAfterFailure", "found \(drops)")
+    check(drops == 4, "cancelPeripheralConnection only in stop, stopSlot, dropAfterFailure and for a kept stray",
+          "found \(drops)")
+    check(body(coordinator, "flushPendingConnects").contains("cancelPeripheralConnection("),
+          "the stray is dropped in flushPendingConnects")
     let drop = body(coordinator, "dropAfterFailure")
     check(drop.contains("slot.droppedAfterFailure = true"), "dropAfterFailure marks the slot")
     check(drop.contains("setStatus(.failed, for: slot.id)"), "dropAfterFailure shows failed")
