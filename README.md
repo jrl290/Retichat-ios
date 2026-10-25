@@ -140,7 +140,7 @@ Retichat uses the standard LXMF protocol and is interoperable with
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details. The app bundles Rust ports of Reticulum and LXMF, which are under the Reticulum License; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT — see [LICENSE](LICENSE) for details. The app bundles Rust ports of Reticulum and LXMF, which are under the Reticulum License, and prns-ble, the Bluetooth LE protocol of [Prns](https://github.com/KenAKAFrosty/Prns) by The Prns Authors, which links the app to RTNodes and is under MIT OR Apache-2.0; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Default Endpoints
 

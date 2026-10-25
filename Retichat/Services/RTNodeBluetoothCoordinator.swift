@@ -3,19 +3,22 @@
 //  Retichat
 //
 //  Bluetooth link to any RTNode in range, with no configuration: the Prns
-//  native protocol, from the dialer's (GATT central's) side.
+//  native protocol, from the dialer's (GATT central's) side. The protocol is
+//  the work of The Prns Authors (Prns, https://github.com/KenAKAFrosty/Prns,
+//  MIT OR Apache-2.0); see THIRD_PARTY_NOTICES.md.
 //
 //  Retichat is only ever the central. It advertises nothing and hosts no
 //  GATT service, so no phone can connect to it; it dials RTNodes only
 //  (their advertisement carries the Prns peripheral-only flag).
 //
-//  The protocol lives in Reticulum-rust (`interfaces::prns_ble`, the
-//  `rns_prns_ble_*` C API): which advertisement to dial, the handshake,
-//  fragments, and one Reticulum interface per RTNode. This class is the
-//  radio: it scans when the engine asks, reports each advertisement,
-//  connects when the engine hands back a link, discovers the service,
-//  subscribes, performs the writes it is asked for, and reports every event.
-//  It keeps no timers and never re-dials on its own: the engine decides.
+//  The protocol lives in Reticulum-rust's prns-ble package, reached through
+//  `interfaces::prns_ble` and the `rns_prns_ble_*` C API: which advertisement
+//  to dial, the handshake, fragments, and one Reticulum interface per RTNode.
+//  This class is the radio: it scans when the engine asks, reports each
+//  advertisement, connects when the engine hands back a link, discovers the
+//  service, subscribes, performs the writes it is asked for, and reports
+//  every event. It keeps no timers and never re-dials on its own: the engine
+//  decides.
 //
 //  Started by ChatRepository.finishStartService() after the delivery
 //  destination is published, and only when the Nearby RTNode switch is on
@@ -57,7 +60,7 @@ enum RTNodeBluetoothStatus: Equatable {
 }
 
 /// The Prns service and its characteristics (Reticulum-rust
-/// `interfaces/prns_ble/wire.rs`).
+/// `prns-ble/src/wire.rs`).
 nonisolated enum PrnsBluetoothUUID {
     static let service = CBUUID(string: "37145B00-442D-4A94-917F-8F42C5DA28E3")
     static let control = CBUUID(string: "37145B00-442D-4A94-917F-8F42C5DA28E7")

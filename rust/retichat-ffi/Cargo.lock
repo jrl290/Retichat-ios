@@ -1223,6 +1223,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "prns-ble"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.6",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1360,6 +1367,7 @@ dependencies = [
  "libc",
  "once_cell",
  "parking_lot",
+ "prns-ble",
  "rand 0.8.6",
  "rmp",
  "rmp-serde",
