@@ -341,9 +341,12 @@ func aPostIsPackedWithThePostingIdentityAndRecordedUnderItsHash() {
           "the optimistic post is the posting identity's")
     let trySend = body(channelClient, "private func trySend(", "// MARK: - Pull deferred blobs")
     check(trySend.contains("senderIdentityHandle: postingHandle,"), "a post is packed with the posting identity")
-    check(trySend.contains("(Data(hexString: postingHex) ?? Data()).hexString\n            + String(format: \"%016llx\", tsMs)"),
+    // A post is packed once (2026-10-30), and keeps the posting identity that
+    // signed it: every send of it, and its id, are that identity's.
+    check(trySend.contains("displayName: postName, postingHex: postingHex)")
+            && trySend.contains("(Data(hexString: post.postingHex) ?? Data()).hexString\n            + String(format: \"%016llx\", tsMs)"),
           "its id is the posting source and its timestamp: the echo is dropped against it")
-    check(trySend.contains("temp.senderHash = postingHex") && trySend.contains("recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)"),
+    check(trySend.contains("temp.senderHash = postingHex") && trySend.contains("recordPostName(post.displayName, channelHashHex: channel.id, postingHex: post.postingHex)"),
           "the row and the name state are the posting identity's")
     check(!trySend.contains("ownHashHex") && !trySend.contains("senderIdentityHandle: identityHandle"),
           "the device's own hash is no longer what a post is filed under")

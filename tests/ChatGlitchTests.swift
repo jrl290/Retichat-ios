@@ -112,14 +112,17 @@ check(!channelList.contains(".defaultScrollAnchor(.bottom)\n"),
 
 let trySend = body(client, "private func trySend(")
 check(inOrder(trySend, [
-    "let canonicalId = (Data(hexString: postingHex) ?? Data()).hexString",
+    "let canonicalId = (Data(hexString: post.postingHex) ?? Data()).hexString",
     "postsAwaitingAnswer[canonicalId] = optimisticId",
     "let answer = await RfedLink.shared.request(nodeHex: channel.rfedNodeHash, path: \"/channel/publish\"",
-    "let echoed = postsAwaitingAnswer.removeValue(forKey: canonicalId) == nil",
+    "let echoed = postsAwaitingAnswer[canonicalId] == nil",
     "if let refusal = Self.publishRefusal(answer) {",
     "guard echoed else {",
-    "return answer == nil ? .unanswered : .failed",
-    "recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)",
+    "guard answer != nil else { return .unanswered }",
+    "postsAwaitingAnswer.removeValue(forKey: canonicalId)",
+    "return .failed",
+    "postsAwaitingAnswer.removeValue(forKey: canonicalId)",
+    "recordPostName(post.displayName, channelHashHex: channel.id, postingHex: post.postingHex)",
     "showSent(optimisticId: optimisticId, canonicalId: canonicalId,",
     "return .sent",
 ]), "a post awaits its answer by its echo's id, and an echo that came first counts as rfed's yes")

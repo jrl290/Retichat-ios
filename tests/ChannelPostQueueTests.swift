@@ -15,6 +15,14 @@
 // earlier process left sending is failed at the next start, not left on the
 // clock.
 //
+// Since 2026-10-30 a post is packed once: every send of it, the retry after a
+// refusal and its release from the queue, sends the same signed post with the
+// same LXMF timestamp, which every reader dedupes. rfed often answers late
+// (links took 6-18 s in production), and each send used to pack the post
+// again with a new timestamp: a post rfed had taken went again as a second
+// post everyone saw. A send with no answer leaves the post awaiting its echo,
+// so a late echo makes the placeholder the post, not a second bubble.
+//
 // Run from the workspace root with:
 //
 //     swift Retichat-ios/tests/ChannelPostQueueTests.swift
@@ -52,6 +60,18 @@ func body(_ signature: String) -> String {
     return String(client[start.lowerBound..<next])
 }
 
+/// Whether `parts` appear in `text` in this order.
+func inOrder(_ text: String, _ parts: [String]) -> Bool {
+    var from = text.startIndex
+    for part in parts {
+        guard let r = text.range(of: part, range: from..<text.endIndex) else { return false }
+        from = r.upperBound
+    }
+    return true
+}
+
+func count(_ text: String, _ needle: String) -> Int { text.components(separatedBy: needle).count - 1 }
+
 // 1. The state, and the clock it shows.
 check(models.contains("static let queued = 5"), "DeliveryState has queued")
 check(bubble.contains("case DeliveryState.pending, DeliveryState.queued:"), "a queued post shows the pending clock")
@@ -69,7 +89,8 @@ check(send.components(separatedBy: "if requeueIfLinkDown(optimisticId: optimisti
 // request timeout tears it down (AppLinks then re-opens it): a post sent on it
 // in that window is not answered, and waits for the new link.
 let trySendBody = body("private func trySend(")
-check(trySendBody.contains("return answer == nil ? .unanswered : .failed"), "a send with no answer is told apart from a refusal")
+check(inOrder(trySendBody, ["guard answer != nil else { return .unanswered }", "return .failed"]),
+      "a send with no answer is told apart from a refusal")
 check(send.components(separatedBy: "case .unanswered:").count - 1 == 2
       && send.components(separatedBy: "queuePost(optimisticId: optimisticId, channel: liveChannel)").count - 1 == 2,
       "a post with no answer is queued, not failed")
@@ -94,6 +115,53 @@ check(!release.contains("asyncAfter") && !release.contains("Task.sleep"), "no ti
 let load = body("private func loadPersistedMessages()")
 check(load.contains("where e.isOutgoing && e.deliveryState == DeliveryState.pending"), "a post left sending by an earlier process is found at start")
 check(load.contains("e.deliveryState = DeliveryState.failed"), "and failed, not left on the clock")
+
+// 5. A post is packed once (2026-10-30): the retry after a refusal and the
+// release from the queue send the post the first send packed, so a post rfed
+// took but answered late is not a second post with a new timestamp.
+check(client.contains("private var packedPosts: [String: PackedPost] = [:]"), "a packed post is kept, by its placeholder id")
+check(inOrder(trySendBody, [
+    "if let packedBefore = packedPosts[optimisticId] {",
+    "post = packedBefore",
+    "} else {",
+    "let postName = channelPostName(for: channel, postingHex: postingHex)",
+    "bridge.channelLxmPack(",
+    "packed.wirePayload.prefix(16).hexString.lowercased() == channel.id.lowercased()",
+    "post = PackedPost(wirePayload: packed.wirePayload, timestampMs: packed.timestampMs,",
+    "packedPosts[optimisticId] = post",
+]), "trySend sends the post it packed before, and packs one (and keeps it) only when there is none")
+check(count(client, "channelLxmPack(") == 1, "nothing else packs a channel post")
+check(inOrder(trySendBody, [
+    "let lxmfData = post.wirePayload",
+    "let tsMs = post.timestampMs",
+    "var payload = lxmfData",
+    "bridge.channelComputeStamp(payload: payload, cost: Int32(cost))",
+    "let canonicalId = (Data(hexString: post.postingHex) ?? Data()).hexString",
+    "recordPostName(post.displayName, channelHashHex: channel.id, postingHex: post.postingHex)",
+]), "only the stamp is computed again, over the same wire payload; the id and the name are the packed post's")
+
+// A send with no answer leaves the post awaiting its echo: rfed may have it.
+// A late echo then makes the placeholder the post (dispatchVerifiedLxmf), and
+// the release registers the same id again. A refusal removes the entry.
+let fromRequest = trySendBody.range(of: "let answer = await RfedLink.shared.request(")
+    .map { String(trySendBody[$0.lowerBound...]) } ?? ""
+let toUnanswered = fromRequest.range(of: "return .unanswered").map { String(fromRequest[..<$0.lowerBound]) } ?? ""
+check(inOrder(trySendBody, ["postsAwaitingAnswer[canonicalId] = optimisticId", "let answer = await RfedLink.shared.request("]),
+      "every send registers the post's id before it asks")
+check(!toUnanswered.isEmpty && !toUnanswered.contains("postsAwaitingAnswer.removeValue"),
+      "a send with no answer keeps its awaiting-answer entry")
+check(inOrder(trySendBody, ["guard answer != nil else { return .unanswered }",
+                            "postsAwaitingAnswer.removeValue(forKey: canonicalId)", "return .failed"]),
+      "a refusal removes it")
+check(body("private func dispatchVerifiedLxmf(").contains("if let optimisticId = postsAwaitingAnswer.removeValue(forKey: msgId) {"),
+      "the echo, however late, finds the placeholder")
+
+// The packed post goes when the post ends, and only then.
+check(body("private func showSent(").contains("packedPosts.removeValue(forKey: optimisticId)"),
+      "a post shown sent drops its packed post (from rfed's answer or its echo)")
+check(body("private func markOptimisticFailed(").contains("packedPosts.removeValue(forKey: optimisticId)"),
+      "a post failed for good drops its packed post")
+check(count(client, "packedPosts.removeValue(") == 2, "nothing else drops it: a queued or pending post keeps it")
 
 if failures.isEmpty {
     print("\nall passed")

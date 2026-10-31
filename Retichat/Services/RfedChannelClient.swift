@@ -785,8 +785,33 @@ final class RfedChannelClient: ObservableObject {
     /// among them, before it answers, and the echo can come first: it then
     /// becomes the post's bubble (showSent), not a second one beside the
     /// placeholder until the answer removed one (James, 2026-10-20: "two
-    /// bubbles for the same message appear, then one is removed").
+    /// bubbles for the same message appear, then one is removed"). A send
+    /// that gets no answer leaves its entry (2026-10-30), so an echo that
+    /// comes after the post was queued still finds its placeholder.
     private var postsAwaitingAnswer: [String: String] = [:]
+
+    /// A post as its first send packed it: the signed wire payload, the LXMF
+    /// timestamp baked into it, the Channel Display Name decision it carries
+    /// (§4.2) and the posting identity that signed it.
+    private struct PackedPost {
+        let wirePayload: Data
+        let timestampMs: UInt64
+        let displayName: DisplayNames.NameField
+        let postingHex: String
+    }
+
+    /// Each post this device is sending, packed once, by its placeholder id,
+    /// until the post is shown sent (showSent) or failed (markOptimisticFailed);
+    /// kept while it is queued or pending. Every later send of the post, the
+    /// retry after a refusal and its release from the queue, sends these same
+    /// signed bytes with this same timestamp, which every reader dedupes
+    /// (source hash, LXMF timestamp); only the stamp is computed again.
+    /// Until 2026-10-30 each send packed the post again, with a new timestamp
+    /// and signature: rfed often answers late, so a post it had taken and sent
+    /// to the channel's readers could go again as a second post everyone saw.
+    /// In memory only: a post still queued when the app is killed is packed
+    /// again, with a new timestamp, when the next process releases it.
+    private var packedPosts: [String: PackedPost] = [:]
 
     func sendMessage(content: String, toChannel channel: Channel) {
         Task { await self.sendMessageAsync(content: content, toChannel: channel) }
@@ -874,6 +899,8 @@ final class RfedChannelClient: ObservableObject {
             // the background reads ACTIVE until its own request timeout tears
             // it down, and AppLinks then opens it again (its re-open arm).
             // The post waits for that link's ACTIVE edge, not the red mark.
+            // rfed may have taken it all the same: the release sends the same
+            // packed post (packedPosts), which readers dedupe.
             queuePost(optimisticId: optimisticId, channel: liveChannel)
             return
         case .failed:
@@ -882,6 +909,8 @@ final class RfedChannelClient: ObservableObject {
 
         // Step 2: a single retry after forcing a stampCost refresh.  This
         // covers the edge case where the operator changed the cost mid-session.
+        // A post the first try packed goes again as it was packed
+        // (packedPosts), stamped at the refreshed cost.
         print("[RfedChannel] SEND failed once — refreshing stampCost and retrying")
         do {
             _ = try await refreshStampCost(for: liveChannel)
@@ -981,8 +1010,10 @@ final class RfedChannelClient: ObservableObject {
 
     /// Mark the optimistic entity (and its in-memory copy) as `failed`.
     /// Called from any terminal SEND error path so the user sees the red
-    /// xmark indicator instead of an indefinite “sending” clock.
+    /// xmark indicator instead of an indefinite “sending” clock. The post has
+    /// ended: its packed copy (packedPosts) goes.
     private func markOptimisticFailed(optimisticId: String, channelHash: String) {
+        packedPosts.removeValue(forKey: optimisticId)
         setOutgoingState(optimisticId: optimisticId, channelHash: channelHash, state: DeliveryState.failed)
     }
 
@@ -1007,7 +1038,8 @@ final class RfedChannelClient: ObservableObject {
     /// back (unanswered).
     private enum SendOutcome { case sent, failed, unanswered }
 
-    /// Build the wire payload, compute the stamp, and ship it.  Returns
+    /// Build the wire payload (once per post: packedPosts), compute the
+    /// stamp, and ship it.  Returns
     /// .failed if any step that would produce a server-rejected packet fails
     /// (so the caller can refresh stampCost and retry), and .unanswered when
     /// rfed's answer did not come.  On a successful
@@ -1018,32 +1050,50 @@ final class RfedChannelClient: ObservableObject {
     private func trySend(content: String, toChannel channel: Channel,
                           optimisticId: String,
                           postingHex: String, postingHandle: UInt64) async -> SendOutcome {
-        // Build the wire payload as an LXMF-authenticated channel message.
-        // The FFI returns both the on-wire bytes AND the LXMF timestamp it
-        // baked into the signed body — we use the same timestamp as the
-        // canonical id so the echo back from RFed dedupes cleanly against
-        // the optimistic entity (after we rename it).
-        let contentData = Data(content.utf8)
-        // The Channel Display Name, by the §4.2 rule (DISPLAY_NAMES.md):
-        // never the Message Display Name.
-        let postName = channelPostName(for: channel, postingHex: postingHex)
-        guard let packed = bridge.channelLxmPack(name: channel.channelName,
-                                                  senderIdentityHandle: postingHandle,
-                                                  content: contentData,
-                                                  title: Data(),
-                                                  displayName: postName) else {
-            print("[RfedChannel] LXMF pack failed: \(bridge.lastError() ?? "unknown")")
-            return .failed
+        // A post is packed once (2026-10-30). A later send of it, the retry
+        // after a refusal or its release from the queue, sends the post as
+        // its first send packed it: the same signed bytes, the same
+        // timestamp, which every reader dedupes. Until then every send packed
+        // it again with a new timestamp, and a post rfed had taken but
+        // answered late went again as a second post for everyone. Its echo's
+        // id and its name state are the packed post's signer's, should the
+        // posting identity change while the post is queued.
+        let post: PackedPost
+        if let packedBefore = packedPosts[optimisticId] {
+            post = packedBefore
+        } else {
+            // Build the wire payload as an LXMF-authenticated channel message.
+            // The FFI returns both the on-wire bytes AND the LXMF timestamp it
+            // baked into the signed body — we use the same timestamp as the
+            // canonical id so the echo back from RFed dedupes cleanly against
+            // the optimistic entity (after we rename it).
+            let contentData = Data(content.utf8)
+            // The Channel Display Name, by the §4.2 rule (DISPLAY_NAMES.md):
+            // never the Message Display Name.
+            let postName = channelPostName(for: channel, postingHex: postingHex)
+            guard let packed = bridge.channelLxmPack(name: channel.channelName,
+                                                      senderIdentityHandle: postingHandle,
+                                                      content: contentData,
+                                                      title: Data(),
+                                                      displayName: postName) else {
+                print("[RfedChannel] LXMF pack failed: \(bridge.lastError() ?? "unknown")")
+                return .failed
+            }
+            guard packed.wirePayload.count >= 16,
+                  packed.wirePayload.prefix(16).hexString.lowercased() == channel.id.lowercased() else {
+                print("[RfedChannel] LXMF pack produced wrong channel_id_hash prefix")
+                return .failed
+            }
+            post = PackedPost(wirePayload: packed.wirePayload, timestampMs: packed.timestampMs,
+                              displayName: postName, postingHex: postingHex)
+            packedPosts[optimisticId] = post
         }
-        let lxmfData = packed.wirePayload
-        let tsMs = packed.timestampMs
+        let lxmfData = post.wirePayload
+        let tsMs = post.timestampMs
 
-        guard lxmfData.count >= 16,
-              lxmfData.prefix(16).hexString.lowercased() == channel.id.lowercased() else {
-            print("[RfedChannel] LXMF pack produced wrong channel_id_hash prefix")
-            return .failed
-        }
-
+        // The stamp alone is computed on every send, over the same wire
+        // payload, at the channel's stamp cost now: the retry after a refusal
+        // follows a stampCost refresh.
         var payload = lxmfData
         if let cost = channel.stampCost, cost > 0 {
             // The rfed node REQUIRES a stamp at this cost. If FFI returns
@@ -1063,7 +1113,7 @@ final class RfedChannelClient: ObservableObject {
         }
         // The post's id as its echo from RFed will have it: sender_hex+lxmf_ts,
         // as `dispatchVerifiedLxmf` makes it.
-        let canonicalId = (Data(hexString: postingHex) ?? Data()).hexString
+        let canonicalId = (Data(hexString: post.postingHex) ?? Data()).hexString
             + String(format: "%016llx", tsMs)
         // A request on rfed.link, answered [ok, reason] (RFed-spec Link.md):
         // until 2026-10-18 the post went as DATA on rfed.channel, whose proof
@@ -1076,21 +1126,32 @@ final class RfedChannelClient: ObservableObject {
                                                    payload: Self.msgpackBin(payload))
         // An echo that came first took the entry: it came from RFed, so RFed
         // has the post, whatever the answer says.
-        let echoed = postsAwaitingAnswer.removeValue(forKey: canonicalId) == nil
+        let echoed = postsAwaitingAnswer[canonicalId] == nil
         if let refusal = Self.publishRefusal(answer) {
             guard echoed else {
                 print("[RfedChannel] Send failed: rfed answered \(refusal)")
-                return answer == nil ? .unanswered : .failed
+                // No answer is not a refusal: rfed may have taken the post and
+                // sent it to the channel's readers, this device among them.
+                // The entry stays (2026-10-30), so that echo, however late,
+                // makes the placeholder the post (dispatchVerifiedLxmf), and
+                // the post's release from the queue sends it under the same
+                // id. Until then it went here, and a late echo showed as a
+                // second bubble beside the placeholder.
+                guard answer != nil else { return .unanswered }
+                postsAwaitingAnswer.removeValue(forKey: canonicalId)
+                return .failed
             }
             print("[RfedChannel] SEND: rfed answered \(refusal), but the post's echo came: sent")
         }
+        // rfed has the post: its entry goes, unless its echo took it already.
+        postsAwaitingAnswer.removeValue(forKey: canonicalId)
         // Handed to RFed: record what this post carried (§4.2).
-        recordPostName(postName, channelHashHex: channel.id, postingHex: postingHex)
+        recordPostName(post.displayName, channelHashHex: channel.id, postingHex: post.postingHex)
 
         // SEND succeeded — the placeholder becomes the post, `sent`
         // (= published to RFed), unless its echo did that first.
         showSent(optimisticId: optimisticId, canonicalId: canonicalId,
-                 channelHash: channel.id, postingHex: postingHex, tsMs: tsMs)
+                 channelHash: channel.id, postingHex: post.postingHex, tsMs: tsMs)
         updateChannelLastMessage(channelHashHex: channel.id, postMs: tsMs)
         return .sent
     }
@@ -1101,6 +1162,8 @@ final class RfedChannelClient: ObservableObject {
     /// first (dispatchVerifiedLxmf); whichever is second finds it done.
     private func showSent(optimisticId: String, canonicalId: String, channelHash: String,
                           postingHex: String, tsMs: UInt64) {
+        // The post has ended: its packed copy (packedPosts) goes.
+        packedPosts.removeValue(forKey: optimisticId)
         if let ctx = modelContext {
             // If a previous trySend attempt already promoted this entity,
             // or if the echo from a prior send beat us here, just leave the
