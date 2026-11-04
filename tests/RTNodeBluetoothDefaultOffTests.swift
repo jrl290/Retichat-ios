@@ -20,6 +20,7 @@
 //
 //   swiftc -o /private/tmp/claude-501/rtnode-bluetooth-default-off \
 //     Retichat-ios/Retichat/Services/UserPreferences.swift \
+//     Retichat-ios/Retichat/Services/ChannelActivity.swift \
 //     Retichat-ios/tests/RTNodeBluetoothDefaultOffTests.swift && \
 //     /private/tmp/claude-501/rtnode-bluetooth-default-off
 //

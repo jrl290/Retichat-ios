@@ -68,7 +68,10 @@ final class UserPreferences {
         static let mutedChatIds = "muted_chat_ids"
         static let channelNotificationsOn = "channel_notifications_on"
         static let channelPushEnabled = "channel_push_enabled"
-        static let channelLastOpened = "channel_last_opened"
+        /// Named for what it held until 2026-11-03, when each channel was
+        /// last opened; those times place the channels as they stand, so
+        /// they are kept (channelLastActive).
+        static let channelLastActive = "channel_last_opened"
         static let distroContacts = "distro_contacts"
         static let backboneSkipList = "default_backbone_skip_list"
     }
@@ -386,14 +389,16 @@ final class UserPreferences {
         defaults.set(Array(set).sorted(), forKey: Keys.distroContacts)
     }
 
-    /// Per-channel "last opened" timestamp in **seconds** (Apple epoch).
-    /// Used by `ChatListView` as the channel sort key so channels only
-    /// bubble to the top when the user actually opens them — incoming
-    /// channel traffic does *not* reorder the list.  Channels never
-    /// opened on this device sit at the bottom (timestamp 0).
-    var channelLastOpened: [String: Double] {
+    /// When each channel was last active, in **seconds** (Apple epoch): a
+    /// post sent from it, or one that came in while it was open (James,
+    /// 2026-11-03; ChannelActivity). `ChatListView` places a channel by it,
+    /// so opening a channel with nothing new, or posts that come in while it
+    /// is not open, leave it in its place. Until then it was when each
+    /// channel was last opened, and the list placed a channel by that;
+    /// those times carry on, so every channel starts where it stands.
+    var channelLastActive: [String: Double] {
         get {
-            let raw = defaults.dictionary(forKey: Keys.channelLastOpened) as? [String: Double] ?? [:]
+            let raw = defaults.dictionary(forKey: Keys.channelLastActive) as? [String: Double] ?? [:]
             // Migrate legacy ms-encoded values written before the unit switch.
             // Anything > 1e11 cannot be a seconds-epoch value (year 5138+).
             var migrated = raw
@@ -403,21 +408,31 @@ final class UserPreferences {
                 changed = true
             }
             if changed {
-                defaults.set(migrated, forKey: Keys.channelLastOpened)
+                defaults.set(migrated, forKey: Keys.channelLastActive)
             }
             return migrated
         }
-        set { defaults.set(newValue, forKey: Keys.channelLastOpened) }
+        set { defaults.set(newValue, forKey: Keys.channelLastActive) }
     }
 
-    func channelLastOpenedTime(_ channelId: String) -> Double {
-        channelLastOpened[channelId] ?? 0
+    /// The channel was active: a post was sent from it, or one came in
+    /// while it was open. It moves to the top of the chat list.
+    func markChannelActive(_ channelId: String, at time: Double = Date().timeIntervalSince1970) {
+        channelLastActive = ChannelActivity.marked(channelLastActive, channelId: channelId, at: time)
     }
 
-    func markChannelOpened(_ channelId: String, at time: Double = Date().timeIntervalSince1970) {
-        var map = channelLastOpened
-        map[channelId] = time
-        channelLastOpened = map
+    /// Places each channel the chat list has no time for yet at its newest
+    /// post's time (RfedChannelClient.channels, on every change).
+    func placeNewChannels(lastMessageTimes: [String: Double]) {
+        if let placed = ChannelActivity.placingNew(channelLastActive, lastMessageTimes: lastMessageTimes) {
+            channelLastActive = placed
+        }
+    }
+
+    /// A channel left: joined again, it is placed as a channel just joined.
+    func forgetChannelActivity(_ channelId: String) {
+        var times = channelLastActive
+        if times.removeValue(forKey: channelId) != nil { channelLastActive = times }
     }
 
     static func normalizedHex(_ value: String) -> String {

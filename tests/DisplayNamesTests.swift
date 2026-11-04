@@ -13,6 +13,7 @@
 //   swiftc -o /private/tmp/claude-501/display-names \
 //     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
 //     Retichat-ios/Retichat/Services/UserPreferences.swift \
+//     Retichat-ios/Retichat/Services/ChannelActivity.swift \
 //     Retichat-ios/Retichat/Services/PendingNotification.swift \
 //     Retichat-ios/tests/DisplayNamesTests.swift && \
 //     /private/tmp/claude-501/display-names

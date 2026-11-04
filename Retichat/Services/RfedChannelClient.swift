@@ -60,7 +60,15 @@ final class RfedChannelClient: ObservableObject {
 
     // MARK: - Published state
 
-    @Published var channels: [Channel] = []
+    @Published var channels: [Channel] = [] {
+        // A channel new to the list is placed in the chat list once, at its
+        // newest post's time; from then on only its activity moves it
+        // (James, 2026-11-03).
+        didSet {
+            prefs.placeNewChannels(lastMessageTimes: Dictionary(channels.map { ($0.id, $0.lastMessageTime) },
+                                                                uniquingKeysWith: max))
+        }
+    }
     @Published var messages: [String: [ChannelMessage]] = [:]   // keyed by channelHash hex
     /// Monotonically increments each time the rfed link transitions INTO
     /// `.connected` from any other state.  Channel-view code uses this as
@@ -501,6 +509,9 @@ final class RfedChannelClient: ObservableObject {
             shareSenderNames()
         }
 
+        // Its place in the chat list goes with it: joined again, it is
+        // placed as a channel just joined.
+        prefs.forgetChannelActivity(channelHashHex)
         channels.removeAll { $0.id == channelHashHex }
         publishPushDirectory()
         openedChannelStreamHashes.remove(Self.normalizedHex(channelHashHex))
@@ -855,6 +866,9 @@ final class RfedChannelClient: ObservableObject {
             )
             modelContext?.insert(optimisticEntity)
             try? modelContext?.save()
+            // A post sent from the channel moves it to the top of the chat list
+            // (James, 2026-11-03); one released from the queue did when it was typed.
+            prefs.markChannelActive(channel.id)
             appendMessage(
                 ChannelMessage(id: optimisticId, channelHash: channel.id,
                                senderHash: postingHex,
@@ -1457,6 +1471,13 @@ final class RfedChannelClient: ObservableObject {
                       deliveryState: deliveryState)
         appendMessage(msg, toChannelHash: channelHashHex)
         updateChannelLastMessage(channelHashHex: channelHashHex, postMs: tsMs)
+        // A post that came in while the channel was open, one it loaded on
+        // opening included, moves it to the top of the chat list; one that
+        // came in while it was not open leaves it in its place (James,
+        // 2026-11-03).
+        if NotificationManager.shared.activeChatId?.lowercased() == channelHashHex.lowercased() {
+            prefs.markChannelActive(channelHashHex)
+        }
 
         if notify, !isOutgoing, let channel = channels.first(where: { $0.id == channelHashHex }),
            UserPreferences.shared.isChannelNotificationsEnabled(channelHashHex) {

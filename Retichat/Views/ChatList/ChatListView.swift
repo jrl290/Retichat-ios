@@ -21,13 +21,11 @@ private enum ListEntry: Identifiable {
     }
 
     /// Sort key for the unified chat list.  DM/group chats sort by their
-    /// real `lastMessageTime`.  Channels sort by the user's own "last
-    /// opened" timestamp so incoming channel traffic does not keep
-    /// bouncing them to the top of the list — they only bubble up when
-    /// the user actively opens them.  Channels that have never been
-    /// opened on this device fall back to `lastMessageTime` so they
-    /// still take a sensible time-based slot interleaved with chats
-    /// instead of clumping at the bottom at timestamp 0.
+    /// real `lastMessageTime`.  A channel sorts by when it was last active:
+    /// a post sent from it, or one that came in while it was open
+    /// (UserPreferences.channelLastActive, James 2026-11-03), so opening
+    /// it with nothing new, or posts that come in while it is not open,
+    /// leave it in its place.  Its row still shows its newest post's time.
     ///
     /// All timestamps are seconds (Apple epoch) so chats and channels
     /// sort directly against each other.
@@ -36,8 +34,8 @@ private enum ListEntry: Identifiable {
         case .chat(let c):
             return c.lastMessageTime
         case .channel(let ch):
-            let opened = UserPreferences.shared.channelLastOpenedTime(ch.id)
-            return opened > 0 ? opened : ch.lastMessageTime
+            return ChannelActivity.sortTime(UserPreferences.shared.channelLastActive,
+                                            channelId: ch.id, lastMessageTime: ch.lastMessageTime)
         }
     }
 }
@@ -231,7 +229,6 @@ struct ChatListView: View {
                                     .onTapGesture {
                                         selectedChatId = nil
                                         selectedChannel = channel
-                                        UserPreferences.shared.markChannelOpened(channel.id)
                                     }
                                     .swipeActions(edge: .trailing) {
                                         Button(role: .destructive) {
