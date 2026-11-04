@@ -433,6 +433,16 @@ final class LxmfClient: @unchecked Sendable {
         }
     }
 
+    /// How fast the route to a destination is, from the round trip its link
+    /// measured as it came up: 0 = not measured yet, 1 = fast, 2 = slow
+    /// (over a second), -1 = error.
+    nonisolated func appLinkRouteSpeed(_ destHash: Data) -> Int32 {
+        destHash.withUnsafeBytes { buf -> Int32 in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_app_link_route_speed(p, UInt32(destHash.count))
+        }
+    }
+
     /// Trigger one explicit re-open cycle for an existing app link.
     @discardableResult
     nonisolated func appLinkReopen(_ destHash: Data) -> Bool {
@@ -603,6 +613,8 @@ final class LxmfClient: @unchecked Sendable {
     /// For outbound request flows, callers should `appLinkOpenPersistent`
     /// the destination and confirm `appLinkStatus(destHash) == 3` (ACTIVE)
     /// before calling.
+    /// A `timeoutSecs` of 0 sets no deadline: the request ends with its
+    /// answer, its own failure or the link closing (a slow route).
     /// Returns response bytes, or `nil` on timeout / failure / error.
     nonisolated func appLinkRequestAsync(destHash: Data, path: String,
                                          payload: Data,

@@ -34,9 +34,30 @@ let _appLinkStatusTrampoline: lxmf_app_link_status_callback_t = {
     guard let destPtr = destPtr, destLen > 0 else { return }
     let bytes = UnsafeBufferPointer(start: destPtr, count: Int(destLen))
     let hex = Data(bytes).hexString
+    // Counted here, in event order, so a slow-route request waiting its
+    // turn sees the link went down.
+    if status == 4 { AppLinkDowns.shared.note(hex) }
     Task { @MainActor in
         ConnectionStateManager.shared._appLinkStatusChanged(
             destHashHex: hex, status: status)
+    }
+}
+
+/// Times each node's link went down, counted on the link-actor thread as
+/// each event arrives (`ConnectionStateManager.slowRouteSend`).
+nonisolated final class AppLinkDowns: @unchecked Sendable {
+    static let shared = AppLinkDowns()
+    private let lock = NSLock()
+    private var counts: [String: UInt64] = [:]
+
+    func note(_ hex: String) {
+        lock.lock(); defer { lock.unlock() }
+        counts[hex, default: 0] += 1
+    }
+
+    func count(_ hex: String) -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return counts[hex] ?? 0
     }
 }
 
@@ -101,6 +122,13 @@ final class ConnectionStateManager {
     /// hex. Fired when requestEssentialPaths observes that both path and
     /// identity are available for a watched infrastructure destination.
     private var essentialReadyHandlers: [String: () -> Void] = [:]
+
+    /// A slow route's requests (`slowRouteSend`): whose turn it is per node,
+    /// those waiting theirs in order, and the waits woken by any status
+    /// event of that node's link.
+    private var slowRouteTurnHeld: Set<String> = []
+    private var slowRouteTurnWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var appLinkStatusWakers: [String: [CheckedContinuation<Void, Never>]] = [:]
 
     private init() {}
 
@@ -204,6 +232,9 @@ final class ConnectionStateManager {
     fileprivate func _appLinkStatusChanged(destHashHex: String, status: UInt8) {
         if let handler = appLinkStatusHandlers[destHashHex] {
             handler(status)
+        }
+        if let wakers = appLinkStatusWakers.removeValue(forKey: destHashHex) {
+            wakers.forEach { $0.resume() }
         }
     }
 
@@ -311,7 +342,8 @@ final class ConnectionStateManager {
     ///
     /// Returns the response bytes from the request, or `nil` if the link
     /// did not reach ACTIVE inside the 5 s budget or the request itself
-    /// failed/timed out.
+    /// failed/timed out.  A held link on a route that isn't known to be fast
+    /// goes to `slowRouteSend` instead.
     func appLinkSend(destHash: Data,
                      app: String,
                      aspects: String,
@@ -335,6 +367,10 @@ final class ConnectionStateManager {
 
         let normalizedAspects = normalizedAspectSegments(app: app, aspects: aspects)
         let usePersistentLink = prefersPersistentAppLink(app: app, aspects: normalizedAspects)
+        if usePersistentLink && client.appLinkRouteSpeed(destHash) != 1 {
+            return await slowRouteSend(client: client, destHash: destHash, app: app,
+                                       aspects: normalizedAspects, path: path, payload: payload)
+        }
 
         switch requestOpenMode(
             usePersistentLink: usePersistentLink,
@@ -380,6 +416,83 @@ final class ConnectionStateManager {
             destHash: destHash, path: path,
             payload: payload, timeoutSecs: 5.0
         )
+    }
+
+    /// A request to RFed over a slow route.  James, 2026-11-04: "The point of
+    /// the ping is to understand whether we're on a fast connection or slow";
+    /// a route is slow when its link's round trip was over a second
+    /// (`AppLinks::route_speed`), and one not measured yet counts as slow.
+    /// Over LoRa, airtime alone can pass 5 s (James, 2026-11-03), so no clock
+    /// of ours cuts anything off here: the link comes up or fails by its own
+    /// events, and the request ends with its answer, its own failure (scaled
+    /// by Reticulum to the link's round trip) or the link closing.
+    /// DESIGN_PRINCIPLES.md §1, "LoRa connections".
+    ///
+    /// Requests take turns, one at a time per node, so a burst can't flood
+    /// the route.  One still waiting its turn when the link goes down fails
+    /// with it; the next request opens a fresh link.
+    private func slowRouteSend(client: LxmfClient,
+                               destHash: Data,
+                               app: String,
+                               aspects: [String],
+                               path: String,
+                               payload: Data) async -> Data? {
+        let key = destHash.hexString
+        let downsBefore = AppLinkDowns.shared.count(key)
+        await takeSlowRouteTurn(key)
+        defer { passSlowRouteTurn(key) }
+        guard AppLinkDowns.shared.count(key) == downsBefore else {
+            print("[ConnState] slow route to \(key.prefix(8)): link went down while \(path) waited its turn")
+            return nil
+        }
+        client.appLinkOpenPersistent(destHash, app: app, aspects: aspects)
+        guard await awaitAppLinkSettled(client: client, destHash: destHash) else { return nil }
+        return await client.appLinkRequestAsync(
+            destHash: destHash, path: path,
+            payload: payload, timeoutSecs: 0
+        )
+    }
+
+    private func takeSlowRouteTurn(_ key: String) async {
+        guard slowRouteTurnHeld.contains(key) else {
+            slowRouteTurnHeld.insert(key)
+            return
+        }
+        // Handed the turn by passSlowRouteTurn, still held.
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            slowRouteTurnWaiters[key, default: []].append(cont)
+        }
+    }
+
+    private func passSlowRouteTurn(_ key: String) {
+        guard var waiters = slowRouteTurnWaiters[key], !waiters.isEmpty else {
+            slowRouteTurnHeld.remove(key)
+            return
+        }
+        let next = waiters.removeFirst()
+        slowRouteTurnWaiters[key] = waiters.isEmpty ? nil : waiters
+        next.resume()
+    }
+
+    /// Suspend until the held link to `destHash` is settled by its own
+    /// events: true once ACTIVE, false once it is down (DISCONNECTED, NONE).
+    /// No deadline of ours (`slowRouteSend`).  The status read and the wait's
+    /// registration both run on the main actor, as status events do, so no
+    /// event can slip between them.
+    private func awaitAppLinkSettled(client: LxmfClient, destHash: Data) async -> Bool {
+        let key = destHash.hexString
+        while true {
+            switch client.appLinkStatus(destHash) {
+            case 3:
+                return true
+            case 1, 2:
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    appLinkStatusWakers[key, default: []].append(cont)
+                }
+            default:
+                return false
+            }
+        }
     }
 
     /// Prime an APP_LINK destination using its preferred ownership mode so

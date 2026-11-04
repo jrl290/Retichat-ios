@@ -410,6 +410,8 @@ uint8_t *lxmf_app_link_request(uint64_t client,
 /// Issues a request on the existing app-link to `dest_hash` and fires
 /// `callback(context, bytes, bytes_len, status)` exactly once when the
 /// response arrives, the request fails, or `timeout_secs` elapses.
+/// A `timeout_secs` of 0 or less sets no deadline of the caller's: the
+/// request is decided by its own events alone (a slow route's request).
 ///
 /// Returns 0 on success (callback will fire), -1 on immediate error
 /// (callback will NOT fire; check `lxmf_last_error`).
@@ -425,6 +427,11 @@ int32_t lxmf_app_link_request_async(uint64_t client,
                                      double timeout_secs,
                                      lxmf_app_link_request_callback_t callback,
                                      void *context);
+
+/// How fast the route to `dest_hash` is, from the round trip its link
+/// measured as it came up: 0 = not measured yet, 1 = fast, 2 = slow (over
+/// a second).  Returns -1 on parameter error.
+int32_t lxmf_app_link_route_speed(const uint8_t *dest_hash, uint32_t dest_len);
 
 /// Non-blocking plain DATA send via an ephemeral APP_LINK.
 ///
