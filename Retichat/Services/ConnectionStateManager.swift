@@ -453,6 +453,17 @@ final class ConnectionStateManager {
         )
     }
 
+    /// The route to `destHash` as its link last measured it coming up:
+    /// 0 not measured, 1 fast, 2 slow (`AppLinks::route_speed`).
+    func appLinkRouteSpeed(destHash: Data) -> Int32 {
+        lxmfClient?.appLinkRouteSpeed(destHash) ?? 0
+    }
+
+    /// Whether no request holds or waits for a slow-route turn on `destHash`.
+    func slowRouteIdle(destHash: Data) -> Bool {
+        !slowRouteTurnHeld.contains(destHash.hexString)
+    }
+
     private func takeSlowRouteTurn(_ key: String) async {
         guard slowRouteTurnHeld.contains(key) else {
             slowRouteTurnHeld.insert(key)

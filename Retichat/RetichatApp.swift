@@ -102,7 +102,14 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 // The message's notification is posted under this id when
                 // it arrives (NotificationIds), whichever wake brought it.
                 let message = wake.message.map { String(NotificationIds.requestIdentifier(messageId: $0).prefix(16)) } ?? "-"
-                self.launchLog.notice("Mesh wake from RFed for message \(message, privacy: .public): collecting")
+                if let channel = wake.channel {
+                    // A channel with its push toggle on (RfedNotifyRegistrar):
+                    // its posts wait at RFed until pulled.
+                    let pulling = self.channelClient.pullAfterWake(channelHashHex: channel.hexString)
+                    self.launchLog.notice("Mesh wake from RFed for channel \(String(channel.hexString.prefix(8)), privacy: .public), message \(message, privacy: .public): \(pulling ? "pulling it" : "not a channel here", privacy: .public)")
+                } else {
+                    self.launchLog.notice("Mesh wake from RFed for message \(message, privacy: .public): collecting")
+                }
                 self.collectAfterWake(isActive: UIApplication.shared.applicationState == .active)
             }
         }

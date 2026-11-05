@@ -96,6 +96,31 @@ final class RfedNotifyRegistrar {
         "lxmf mesh relay=\(relayHex.prefix(8)) identity=\(identityHandle)"
     }
 
+    private static func meshChannelKey(_ channelHash: Data, relayHex: String, identityHandle: UInt64) -> String {
+        "channel \(channelHash.hexString.prefix(8)) mesh relay=\(relayHex.prefix(8)) identity=\(identityHandle)"
+    }
+
+    /// The mesh relay this run hosts and registered, nil when it hosts none.
+    @MainActor private var hostedMeshRelayHex: String?
+
+    /// Whether this run hosts its own wake address and owes or has delivered
+    /// its registration (RfedLink.holdsNoLink).
+    @MainActor var hostsMeshRelay: Bool { hostedMeshRelayHex != nil }
+
+    /// The channels whose push toggle is on, as 16-byte hashes.
+    private func pushEnabledChannels() -> [Data] {
+        prefs.channelPushEnabled.compactMap { Data(hexString: $0) }.filter { $0.count == 16 }
+    }
+
+    /// Owe the mesh relay's registration for one channel's wakes.
+    @MainActor
+    private func oweMeshChannel(_ channelHash: Data, relayHex: String, nodeHex: String, identityHandle: UInt64) {
+        guard let payload = buildSignedPayload(operation: "register", relayHex: relayHex,
+                                               channelHash: channelHash, identityHandle: identityHandle) else { return }
+        registrations(forNode: nodeHex)?.owe(
+            key: Self.meshChannelKey(channelHash, relayHex: relayHex, identityHandle: identityHandle), payload: payload)
+    }
+
     /// Register this device's own relay (`rfed.notify` under its identity)
     /// for its LXMF wakes, beside the push bridge's: RFed wakes every relay a
     /// device registered, so this one gets the wake over the mesh. Owed to
@@ -110,6 +135,14 @@ final class RfedNotifyRegistrar {
             return
         }
         registrations.owe(key: Self.meshKey(relayHex, identityHandle: identityHandle), payload: payload)
+        hostedMeshRelayHex = relayHex
+        // Channel wakes follow each channel's push toggle (James, 2026-11-05:
+        // a private channel is sometimes a group chat): a channel with push
+        // on wakes this relay too, so a phone reached only over the mesh,
+        // holding no link to RFed on a slow route, still hears of its posts.
+        for channelHash in pushEnabledChannels() {
+            oweMeshChannel(channelHash, relayHex: relayHex, nodeHex: node, identityHandle: identityHandle)
+        }
     }
 
     /// One per RFed node: the mesh relay's unregistration, owed like a
@@ -135,7 +168,25 @@ final class RfedNotifyRegistrar {
             })
         meshUnregistrations[node] = unregistrations
         unregistrations.owe(key: key, payload: payload)
+        hostedMeshRelayHex = nil
+        // Its channel registrations go too, owed the same way, apart from
+        // the one above whose proof forgets the relay.
+        let channelUnregistrations = meshChannelUnregistrations[node] ?? HeldLinkRegistrations(
+            destHash: dest, app: "rfed", aspects: ["link"],
+            ops: RfedLinkHeldOps(nodeHex: node, path: "/notify/unregister"))
+        meshChannelUnregistrations[node] = channelUnregistrations
+        for channelHash in pushEnabledChannels() {
+            let channelKey = Self.meshChannelKey(channelHash, relayHex: relayHex, identityHandle: identityHandle)
+            registrations(forNode: node)?.forget(key: channelKey)
+            if let channelPayload = buildSignedPayload(operation: "unregister", relayHex: relayHex,
+                                                       channelHash: channelHash, identityHandle: identityHandle) {
+                channelUnregistrations.owe(key: channelKey, payload: channelPayload)
+            }
+        }
     }
+
+    /// One per RFed node: the mesh relay's channel unregistrations.
+    @MainActor private var meshChannelUnregistrations: [String: HeldLinkRegistrations] = [:]
 
     /// `HeldLinkOps` that also runs `proved` when a send is proved.
     @MainActor
@@ -205,6 +256,10 @@ final class RfedNotifyRegistrar {
         let key = Self.channelKey(channelHash, relayHex: relayHex, identityHandle: identityHandle)
         Task { @MainActor in
             self.registrations(forNode: nodeHex)?.owe(key: key, payload: payload)
+            // The mesh relay too, while one is hosted (registerMeshRelay).
+            if let meshRelayHex = self.hostedMeshRelayHex {
+                self.oweMeshChannel(channelHash, relayHex: meshRelayHex, nodeHex: nodeHex, identityHandle: identityHandle)
+            }
         }
     }
 
@@ -223,6 +278,16 @@ final class RfedNotifyRegistrar {
             self.registrations(forNode: nodeHex)?.forget(key: key)
             if await self.unregisterOnce(nodeHex: nodeHex, payload: payload) {
                 print("[RfedNotify] Delivered channel deregister (channel=\(channelHash.hexString.prefix(8))…)")
+            }
+            // The mesh relay's registration for the channel, if it has one.
+            guard let meshRelayHex = self.prefs.meshWakeRelayHex,
+                  let meshPayload = self.buildSignedPayload(operation: "unregister", relayHex: meshRelayHex,
+                                                            channelHash: channelHash,
+                                                            identityHandle: identityHandle) else { return }
+            self.registrations(forNode: nodeHex)?.forget(
+                key: Self.meshChannelKey(channelHash, relayHex: meshRelayHex, identityHandle: identityHandle))
+            if await self.unregisterOnce(nodeHex: nodeHex, payload: meshPayload) {
+                print("[RfedNotify] Delivered the mesh relay's channel deregister (channel=\(channelHash.hexString.prefix(8))…)")
             }
         }
     }

@@ -207,12 +207,24 @@ func testStartUpSyncFollowsTheBinding() {
         check(open.contains("if response != nil {\n                self?.pollPropagationNode(force: true)"),
               "but not when the link gave no answer: the next link syncs")
 
-        guard let binder = sourceFragment(repository, start: "RfedLink.shared.setBinder(owner: \"propagation\")",
+        guard let binder = sourceFragment(repository, start: "RfedLink.shared.setBinder(owner: \"propagation\", forPushes: true)",
                                           end: "\n        }\n") else {
             check(false, "extracts the propagation binder")
             return
         }
         check(binder.contains("self.sendPropagationStreamOpen()"), "every fresh link is bound, so every fresh link syncs")
+
+        // James, 2026-11-05: over a slow route the device holds no link to
+        // RFed and is woken instead. A link it doesn't hold is not bound for
+        // pushes, so no sync follows it: wakes sync with force, and the
+        // casual cadence is six hours.
+        let link = try sourceFile(["Retichat", "Services", "RfedLink.swift"])
+        check(link.contains("where pushes || !pushBinders.contains(owner)"),
+              "a link the device doesn't hold skips the push binders")
+        check(repository.contains("? Self.wokenPollInterval : pollMinInterval"),
+              "woken over a slow route, the casual sync waits six hours")
+        check(repository.contains("private static let wokenPollInterval: TimeInterval = 6 * 60 * 60"),
+              "six hours")
     } catch {
         check(false, "reads ChatRepository source", String(describing: error))
     }

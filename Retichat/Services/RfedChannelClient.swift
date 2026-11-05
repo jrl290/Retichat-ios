@@ -242,6 +242,16 @@ final class RfedChannelClient: ObservableObject {
         return channels.first { Self.normalizedHex($0.id) == normalized }
     }
 
+    /// A channel wake over the mesh (MeshWake.swift): pull that channel's
+    /// waiting posts, queued until RFed operations can go. False when it is
+    /// not a channel this device has.
+    @discardableResult
+    func pullAfterWake(channelHashHex: String) -> Bool {
+        guard let channel = liveChannel(channelHashHex: channelHashHex) else { return false }
+        Task { _ = await self.pullDeferred(channel: channel) }
+        return true
+    }
+
     private func enqueuePendingPull(channel: Channel) {
         let normalized = Self.normalizedHex(channel.id)
         guard pendingPullChannelHashes.insert(normalized).inserted else { return }
@@ -1768,7 +1778,9 @@ final class RfedChannelClient: ObservableObject {
             // The stream is bound on rfed.link: RfedLink runs this client's
             // binder (sendChannelStreamConfigForNode) on every ACTIVE edge.
             trackedChannelStreamNodes.insert(nodeIdentityHashHex)
-            guard RfedLink.shared.ensure(nodeHex: nodeIdentityHashHex) != nil else { continue }
+            // Not opened just to be pushed to over a slow route (RfedLink.holdsNoLink).
+            guard !RfedLink.shared.holdsNoLink(nodeHex: nodeIdentityHashHex),
+                  RfedLink.shared.ensure(nodeHex: nodeIdentityHashHex) != nil else { continue }
             // Not up yet: the binder sends the filters on its ACTIVE edge.
             if RfedLink.shared.status(nodeHex: nodeIdentityHashHex) == 3 {
                 sendChannelStreamConfigForNode(nodeIdentityHashHex: nodeIdentityHashHex)
@@ -1784,7 +1796,7 @@ final class RfedChannelClient: ObservableObject {
         RfedLink.setPushHandler(path: RfedLink.pushDelivery) { [weak self] blob in
             self?.onRfedBlob(blob) ?? false
         }
-        RfedLink.shared.setBinder(owner: "channel") { [weak self] node in
+        RfedLink.shared.setBinder(owner: "channel", forPushes: true) { [weak self] node in
             guard let self, self.trackedChannelStreamNodes.contains(node) else { return }
             self.sendChannelStreamConfigForNode(nodeIdentityHashHex: node)
         }

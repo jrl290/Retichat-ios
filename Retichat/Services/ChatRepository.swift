@@ -127,6 +127,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// the throttle by passing `force: true`.
     private var lastPollTime: Date = .distantPast
     private let pollMinInterval: TimeInterval = 290  // ~5 min, slightly < timer
+    /// The casual cadence while RFed wakes this device over a slow route.
+    private static let wokenPollInterval: TimeInterval = 6 * 60 * 60
 
     /// Set to `true` whenever the system suspends us (background-task
     /// expiration fires) — sockets will be torn down by iOS while we're
@@ -926,7 +928,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         propagationStreamNode = identityHex
         installPropagationLinkHandlers()
 
-        guard RfedLink.shared.ensure(nodeHex: identityHex) != nil else { return }
+        // Not opened just to be pushed to over a slow route (RfedLink.holdsNoLink).
+        guard !RfedLink.shared.holdsNoLink(nodeHex: identityHex),
+              RfedLink.shared.ensure(nodeHex: identityHex) != nil else { return }
         if RfedLink.shared.status(nodeHex: identityHex) == 3 {
             sendPropagationStreamOpen()
         }
@@ -940,7 +944,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         RfedLink.setPushHandler(path: RfedLink.pushLxmf) { [weak self] data in
             self?.onLxmfPush(data) ?? false
         }
-        RfedLink.shared.setBinder(owner: "propagation") { [weak self] node in
+        RfedLink.shared.setBinder(owner: "propagation", forPushes: true) { [weak self] node in
             guard let self, node == self.propagationStreamNode else { return }
             self.sendPropagationStreamOpen()
         }
@@ -1208,7 +1212,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // any other casual caller all share the same minimum cadence so we
         // never spam the propagation node like the pre-2026-04 logs showed.
         let now = Date()
-        if !force, now.timeIntervalSince(lastPollTime) < pollMinInterval {
+        // Woken by RFed over a slow route (RfedLink.holdsNoLink), the casual
+        // cadence is six hours: the longest a message whose wake was lost on
+        // the radio waits, as on the T-Deck. Wakes poll with force.
+        let node = prefs.effectiveRfedNodeIdentityHash
+        let minInterval = !node.isEmpty && RfedLink.shared.holdsNoLink(nodeHex: node)
+            ? Self.wokenPollInterval : pollMinInterval
+        if !force, now.timeIntervalSince(lastPollTime) < minInterval {
             return
         }
         lastPollTime = now

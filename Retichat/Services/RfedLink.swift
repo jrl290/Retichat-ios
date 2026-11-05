@@ -22,6 +22,11 @@
 //  destination at creation). Pushes are bound per link: every ACTIVE edge
 //  runs the binders (the two stream opens) again.
 //
+//  Over a slow route the device holds no link (`holdsNoLink`, James
+//  2026-11-05: "for LoRa/Slow connections we can't maintain a link to
+//  RFed"): RFed wakes its own wake address instead of pushing, the link
+//  opens for requests only, and it closes once none waits.
+//
 
 import Foundation
 
@@ -45,6 +50,10 @@ final class RfedLink {
     /// on each ACTIVE edge: the channel stream and the propagation stream.
     private var binders: [String: (String) -> Void] = [:]
 
+    /// The binders that only ask the node to push (the stream opens), skipped
+    /// on a link this device doesn't hold.
+    private var pushBinders = Set<String>()
+
     /// Who takes each push (path → handler). Called on a link worker thread,
     /// which waits for the answer: true only when this device now holds the
     /// blob. Set by the services that hold what is pushed.
@@ -60,9 +69,11 @@ final class RfedLink {
         pushHandlers.set(path, handler)
     }
 
-    /// Run `bind(node)` on every ACTIVE edge of an rfed.link, as `owner`.
-    func setBinder(owner: String, _ bind: @escaping (String) -> Void) {
+    /// Run `bind(node)` on every ACTIVE edge of an rfed.link, as `owner`;
+    /// `forPushes` when all it does is ask the node to push on the link.
+    func setBinder(owner: String, forPushes: Bool = false, _ bind: @escaping (String) -> Void) {
         binders[owner] = bind
+        if forPushes { pushBinders.insert(owner) } else { pushBinders.remove(owner) }
     }
 
     /// Follow `nodeHex`'s rfed.link status as `owner` (one handler per
@@ -127,8 +138,30 @@ final class RfedLink {
     /// when the link or the request failed inside the 5 s budget.
     func request(nodeHex: String, path: String, payload: Data) async -> Data? {
         guard let dest = ensure(nodeHex: nodeHex) else { return nil }
-        return await ConnectionStateManager.shared.appLinkSend(
+        let answer = await ConnectionStateManager.shared.appLinkSend(
             destHash: dest, app: "rfed", aspects: ["link"], path: path, payload: payload)
+        closeIfIdle(nodeHex: nodeHex, dest: dest)
+        return answer
+    }
+
+    /// Whether this device holds no link to `nodeHex`: its route was measured
+    /// slow (ConnectionStateManager.slowRouteSend) and it hosts its own wake
+    /// address (MeshWake.swift), so RFed wakes it when something waits. Then
+    /// nothing opens the link just to be pushed to.
+    func holdsNoLink(nodeHex: String) -> Bool {
+        guard let dest = Self.destHash(nodeHex: nodeHex) else { return false }
+        return ConnectionStateManager.shared.appLinkRouteSpeed(destHash: dest) == 2
+            && RfedNotifyRegistrar.shared.hostsMeshRelay
+    }
+
+    /// After a request: a link this device doesn't hold closes once no other
+    /// request waits its turn on it.
+    private func closeIfIdle(nodeHex: String, dest: Data) {
+        let csm = ConnectionStateManager.shared
+        guard holdsNoLink(nodeHex: nodeHex), csm.slowRouteIdle(destHash: dest),
+              csm.appLinkStatus(destHash: dest) != 0 else { return }
+        print("[RfedLink] \(nodeHex.prefix(8)): slow route, no request waiting: link closed; RFed wakes this device")
+        csm.closeAppLink(destHash: dest)
     }
 
     /// The stack stopped: the next stack sets every link up again. The
@@ -142,8 +175,9 @@ final class RfedLink {
         for handler in Array((statusListeners[node] ?? [:]).values) { handler(status) }
         guard status == 3 else { return }
         // A fresh link: bind it for channel and LXMF pushes (Link.md "The
-        // client re-binds on every link").
-        for bind in Array(binders.values) { bind(node) }
+        // client re-binds on every link"), unless it closes after its requests.
+        let pushes = !holdsNoLink(nodeHex: node)
+        for (owner, bind) in Array(binders) where pushes || !pushBinders.contains(owner) { bind(node) }
     }
 
     /// A push from the node. True only when this device now holds the blob;
