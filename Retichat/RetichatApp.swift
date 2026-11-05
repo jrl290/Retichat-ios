@@ -53,6 +53,10 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
     /// Channel client — shared across the app.
     let channelClient = RfedChannelClient()
 
+    /// What RFed holds, collected in order: wakes over the mesh, links this
+    /// device doesn't hold, and the 6-hour check over a slow route.
+    private lazy var collector = RfedCollect(repository: repository, channelClient: channelClient)
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
@@ -84,9 +88,15 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 self.beginBackgroundExecution(repository: self.repository)
             }
         }
+        // Over a slow route a link opened for requests, and the 6-hour
+        // check, collect what RFed holds, in order (RfedCollect).
+        RfedLink.shared.setCollector { [weak self] _ in
+            self?.collector.request(why: "rfed.link opened", linkOpened: true)
+        }
+        repository.collectAll = { [weak self] why in self?.collector.request(why: why) }
         // A wake RFed sent to this device's own relay over the mesh
-        // (MeshWake.swift): handled as a push is, so a suspended app reached
-        // only by Bluetooth collects its messages too.
+        // (MeshWake.swift): it collects what RFed holds, in order, so a
+        // suspended app reached only by Bluetooth collects its messages too.
         NotificationCenter.default.addObserver(forName: MeshWake.received, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
                 guard let self else { return }
@@ -105,12 +115,17 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
                 if let channel = wake.channel {
                     // A channel with its push toggle on (RfedNotifyRegistrar):
                     // its posts wait at RFed until pulled.
-                    let pulling = self.channelClient.pullAfterWake(channelHashHex: channel.hexString)
-                    self.launchLog.notice("Mesh wake from RFed for channel \(String(channel.hexString.prefix(8)), privacy: .public), message \(message, privacy: .public): \(pulling ? "pulling it" : "not a channel here", privacy: .public)")
+                    let channelHex = String(channel.hexString.prefix(8))
+                    guard self.channelClient.hasChannel(channelHashHex: channel.hexString) else {
+                        self.launchLog.notice("Mesh wake from RFed for channel \(channelHex, privacy: .public), not a channel here: ignored")
+                        return
+                    }
+                    self.launchLog.notice("Mesh wake from RFed for channel \(channelHex, privacy: .public), message \(message, privacy: .public): collecting")
+                    self.collector.request(why: "a wake for channel \(channelHex)")
                 } else {
                     self.launchLog.notice("Mesh wake from RFed for message \(message, privacy: .public): collecting")
+                    self.collector.request(why: "a wake for message \(message)")
                 }
-                self.collectAfterWake(isActive: UIApplication.shared.applicationState == .active)
             }
         }
         if BluetoothRestoration.startsStackAtLaunch(savedRNode: repository.hasEnabledRNode,
@@ -198,8 +213,8 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         }
     }
 
-    /// A wake from RFed, through APNs or over the mesh (MeshWake.swift):
-    /// collect what it holds for this device.
+    /// A wake from RFed through APNs: collect what it holds for this device.
+    /// A wake over the mesh collects through RfedCollect.
     private func collectAfterWake(isActive: Bool) {
         if isActive {
             if repository.serviceRunning {

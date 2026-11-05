@@ -54,6 +54,9 @@ final class RfedLink {
     /// on a link this device doesn't hold.
     private var pushBinders = Set<String>()
 
+    /// What a fresh link this device doesn't hold runs (`setCollector`).
+    private var collector: ((String) -> Void)?
+
     /// Runs of requests (`holding`) under way on each node: hex → how many.
     private var runs: [String: Int] = [:]
 
@@ -77,6 +80,12 @@ final class RfedLink {
     func setBinder(owner: String, forPushes: Bool = false, _ bind: @escaping (String) -> Void) {
         binders[owner] = bind
         if forPushes { pushBinders.insert(owner) } else { pushBinders.remove(owner) }
+    }
+
+    /// Run `collect(node)` on each fresh link this device doesn't hold
+    /// (`holdsNoLink`), after the binders: RfedCollect, set by the app.
+    func setCollector(_ collect: @escaping (String) -> Void) {
+        collector = collect
     }
 
     /// Follow `nodeHex`'s rfed.link status as `owner` (one handler per
@@ -195,10 +204,25 @@ final class RfedLink {
     private func onStatus(node: String, status: UInt8) {
         for handler in Array((statusListeners[node] ?? [:]).values) { handler(status) }
         guard status == 3 else { return }
-        // A fresh link: bind it for channel and LXMF pushes (Link.md "The
-        // client re-binds on every link"), unless it closes after its requests.
+        // A fresh link: bind it for LXMF and channel pushes (Link.md "The
+        // client re-binds on every link"), in `bindOrder`. A link this device
+        // doesn't hold opened for requests and closes after them: what RFed
+        // holds is collected in order instead, the channels with push on
+        // only (RfedCollect).
         let pushes = !holdsNoLink(nodeHex: node)
-        for (owner, bind) in Array(binders) where pushes || !pushBinders.contains(owner) { bind(node) }
+        for owner in Self.bindOrder(Array(binders.keys)) where pushes || !pushBinders.contains(owner) {
+            binders[owner]?(node)
+        }
+        if !pushes { collector?(node) }
+    }
+
+    /// The order binders run in on a fresh link: the posts that waited for
+    /// it, then the propagation stream with its pull of the distro queue,
+    /// then the channel stream (James, 2026-11-05: "distro and propagation
+    /// should be first"); any other after them, by name.
+    nonisolated static func bindOrder(_ owners: [String]) -> [String] {
+        let first = ["channel-queue", "propagation", "channel"]
+        return owners.sorted { (first.firstIndex(of: $0) ?? first.count, $0) < (first.firstIndex(of: $1) ?? first.count, $1) }
     }
 
     /// A push from the node. True only when this device now holds the blob;

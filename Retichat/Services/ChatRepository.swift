@@ -130,6 +130,17 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// The casual cadence while RFed wakes this device over a slow route.
     private static let wokenPollInterval: TimeInterval = 6 * 60 * 60
 
+    /// How long `syncPropagationNode` waits over a fast route (Android
+    /// PropagationSync.DEADLINE_MS), and the transfer states it ends on
+    /// (LXMF's PR_COMPLETE, and PR_NO_PATH and above, the failures).
+    private static let syncDeadline: TimeInterval = 20
+    private static let propagationComplete: Int32 = 0x07
+    private static let propagationFailed: Int32 = 0xF0
+
+    /// Set by the app: RfedCollect's collection, run by the 6-hour check over
+    /// a slow route instead of a propagation sync alone.
+    var collectAll: ((String) -> Void)?
+
     /// Set to `true` whenever the system suspends us (background-task
     /// expiration fires) — sockets will be torn down by iOS while we're
     /// suspended, so the next foreground transition needs a fresh PSYNC.
@@ -1216,41 +1227,98 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // cadence is six hours: the longest a message whose wake was lost on
         // the radio waits, as on the T-Deck. Wakes poll with force.
         let node = prefs.effectiveRfedNodeIdentityHash
-        let minInterval = !node.isEmpty && RfedLink.shared.holdsNoLink(nodeHex: node)
-            ? Self.wokenPollInterval : pollMinInterval
+        let woken = !node.isEmpty && RfedLink.shared.holdsNoLink(nodeHex: node)
+        let minInterval = woken ? Self.wokenPollInterval : pollMinInterval
         if !force, now.timeIntervalSince(lastPollTime) < minInterval {
             return
         }
         lastPollTime = now
 
-        propManager.setUserConfiguredNode(prefs.effectiveLxmfPropagationHash)
+        // Over a slow route the 6-hour check collects all RFed holds, in
+        // order: the distro queue, propagation, the channels with push on.
+        if woken, !force, let collectAll {
+            collectAll("the 6-hour check")
+            return
+        }
 
-        if let nodeHash = propManager.currentNode() {
-            _ = client.setPropagationNode(nodeHash: nodeHash)
-
-            // PSYNC link establishment needs the propagation node's identity
-            // (public key), not just a cached path. On cold start the path
-            // table loads from disk while known-destinations is empty until
-            // an announce arrives. Kick a path request if identity is
-            // missing — PATH_RESPONSE is an announce and will populate the
-            // known-destinations table on receipt. The next poll cycle then
-            // succeeds. See DESIGN_PRINCIPLES.md §1: no retries here, the
-            // existing periodic poll IS the retry cadence.
-            let bridge = RetichatBridge.shared
-            if !bridge.transportIdentityKnown(destHash: nodeHash) {
-                _ = bridge.transportRequestPath(destHash: nodeHash)
-                print("[Retichat] pollPropagationNode: requested path for \(nodeHash.hexString.prefix(8)) (identity not yet known) — skipping this cycle")
-                return
-            }
-            ffiQueue.async { [weak self] in
-                let ok = client.sync(nodeHash: nodeHash)
-                if !ok {
-                    Task { @MainActor [weak self] in
-                        self?.propManager.rotateToNext()
-                    }
+        guard let nodeHash = propagationNodeForSync(client) else { return }
+        ffiQueue.async { [weak self] in
+            let ok = client.sync(nodeHash: nodeHash)
+            if !ok {
+                Task { @MainActor [weak self] in
+                    self?.propManager.rotateToNext()
                 }
             }
         }
+    }
+
+    /// One sync with the propagation node, awaited to its end, as Android's
+    /// PropagationSync.runOnce: complete, failed, or, over a fast route, after
+    /// 20 s. Over a slow route there is no deadline of ours: the link and the
+    /// transfer end by themselves (DESIGN_PRINCIPLES.md §1, "LoRa
+    /// connections"). RfedCollect's step between the distro queue and the
+    /// channels. True when the transfer completed.
+    func syncPropagationNode() async -> Bool {
+        guard let client = lxmfClient else { return false }
+        lastPollTime = Date()
+        guard let nodeHash = propagationNodeForSync(client) else { return false }
+        let queue = ffiQueue
+        let started = await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+            queue.async { done.resume(returning: client.sync(nodeHash: nodeHash)) }
+        }
+        guard started else {
+            propManager.rotateToNext()
+            return false
+        }
+        // The propagation node's own route is measured only once its link
+        // is up, so RFed's, on the same radio, counts too (staging,
+        // 2026-11-05: unmeasured, Android's sync was cut at 20 s over LoRa).
+        let csm = ConnectionStateManager.shared
+        let slow = csm.appLinkRouteSpeed(destHash: nodeHash) == 2
+            || RfedLink.destHash(nodeHex: prefs.effectiveRfedNodeIdentityHash)
+                .map { csm.appLinkRouteSpeed(destHash: $0) == 2 } ?? false
+        let deadline = Date().addingTimeInterval(Self.syncDeadline)
+        var last: Int32 = -1
+        while slow || Date() < deadline {
+            let state = await withCheckedContinuation { (done: CheckedContinuation<Int32, Never>) in
+                queue.async { done.resume(returning: client.propagationState) }
+            }
+            if state != last {
+                print("[Retichat] propagation sync: state 0x\(String(format: "%02X", state))")
+                last = state
+            }
+            if state == Self.propagationComplete { return true }
+            if state < 0 || state >= Self.propagationFailed { return false }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        print("[Retichat] propagation sync: not done after \(Int(Self.syncDeadline)) s; the collection goes on")
+        return false
+    }
+
+    /// The propagation node to sync with, set on the client. Nil when there
+    /// is none, or when its identity is not known yet: a path request goes
+    /// out instead.
+    private func propagationNodeForSync(_ client: LxmfClient) -> Data? {
+        propManager.setUserConfiguredNode(prefs.effectiveLxmfPropagationHash)
+
+        guard let nodeHash = propManager.currentNode() else { return nil }
+        _ = client.setPropagationNode(nodeHash: nodeHash)
+
+        // PSYNC link establishment needs the propagation node's identity
+        // (public key), not just a cached path. On cold start the path
+        // table loads from disk while known-destinations is empty until
+        // an announce arrives. Kick a path request if identity is
+        // missing — PATH_RESPONSE is an announce and will populate the
+        // known-destinations table on receipt. The next poll cycle then
+        // succeeds. See DESIGN_PRINCIPLES.md §1: no retries here, the
+        // existing periodic poll IS the retry cadence.
+        let bridge = RetichatBridge.shared
+        if !bridge.transportIdentityKnown(destHash: nodeHash) {
+            _ = bridge.transportRequestPath(destHash: nodeHash)
+            print("[Retichat] pollPropagationNode: requested path for \(nodeHash.hexString.prefix(8)) (identity not yet known) — skipping this cycle")
+            return nil
+        }
+        return nodeHash
     }
 
     // MARK: - Send message

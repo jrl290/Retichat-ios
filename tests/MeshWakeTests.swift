@@ -194,10 +194,20 @@ func testAppDelegate() {
     guard let app = sourceFile(["Retichat", "RetichatApp.swift"]) else { return }
     let launch = member(app, "didFinishLaunchingWithOptions launchOptions:")
     check(ordered(launch, ["forName: MeshWake.received", "MeshWake.parse(", "wake.receiver == self.repository.ownHash",
-                           "collectAfterWake("]),
-          "app: a mesh wake for this device collects, as a push does")
-    check(launch.contains("if let channel = wake.channel") && launch.contains("self.channelClient.pullAfterWake(channelHashHex:"),
-          "app: a channel wake pulls that channel")
+                           "if let channel = wake.channel", "self.channelClient.hasChannel(channelHashHex:",
+                           "not a channel here: ignored", "self.collector.request(why: \"a wake for channel",
+                           "self.collector.request(why: \"a wake for message"]),
+          "app: a mesh wake for this device collects in order, a channel wake for a channel here")
+    // James, 2026-11-05: "distro and propagation should be first", and "if a
+    // Channel is registered as a notify, it should be pulled".
+    guard let rfedCollect = sourceFile(["Retichat", "Services", "RfedCollect.swift"]) else { return }
+    check(ordered(member(rfedCollect, "private func collect(why:"),
+                  ["RfedLink.shared.holding(nodeHexes: [node])", "RfedDistroClient.shared.pull()",
+                   "repository.syncPropagationNode()", "channelClient.pullPushChannels()"]),
+          "collect: one run, the distro queue, then propagation, then the channels with push on")
+    check(launch.contains("RfedLink.shared.setCollector {") && launch.contains("linkOpened: true")
+              && launch.contains("repository.collectAll = {"),
+          "app: a link the device doesn't hold, and the 6-hour check, collect too")
     let push = member(app, "didReceiveRemoteNotification userInfo:")
     check(push.contains("self.collectAfterWake(isActive: isActive)"), "app: the push path shares it")
     let collect = member(app, "private func collectAfterWake(")

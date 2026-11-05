@@ -237,6 +237,24 @@ func testStartUpSyncFollowsTheBinding() {
               "woken over a slow route, the casual sync waits six hours")
         check(repository.contains("private static let wokenPollInterval: TimeInterval = 6 * 60 * 60"),
               "six hours")
+        // James, 2026-11-05: "distro and propagation should be first"; over
+        // a slow route the 6-hour check and each link the device opens
+        // collect in that order, the channels with push on last.
+        check(repository.contains("if woken, !force, let collectAll {\n            collectAll(\"the 6-hour check\")"),
+              "over a slow route the 6-hour check collects in order")
+        guard let sync = sourceFragment(repository, start: "func syncPropagationNode() async -> Bool {", end: "\n    }\n") else {
+            check(false, "extracts the awaited sync")
+            return
+        }
+        check(sync.contains("while slow || Date() < deadline {") && sync.contains("|| RfedLink.destHash(nodeHex: prefs.effectiveRfedNodeIdentityHash)") && sync.contains("if state == Self.propagationComplete { return true }")
+                  && sync.contains("if state < 0 || state >= Self.propagationFailed { return false }"),
+              "the collection's sync is awaited to its end, with no deadline of ours over a slow route")
+        check(link.contains("for owner in Self.bindOrder(Array(binders.keys)) where pushes || !pushBinders.contains(owner) {")
+                  && link.contains("if !pushes { collector?(node) }")
+                  && link.contains("let first = [\"channel-queue\", \"propagation\", \"channel\"]"),
+              "a fresh link binds the propagation stream before the channel stream, and one the device doesn't hold collects")
+        check(channels.contains("let pulling = channels.filter { $0.isSubscribed && push.contains(Self.normalizedHex($0.id)) }"),
+              "the collection pulls the channels with push on only")
     } catch {
         check(false, "reads ChatRepository source", String(describing: error))
     }

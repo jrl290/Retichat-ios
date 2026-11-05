@@ -242,15 +242,35 @@ final class RfedChannelClient: ObservableObject {
         return channels.first { Self.normalizedHex($0.id) == normalized }
     }
 
-    /// A channel wake over the mesh (MeshWake.swift): pull that channel's
-    /// waiting posts, queued until RFed operations can go. False when it is
-    /// not a channel this device has.
-    @discardableResult
-    func pullAfterWake(channelHashHex: String) -> Bool {
-        guard let channel = liveChannel(channelHashHex: channelHashHex) else { return false }
-        Task { _ = await self.pullDeferred(channel: channel) }
-        return true
+    /// Whether `channelHashHex` is a channel this device has.
+    func hasChannel(channelHashHex: String) -> Bool {
+        liveChannel(channelHashHex: channelHashHex) != nil
     }
+
+    /// Pull the channels with push on, the ones RFed wakes this device for
+    /// (RfedNotifyRegistrar), up to `pushPullPages` pages each, in one run on
+    /// their links: the last step of RfedCollect, over a slow route, where
+    /// the other channels wait until they are opened (Android
+    /// RfedChannelClient.pullPushChannels).
+    func pullPushChannels() async {
+        let push = Set(UserPreferences.shared.channelPushEnabled.map(Self.normalizedHex))
+        let pulling = channels.filter { $0.isSubscribed && push.contains(Self.normalizedHex($0.id)) }
+        guard !pulling.isEmpty else { return }
+        print("[RfedChannel] PULL of the channels with push on: \(pulling.count)")
+        await RfedLink.shared.holding(nodeHexes: pulling.map(\.rfedNodeHash)) {
+            for channel in pulling where pullInFlight[Self.normalizedHex(channel.id)] != true {
+                var pages = 0
+                while await pullDeferred(channel: channel) {
+                    pages += 1
+                    if pages >= Self.pushPullPages { break }
+                }
+            }
+        }
+    }
+
+    /// Pages `pullPushChannels` pulls per channel at most (Android
+    /// ACTIVE_EDGE_PULL_PAGES).
+    private static let pushPullPages = 8
 
     private func enqueuePendingPull(channel: Channel) {
         let normalized = Self.normalizedHex(channel.id)
