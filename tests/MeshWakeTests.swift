@@ -162,6 +162,16 @@ func testRegistrar() {
     check(unregister.contains("prefs.meshWakeRelayHex = nil"), "registrar: and forgotten once rfed proves it")
     check(member(registrar, "func deregisterFrom(").contains("prefs.meshWakeRelayHex"),
           "registrar: a node change unregisters the mesh relay from the old node too")
+    // James, 2026-11-05: channel wakes follow each channel's push toggle (a
+    // private channel is sometimes a group chat).
+    check(register.contains("for channelHash in pushEnabledChannels()") && register.contains("oweMeshChannel("),
+          "registrar: the relay is registered for every channel whose push toggle is on")
+    check(unregister.contains("for channelHash in pushEnabledChannels()") && unregister.contains("channelUnregistrations.owe("),
+          "registrar: and unregistered for them")
+    check(member(registrar, "func registerForChannel(").contains("self.oweMeshChannel("),
+          "registrar: a channel's push turned on registers the hosted relay for it")
+    check(member(registrar, "func deregisterForChannel(").contains("prefs.meshWakeRelayHex"),
+          "registrar: and turned off, unregisters it")
 }
 
 func testStack() {
@@ -186,6 +196,8 @@ func testAppDelegate() {
     check(ordered(launch, ["forName: MeshWake.received", "MeshWake.parse(", "wake.receiver == self.repository.ownHash",
                            "collectAfterWake("]),
           "app: a mesh wake for this device collects, as a push does")
+    check(launch.contains("if let channel = wake.channel") && launch.contains("self.channelClient.pullAfterWake(channelHashHex:"),
+          "app: a channel wake pulls that channel")
     let push = member(app, "didReceiveRemoteNotification userInfo:")
     check(push.contains("self.collectAfterWake(isActive: isActive)"), "app: the push path shares it")
     let collect = member(app, "private func collectAfterWake(")

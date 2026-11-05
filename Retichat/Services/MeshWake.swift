@@ -21,8 +21,9 @@
 //  Nearby RTNode switch on): over Wi-Fi or cellular a suspended app's
 //  sockets are down, so the wake could not arrive, and RFed would spend a
 //  packet, or a path request, on every wake for nothing. Registered for the
-//  device's LXMF wakes (direct messages and its distro); channel wakes stay
-//  with APNs for now.
+//  device's LXMF wakes (direct messages and its distro), and for the wakes
+//  of each channel whose push toggle is on (RfedNotifyRegistrar), which
+//  pull that channel.
 //
 //  Pure (no FFI, no UIKit), so tests/MeshWakeTests.swift can check it.
 //
