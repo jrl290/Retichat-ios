@@ -221,6 +221,18 @@ func testStartUpSyncFollowsTheBinding() {
         let link = try sourceFile(["Retichat", "Services", "RfedLink.swift"])
         check(link.contains("where pushes || !pushBinders.contains(owner)"),
               "a link the device doesn't hold skips the push binders")
+        // Staging, 2026-11-05: closed after each request, a run of channel
+        // pulls opened a link per pull over LoRa. A run holds it to its end.
+        check(link.contains("guard holdsNoLink(nodeHex: nodeHex), runs[nodeHex.lowercased()] == nil, csm.slowRouteIdle(destHash: dest),"),
+              "a link the device doesn't hold closes only when no run holds it and no request waits")
+        let held = try sourceFile(["Retichat", "Services", "ConnectionStateManager.swift"])
+        check(held.contains("await ops.inOneRun {\n                for entry in owed {"), "the sends owed at an ACTIVE edge are one run")
+        let distro = try sourceFile(["Retichat", "Services", "RfedDistroClient.swift"])
+        check(distro.contains("await RfedLink.shared.holding(nodeHexes: [rfedNode]) {\n            for round in 1...Self.pullRoundsMax {"),
+              "a distro pull's pages are one run")
+        let channels = try sourceFile(["Retichat", "Services", "RfedChannelClient.swift"])
+        check(channels.contains("await RfedLink.shared.holding(nodeHexes: toResub.map(\\.rfedNodeHash)) {\n                for channel in toResub {"),
+              "the re-subscribes at start are one run")
         check(repository.contains("? Self.wokenPollInterval : pollMinInterval"),
               "woken over a slow route, the casual sync waits six hours")
         check(repository.contains("private static let wokenPollInterval: TimeInterval = 6 * 60 * 60"),

@@ -108,7 +108,9 @@ check(client.contains("RfedLink.shared.setBinder(owner: \"channel-queue\") { [we
 let release = body("private func releaseQueuedPosts()")
 check(release.contains("sortBy: [SortDescriptor(\\.timestamp)]"), "oldest first")
 check(release.contains("if releasingQueuedPosts {\n            releaseQueuedPostsAgain = true"), "one release at a time; one asked for meanwhile runs after it")
-check(release.contains("state: DeliveryState.pending)\n                    await sendMessageAsync("), "each post is taken from the queue before it is sent")
+check(release.contains("state: DeliveryState.pending)\n                        await sendMessageAsync("), "each post is taken from the queue before it is sent")
+check(release.contains("await RfedLink.shared.holding(nodeHexes: channels.map(\\.rfedNodeHash)) {"),
+      "the release is one run: a link the device doesn't hold closes after it, not between posts")
 check(!release.contains("asyncAfter") && !release.contains("Task.sleep"), "no timer: each release follows a signal")
 
 // 4. A post an earlier process left sending.

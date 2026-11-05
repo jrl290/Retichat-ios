@@ -1056,6 +1056,12 @@ protocol HeldLinkOps: AnyObject {
     func close(_ destHash: Data)
     func setStatusHandler(_ destHash: Data, _ handler: @escaping (UInt8) -> Void)
     func sendData(_ destHash: Data, app: String, aspects: [String], payload: Data) async -> Bool
+    /// Run `run`, the sends owed at one ACTIVE edge, as one run (RfedLink.holding).
+    func inOneRun(_ run: () async -> Void) async
+}
+
+extension HeldLinkOps {
+    func inOneRun(_ run: () async -> Void) async { await run() }
 }
 
 /// Registrations owed to one destination (`apns.register`,
@@ -1124,13 +1130,15 @@ final class HeldLinkRegistrations {
         sending = true
         repeat {
             edgeWhileSending = false
-            for entry in owed {
-                if await ops.sendData(destHash, app: app, aspects: aspects, payload: entry.payload) {
-                    owed.removeAll { $0.key == entry.key }
-                    delivered.insert(entry.key)
-                    log("[HeldLinkReg] \(app).\(aspects.joined(separator: ".")): \(entry.key) delivered")
-                } else {
-                    log("[HeldLinkReg] \(app).\(aspects.joined(separator: ".")): \(entry.key) not proved; owed until the link is next established")
+            await ops.inOneRun {
+                for entry in owed {
+                    if await ops.sendData(destHash, app: app, aspects: aspects, payload: entry.payload) {
+                        owed.removeAll { $0.key == entry.key }
+                        delivered.insert(entry.key)
+                        log("[HeldLinkReg] \(app).\(aspects.joined(separator: ".")): \(entry.key) delivered")
+                    } else {
+                        log("[HeldLinkReg] \(app).\(aspects.joined(separator: ".")): \(entry.key) not proved; owed until the link is next established")
+                    }
                 }
             }
         } while edgeWhileSending && !owed.isEmpty

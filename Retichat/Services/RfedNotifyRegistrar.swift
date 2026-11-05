@@ -203,6 +203,7 @@ final class RfedNotifyRegistrar {
             if ok { proved() }
             return ok
         }
+        func inOneRun(_ run: () async -> Void) async { await ops.inOneRun(run) }
     }
 
     /// Best-effort deregistration from a previous rfed node: one signed

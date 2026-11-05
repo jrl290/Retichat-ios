@@ -54,6 +54,9 @@ final class RfedLink {
     /// on a link this device doesn't hold.
     private var pushBinders = Set<String>()
 
+    /// Runs of requests (`holding`) under way on each node: hex → how many.
+    private var runs: [String: Int] = [:]
+
     /// Who takes each push (path → handler). Called on a link worker thread,
     /// which waits for the answer: true only when this device now holds the
     /// blob. Set by the services that hold what is pushed.
@@ -154,11 +157,29 @@ final class RfedLink {
             && RfedNotifyRegistrar.shared.hostsMeshRelay
     }
 
-    /// After a request: a link this device doesn't hold closes once no other
-    /// request waits its turn on it.
+    /// Run `run`, a run of requests to `nodeHexes` sent one after another,
+    /// holding each node's link from one request to the next: a link this
+    /// device doesn't hold (`holdsNoLink`) closes when the run ends, not
+    /// between its requests (staging, 2026-11-05: closed after each channel
+    /// pull, every pull opened a link of its own over LoRa).
+    func holding<T>(nodeHexes: [String], _ run: () async -> T) async -> T {
+        let nodes = Set(nodeHexes.map { $0.lowercased() })
+        for node in nodes { runs[node, default: 0] += 1 }
+        defer {
+            for node in nodes {
+                let left = (runs[node] ?? 1) - 1
+                runs[node] = left > 0 ? left : nil
+                if let dest = Self.destHash(nodeHex: node) { closeIfIdle(nodeHex: node, dest: dest) }
+            }
+        }
+        return await run()
+    }
+
+    /// After a request or a run: a link this device doesn't hold closes once
+    /// no run holds it and no other request waits its turn on it.
     private func closeIfIdle(nodeHex: String, dest: Data) {
         let csm = ConnectionStateManager.shared
-        guard holdsNoLink(nodeHex: nodeHex), csm.slowRouteIdle(destHash: dest),
+        guard holdsNoLink(nodeHex: nodeHex), runs[nodeHex.lowercased()] == nil, csm.slowRouteIdle(destHash: dest),
               csm.appLinkStatus(destHash: dest) != 0 else { return }
         print("[RfedLink] \(nodeHex.prefix(8)): slow route, no request waiting: link closed; RFed wakes this device")
         csm.closeAppLink(destHash: dest)
@@ -237,5 +258,8 @@ final class RfedLinkHeldOps: HeldLinkOps {
     }
     func sendData(_ destHash: Data, app: String, aspects: [String], payload: Data) async -> Bool {
         await RfedLink.shared.request(nodeHex: nodeHex, path: path, payload: payload) == Data([0xc3])
+    }
+    func inOneRun(_ run: () async -> Void) async {
+        await RfedLink.shared.holding(nodeHexes: [nodeHex], run)
     }
 }

@@ -1012,20 +1012,22 @@ final class RfedChannelClient: ObservableObject {
                     sortBy: [SortDescriptor(\.timestamp)]
                 ))) ?? []
                 if !rows.isEmpty { print("[RfedChannel] SEND: releasing \(rows.count) queued post(s)") }
-                for row in rows {
-                    guard row.deliveryState == DeliveryState.queued else { continue }
-                    let (id, content, channelHash) = (row.id, row.content, row.channelHash)
-                    guard let channel = liveChannel(channelHashHex: channelHash) else {
-                        print("[RfedChannel] SEND: queued \(id) has no channel \(channelHash) — failed")
-                        markOptimisticFailed(optimisticId: id, channelHash: channelHash)
-                        continue
+                await RfedLink.shared.holding(nodeHexes: channels.map(\.rfedNodeHash)) {
+                    for row in rows {
+                        guard row.deliveryState == DeliveryState.queued else { continue }
+                        let (id, content, channelHash) = (row.id, row.content, row.channelHash)
+                        guard let channel = liveChannel(channelHashHex: channelHash) else {
+                            print("[RfedChannel] SEND: queued \(id) has no channel \(channelHash) — failed")
+                            markOptimisticFailed(optimisticId: id, channelHash: channelHash)
+                            continue
+                        }
+                        guard Self.linkUp(RfedLink.shared.status(nodeHex: channel.rfedNodeHash)) else {
+                            RfedLink.shared.ensure(nodeHex: channel.rfedNodeHash)
+                            continue
+                        }
+                        setOutgoingState(optimisticId: id, channelHash: channelHash, state: DeliveryState.pending)
+                        await sendMessageAsync(content: content, toChannel: channel, optimisticId: id)
                     }
-                    guard Self.linkUp(RfedLink.shared.status(nodeHex: channel.rfedNodeHash)) else {
-                        RfedLink.shared.ensure(nodeHex: channel.rfedNodeHash)
-                        continue
-                    }
-                    setOutgoingState(optimisticId: id, channelHash: channelHash, state: DeliveryState.pending)
-                    await sendMessageAsync(content: content, toChannel: channel, optimisticId: id)
                 }
             } while releaseQueuedPostsAgain
             releasingQueuedPosts = false
@@ -1733,32 +1735,34 @@ final class RfedChannelClient: ObservableObject {
         }
         print("[RfedChannel] Re-subscribing to \(toResub.count) persisted channel(s) after restart")
         Task {
-            for channel in toResub {
-                guard let channelHashData = Data(hexString: channel.id) else {
-                    print("[RfedChannel] Re-subscribe failed for \(channel.channelName): its stored channel hash is not hex")
-                    continue
-                }
-                do {
-                    let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
-                                                               rfedNodeIdentityHashHex: channel.rfedNodeHash)
-                    // Update in-memory stamp cost if the server returns a different value.
-                    if let idx = channels.firstIndex(where: { $0.id == channel.id }) {
-                        channels[idx] = Channel(id: channel.id, channelName: channel.channelName,
-                                                rfedNodeHash: channel.rfedNodeHash,
-                                                lastMessageTime: channel.lastMessageTime,
-                                                isSubscribed: true, stampCost: stampCost)
+            await RfedLink.shared.holding(nodeHexes: toResub.map(\.rfedNodeHash)) {
+                for channel in toResub {
+                    guard let channelHashData = Data(hexString: channel.id) else {
+                        print("[RfedChannel] Re-subscribe failed for \(channel.channelName): its stored channel hash is not hex")
+                        continue
                     }
-                    print("[RfedChannel] Re-subscribed to \(channel.channelName) (stampCost=\(stampCost.map { "\($0)" } ?? "nil"))")
-                    // Re-register per-channel notify so wakeups resume after app restart,
-                    // but only if the user has push enabled for this channel.
-                    if UserPreferences.shared.isChannelPushEnabled(channel.id) {
-                        RfedNotifyRegistrar.shared.registerForChannel(
-                            channelHash: channelHashData,
-                            nodeHex: prefs.effectiveRfedNodeIdentityHash,
-                            identityHandle: identityHandle)
+                    do {
+                        let stampCost = try await subscribeOnServer(channelHashData: channelHashData,
+                                                                   rfedNodeIdentityHashHex: channel.rfedNodeHash)
+                        // Update in-memory stamp cost if the server returns a different value.
+                        if let idx = channels.firstIndex(where: { $0.id == channel.id }) {
+                            channels[idx] = Channel(id: channel.id, channelName: channel.channelName,
+                                                    rfedNodeHash: channel.rfedNodeHash,
+                                                    lastMessageTime: channel.lastMessageTime,
+                                                    isSubscribed: true, stampCost: stampCost)
+                        }
+                        print("[RfedChannel] Re-subscribed to \(channel.channelName) (stampCost=\(stampCost.map { "\($0)" } ?? "nil"))")
+                        // Re-register per-channel notify so wakeups resume after app restart,
+                        // but only if the user has push enabled for this channel.
+                        if UserPreferences.shared.isChannelPushEnabled(channel.id) {
+                            RfedNotifyRegistrar.shared.registerForChannel(
+                                channelHash: channelHashData,
+                                nodeHex: prefs.effectiveRfedNodeIdentityHash,
+                                identityHandle: identityHandle)
+                        }
+                    } catch {
+                        print("[RfedChannel] Re-subscribe failed for \(channel.channelName): \(error)")
                     }
-                } catch {
-                    print("[RfedChannel] Re-subscribe failed for \(channel.channelName): \(error)")
                 }
             }
             await MainActor.run {

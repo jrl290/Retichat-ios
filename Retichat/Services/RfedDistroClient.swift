@@ -701,52 +701,55 @@ final class RfedDistroClient: ObservableObject {
         var total = 0
         var unfinished: String?
         var more = false
-        for round in 1...Self.pullRoundsMax {
-            guard isCurrent(k) else {
-                // Said, never silent: until 2026-10-10 a superseded pull broke off without a word.
-                unfinished = "cancelled: the stack stopped or the distro changed before round \(round)"
-                print("[Distro] pull \(unfinished ?? "")")
-                break
+        // One run: a link this device doesn't hold stays up from page to page.
+        await RfedLink.shared.holding(nodeHexes: [rfedNode]) {
+            for round in 1...Self.pullRoundsMax {
+                guard isCurrent(k) else {
+                    // Said, never silent: until 2026-10-10 a superseded pull broke off without a word.
+                    unfinished = "cancelled: the stack stopped or the distro changed before round \(round)"
+                    print("[Distro] pull \(unfinished ?? "")")
+                    break
+                }
+                let resp = await RfedLink.shared.request(nodeHex: rfedNode, path: "/distro/pull",
+                                                         payload: DistroCodec.msgpackNil)
+                guard isCurrent(k) else {
+                    // A stop (Settings, the stack's restart), a forget or an adopt while
+                    // the round waited: cancelled by it, not failed (the truth rule), and
+                    // what came back is not used, as before; now it is said.
+                    let what = resp.map { "its answer (\($0.count) bytes) is not used" } ?? "no answer had come"
+                    unfinished = "cancelled: the stack stopped or the distro changed while round \(round) waited for RFed"
+                    print("[Distro] pull round \(round): \(unfinished ?? ""); \(what)")
+                    break
+                }
+                guard let resp else {
+                    // No answer, which is not "link not reachable" when the link was up
+                    // and the request went unanswered (until 2026-10-10 it said that).
+                    unfinished = "no answer from RFed (no link inside 5 s, or the request went unanswered)"
+                    status.lastError = "RFed pull: no answer"
+                    print("[Distro] pull round \(round): \(unfinished ?? "")")
+                    break
+                }
+                if let code = DistroCodec.pullErrorCode(resp) {
+                    status.lastError = String(format: "RFed pull refused (0x%02X)", code)
+                    unfinished = String(format: "refused (0x%02X)", code)
+                    print("[Distro] pull round \(round): \(status.lastError ?? "")")
+                    break
+                }
+                guard let decoded = RfedChannelClient.decodePullResponse(resp) else {
+                    status.lastError = "RFed pull: malformed response"
+                    unfinished = "malformed response (\(resp.count) bytes)"
+                    print("[Distro] pull round \(round): malformed response (\(resp.count) bytes)")
+                    break
+                }
+                print("[Distro] pull round \(round): sent c0, got \(decoded.pairs.count) blob(s), more=\(decoded.morePending)")
+                // The pair's first element is the distro hash; the blob itself
+                // already starts with it (dest(16)|encrypted).
+                for pair in decoded.pairs { Self.ingestBlob(pair.1) }
+                total += decoded.pairs.count
+                more = decoded.morePending
+                if status.lastError?.hasPrefix("RFed pull") == true { status.lastError = nil }
+                if !decoded.morePending { break }
             }
-            let resp = await RfedLink.shared.request(nodeHex: rfedNode, path: "/distro/pull",
-                                                     payload: DistroCodec.msgpackNil)
-            guard isCurrent(k) else {
-                // A stop (Settings, the stack's restart), a forget or an adopt while
-                // the round waited: cancelled by it, not failed (the truth rule), and
-                // what came back is not used, as before; now it is said.
-                let what = resp.map { "its answer (\($0.count) bytes) is not used" } ?? "no answer had come"
-                unfinished = "cancelled: the stack stopped or the distro changed while round \(round) waited for RFed"
-                print("[Distro] pull round \(round): \(unfinished ?? ""); \(what)")
-                break
-            }
-            guard let resp else {
-                // No answer, which is not "link not reachable" when the link was up
-                // and the request went unanswered (until 2026-10-10 it said that).
-                unfinished = "no answer from RFed (no link inside 5 s, or the request went unanswered)"
-                status.lastError = "RFed pull: no answer"
-                print("[Distro] pull round \(round): \(unfinished ?? "")")
-                break
-            }
-            if let code = DistroCodec.pullErrorCode(resp) {
-                status.lastError = String(format: "RFed pull refused (0x%02X)", code)
-                unfinished = String(format: "refused (0x%02X)", code)
-                print("[Distro] pull round \(round): \(status.lastError ?? "")")
-                break
-            }
-            guard let decoded = RfedChannelClient.decodePullResponse(resp) else {
-                status.lastError = "RFed pull: malformed response"
-                unfinished = "malformed response (\(resp.count) bytes)"
-                print("[Distro] pull round \(round): malformed response (\(resp.count) bytes)")
-                break
-            }
-            print("[Distro] pull round \(round): sent c0, got \(decoded.pairs.count) blob(s), more=\(decoded.morePending)")
-            // The pair's first element is the distro hash; the blob itself
-            // already starts with it (dest(16)|encrypted).
-            for pair in decoded.pairs { Self.ingestBlob(pair.1) }
-            total += decoded.pairs.count
-            more = decoded.morePending
-            if status.lastError?.hasPrefix("RFed pull") == true { status.lastError = nil }
-            if !decoded.morePending { break }
         }
         if isCurrent(k) { status.lastPullCount = total }
         return .init(blobs: total, unfinished: unfinished, morePending: unfinished == nil && more)
