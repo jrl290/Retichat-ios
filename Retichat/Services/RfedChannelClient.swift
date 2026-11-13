@@ -121,6 +121,11 @@ final class RfedChannelClient: ObservableObject {
     /// per app run, the first time the rfed.channel route is reachable.
     /// Set to true after the first successful re-subscribe pass kicks off.
     private var didResubscribeOnActive = false
+    /// The start's re-subscription, owed when RFed was not reachable yet over
+    /// a slow route. Whoever takes it runs it: the start itself if RFed is
+    /// reachable after all, else the rfed.link's next ACTIVE edge (the
+    /// "channel-queue" binder, `resubscribeOwedOnLinkActive`).
+    private var resubscribeOwed = false
     private var didLoadPersistedState = false
     private var didStartNetworkFlows = false
     /// RfedDistroClient.stackStops as the latest start() with an identity saw it:
@@ -1707,11 +1712,32 @@ final class RfedChannelClient: ObservableObject {
                 say: { line, _ in print("[RfedChannel] \(line)") }
             ) {
                 // Every return is said (the truth rule): the gate only lets this run.
-                guard await ConnectionStateManager.shared.waitForRfedReachable(timeoutSecs: 5.0) else {
-                    // Said, never silent: until 2026-10-10 this returned without a word.
-                    let n = self.channels.filter { $0.isSubscribed }.count
-                    print("[RfedChannel] RFed not reachable within 5 s: \(n) persisted channel(s) not re-subscribed at this start")
-                    return
+                if ConnectionStateManager.shared.rfedRouteIsSlow() {
+                    // Over a slow route (DESIGN_PRINCIPLES §1, "LoRa connections")
+                    // there is no 5 s wait: RFed answers over LoRa in its own time.
+                    // The re-subscription is owed, and runs now if RFed is
+                    // reachable, else on the rfed.link's next ACTIVE edge. Until
+                    // 2026-11-13 this waited 5 s on every route, and an iPad on an
+                    // RNode re-subscribed no channel in the whole run.
+                    self.resubscribeOwed = true
+                    guard ConnectionStateManager.shared.rfedReachableNow() else {
+                        let n = self.channels.filter { $0.isSubscribed }.count
+                        print("[RfedChannel] RFed not reachable yet over a slow route: \(n) persisted channel(s) re-subscribed when the rfed.link comes up")
+                        return
+                    }
+                    guard self.resubscribeOwed else {
+                        let n = self.channels.filter { $0.isSubscribed }.count
+                        print("[RfedChannel] The rfed.link came up while this start checked RFed: its ACTIVE edge re-subscribes the \(n) persisted channel(s)")
+                        return
+                    }
+                    self.resubscribeOwed = false
+                } else {
+                    guard await ConnectionStateManager.shared.waitForRfedReachable(timeoutSecs: 5.0) else {
+                        // Said, never silent: until 2026-10-10 this returned without a word.
+                        let n = self.channels.filter { $0.isSubscribed }.count
+                        print("[RfedChannel] RFed not reachable within 5 s: \(n) persisted channel(s) not re-subscribed at this start")
+                        return
+                    }
                 }
                 guard !stopped() else {
                     let n = self.channels.filter { $0.isSubscribed }.count
@@ -1824,9 +1850,38 @@ final class RfedChannelClient: ObservableObject {
             guard let self, self.trackedChannelStreamNodes.contains(node) else { return }
             self.sendChannelStreamConfigForNode(nodeIdentityHashHex: node)
         }
-        // The posts that waited for a link go on each fresh one.
+        // The posts that waited for a link go on each fresh one, and so does
+        // the start's re-subscription when it is owed.
         RfedLink.shared.setBinder(owner: "channel-queue") { [weak self] _ in
             self?.releaseQueuedPosts()
+            self?.resubscribeOwedOnLinkActive()
+        }
+    }
+
+    /// The start's re-subscription that RFed was not reachable for over a slow
+    /// route (`resubscribeOwed`), run on the rfed.link ACTIVE edge that takes
+    /// it: through the start's distro-first gate (DESIGN_PRINCIPLES §5), so the
+    /// distro's queue is applied before any channel is subscribed again.
+    private func resubscribeOwedOnLinkActive() {
+        guard resubscribeOwed else { return }
+        resubscribeOwed = false
+        let stopsAtEdge = RfedDistroClient.shared.stackStops
+        Task { [weak self] in
+            guard let self else { return }
+            _ = await DistroFirst.thenResubscribe(
+                hasDistro: DistroManager.shared.has,
+                pull: { await RfedDistroClient.shared.pullForStart() },
+                stopped: { RfedDistroClient.shared.stackStops != stopsAtEdge },
+                say: { line, _ in print("[RfedChannel] \(line)") }
+            ) {
+                guard !self.didResubscribeOnActive else {
+                    print("[RfedChannel] The persisted channels' re-subscription ran already in this process: it does not run again at this start")
+                    return
+                }
+                self.didResubscribeOnActive = true
+                print("[RfedChannel] rfed.link came up → re-subscribing the persisted channels this start owed")
+                self.resubscribePersistedChannels()
+            }
         }
     }
 

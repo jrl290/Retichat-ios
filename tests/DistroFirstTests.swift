@@ -241,6 +241,28 @@ enum DistroFirstTests {
                   && !text.contains("registerForChannel("), "\(file) never subscribes a channel")
         }
 
+        // Over a slow route (DESIGN_PRINCIPLES §1, "LoRa connections", 2026-11-13: an iPad on an
+        // RNode waited 5 s for RFed and re-subscribed no channel in the whole run): no 5 s wait.
+        // The start owes the re-subscription, checks RFed, then takes it; otherwise the rfed.link's
+        // next ACTIVE edge (the "channel-queue" binder) runs it through the same distro-first gate.
+        check(before(schedule, "if ConnectionStateManager.shared.rfedRouteIsSlow() {", "self.resubscribeOwed = true")
+              && before(schedule, "self.resubscribeOwed = true", "guard ConnectionStateManager.shared.rfedReachableNow() else {")
+              && before(schedule, "guard ConnectionStateManager.shared.rfedReachableNow() else {", "guard self.resubscribeOwed else {")
+              && before(schedule, "guard self.resubscribeOwed else {", "waitForRfedReachable(timeoutSecs: 5.0)"),
+              "over a slow route the start owes the re-subscription before it checks RFed; a fast route keeps its 5 s")
+        check(schedule.contains("print(\"[RfedChannel] RFed not reachable yet over a slow route: \\(n) persisted channel(s) re-subscribed when the rfed.link comes up\")"),
+              "an owed re-subscription is said")
+        let handlers = body(channel, "private func installRfedLinkHandlers() {", "private func sendChannelStreamConfigForNode(")
+        check(before(handlers, "self?.releaseQueuedPosts()", "self?.resubscribeOwedOnLinkActive()"),
+              "the channel-queue binder runs what is owed on each ACTIVE edge")
+        let owedRun = body(channel, "private func resubscribeOwedOnLinkActive() {", "private func sendChannelStreamConfigForNode(")
+        check(owedRun.contains("guard resubscribeOwed else { return }") && before(owedRun, "resubscribeOwed = false", "Task {")
+              && owedRun.contains("await DistroFirst.thenResubscribe(") && owedRun.contains("pull: { await RfedDistroClient.shared.pullForStart() },")
+              && before(owedRun, "guard !self.didResubscribeOnActive else {", "self.resubscribePersistedChannels()"),
+              "the owed re-subscription runs once, through the start's distro-first gate")
+        let csm = read("Retichat/Services/ConnectionStateManager.swift")
+        check(csm.contains("return appLinkRouteSpeed(destHash: dest) != 1"), "slow means not measured fast")
+
         print("\(checks) checks, \(failures.count) failed")
         if !failures.isEmpty { exit(1) }
     }

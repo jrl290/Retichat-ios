@@ -459,6 +459,22 @@ final class ConnectionStateManager {
         lxmfClient?.appLinkRouteSpeed(destHash) ?? 0
     }
 
+    /// Whether the RFed node's route is slow (DESIGN_PRINCIPLES §1, "LoRa
+    /// connections"): its rfed.link has not measured it fast, and one not
+    /// measured yet counts as slow, as for the slow route's requests.
+    func rfedRouteIsSlow() -> Bool {
+        guard let dest = rfedServiceDestData(includeHiddenDefault: true, aspects: ["link"]) else { return false }
+        return appLinkRouteSpeed(destHash: dest) != 1
+    }
+
+    /// The RFed node is reachable now: `waitForRfedReachable`'s check, once,
+    /// without waiting.
+    func rfedReachableNow() -> Bool {
+        guard let dest = rfedServiceDestData(includeHiddenDefault: true, aspects: ["link"]) else { return false }
+        let bridge = RetichatBridge.shared
+        return bridge.transportHasPath(destHash: dest) && bridge.transportPathVerifiedThisSession(destHash: dest)
+    }
+
     /// Whether no request holds or waits for a slow-route turn on `destHash`.
     func slowRouteIdle(destHash: Data) -> Bool {
         !slowRouteTurnHeld.contains(destHash.hexString)
