@@ -61,6 +61,14 @@ class RetichatAppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // The app is dark-only (ContentView .preferredColorScheme(.dark)), but
+        // that reaches only the view tree, not the keyboard, which draws in a
+        // window of its own: on the iPad the RNode frequency fields' number pad
+        // came up white with light digits (James, 2026-11-13). Info.plist's
+        // UIUserInterfaceStyle Dark makes every window of the app dark, and
+        // this line asks every text field (SwiftUI's TextField is a
+        // UITextField) for the dark keyboard as well.
+        UITextField.appearance().keyboardAppearance = .dark
         // Must set delegate before any notification arrives
         NotificationManager.shared.configure()
         // Clean up stale NSE handoff files from previous session
