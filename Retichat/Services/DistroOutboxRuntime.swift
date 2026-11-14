@@ -67,11 +67,17 @@ nonisolated struct DistroOutboxFailure: Error, LocalizedError {
 }
 
 /// `PropagationPort` over the glue crate: the link AppLinks holds for the
-/// propagation node, and uploads on it.
+/// propagation node, and uploads on it. With an RFed node that announces
+/// protocol version 2 that link is the node's rfed.link (RfedPropagationCarrier;
+/// RFed-spec/Link.md, "LXMF propagation on rfed.link"): an upload goes as a
+/// `/propagation/upload` request, its answer `true` is the proof, and a loss
+/// never tears the link down, since it carries every other RFed request.
 nonisolated final class FFIPropagationPort: PropagationPort, @unchecked Sendable {
     private let lock = NSLock()
     private var current: Data?
     private var rfedDerived: Data?
+    /// The RFed node's rfed.link the uploads go on, while it carries the propagation.
+    private var rfedLink: (dest: Data, node: String)?
     private let bridge: RetichatBridge
 
     init(bridge: RetichatBridge) {
@@ -94,13 +100,28 @@ nonisolated final class FFIPropagationPort: PropagationPort, @unchecked Sendable
         return current
     }
 
+    /// The RFed node (hex) whose rfed.link carries the uploads, or nil: on the
+    /// link to lxmf.propagation (`DistroOutboxRuntime.refreshNode`).
+    func setRfedLink(dest: Data?, node: String?) {
+        lock.lock(); defer { lock.unlock() }
+        if let dest, let node { rfedLink = (dest, node) } else { rfedLink = nil }
+    }
+
+    private func carrier() -> (dest: Data, node: String)? {
+        lock.lock(); defer { lock.unlock() }
+        return rfedLink
+    }
+
+    /// The destination whose link the uploads go on, and whose link events the outbox follows.
+    func linkDest() -> Data? { carrier()?.dest ?? node() }
+
     private func nodeAndRfed() -> (node: Data?, rfedDerived: Data?) {
         lock.lock(); defer { lock.unlock() }
         return (current, rfedDerived)
     }
 
     func held() -> HeldLink? {
-        guard let node = node(), let link = bridge.propagationLink(node: node) else { return nil }
+        guard let dest = linkDest(), let link = bridge.propagationLink(node: dest) else { return nil }
         return HeldLink(id: link.id, active: link.active)
     }
 
@@ -146,6 +167,7 @@ nonisolated final class FFIPropagationPort: PropagationPort, @unchecked Sendable
     func cameUpSince(_ mark: UInt64) -> Bool { bridge.interfaceCameUpSince(mark) }
 
     func upload(_ upload: Data, sink: UploadSink) throws -> UploadLeft? {
+        if let rfed = carrier() { return uploadOnRfedLink(rfed, upload: upload, sink: sink) }
         guard let node = node() else { return nil }
         let watched = WatchedSink(sink)
         guard let started = bridge.propagationUpload(node: node, upload: upload, sink: watched) else {
@@ -167,6 +189,32 @@ nonisolated final class FFIPropagationPort: PropagationPort, @unchecked Sendable
         }
         return UploadLeft(linkId: started.linkId, resource: started.resource)
     }
+
+    /// `upload` as a `/propagation/upload` request on the RFed node's rfed.link,
+    /// which must be ACTIVE (RFed-spec/Link.md). The node answers once it has
+    /// validated and stored it: `true` is the proof; a refusal or no answer is a
+    /// loss, and the link is kept. Over the link MDU the request goes as a
+    /// Resource, as RNS carries any request.
+    private func uploadOnRfedLink(_ rfed: (dest: Data, node: String), upload: Data, sink: UploadSink) -> UploadLeft? {
+        guard let link = bridge.propagationLink(node: rfed.dest), link.active else {
+            print("[DistroOutbox] upload did not leave: rfed.link is not up")
+            return nil
+        }
+        let payload = RfedChannelClient.msgpackBin(upload)
+        Task { @MainActor in
+            let answer = await RfedLink.shared.request(nodeHex: rfed.node, path: "/propagation/upload", payload: payload)
+            if answer == Data([0xc3]) {
+                sink.proved()
+            } else {
+                print("[DistroOutbox] upload on rfed.link not proved: \(answer?.hexString ?? "no answer")")
+                sink.lost()
+            }
+        }
+        return UploadLeft(linkId: link.id, resource: upload.count > Self.rfedLinkMdu)
+    }
+
+    /// RNS's link MDU: a request larger than this goes as a Resource.
+    private static let rfedLinkMdu = 431
 }
 
 /// An upload's sink that notes it was decided, for the §1 watch.
@@ -247,6 +295,8 @@ final class DistroOutboxRuntime: ObservableObject {
     private var settledWatch: AnyCancellable?
     private var linkEventsRegistered = false
     private var interfaceUpRegistered = false
+    /// Begun (the device knows its distro) and not stopped: the link it follows may change.
+    private var running = false
 
     /// Bumped by start and stop: a start that finds it changed has been stopped.
     private var generation = 0
@@ -297,8 +347,31 @@ final class DistroOutboxRuntime: ObservableObject {
         func hash16(_ hex: String) -> Data? {
             Data(hexString: hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()).flatMap { $0.count == 16 ? $0 : nil }
         }
-        port.setNode(hash16(UserPreferences.shared.effectiveLxmfPropagationHash),
-                     rfedDerived: hash16(UserPreferences.shared.rfedDerivedLxmfPropagationHash))
+        let node = hash16(UserPreferences.shared.effectiveLxmfPropagationHash)
+        port.setNode(node, rfedDerived: hash16(UserPreferences.shared.rfedDerivedLxmfPropagationHash))
+        // With a node of protocol version 2 the uploads go on its rfed.link (RfedPropagationCarrier).
+        let rfedNode = UserPreferences.shared.effectiveRfedNodeIdentityHash.lowercased()
+        if let node, RfedPropagationCarrier.shared.carries(node), let dest = RfedLink.destHash(nodeHex: rfedNode) {
+            port.setRfedLink(dest: dest, node: rfedNode)
+        } else {
+            port.setRfedLink(dest: nil, node: nil)
+        }
+    }
+
+    /// The propagation's link changed (RfedPropagationCarrier: to the RFed node's
+    /// rfed.link, or back): the events followed are that link's, and a link already
+    /// up is its coming-up, as at `start`.
+    static func linkChanged() {
+        shared.followLink()
+    }
+
+    private func followLink() {
+        refreshNode()
+        guard let outbox, running else { return }
+        PropagationLinkTarget.set(node: port.linkDest(), outbox: outbox)
+        if let held = port.held(), held.active {
+            outbox.spawn { await outbox.onLinkEstablished(held.id) }
+        }
     }
 
     /// The stack is up (called from its start, once the router has its propagation node): load
@@ -339,7 +412,8 @@ final class DistroOutboxRuntime: ObservableObject {
             print("[DistroOutbox] no store is configured: nothing is kept for the distro")
             return
         }
-        PropagationLinkTarget.set(node: port.node(), outbox: outbox)
+        running = true
+        PropagationLinkTarget.set(node: port.linkDest(), outbox: outbox)
         chain { [weak self] in
             await outbox.start()
             await self?.listen(outbox, generation: mine)
@@ -378,6 +452,7 @@ final class DistroOutboxRuntime: ObservableObject {
     /// callbacks and `interfaceUpClear` the interface one; the next `start` registers them again.
     func stop() {
         generation += 1
+        running = false
         settledWatch = nil
         linkEventsRegistered = false
         bridge.propagationLinkEventsClear()

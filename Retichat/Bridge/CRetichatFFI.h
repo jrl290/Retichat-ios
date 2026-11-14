@@ -242,6 +242,39 @@ int32_t lxmf_client_set_message_state_callback(uint64_t client,
                                                 lxmf_message_state_callback_t callback,
                                                 void *context);
 
+#pragma mark - LXMF propagation over rfed.link (RFed-spec/Link.md)
+
+/// A propagation carrier request: send `data` (msgpack) as a request on
+/// `path` over the app's rfed.link to its RFed node, then answer it once with
+/// `lxmf_propagation_carrier_complete(token, ...)`. Called on a thread of its
+/// own, never under the router's lock; it may block.
+typedef void (*lxmf_propagation_carrier_callback_t)(
+    void *context,
+    uint64_t token,
+    const char *path,
+    const uint8_t *data, uint32_t data_len
+);
+
+/// Carry the router's LXMF propagation (uploads and the message get) over the
+/// app's rfed.link when the RFed node behind `rfed_link_hash` announces
+/// protocol version 2 with a propagation stamp cost; otherwise remove the
+/// carrier, and the router links to lxmf.propagation as before. The router
+/// uses it while that node's lxmf.propagation is its propagation node.
+/// Returns 1 when installed, 0 when not, -1 on error.
+int32_t lxmf_client_sync_rfed_carrier(uint64_t client,
+                                      const uint8_t *rfed_link_hash, uint32_t hash_len,
+                                      lxmf_propagation_carrier_callback_t callback,
+                                      void *context);
+
+/// The answer to carrier request `token`: the node's response (msgpack), or
+/// NULL when the request failed. Returns 0, or -1 when no request waits.
+int32_t lxmf_propagation_carrier_complete(uint64_t token,
+                                          const uint8_t *response, uint32_t response_len);
+
+/// The protocol version an RFed node announces on `dest_hash` (its rfed.link,
+/// RFed SPEC §12); 0 when unknown.
+uint32_t lxmf_rfed_node_protocol_version(const uint8_t *dest_hash, uint32_t hash_len);
+
 #pragma mark - LXMF Client Queries
 
 uint64_t lxmf_client_identity_handle(uint64_t client);

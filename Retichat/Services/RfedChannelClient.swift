@@ -1903,7 +1903,8 @@ final class RfedChannelClient: ObservableObject {
 
     private func sendChannelStreamConfig(nodeIdentityHashHex: String,
                                          filters: [Data]) {
-        guard let payload = buildChannelStreamPayload(filters: filters) else {
+        guard let payload = buildChannelStreamPayload(
+            filters: filters, nodeProtocolVersion: RfedLink.protocolVersion(nodeHex: nodeIdentityHashHex)) else {
             print("[RfedChannel] channel.stream config build failed for node=\(nodeIdentityHashHex)")
             return
         }
@@ -2216,6 +2217,20 @@ final class RfedChannelClient: ObservableObject {
         return out
     }
 
+    /// The `/channel/stream/open` payload for a node announcing
+    /// `nodeProtocolVersion`: `signed`, the three-element `[value, pubkey,
+    /// signature]`, and to a node of version 2 or later a fourth element, 2 —
+    /// this client handles the channel push `/channel/delivery`
+    /// (RFed-spec/Link.md). Never to an older node, which refuses a signed
+    /// payload of four elements; it pushes the deprecated `/delivery`.
+    nonisolated static func channelStreamBind(_ signed: Data, nodeProtocolVersion: UInt32) -> Data {
+        guard nodeProtocolVersion >= 2, signed.first == 0x93 else { return signed }
+        var out = Data([0x94])   // fixarray of 4
+        out.append(signed.dropFirst())
+        out.append(0x02)
+        return out
+    }
+
     nonisolated static func msgpackArrayOfBins(_ elements: [Data]) -> Data {
         var out = Data()
         if elements.count <= 0x0f {
@@ -2233,11 +2248,12 @@ final class RfedChannelClient: ObservableObject {
         return out
     }
 
-    private func buildChannelStreamPayload(filters: [Data]) -> Data? {
+    private func buildChannelStreamPayload(filters: [Data], nodeProtocolVersion: UInt32) -> Data? {
         guard let pubkey = bridge.identityPublicKey(handle: identityHandle) else { return nil }
         let value = Self.msgpackArrayOfBins(filters)
         guard let sig = bridge.identitySign(handle: identityHandle, data: value) else { return nil }
-        return Self.msgpackSigned(value: value, pubkey: pubkey, sig: sig)
+        return Self.channelStreamBind(Self.msgpackSigned(value: value, pubkey: pubkey, sig: sig),
+                                      nodeProtocolVersion: nodeProtocolVersion)
     }
 
     nonisolated private static func channelStreamResponseOk(_ response: Data?) -> Bool {

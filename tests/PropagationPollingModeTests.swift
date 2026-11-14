@@ -242,8 +242,18 @@ func testStartUpSyncFollowsTheBinding() {
         // collect in that order, the channels with push on last.
         check(repository.contains("if woken, !force, let collectAll {\n            collectAll(\"the 6-hour check\")"),
               "over a slow route the 6-hour check collects in order")
-        guard let sync = sourceFragment(repository, start: "func syncPropagationNode() async -> Bool {", end: "\n    }\n") else {
+        // RFed-spec/Link.md: with a node of protocol version 2 the sync goes on its rfed.link, held
+        // for its three requests; either way it is followed to its end the same way (followSync).
+        guard let start = sourceFragment(repository, start: "func syncPropagationNode() async -> Bool {", end: "\n    }\n") else {
             check(false, "extracts the awaited sync")
+            return
+        }
+        check(start.contains("RfedPropagationCarrier.shared.carries(nodeHash)")
+                  && start.contains("return await RfedLink.shared.holding(nodeHexes: [rfedNode]) {")
+                  && start.contains("return await followSync(client, nodeHash: nodeHash)"),
+              "on rfed.link the sync holds the link for its three requests")
+        guard let sync = sourceFragment(repository, start: "private func followSync(", end: "\n    }\n") else {
+            check(false, "extracts the followed sync")
             return
         }
         check(sync.contains("while slow || Date() < deadline {") && sync.contains("|| RfedLink.destHash(nodeHex: prefs.effectiveRfedNodeIdentityHash)") && sync.contains("if state == Self.propagationComplete { return true }")

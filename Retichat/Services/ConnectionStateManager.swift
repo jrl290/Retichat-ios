@@ -90,6 +90,9 @@ final class ConnectionStateManager {
     /// Weak reference to the LXMF client, set after startup.
     private weak var lxmfClient: LxmfClient? = nil
 
+    /// The LXMF client registered after startup, nil before it or after the stack stopped.
+    var registeredLxmfClient: LxmfClient? { lxmfClient }
+
     /// Network reachability monitor — fires `appLinkNetworkChanged()` on every
     /// path-status transition so the router gets exactly one retry trigger per
     /// real network event (no polling).

@@ -233,8 +233,10 @@ func theRuntimeStartsNoLinkAndOnlyALinksComingUpFlushes() {
     for call in ["appLinkOpen", "openHeldAppLink", "closeAppLink", "appLinkReopen", "setPropagationNode", "rotateToNext", "sync(nodeHash"] {
         check(!source.contains(call), "the runtime does not call \(call)")
     }
-    // onLinkEstablished: the link callback's ACTIVE event and the check at start, nothing else.
-    check(count(source, "onLinkEstablished(") == 2, "onLinkEstablished is called from two places")
+    // onLinkEstablished: the link callback's ACTIVE event, the check at start, and the same check
+    // when the propagation moves to the RFed node's rfed.link or back (followLink, RFed-spec/Link.md:
+    // with a node of protocol version 2), nothing else.
+    check(count(source, "onLinkEstablished(") == 3, "onLinkEstablished is called from three places")
     // onLinkRecovered: the link callback's RECOVERED event (a STALE link that heard the node again),
     // from the runtime alone; no clock and no poll of the link, and nothing else in the app calls it.
     check(count(source, "onLinkRecovered(") == 1, "onLinkRecovered is called from one place")
@@ -250,7 +252,7 @@ func theRuntimeStartsNoLinkAndOnlyALinksComingUpFlushes() {
           "the §1 watch only logs")
     // The node is the RFed node's own lxmf.propagation or the Settings override, set at start.
     check(runtime.contains("UserPreferences.shared.effectiveLxmfPropagationHash")
-            && before(runtime, "refreshNode()", "PropagationLinkTarget.set(node: port.node(), outbox: outbox)"),
+            && before(runtime, "refreshNode()", "PropagationLinkTarget.set(node: port.linkDest(), outbox: outbox)"),
           "the node is the one the distro's messages are fanned out from")
     // On a background launch before the first unlock the Keychain cannot be read, and "no distro" is no
     // finding: the outbox starts only once the device knows what it holds, and drops nothing before.

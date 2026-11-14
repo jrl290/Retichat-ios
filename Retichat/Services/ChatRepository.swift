@@ -1242,6 +1242,12 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         }
 
         guard let nodeHash = propagationNodeForSync(client) else { return }
+        // On rfed.link (a node of protocol version 2) the sync is three
+        // requests on the one link: held for all three (syncPropagationNode).
+        if RfedPropagationCarrier.shared.carries(nodeHash) {
+            Task { _ = await self.syncPropagationNode() }
+            return
+        }
         ffiQueue.async { [weak self] in
             let ok = client.sync(nodeHash: nodeHash)
             if !ok {
@@ -1262,6 +1268,21 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         guard let client = lxmfClient else { return false }
         lastPollTime = Date()
         guard let nodeHash = propagationNodeForSync(client) else { return false }
+        // RFed-spec/Link.md: with a node of protocol version 2 the sync goes
+        // on its rfed.link, and its list, fetch and purge are three requests:
+        // over a slow route the link a device doesn't hold stays up from one
+        // to the next. No link to its lxmf.propagation is opened.
+        let rfedNode = prefs.effectiveRfedNodeIdentityHash
+        if !rfedNode.isEmpty, RfedPropagationCarrier.shared.carries(nodeHash) {
+            return await RfedLink.shared.holding(nodeHexes: [rfedNode]) {
+                await self.followSync(client, nodeHash: nodeHash)
+            }
+        }
+        return await followSync(client, nodeHash: nodeHash)
+    }
+
+    /// Start the sync with `nodeHash` and follow it to its end (`syncPropagationNode`).
+    private func followSync(_ client: LxmfClient, nodeHash: Data) async -> Bool {
         let queue = ffiQueue
         let started = await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
             queue.async { done.resume(returning: client.sync(nodeHash: nodeHash)) }
@@ -1312,6 +1333,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // known-destinations table on receipt. The next poll cycle then
         // succeeds. See DESIGN_PRINCIPLES.md §1: no retries here, the
         // existing periodic poll IS the retry cadence.
+        // On rfed.link the node's identity is its rfed.link's, and no link to
+        // its lxmf.propagation is made (RfedPropagationCarrier).
+        if RfedPropagationCarrier.shared.carries(nodeHash) { return nodeHash }
         let bridge = RetichatBridge.shared
         if !bridge.transportIdentityKnown(destHash: nodeHash) {
             _ = bridge.transportRequestPath(destHash: nodeHash)

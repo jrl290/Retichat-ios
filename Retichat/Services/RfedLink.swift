@@ -6,9 +6,12 @@
 //  operation, both ways (RFed-spec/Link.md). The client's requests go as
 //  requests on their path (`/channel/subscribe`, `/channel/publish`,
 //  `/distro/pull`, ...); the node's pushes come back on the same link as
-//  requests to `/delivery` (channel posts), `/lxmf/delivery` (LXMF messages
-//  for this device or its distro) and `/notify` (a wake), and this client's
-//  answer to each is the delivery proof.
+//  requests to `/channel/delivery` (channel posts; `/delivery` from a node
+//  before the 2026-11-13 revision), `/lxmf/delivery` (LXMF messages for this
+//  device or its distro) and `/notify` (a wake), and this client's answer to
+//  each is the delivery proof. With a node of protocol version 2 the link also
+//  carries the router's LXMF propagation (`RfedPropagationCarrier`, below), so
+//  this device holds no second link to the node's `lxmf.propagation`.
 //
 //  Before 2026-10-18 iOS used a destination per operation: a link per
 //  aspect, publishes as unanswered DATA, and pushes on two stream links.
@@ -34,6 +37,9 @@ import Foundation
 final class RfedLink {
     static let shared = RfedLink()
 
+    /// The channel push (RFed-spec/Link.md), from a node of protocol version 2.
+    nonisolated static let pushChannelDelivery = "/channel/delivery"
+    /// The channel push's name before the 2026-11-13 revision, deprecated: older nodes push it.
     nonisolated static let pushDelivery = "/delivery"
     nonisolated static let pushLxmf = "/lxmf/delivery"
     nonisolated static let pushNotify = "/notify"
@@ -101,6 +107,15 @@ final class RfedLink {
 
     // MARK: - The link
 
+    /// The protocol version `nodeHex` announces on its rfed.link (RFed SPEC
+    /// §12), from the announce the stack holds; 0 when none is known.
+    nonisolated static func protocolVersion(nodeHex: String) -> UInt32 {
+        guard let dest = destHash(nodeHex: nodeHex) else { return 0 }
+        return dest.withUnsafeBytes { buf -> UInt32 in
+            lxmf_rfed_node_protocol_version(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(dest.count))
+        }
+    }
+
     /// The `rfed.link` destination hash of `nodeHex`.
     nonisolated static func destHash(nodeHex: String) -> Data? {
         let hex = RfedChannelClient.rfedDestHash(
@@ -119,9 +134,11 @@ final class RfedLink {
         guard let dest = Self.destHash(nodeHex: node) else { return nil }
         let csm = ConnectionStateManager.shared
         if !setUp.contains(node) {
+            // Both channel push names: a node of version 2 pushes the new one
+            // to a client that binds saying so, an older node the old one.
             let ok = csm.setAppLinkOutboundSetup(
                 destHash: dest, identify: true,
-                paths: [Self.pushDelivery, Self.pushLxmf, Self.pushNotify]
+                paths: [Self.pushChannelDelivery, Self.pushDelivery, Self.pushLxmf, Self.pushNotify]
             ) { path, data in
                 RfedLink.onPush(path: path, data: data)
             }
@@ -133,6 +150,9 @@ final class RfedLink {
             csm.setAppLinkStatusHandler(destHash: dest) { [weak self] status in
                 self?.onStatus(node: node, status: status)
             }
+            // What the node announced, remembered from before, decides at once
+            // where the router's propagation goes; each ACTIVE edge decides again.
+            RfedPropagationCarrier.shared.sync(nodeHex: node)
         }
         if csm.appLinkStatus(destHash: dest) != 3 {
             csm.openHeldAppLink(destHash: dest, app: "rfed", aspects: ["link"])
@@ -204,6 +224,9 @@ final class RfedLink {
     private func onStatus(node: String, status: UInt8) {
         for handler in Array((statusListeners[node] ?? [:]).values) { handler(status) }
         guard status == 3 else { return }
+        // The path response before the link carried the node's announce: its
+        // protocol version decides where the router's propagation goes.
+        RfedPropagationCarrier.shared.sync(nodeHex: node)
         // A fresh link: bind it for LXMF and channel pushes (Link.md "The
         // client re-binds on every link"), in `bindOrder`. A link this device
         // doesn't hold opened for requests and closes after them: what RFed
@@ -238,7 +261,9 @@ final class RfedLink {
             }
             return true
         }
-        guard let handler = pushHandlers.get(path) else {
+        // The channel push under either name goes to the channel client.
+        let taker = path == pushChannelDelivery ? pushDelivery : path
+        guard let handler = pushHandlers.get(taker) else {
             print("[RfedLink] push on \(path) with no taker: refused")
             return false
         }
@@ -285,5 +310,93 @@ final class RfedLinkHeldOps: HeldLinkOps {
     }
     func inOneRun(_ run: () async -> Void) async {
         await RfedLink.shared.holding(nodeHexes: [nodeHex], run)
+    }
+}
+
+/// LXMF propagation over rfed.link (RFed-spec/Link.md, "LXMF propagation on
+/// `rfed.link`", 2026-11-13). An RFed node that announces protocol version 2
+/// takes the router's uploads and message get as requests on its rfed.link,
+/// so this device holds one link to the node and none to its
+/// `lxmf.propagation`. The router hands each request here, and it goes as
+/// every other request on the link does (`RfedLink.request`): over a slow
+/// route the link opens for it and closes once nothing waits. With a node
+/// that announces version 1, or none yet, the carrier is removed and the
+/// router links to `lxmf.propagation` as before. A port of Android's
+/// RfedPropagationCarrier.kt.
+@MainActor
+final class RfedPropagationCarrier {
+    static let shared = RfedPropagationCarrier()
+
+    /// The `lxmf.propagation` the carrier is installed for (hex).
+    private(set) var carried: String?
+
+    /// The nodes requests are carried for, kept alive while the router may
+    /// call with them: the callback's context.
+    private var targets: [String: Target] = [:]
+
+    private init() {}
+
+    /// Whether the router's propagation to `node` (an `lxmf.propagation`
+    /// hash) goes on rfed.link.
+    func carries(_ node: Data) -> Bool { carried == node.hexString }
+
+    /// Install the router's carrier to `nodeHex`'s rfed.link when the node
+    /// announces version 2 with a propagation stamp cost, and remove it
+    /// otherwise. True when installed: the router uses it while the node's
+    /// lxmf.propagation is its propagation node.
+    @discardableResult
+    func sync(nodeHex: String) -> Bool {
+        let node = nodeHex.lowercased()
+        guard let client = ConnectionStateManager.shared.registeredLxmfClient,
+              let dest = RfedLink.destHash(nodeHex: node) else { return false }
+        let target = targets[node] ?? Target(node: node)
+        targets[node] = target
+        let installed = client.syncRfedCarrier(
+            rfedLinkHash: dest, callback: rfedCarrierRequest,
+            context: Unmanaged.passUnretained(target).toOpaque())
+        let propagation = RfedChannelClient.rfedDestHash(identityHashHex: node, app: "lxmf", aspects: ["propagation"])
+        let now = installed && propagation.count == 32 ? propagation : nil
+        if now != carried {
+            carried = now
+            print("[RfedPropagation] \(node.prefix(8)): LXMF propagation on \(now != nil ? "rfed.link (protocol version 2)" : "lxmf.propagation")")
+            // What the distro outbox owes follows the propagation to its link.
+            DistroOutboxRuntime.linkChanged()
+        }
+        return installed
+    }
+
+    /// Answer carrier request `token`: the node's response, or nil when the
+    /// request failed. Once, whatever happened.
+    nonisolated static func complete(token: UInt64, answer: Data?) {
+        guard let answer, !answer.isEmpty else {
+            _ = lxmf_propagation_carrier_complete(token, nil, 0)
+            return
+        }
+        answer.withUnsafeBytes { buf in
+            _ = lxmf_propagation_carrier_complete(
+                token, buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(answer.count))
+        }
+    }
+
+    /// A node the requests are for (the callback's context).
+    final class Target: @unchecked Sendable {
+        let node: String
+        init(node: String) { self.node = node }
+    }
+}
+
+/// The router's carrier request (`lxmf_client_sync_rfed_carrier`), on a thread
+/// of its own: copied out, then sent on the node's rfed.link, and answered.
+private let rfedCarrierRequest: lxmf_propagation_carrier_callback_t = { context, token, path, data, dataLen in
+    guard let context, let path else {
+        RfedPropagationCarrier.complete(token: token, answer: nil)
+        return
+    }
+    let target = Unmanaged<RfedPropagationCarrier.Target>.fromOpaque(context).takeUnretainedValue()
+    let requestPath = String(cString: path)
+    let payload = data.map { Data(bytes: $0, count: Int(dataLen)) } ?? Data()
+    Task { @MainActor in
+        let answer = await RfedLink.shared.request(nodeHex: target.node, path: requestPath, payload: payload)
+        RfedPropagationCarrier.complete(token: token, answer: answer)
     }
 }

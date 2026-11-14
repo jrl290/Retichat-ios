@@ -292,6 +292,22 @@ final class LxmfClient: @unchecked Sendable {
 
     // MARK: - Propagation
 
+    /// Carry the router's LXMF propagation (uploads and the message get) over
+    /// the app's rfed.link when the RFed node behind `rfedLinkHash` announces
+    /// protocol version 2 with a propagation stamp cost, and remove the carrier
+    /// otherwise (RFed-spec/Link.md, "LXMF propagation on rfed.link"). The
+    /// router uses it while that node's lxmf.propagation is its propagation
+    /// node. Each request reaches `callback` on a thread of its own and is
+    /// answered with `lxmf_propagation_carrier_complete`. True when installed.
+    func syncRfedCarrier(rfedLinkHash: Data,
+                         callback: lxmf_propagation_carrier_callback_t,
+                         context: UnsafeMutableRawPointer?) -> Bool {
+        rfedLinkHash.withUnsafeBytes { buf -> Bool in
+            let p = buf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return lxmf_client_sync_rfed_carrier(handle, p, UInt32(rfedLinkHash.count), callback, context) == 1
+        }
+    }
+
     /// Set the outbound propagation node without starting a sync.
     @discardableResult
     func setPropagationNode(nodeHash: Data) -> Bool {
