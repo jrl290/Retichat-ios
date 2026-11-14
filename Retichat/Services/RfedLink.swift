@@ -342,11 +342,16 @@ final class RfedPropagationCarrier {
 
     /// Install the router's carrier to `nodeHex`'s rfed.link when the node
     /// announces version 2 with a propagation stamp cost, and remove it
-    /// otherwise. True when installed: the router uses it while the node's
-    /// lxmf.propagation is its propagation node.
+    /// otherwise; only for the RFed node this device propagates through
+    /// (Settings, else the default). True when installed: the router uses it
+    /// while the node's lxmf.propagation is its propagation node.
     @discardableResult
     func sync(nodeHex: String) -> Bool {
         let node = nodeHex.lowercased()
+        // Only the RFed node this device propagates through decides: it also
+        // links to the nodes its channels live on, and a carrier to one of
+        // those would take this one's place.
+        guard node == UserPreferences.shared.effectiveRfedNodeIdentityHash.lowercased() else { return false }
         guard let client = ConnectionStateManager.shared.registeredLxmfClient,
               let dest = RfedLink.destHash(nodeHex: node) else { return false }
         let target = targets[node] ?? Target(node: node)

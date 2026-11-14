@@ -94,6 +94,8 @@ check(callback.contains("RfedPropagationCarrier.complete(token: token, answer: n
           && callback.contains("RfedPropagationCarrier.complete(token: token, answer: answer)"),
       "every carrier request is sent on rfed.link and answered once")
 
+check(link.contains("guard node == UserPreferences.shared.effectiveRfedNodeIdentityHash.lowercased() else { return false }"),
+      "only the node this device propagates through decides the carrier, never a channel's node")
 check(repository.contains("if RfedPropagationCarrier.shared.carries(nodeHash) { return nodeHash }"),
       "on rfed.link no identity of lxmf.propagation is waited for")
 let poll = repository.components(separatedBy: "func pollPropagationNode(force: Bool = false) {").dropFirst().first?
