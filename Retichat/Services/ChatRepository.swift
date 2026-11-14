@@ -882,6 +882,10 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // through startup) fails at once (lxm_router.rs). On ffiQueue, so it
         // lands ahead of every send submitted after startup.
         if let client = lxmfClient, let nodeHash = propManager.currentNode() {
+            // First what the RFed node announced, remembered from before: with
+            // a node of protocol version 2 the router then opens no link to its
+            // lxmf.propagation when it is given the node (RfedPropagationCarrier).
+            RfedPropagationCarrier.shared.sync(nodeHex: prefs.effectiveRfedNodeIdentityHash, client: client)
             ffiQueue.async {
                 _ = client.setPropagationNode(nodeHash: nodeHash)
             }

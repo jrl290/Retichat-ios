@@ -96,6 +96,12 @@ check(callback.contains("RfedPropagationCarrier.complete(token: token, answer: n
 
 check(link.contains("guard node == UserPreferences.shared.effectiveRfedNodeIdentityHash.lowercased() else { return false }"),
       "only the node this device propagates through decides the carrier, never a channel's node")
+let polling = repository.components(separatedBy: "private func startPropagationPolling() {").dropFirst().first?
+    .components(separatedBy: "\n    }\n").first ?? ""
+let carrierAt = polling.range(of: "RfedPropagationCarrier.shared.sync(nodeHex: prefs.effectiveRfedNodeIdentityHash, client: client)")
+let nodeAt = polling.range(of: "_ = client.setPropagationNode(nodeHash: nodeHash)")
+check(carrierAt != nil && nodeAt != nil && carrierAt!.lowerBound < nodeAt!.lowerBound,
+      "at start the carrier is synced before the router is given its node, so no lxmf.propagation link opens")
 check(repository.contains("if RfedPropagationCarrier.shared.carries(nodeHash) { return nodeHash }"),
       "on rfed.link no identity of lxmf.propagation is waited for")
 let poll = repository.components(separatedBy: "func pollPropagationNode(force: Bool = false) {").dropFirst().first?
