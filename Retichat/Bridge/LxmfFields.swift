@@ -238,7 +238,7 @@ nonisolated enum MemberStatus {
 
 // MARK: - Parsed fields
 
-struct LxmfFields {
+nonisolated struct LxmfFields {
     var attachments: [(filename: String, data: Data)] = []
     /// The group entries as sent (§10): from the Retichat field 0xD1 when it
     /// holds the entry with its type, else from the old field 0xA0-0xA8.
@@ -349,7 +349,7 @@ nonisolated enum RepeatedKeys {
 
 // MARK: - MsgPack decoder
 
-final class LxmfFieldsDecoder {
+nonisolated final class LxmfFieldsDecoder {
 
     static func decode(_ data: Data) -> LxmfFields {
         var fields = LxmfFields()
