@@ -1125,6 +1125,13 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 continue
             }
 
+            // Same rule as handleIncomingMessage: a Distro control message without a group id
+            // is not this address's. The NSE no longer stores one; this covers older NSE files.
+            if fields.isMisroutedDistroControl {
+                print("[Retichat] importNSEMessages: DROPPED Distro control message \(fields.distroControlType ?? "") from \(srcHex.prefix(8)) outside the Distro Fanout")
+                continue
+            }
+
             // DISPLAY_NAMES.md §5.2 on the NSE path, as on the router's: the
             // NSE keeps the delivery's reason. A file from an older NSE build
             // has none; an unvalidated message without one counts as invalid,
@@ -2621,6 +2628,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // become an incoming bubble.
         if fields.isDistroSentCopy {
             print("[Retichat] handleIncomingMessage: DROPPED distro sent-copy marker outside fan-out src=\(srcHex.prefix(8))")
+            return
+        }
+
+        // A Distro control message without a group id (a channel join or leave, a group sync,
+        // a kind a later build adds) belongs to the Distro Fanout, never this address: dropped,
+        // whoever sent it and filter on or off, as the web drops it (isMisroutedDistroControl).
+        if fields.isMisroutedDistroControl {
+            print("[Retichat] handleIncomingMessage: DROPPED Distro control message \(fields.distroControlType ?? "") from \(srcHex.prefix(8)) outside the Distro Fanout")
             return
         }
 

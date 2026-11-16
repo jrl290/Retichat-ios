@@ -72,6 +72,13 @@ private func nseHandOffForm(_ msg: PendingNotification.NSEMessage) -> PendingNot
               String(msg.senderHash.prefix(8)))
         return nil
     }
+    if fields.isMisroutedDistroControl {
+        // As the app's handleIncomingMessage: a Distro control message without a group id
+        // belongs to the Distro Fanout, never this address. Not stored and not shown.
+        NSLog("[NSE] Distro control message %@ from %@ outside the Distro Fanout — dropped",
+              fields.distroControlType ?? "", String(msg.senderHash.prefix(8)))
+        return nil
+    }
     if case .refused(let why)? = fields.reaction {
         // REACTIONS-DESIGN.md §5: a reaction the app would refuse is dropped here as it is
         // there, never stored and never shown. A valid one is stored for the app (nseShows).

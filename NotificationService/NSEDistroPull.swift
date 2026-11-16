@@ -351,11 +351,18 @@ enum NSEDistroPull {
         if m.sent_by != nil || !(m.distro_transfer_key ?? "").isEmpty || m.is_delivery_notification {
             return nil
         }
+        let fields = LxmfFieldsDecoder.decode(m.fields.flatMap { Data(base64Encoded: $0) } ?? Data())
+        // Any other Distro control message (a channel join or leave, a kind a later build adds) is
+        // no message, as the app's unwrap drops it (RfedDistroClient): never shown.
+        if let type = fields.distroControlType {
+            NSLog("[NSE] distro pull: Distro control message %@ from %@ not shown", type, String(m.source_hash.prefix(8)))
+            return nil
+        }
         // REACTIONS-DESIGN.md §3 "Notifications": a reaction is shown only as someone else's to one
         // of the user's own messages in the chat with its source, worded with it. The app applies
         // every one when it pulls.
         var content = m.content ?? ""
-        let reaction = LxmfFieldsDecoder.decode(m.fields.flatMap { Data(base64Encoded: $0) } ?? Data()).reaction
+        let reaction = fields.reaction
         if reaction != nil {
             guard let text = ReactionNotice.text(for: reaction, chatId: m.source_hash,
                                                  quotes: PendingNotification.readNSESentQuotes()) else {

@@ -960,6 +960,13 @@ final class RfedDistroClient: ObservableObject {
             // This device signs as the distro, so recipients' delivery
             // notifications come back via fan-out. Storing them posts empty bubbles.
             inbound = .notification
+        } else if let type = LxmfFieldsDecoder.decode(parsed.fieldsRaw ?? Data()).distroControlType {
+            // A Distro control message no branch above took (a channel join or leave without
+            // its 0xFC, a transfer without its key, a kind a later build adds) is no message:
+            // dropped with a line, as the web drops it. Until 2026-10-24 it was filed as a DM
+            // or as "[Attachment not available via the distro address]".
+            print("[Distro] Distro control message \(type) from \(srcHex.prefix(8)) is no kind this build acts on — dropped, not a message")
+            return false
         } else {
             // Carries the fields: ChatRepository stores the attachments.
             var message = DistroMessage(unwrapped: parsed, sourceHash: src, shownByNSE: shownByNSE)

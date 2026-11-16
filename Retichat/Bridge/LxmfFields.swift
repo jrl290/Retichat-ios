@@ -197,6 +197,16 @@ nonisolated enum DistroSent {
     static let customType = "rfed.distro.sent"
 }
 
+// MARK: - Distro control messages
+//
+// Every Distro control message's FIELD_CUSTOM_TYPE (0xFB) starts "rfed.distro.": a sent copy,
+// a transfer, a channel join or leave (§17.12), a group sync (§17.14), or a kind a later build
+// adds. None is a message to show (`LxmfFields.distroControlType`).
+
+nonisolated enum DistroControl {
+    static let typePrefix = "rfed.distro."
+}
+
 // MARK: - Group action constants
 
 nonisolated enum GroupAction {
@@ -287,6 +297,24 @@ struct LxmfFields {
     /// must not become an incoming bubble.
     var isDistroSentCopy: Bool {
         customType == DistroSent.customType
+    }
+
+    /// The "rfed.distro." type this message carries in 0xFB, else nil (`DistroControl`). One no
+    /// branch acts on is dropped with a log line on the distro unwrap (RfedDistroClient,
+    /// NSEDistroPull), as the web drops it; until 2026-10-24 it was filed as a DM or a placeholder.
+    var distroControlType: String? {
+        guard let type = customType, type.hasPrefix(DistroControl.typePrefix) else { return nil }
+        return type
+    }
+
+    /// A Distro control message on the device's own address that is neither a transfer nor a
+    /// group's: it belongs to the Distro Fanout, so every direct reader drops it with a log line,
+    /// whoever sent it and filter on or off, as the web drops it. A group id still makes it the
+    /// group's, and a transfer marker without a usable key stays a DM, as on Android and the
+    /// web. Until 2026-10-24 it was filed as a DM: an empty message in a chat with its sender.
+    var isMisroutedDistroControl: Bool {
+        guard let type = distroControlType else { return false }
+        return type != DistroTransfer.customType && groupId == nil
     }
 
     /// RFed SPEC §17.14, on the direct path as on the distro's: a message whose GROUP_ID is not a
