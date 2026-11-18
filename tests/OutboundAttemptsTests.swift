@@ -247,9 +247,17 @@ func testChatRepositoryWiring() {
         check(!retry.contains(old) && !submit.contains(old),
               "the copy is no longer built as a new message (\(old))")
     }
-    check(inOrder(["lonePropagated(directHandle)", "defer { DistroMessageFFI.destroy(copy) }",
-                   "DistroMessageFFI.sendViaAppLinks(copy)"], in: submit),
-          "the copy's registry handle is released once submitted")
+    // RFed SPEC §17.15 (2026-11-18): a copy that went out also goes to the offline side, which
+    // owns its registry handle from there and releases it once no copy for a distro's offline
+    // devices needs it; a copy that did not go out is released at once.
+    check(inOrder(["lonePropagated(directHandle)", "DistroMessageFFI.sendViaAppLinks(copy)", "copyHash.hexString != hashHex",
+                   "offline.fallbackSent(peer: peer, handle: copy, messageId: hashHex, release: { DistroMessageFFI.destroy(copy) })"],
+                  in: submit),
+          "a copy that went out, under the message's hash, goes to the offline side, which releases its handle")
+    check(submit.components(separatedBy: "DistroMessageFFI.destroy(copy)").count - 1 == 3,
+          "the copy's registry handle is released on every path: when not sent, when under another hash, and by the offline side")
+    check(!submit.contains("defer { DistroMessageFFI.destroy(copy) }"),
+          "the handle is not released before the offline side has made its copy")
     check(!retry.contains("pendingOutbound[") && !submit.contains("pendingOutbound["),
           "the copy registers no second pending entry (it would overwrite the DIRECT one)")
 
@@ -279,7 +287,8 @@ func testChatRepositoryWiring() {
           "the copy's bookkeeping lives in the one pending entry")
 
     let apply = method("private func apply(_ step: OutboundAttempts.Step", in: source)
-    check(inOrder(["step.show", "step.startCopy", "retrySendViaPropNode(hashHex: hashHex, directHandle: pending.msgHandle)",
+    check(inOrder(["step.show", "step.startCopy",
+                   "retrySendViaPropNode(hashHex: hashHex, directHandle: pending.msgHandle, peer: pending.peerHash)",
                    "step.complete", "completePending("], in: apply),
           "apply writes the bubble, starts the copy, then completes")
 

@@ -2431,7 +2431,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             updateDeliveryState(messageId: pending.messageId, state: Self.deliveryState(shown))
         }
         if step.startCopy {
-            retrySendViaPropNode(hashHex: hashHex, directHandle: pending.msgHandle)
+            retrySendViaPropNode(hashHex: hashHex, directHandle: pending.msgHandle, peer: pending.peerHash)
         }
         if step.complete {
             completePending(hashHex: hashHex, pending: pending)
@@ -2482,13 +2482,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// completes, so it is still registered unless the message completed
     /// (delivered, or the stack stopped) before the clone ran — and then no
     /// copy is needed.
-    private func retrySendViaPropNode(hashHex: String, directHandle: UInt64) {
+    private func retrySendViaPropNode(hashHex: String, directHandle: UInt64, peer: Data) {
         guard lxmfClient != nil else {
             propagatedCopyNotStarted(hashHex: hashHex)
             return
         }
+        let offlineRef = DistroOffline.shared
         ffiQueue.async { [weak self] in
-            if Self.submitPropagatedCopy(of: directHandle, hashHex: hashHex) { return }
+            if Self.submitPropagatedCopy(of: directHandle, hashHex: hashHex, peer: peer, offline: offlineRef) { return }
             Task { @MainActor [weak self] in
                 self?.propagatedCopyNotStarted(hashHex: hashHex)
             }
@@ -2497,30 +2498,36 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
 
     /// Clone, submit and release the copy. The router keeps its own
     /// reference to a submitted message and every state arrives by hash, so
-    /// nothing needs the copy's registry handle: it is released at once, as
-    /// GroupChatManager does. Returns false (logged) when no copy we can
-    /// follow went out.
+    /// nothing here needs the copy's registry handle, as GroupChatManager
+    /// does. A copy that went out goes to `offline` too (RFed SPEC §17.15):
+    /// a message to a distro gets its copy for the distro's offline devices,
+    /// as one sent through propagation from the start does, and `offline`
+    /// releases the handle once no copy needs it (at once for any other
+    /// peer). Returns false (logged) when no copy we can follow went out.
     ///
     /// nonisolated: runs on ffiQueue, so it uses DistroMessageFFI's
     /// nonisolated wrappers (LxmfClient's statics are main-actor isolated).
-    nonisolated private static func submitPropagatedCopy(of directHandle: UInt64, hashHex: String) -> Bool {
+    nonisolated private static func submitPropagatedCopy(of directHandle: UInt64, hashHex: String, peer: Data,
+                                                         offline: DistroOffline) -> Bool {
         let copy = DistroMessageFFI.clonePropagated(directHandle)
         guard copy != 0 else {
             print("[Retichat] propagated copy of \(hashHex.prefix(8)) not cloned: \(DistroMessageFFI.lastError())")
             return false
         }
-        defer { DistroMessageFFI.destroy(copy) }
         guard DistroMessageFFI.sendViaAppLinks(copy) else {
             print("[Retichat] propagated copy of \(hashHex.prefix(8)) not sent: \(DistroMessageFFI.lastError())")
+            DistroMessageFFI.destroy(copy)
             return false
         }
         // The clone keeps the hash (LXMF-rust propagated_copy); a copy under
         // another would report where no pending entry hears it.
         if let copyHash = DistroMessageFFI.hash(copy), copyHash.hexString != hashHex {
             print("[Retichat] propagated copy of \(hashHex.prefix(8)) went out as \(copyHash.hexString.prefix(8)): its states cannot reach the bubble")
+            DistroMessageFFI.destroy(copy)
             return false
         }
         print("[Retichat] propagated copy of \(hashHex.prefix(8)) submitted")
+        offline.fallbackSent(peer: peer, handle: copy, messageId: hashHex, release: { DistroMessageFFI.destroy(copy) })
         return true
     }
 

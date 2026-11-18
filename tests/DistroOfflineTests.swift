@@ -112,8 +112,8 @@ func everyNewFunctionHasItsRustSymbolAndTheBridgeCallsIt() {
     for name in ["retichat_distro_direct_register", "retichat_distro_direct_unregister", "retichat_distro_direct_hold",
                  "retichat_distro_direct_set_app_data", "retichat_distro_direct_announce", "retichat_distro_direct_sign",
                  "retichat_propagation_build_direct_upload", "retichat_distro_direct_copy", "retichat_distro_direct_send",
-                 "retichat_distro_direct_ask", "retichat_online_interfaces", "retichat_interface_edges_register",
-                 "retichat_interface_edges_clear"] {
+                 "retichat_distro_direct_ask", "retichat_distro_direct_watch", "retichat_online_interfaces",
+                 "retichat_interface_edges_register", "retichat_interface_edges_clear"] {
         check(header.contains(" \(name)(") || header.contains("*\(name)("), "\(name) is declared in the header")
         check(rust.contains("pub extern \"C\" fn \(name)("), "\(name) has its Rust symbol")
         check(bridge.contains("\(name)("), "\(name) is called by the bridge")
@@ -159,7 +159,10 @@ func theStackStartsAndStopsItAndTheDistroSendsHandItEachMessage() {
     }
     // The text message and the reaction, each only to a distro address, once it has gone to the router.
     checkEqual(repo.components(separatedBy: "if toDistro { offlineRef.sentToDistro(").count - 1, 2, "both sends to a distro")
-    checkEqual(repo.components(separatedBy: "let offlineRef = DistroOffline.shared").count - 1, 2, "each captured on the main actor")
+    // The two sends and the fall-back to RFed (2026-11-18).
+    checkEqual(repo.components(separatedBy: "let offlineRef = DistroOffline.shared").count - 1, 3, "each captured on the main actor")
+    check(repo.contains("offline.fallbackSent(peer: peer, handle: copy, messageId: hashHex, release: { DistroMessageFFI.destroy(copy) })"),
+          "a message that went direct first and fell back to RFed gets its copy too")
     // What comes direct is opened and kept as RFed's blobs are, and owed only when new.
     let client = source("Retichat/Services/RfedDistroClient.swift")
     check(client.contains("nonisolated static func takeDirect(sealed: Data, stamp: Data) -> Bool {\n        blobQueue.sync {"),
@@ -169,6 +172,27 @@ func theStackStartsAndStopsItAndTheDistroSendsHandItEachMessage() {
     check(client.contains("} else if let hash = parsed.hash, hash.count == 64 {"), "what RFed brings settles it")
     check(client.contains("            DistroOutboxRuntime.brought(hash)"), "through the outbox runtime")
     check(client.contains("Self.blobQueue.async { DistroOutboxRuntime.pulled() }"), "a drained pull lets it go up")
+}
+
+/// 2026-11-18 (James: "Yes, build it"): the device announces its lookup address with its offline
+/// address while offline, and the sender watches each distro it knows, so the lookup and kept
+/// offline addresses pass the app's drop of announces.
+func theDeviceAnnouncesItsLookupAndTheSenderWatchesEachDistroItKnows() {
+    let direct = source("rust/retichat-ffi/src/distro_direct.rs")
+    check(direct.contains(".find(|h| h.offline == offline && !h.back).map(|h| h.lookup.clone())"),
+          "the lookup is announced only while the device is offline, never once it is back")
+    check(direct.contains("AppLinks::announce_held(&lookup, None, interfaces)"), "on the same mesh connections as the offline address")
+    check(direct.contains("Transport::watch_announce(hash.clone());"), "watched addresses pass the drop of announces")
+    let offline = source("Retichat/Services/DistroOffline.swift")
+    checkEqual(offline.components(separatedBy: "bridge.distroDirectWatch(").count - 1, 1, "one watch call site")
+    check(offline.contains("for d in UserPreferences.knownDistroContacts() { self.watch(d) }"), "at start, every distro known")
+    check(offline.contains("    private func makeCopy(_ d: String, handle: UInt64, messageId: String, release: (() -> Void)?) {\n        watch(d)"),
+          "at each send to a distro")
+    check(offline.contains("            say(\"kept \\(d.prefix(8))'s offline address \\(random) (§17.15)\")\n            watch(d)"),
+          "when it keeps an address it heard announced")
+    check(offline.contains("        watch(d)\n        sendKept(d, to: named)"), "when a lookup names addresses")
+    check(offline.contains("if copy.afterAsk || waiting(copy) { kept.append(copy) } else { copy.release?() }"),
+          "a fall-back's clone is let go once its copy is dropped")
 }
 
 let tests: [(String, () -> Void)] = [
@@ -183,6 +207,7 @@ let tests: [(String, () -> Void)] = [
     ("a send goes from one place and a failure is never sent again", aSendGoesFromOnePlaceAndAFailureIsNeverSentAgain),
     ("the device announces only on its mesh connections and never on a timer", theDeviceAnnouncesOnlyOnItsMeshConnectionsAndNeverOnATimer),
     ("the stack starts and stops it, and the distro sends hand it each message", theStackStartsAndStopsItAndTheDistroSendsHandItEachMessage),
+    ("the device announces its lookup and the sender watches each distro it knows", theDeviceAnnouncesItsLookupAndTheSenderWatchesEachDistroItKnows),
 ]
 
 @main

@@ -10,11 +10,12 @@
 //  default) and it is offline (DistroOfflineRules.offline), it holds its offline address
 //  `rfed.distro.direct.<random>` and the lookup address `rfed.distro.direct`, both with the
 //  distro's key, until the app restarts; `<random>` is made once per distro and kept
-//  (UserPreferences.distroOfflineRandom). It announces the offline address on each of its
-//  mesh connections when it goes offline, and on a mesh connection that comes up while it is
+//  (UserPreferences.distroOfflineRandom). It announces the offline address, and the lookup
+//  address with it (2026-11-18: relays then keep the lookup's answer), on each of its mesh
+//  connections when it goes offline, and on a mesh connection that comes up while it is
 //  offline; never on a timer. Once it reaches RFed again, or the toggle is turned off, it is
 //  back: it announces once on its mesh connections that it is back, and the lookup answers
-//  nothing. A message that comes to the offline address is kept as Distro mail from RFed is
+//  nothing and is not announced. A message that comes to the offline address is kept as Distro mail from RFed is
 //  (RfedDistroClient.takeDirect) and owed to RFed as a sent copy is
 //  (DistroOutboxRuntime.oweDirect).
 //
@@ -22,9 +23,12 @@
 //  message, with the same stamp, to each offline address of that distro that is live (a
 //  fan-out, `sentToDistro`). It keeps every offline address it learns; one is live from when
 //  its announce, or an answer for it, says it is offline, or a lookup names it, until one says
-//  it is back or a send to it fails. Once per distro each time a mesh connection comes up, a
-//  send asks over the mesh connections: a path request for each kept address and for the
-//  lookup. When an address becomes live, it is sent each message for the distro still waiting
+//  it is back or a send to it fails. It watches every distro it knows (at start, at a send,
+//  and when it keeps a new address): the distro's lookup address and each kept offline address
+//  pass the app's drop of announces, so it hears a device go offline when it announces
+//  (2026-11-18). Once per distro each time a mesh connection comes up, a send still asks over
+//  the mesh connections, for a device it missed: a path request for each kept address and for
+//  the lookup. A message that went direct first and fell back to RFed gets its copy too. When an address becomes live, it is sent each message for the distro still waiting
 //  to reach RFed, and each sent after asking, that it has not had. A failed send is said in the
 //  log and never repeated (DESIGN_PRINCIPLES §3); the message still goes through RFed. A send
 //  the device proves, or answers it holds, shows the message delivered.
@@ -82,12 +86,17 @@ nonisolated final class DistroOffline: @unchecked Sendable {
         let handle: UInt64
         var afterAsk: Bool
         var sentTo = Set<String>()
-        init(messageId: String, msgHash: String, bytes: Data, handle: UInt64, afterAsk: Bool) {
+        /// Lets `handle` go when this side owns it (a fall-back's clone), once the copy is
+        /// dropped; nil for the send's own handle, which ChatRepository releases.
+        let release: (() -> Void)?
+        init(messageId: String, msgHash: String, bytes: Data, handle: UInt64, afterAsk: Bool,
+             release: (() -> Void)? = nil) {
             self.messageId = messageId
             self.msgHash = msgHash
             self.bytes = bytes
             self.handle = handle
             self.afterAsk = afterAsk
+            self.release = release
         }
     }
     /// Distro (hex) -> the copies kept for its offline addresses.
@@ -98,6 +107,8 @@ nonisolated final class DistroOffline: @unchecked Sendable {
     private var asked = Set<String>()
     /// Distros heard from since a mesh connection last came up.
     private var heard = Set<String>()
+    /// Distro (hex) -> the kept random parts watched for in this run, its lookup with them.
+    private var watching: [String: Set<String>] = [:]
 
     private init(bridge: RetichatBridge) {
         self.bridge = bridge
@@ -132,6 +143,9 @@ nonisolated final class DistroOffline: @unchecked Sendable {
             self.online = self.bridge.onlineInterfaces()
             self.rfedReached = nil
             self.started = true
+            // The sender listens for every distro it knows, not only those it sends to in this run.
+            self.watching = [:]
+            for d in UserPreferences.knownDistroContacts() { self.watch(d) }
         }
         if !bridge.distroDirectRegister(
             take: { [weak self] distro, sealed, stamp in self?.take(distro: distro, sealed: sealed, stamp: stamp) ?? 0 },
@@ -317,6 +331,7 @@ nonisolated final class DistroOffline: @unchecked Sendable {
         guard sendsTo(d) else { return }
         if UserPreferences.keepDistroOfflineAddress(distroHex: d, random: random) {
             say("kept \(d.prefix(8))'s offline address \(random) (§17.15)")
+            watch(d)
         }
         heard.insert(d)
         if back {
@@ -337,7 +352,26 @@ nonisolated final class DistroOffline: @unchecked Sendable {
             _ = UserPreferences.keepDistroOfflineAddress(distroHex: d, random: random)
             live[d, default: []].insert(random)
         }
+        watch(d)
         sendKept(d, to: named)
+    }
+
+    /// Watch for the announces of `d`'s lookup address and of each offline address of `d` kept,
+    /// so they pass the app's drop of announces (§17.15, 2026-11-18): this device hears one of
+    /// `d`'s devices go offline when it announces, not only when it next asks. Told again only
+    /// when something new is kept; not recorded when it fails (`d`'s identity not known yet),
+    /// so the next event for `d` tells it again.
+    private func watch(_ d: String) {
+        guard let distro = Data(hexString: d) else { return }
+        let kept = UserPreferences.distroOfflineKept(distroHex: d)
+        if watching[d] == kept { return }
+        let count = bridge.distroDirectWatch(distro: distro, randoms: Array(kept))
+        if count < 0 {
+            say("\(d.prefix(8))'s offline devices are not watched for yet: \(DistroMessageFFI.rnsLastError()) (§17.15)")
+            return
+        }
+        watching[d] = kept
+        say("watching for \(d.prefix(8))'s lookup and \(kept.count) kept offline address(es) (§17.15)")
     }
 
     /// A message this device just sent to the distro `distro` through propagation (the
@@ -347,27 +381,51 @@ nonisolated final class DistroOffline: @unchecked Sendable {
     /// is time. Never throws.
     func sentToDistro(distro: Data, handle: UInt64, messageId: String) {
         let d = distro.hexString
-        let bridge = bridge
         queue.async {
             guard self.started else { return }
-            guard let node = self.propagationNode else {
-                self.say("no propagation node is configured: the message to \(d.prefix(8)) has no copy for its offline devices (§17.15)")
+            self.makeCopy(d, handle: handle, messageId: messageId, release: nil)
+        }
+    }
+
+    /// The propagated copy of a message that went direct first (ChatRepository's fall-back to
+    /// RFed), `handle` the clone the router sends, which `release` lets go: made into a copy
+    /// for the offline devices as `sentToDistro` makes one when `peer` is a distro this device
+    /// sends to, the handle released once no copy needs it; released at once otherwise.
+    func fallbackSent(peer: Data, handle: UInt64, messageId: String, release: @escaping () -> Void) {
+        let d = peer.hexString
+        queue.async {
+            guard self.started, self.sendsTo(d) else { release(); return }
+            self.makeCopy(d, handle: handle, messageId: messageId, release: release)
+        }
+    }
+
+    /// On `queue`: watch `d`, make the copy of `handle` off the queue, then fan it out. A copy
+    /// not made releases the handle (`release`, when this side owns it) at once.
+    private func makeCopy(_ d: String, handle: UInt64, messageId: String, release: (() -> Void)?) {
+        watch(d)
+        guard let node = propagationNode else {
+            say("no propagation node is configured: the message to \(d.prefix(8)) has no copy for its offline devices (§17.15)")
+            release?()
+            return
+        }
+        let bridge = bridge
+        // Mining blocks: its own thread, never this queue's or the send's.
+        DispatchQueue.global(qos: .utility).async {
+            guard let copy = bridge.distroDirectCopy(handle: handle, node: node) else {
+                // Read on this thread, at once: the Rust error slot is thread-local.
+                let error = DistroMessageFFI.rnsLastError()
+                self.queue.async {
+                    self.say("the message to \(d.prefix(8)) has no copy for its offline devices: \(error) (§17.15)")
+                    release?()
+                }
                 return
             }
-            // Mining blocks: its own thread, never this queue's or the send's.
-            DispatchQueue.global(qos: .utility).async {
-                guard let copy = bridge.distroDirectCopy(handle: handle, node: node) else {
-                    // Read on this thread, at once: the Rust error slot is thread-local.
-                    let error = DistroMessageFFI.rnsLastError()
-                    self.queue.async { self.say("the message to \(d.prefix(8)) has no copy for its offline devices: \(error) (§17.15)") }
-                    return
-                }
-                var hash = [UInt8](repeating: 0, count: 32)
-                let len = lxmf_message_hash(handle, &hash, 32)
-                let msgHash = len > 0 ? Data(hash.prefix(Int(len))).hexString : ""
-                self.queue.async {
-                    self.fanOut(d, Copy(messageId: messageId, msgHash: msgHash, bytes: copy, handle: handle, afterAsk: false))
-                }
+            var hash = [UInt8](repeating: 0, count: 32)
+            let len = lxmf_message_hash(handle, &hash, 32)
+            let msgHash = len > 0 ? Data(hash.prefix(Int(len))).hexString : ""
+            self.queue.async {
+                self.fanOut(d, Copy(messageId: messageId, msgHash: msgHash, bytes: copy, handle: handle,
+                                    afterAsk: false, release: release))
             }
         }
     }
@@ -450,7 +508,11 @@ nonisolated final class DistroOffline: @unchecked Sendable {
     /// Keep only the copies an address that becomes live could still need: waiting to reach
     /// RFed, or sent after asking.
     private func prune(_ d: String) {
-        copies[d]?.removeAll { !$0.afterAsk && !waiting($0) }
-        if copies[d]?.isEmpty == true { copies.removeValue(forKey: d) }
+        guard let list = copies[d] else { return }
+        var kept: [Copy] = []
+        for copy in list {
+            if copy.afterAsk || waiting(copy) { kept.append(copy) } else { copy.release?() }
+        }
+        if kept.isEmpty { copies.removeValue(forKey: d) } else { copies[d] = kept }
     }
 }

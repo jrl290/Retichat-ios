@@ -2505,6 +2505,23 @@ pub extern "C" fn retichat_distro_direct_ask(
     }
 }
 
+/// Watch for the announces of the lookup address of the distro whose `lxmf.delivery` is
+/// `distro`, and of its offline addresses `randoms` (newline-separated random parts) this sender
+/// keeps (§17.15): they pass the app's drop of announces. How many addresses are watched, or -1
+/// with `rns_last_error` (the distro's identity is not known yet).
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_watch(distro: *const u8, distro_len: u32, randoms: *const c_char) -> i32 {
+    let distro = slice_from_raw(distro, distro_len);
+    let randoms = unsafe { lines_of(randoms) };
+    match distro_direct::watch(&distro, &randoms) {
+        Ok(count) => count as i32,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
 /// The names of the Reticulum interfaces online now (`Transport::online_interface_names`),
 /// newline-separated UTF-8 (heap bytes, free with `rns_free_bytes`; empty for none). Read at an
 /// interface's edge.

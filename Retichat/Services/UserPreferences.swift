@@ -525,4 +525,10 @@ extension UserPreferences {
     nonisolated static func isDistroContactKnown(_ hex: String) -> Bool {
         (UserDefaults.standard.stringArray(forKey: distroContactsKey) ?? []).contains(hex.lowercased())
     }
+
+    /// Every address whose past announce carried the distro flag, off the main actor: the
+    /// distros a sender watches for at start (§17.15).
+    nonisolated static func knownDistroContacts() -> [String] {
+        (UserDefaults.standard.stringArray(forKey: distroContactsKey) ?? []).map { $0.lowercased() }
+    }
 }

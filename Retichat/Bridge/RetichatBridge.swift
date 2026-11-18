@@ -1351,6 +1351,17 @@ extension RetichatBridge {
         }
     }
 
+    /// Watch for the announces of `distro`'s lookup address and of its offline addresses
+    /// `randoms`, so they pass the app's drop of announces (§17.15). How many addresses are
+    /// watched, or -1 with the error slot set (the distro's identity is not known yet).
+    nonisolated func distroDirectWatch(distro: Data, randoms: [String]) -> Int32 {
+        randoms.joined(separator: "\n").withCString { randomsPtr in
+            distro.withUnsafeBytes { buf in
+                retichat_distro_direct_watch(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(distro.count), randomsPtr)
+            }
+        }
+    }
+
     /// The names of the Reticulum interfaces online now.
     nonisolated func onlineInterfaces() -> [String] {
         var outLen: UInt32 = 0

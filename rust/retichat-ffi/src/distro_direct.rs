@@ -459,9 +459,28 @@ pub fn set_app_data(offline: &[u8], back: bool, lookup: &[String]) -> Result<(),
 }
 
 /// Announce the offline address on each of `interfaces` that is up, with its
-/// `app_data` as set. How many announces went.
+/// `app_data` as set, and, while the device is offline (not back), the lookup
+/// address with it (§17.15, 2026-11-18): relays then keep the lookup's answer
+/// and give it to a sender that asks, even while they hold back searches for
+/// unknown addresses, and a sender that watches the lookup hears it. Once the
+/// device is back the lookup answers `[]` and is not announced. How many
+/// announces of the offline address went; the lookup's are said in the log.
 pub fn announce(offline: &[u8], interfaces: &[String]) -> Result<usize, String> {
-    AppLinks::announce_held(offline, None, interfaces)
+    let count = AppLinks::announce_held(offline, None, interfaces)?;
+    let lookup = HELD_PAIRS
+        .lock()
+        .ok()
+        .and_then(|pairs| pairs.iter().find(|h| h.offline == offline && !h.back).map(|h| h.lookup.clone()));
+    if let Some(lookup) = lookup {
+        match AppLinks::announce_held(&lookup, None, interfaces) {
+            Ok(sent) => say(
+                format!("the lookup address {} announced on {sent} mesh connection(s)", reticulum_rust::hexrep(&lookup, false)),
+                reticulum_rust::LOG_NOTICE,
+            ),
+            Err(e) => say(format!("the lookup address was not announced: {e}"), reticulum_rust::LOG_ERROR),
+        }
+    }
+    Ok(count)
 }
 
 /// A copy that came to the offline address `offline`, as one packet or as a
@@ -601,6 +620,33 @@ pub fn send(distro: &[u8], random: &str, copy: Vec<u8>, outcome: Arc<dyn Fn(u8) 
     Ok(true)
 }
 
+/// The addresses a sender watches for the distro whose identity hash is
+/// `identity_hash`: its lookup address first, then the offline address of each
+/// valid random part in `randoms`.
+fn watched_hashes(identity_hash: &[u8], randoms: &[String]) -> Vec<Vec<u8>> {
+    let mut hashes = vec![lookup_hash(identity_hash)];
+    hashes.extend(randoms.iter().filter(|r| valid_random(r)).map(|r| offline_hash(identity_hash, r)));
+    hashes
+}
+
+/// Watch for the announces of the lookup address of the distro whose
+/// `lxmf.delivery` is `distro`, and of each of its offline addresses `randoms`
+/// that this sender keeps (§17.15 "On the sender", 2026-11-18). The apps drop
+/// announces they have not asked for (Transport `drop_announces`); watched
+/// addresses pass that drop (Transport `watch_announce`), so a sender hears a
+/// device of the distro go offline when it announces, not only when it next
+/// asks. Watching is kept for the process and is the same however often it is
+/// asked for. How many addresses are watched.
+pub fn watch(distro: &[u8], randoms: &[String]) -> Result<usize, String> {
+    let identity = Identity::recall(distro).ok_or("the distro's identity is not known: its announce has not been heard")?;
+    let identity_hash = identity.hash.clone().ok_or("the distro's identity has no hash")?;
+    let hashes = watched_hashes(&identity_hash, randoms);
+    for hash in &hashes {
+        Transport::watch_announce(hash.clone());
+    }
+    Ok(hashes.len())
+}
+
 /// Ask, over each of `interfaces` (the sender's mesh connections), for a path
 /// to each offline address `randoms` of the distro whose `lxmf.delivery` is
 /// `distro`, and, `with_lookup`, to its lookup address (§17.15). A relay that
@@ -700,6 +746,19 @@ mod tests {
         assert_eq!(lookup_hash(&id), Destination::hash(Some(&id), "rfed", &["distro", "direct"]));
         assert_ne!(offline_hash(&id, RANDOM), offline_hash(&id, "fedcba9876543210"));
         assert_eq!(distro_of(&id), delivery_hash(&distro).unwrap());
+    }
+
+    #[test]
+    fn a_sender_watches_the_lookup_and_each_kept_offline_address() {
+        let distro = Identity::new(true);
+        let id = distro.hash.clone().unwrap();
+        let kept = vec![RANDOM.to_string(), "not-a-random".to_string(), "fedcba9876543210".to_string()];
+        assert_eq!(
+            watched_hashes(&id, &kept),
+            vec![lookup_hash(&id), offline_hash(&id, RANDOM), offline_hash(&id, "fedcba9876543210")],
+            "the lookup first, then each valid kept random part; an invalid one is skipped"
+        );
+        assert_eq!(watched_hashes(&id, &[]), vec![lookup_hash(&id)], "with nothing kept, the lookup alone");
     }
 
     /// A sealed message to `distro` and a stamp over it at `cost`.

@@ -1323,6 +1323,12 @@ int32_t retichat_distro_direct_send(const uint8_t *distro, uint32_t distro_len, 
 int32_t retichat_distro_direct_ask(const uint8_t *distro, uint32_t distro_len, const char *randoms,
                                    int32_t with_lookup, const char *interfaces);
 
+/// Watch for the announces of `distro`'s lookup address and of each of its
+/// offline addresses named in `randoms` (newline-separated): they pass the
+/// app's drop of announces. How many addresses are watched, or -1 (the
+/// distro's identity is not known yet).
+int32_t retichat_distro_direct_watch(const uint8_t *distro, uint32_t distro_len, const char *randoms);
+
 /// The names of the Reticulum interfaces online now, newline-separated UTF-8
 /// (heap bytes; empty for none).
 uint8_t *retichat_online_interfaces(uint32_t *out_len);
