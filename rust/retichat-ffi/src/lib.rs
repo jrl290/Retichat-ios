@@ -20,6 +20,7 @@
 pub use lxmf_rust::cffi::*;
 pub use reticulum_rust::cffi::*;
 
+mod distro_direct;
 mod distro_outbox;
 mod group_status;
 
@@ -2192,6 +2193,367 @@ fn deliver_with_receipt(callback: GroupDeliveryFn, context: &DeliveryContext, me
         packed, packed_len,
         transient_id, transient_id_len,
     );
+}
+
+// ── Offline use of a distro address (RFed SPEC §17.15, James 2026-11-17) ─────
+//
+// Thin C wrappers over `distro_direct.rs`, the same module Retichat-android's
+// JNI wraps: the device's two addresses and what comes to them, the Distro Sync
+// proof and upload of a message received direct, the sender's copy, send and
+// path requests, and the interfaces' edges. The app (Services/DistroOffline.swift)
+// decides when and where; nothing here sends on a timer or sends again. A list
+// crosses the boundary as one NUL-terminated string, its items separated by
+// newlines (random parts are hex; interface names hold no newline).
+
+/// The items of a newline-separated C string; empty ones are left out.
+unsafe fn lines_of(ptr: *const c_char) -> Vec<String> {
+    cstr_to_string(ptr).split('\n').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+}
+
+type DirectTakeCallback = Option<extern "C" fn(*mut c_void, *const u8, u32, *const u8, u32, *const u8, u32) -> i32>;
+type DirectOfflineCallback = Option<extern "C" fn(*mut c_void, *const u8, u32, *const c_char, i32)>;
+type DirectLookupCallback = Option<extern "C" fn(*mut c_void, *const u8, u32, *const c_char)>;
+
+/// Tell the host what comes to this device's offline address and every offline address and lookup
+/// answer heard (RFed SPEC §17.15):
+///
+/// * `take(context, distro, distro_len, sealed, sealed_len, stamp, stamp_len)`: a copy that came to
+///   the offline address of the distro `distro` (its `lxmf.delivery`), its stamp already checked
+///   against the RFed node's cost. The host opens it and keeps it, and returns its answer's bits:
+///   1 the device holds the message afterwards, newly or already; 2 the device is back. The
+///   packet's proof, or the request's answer, waits for it.
+/// * `offline(context, distro, distro_len, random, back)`: an offline address of `distro` announced
+///   or answered for, checked against the identity that announced it; `random` is its random part
+///   (NUL-terminated) and `back` non-zero when it says the device is back.
+/// * `lookup(context, distro, distro_len, randoms)`: `distro`'s lookup address answered for: the
+///   random parts it names, newline-separated (empty once that device is back).
+///
+/// The pointers are valid only during the call. Calls come on stack threads; `offline` and `lookup`
+/// must not block. One registration at a time: a later one replaces it. 0, or -1 with
+/// `rns_last_error` when a callback is NULL.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_register(
+    take: DirectTakeCallback,
+    offline: DirectOfflineCallback,
+    lookup: DirectLookupCallback,
+    context: *mut c_void,
+) -> i32 {
+    let (Some(take), Some(offline), Some(lookup)) = (take, offline, lookup) else {
+        rns::set_error("the three offline-address callbacks are required".to_string());
+        return -1;
+    };
+    let context = context as usize;
+    let on_direct: distro_direct::OnDirect = Arc::new(move |distro: &[u8], sealed: &[u8], stamp: &[u8]| -> u8 {
+        let bits = take(
+            context as *mut c_void,
+            distro.as_ptr(),
+            distro.len() as u32,
+            sealed.as_ptr(),
+            sealed.len() as u32,
+            stamp.as_ptr(),
+            stamp.len() as u32,
+        );
+        (bits & 0xff) as u8
+    });
+    let on_offline_address: distro_direct::OnOfflineAddress = Arc::new(move |distro: &[u8], random: &str, back: bool| {
+        let Ok(random) = std::ffi::CString::new(random) else { return };
+        offline(context as *mut c_void, distro.as_ptr(), distro.len() as u32, random.as_ptr(), back as i32);
+    });
+    let on_lookup: distro_direct::OnLookup = Arc::new(move |distro: &[u8], randoms: &[String]| {
+        let Ok(named) = std::ffi::CString::new(randoms.join("\n")) else { return };
+        lookup(context as *mut c_void, distro.as_ptr(), distro.len() as u32, named.as_ptr());
+    });
+    distro_direct::set_sink(distro_direct::Sink { on_direct, on_offline_address, on_lookup });
+    distro_direct::hook_announces();
+    0
+}
+
+/// Tell no one (the stack is stopping). Transport keeps its one announce handler, which then tells
+/// no one, and a copy that comes meanwhile is refused, said in the log.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_unregister() {
+    distro_direct::clear_sink();
+}
+
+/// Hold the distro's offline address `rfed.distro.direct.<random>` (its ratchets kept at
+/// `ratchets_path`) and its lookup address `rfed.distro.direct` until the app restarts, with the
+/// key of `distro_handle`. A copy's stamp is checked against the cost of `node`, the RFed node's
+/// own `lxmf.propagation` (16 bytes; none: every copy is refused). Their `app_data` is
+/// `[random, back]` and the lookup's random parts, newline-separated in `lookup`. Held already: the
+/// node and both `app_data` are set again. The offline address's hash (heap bytes, free with
+/// `rns_free_bytes`), or NULL with `rns_last_error`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_hold(
+    distro_handle: u64,
+    random: *const c_char,
+    ratchets_path: *const c_char,
+    node: *const u8,
+    node_len: u32,
+    back: i32,
+    lookup: *const c_char,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let Some(distro) = distro_identity(distro_handle, "distro") else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    };
+    let random = unsafe { cstr_to_string(random) };
+    let ratchets_path = unsafe { cstr_to_string(ratchets_path) };
+    let node = slice_from_raw(node, node_len);
+    let lookup = unsafe { lines_of(lookup) };
+    match distro_direct::hold(&distro, &random, &ratchets_path, &node, back != 0, &lookup) {
+        Ok(offline) => emit_buffer(offline, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// The held offline address `offline`'s `app_data` becomes `[random, back]` and its lookup's the
+/// random parts in `lookup` (newline-separated): what Reticulum answers path requests with, and
+/// what the next announce carries. 0, or -1 with `rns_last_error`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_set_app_data(offline: *const u8, offline_len: u32, back: i32, lookup: *const c_char) -> i32 {
+    let offline = slice_from_raw(offline, offline_len);
+    let lookup = unsafe { lines_of(lookup) };
+    match distro_direct::set_app_data(&offline, back != 0, &lookup) {
+        Ok(()) => 0,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// Announce the held offline address `offline` on each interface named in `interfaces`
+/// (newline-separated: the device's mesh connections) that is up. How many announces went, or -1
+/// with `rns_last_error`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_announce(offline: *const u8, offline_len: u32, interfaces: *const c_char) -> i32 {
+    let offline = slice_from_raw(offline, offline_len);
+    let interfaces = unsafe { lines_of(interfaces) };
+    match distro_direct::announce(&offline, &interfaces) {
+        Ok(count) => count as i32,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// The §17.13 Distro Sync proof of `sealed`, a message to the distro of `distro_handle` received
+/// direct: D's 64-byte signature over `"rfed.distro.sync" | 0x01 | D_hash | SHA-256(sealed)`. Heap
+/// bytes (free with `rns_free_bytes`), or NULL with `rns_last_error` when the handle has no private
+/// key or `sealed` is not addressed to it.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_sign(distro_handle: u64, sealed: *const u8, sealed_len: u32, out_len: *mut u32) -> *mut u8 {
+    let Some(distro) = distro_identity(distro_handle, "distro") else {
+        unsafe { *out_len = 0; }
+        return std::ptr::null_mut();
+    };
+    let sealed = slice_from_raw(sealed, sealed_len);
+    match distro_direct::sign_sealed(&distro, &sealed) {
+        Ok(sig) => emit_buffer(sig, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// One upload of a message received direct (RFed SPEC §17.15) for the node `node` (16 bytes):
+/// `sealed` and the sender's `stamp` unchanged while it meets the node's cost (read from its
+/// announce as `retichat_propagation_build_sealed_upload` reads it), a new stamp when the cost has
+/// risen above it, and the claim only when `with_claim` is non-zero. BLOCKS while a stamp is
+/// mined: never on the main thread. Heap bytes (free with `rns_free_bytes`), or NULL with
+/// `rns_last_error` and nothing sent. As Retichat-android's `nativePropagationBuildDirectUpload`.
+#[no_mangle]
+pub extern "C" fn retichat_propagation_build_direct_upload(
+    distro_public_key: *const u8,
+    key_len: u32,
+    sealed: *const u8,
+    sealed_len: u32,
+    stamp: *const u8,
+    stamp_len: u32,
+    sig: *const u8,
+    sig_len: u32,
+    with_claim: i32,
+    node: *const u8,
+    node_len: u32,
+    out_len: *mut u32,
+) -> *mut u8 {
+    let key = slice_from_raw(distro_public_key, key_len);
+    let sealed = slice_from_raw(sealed, sealed_len);
+    let stamp = slice_from_raw(stamp, stamp_len);
+    let sig = slice_from_raw(sig, sig_len);
+    let node = slice_from_raw(node, node_len);
+    let cost = match propagation_node_stamp_cost(&node) {
+        Ok(cost) => cost,
+        Err(e) => return emit_error(out_len, e),
+    };
+    match distro_outbox::build_direct_upload(&key, &sealed, &stamp, &sig, with_claim != 0, cost) {
+        Ok(bytes) => emit_buffer(bytes, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+/// A sender's copy of the outbound message `handle`, a message to a distro the router has taken
+/// through propagation: `msgpack [ bin sealed, bin stamp ]`, one sealed message with RFed's and one
+/// stamp, made here at `node`'s cost (16 bytes, the node the router sends it to) when the router has
+/// not made it yet (`distro_direct::direct_copy`). The cost is read before the message's lock is
+/// taken, never under it. BLOCKS while a stamp is mined: never on the main thread. Heap bytes (free
+/// with `rns_free_bytes`), or NULL with `rns_last_error`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_copy(handle: u64, node: *const u8, node_len: u32, out_len: *mut u32) -> *mut u8 {
+    let node = slice_from_raw(node, node_len);
+    let cost = distro_outbox::node_stamp_cost(Identity::recall_app_data(&node).as_deref()).ok();
+    let Some(msg) = rns::get_handle::<Arc<Mutex<lxmf_rust::lx_message::LXMessage>>>(handle) else {
+        return emit_error(out_len, "invalid message handle".to_string());
+    };
+    let copy = match msg.lock() {
+        Ok(mut m) => distro_direct::direct_copy(&mut m, cost),
+        Err(e) => Err(e.to_string()),
+    };
+    match copy {
+        Ok(bytes) => emit_buffer(bytes, out_len),
+        Err(e) => emit_error(out_len, e),
+    }
+}
+
+type DirectOutcomeCallback = Option<extern "C" fn(*mut c_void, i32)>;
+
+/// What tells the host how one send to an offline address ended: once, and the host's `context` is
+/// released, once, when the last closure holding this report is dropped (or at once when nothing
+/// was sent).
+struct DirectReport {
+    outcome: DirectOutcomeCallback,
+    release: UploadReleaseCallback,
+    context: usize,
+    told: AtomicBool,
+}
+
+impl DirectReport {
+    fn tell(&self, bits: u8) {
+        if !self.told.swap(true, Ordering::SeqCst) {
+            if let Some(callback) = self.outcome {
+                callback(self.context as *mut c_void, bits as i32);
+            }
+        }
+    }
+}
+
+impl Drop for DirectReport {
+    fn drop(&mut self) {
+        if let Some(release) = self.release {
+            release(self.context as *mut c_void);
+        }
+    }
+}
+
+/// Send `copy` to the offline address `random` (NUL-terminated) of the distro `distro` (its
+/// `lxmf.delivery`, 16 bytes): one packet with a proof asked for when it fits, otherwise one
+/// `/distro/direct` request on a link of its own. `outcome(context, bits)` is told once, on a stack
+/// thread: 1 held (a proof, or the answer said so), 2 back, 0 failed (no proof, the link did not
+/// come up or closed, the request failed). `context` is owned by the library from this call on:
+/// `release(context)` is called exactly once, after the outcome, or at once when nothing went.
+/// 1 when it went, 0 when no path to the address is known (nothing went: ask for one), -1 with
+/// `rns_last_error`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_send(
+    distro: *const u8,
+    distro_len: u32,
+    random: *const c_char,
+    copy: *const u8,
+    copy_len: u32,
+    outcome: DirectOutcomeCallback,
+    release: UploadReleaseCallback,
+    context: *mut c_void,
+) -> i32 {
+    // Made first, so that every way out of this function releases the context.
+    let report = Arc::new(DirectReport { outcome, release, context: context as usize, told: AtomicBool::new(false) });
+    let distro = slice_from_raw(distro, distro_len);
+    let random = unsafe { cstr_to_string(random) };
+    let copy = slice_from_raw(copy, copy_len);
+    let told = report.clone();
+    let tell: Arc<dyn Fn(u8) + Send + Sync> = Arc::new(move |bits: u8| told.tell(bits));
+    match distro_direct::send(&distro, &random, copy, tell) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// Path requests, over each interface named in `interfaces` (newline-separated: the sender's mesh
+/// connections), for each offline address of `distro` (16 bytes) whose random part is in `randoms`
+/// (newline-separated) and, when `with_lookup` is non-zero, for its lookup address. How many went,
+/// or -1 with `rns_last_error`.
+#[no_mangle]
+pub extern "C" fn retichat_distro_direct_ask(
+    distro: *const u8,
+    distro_len: u32,
+    randoms: *const c_char,
+    with_lookup: i32,
+    interfaces: *const c_char,
+) -> i32 {
+    let distro = slice_from_raw(distro, distro_len);
+    let randoms = unsafe { lines_of(randoms) };
+    let interfaces = unsafe { lines_of(interfaces) };
+    match distro_direct::ask(&distro, &randoms, with_lookup != 0, &interfaces) {
+        Ok(count) => count as i32,
+        Err(e) => {
+            rns::set_error(e);
+            -1
+        }
+    }
+}
+
+/// The names of the Reticulum interfaces online now (`Transport::online_interface_names`),
+/// newline-separated UTF-8 (heap bytes, free with `rns_free_bytes`; empty for none). Read at an
+/// interface's edge.
+#[no_mangle]
+pub extern "C" fn retichat_online_interfaces(out_len: *mut u32) -> *mut u8 {
+    let names = Transport::online_interface_names().join("\n");
+    emit_buffer(names.into_bytes(), out_len)
+}
+
+type InterfaceEdgeCallback = Option<extern "C" fn(*mut c_void)>;
+
+/// The host's interface edge callback and its context, or none: replaced by each
+/// `retichat_interface_edges_register`, dropped by `retichat_interface_edges_clear`.
+static INTERFACE_EDGE_HOST: Mutex<Option<(extern "C" fn(*mut c_void), usize)>> = Mutex::new(None);
+
+/// Transport's listeners are never taken out again, so ours are added once per process.
+static INTERFACE_EDGE_HOOKED: std::sync::Once = std::sync::Once::new();
+
+fn deliver_interface_edge() {
+    let host = *INTERFACE_EDGE_HOST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((callback, context)) = host {
+        callback(context as *mut c_void);
+    }
+}
+
+/// Tell the host, through `callback(context)`, at every Reticulum interface up- and down-edge
+/// (Transport's own, `set_interface_online` and an online interface removed): the host then reads
+/// `retichat_online_interfaces`. Offline use of a distro address decides by it whether an internet
+/// connection is up and which mesh connection came up (RFed SPEC §17.15). Runs on a thread of its
+/// own and must not block. One host callback at a time, apart from `retichat_interface_up_register`'s.
+/// 0, or -1 with `rns_last_error` when `callback` is NULL.
+#[no_mangle]
+pub extern "C" fn retichat_interface_edges_register(callback: InterfaceEdgeCallback, context: *mut c_void) -> i32 {
+    let Some(callback) = callback else {
+        rns::set_error("an interface edge callback is required".to_string());
+        return -1;
+    };
+    *INTERFACE_EDGE_HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some((callback, context as usize));
+    INTERFACE_EDGE_HOOKED.call_once(|| {
+        Transport::add_interface_up_listener(Arc::new(|_: &str| deliver_interface_edge()));
+        Transport::add_interface_down_listener(Arc::new(|_: &str| deliver_interface_edge()));
+    });
+    0
+}
+
+/// The host stops listening to interface edges (the stack is stopping).
+#[no_mangle]
+pub extern "C" fn retichat_interface_edges_clear() {
+    *INTERFACE_EDGE_HOST.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[cfg(test)]

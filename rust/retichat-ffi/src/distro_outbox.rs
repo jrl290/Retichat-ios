@@ -208,6 +208,52 @@ pub fn build_sealed_propagation_upload(
     sealed_upload_with_stamp(distro_public_key, sealed, sync_sig, with_claim, &stamp, now_seconds())
 }
 
+/// One upload of a message this device received direct at its offline address (RFed SPEC §17.15
+/// "Taking a message"): the sealed bytes as the sender sent them, and the sender's own `stamp` with
+/// them, unchanged, when it still meets the node's `stamp_cost`. If the node's cost has risen above
+/// it since, a new stamp is mined, as `build_sealed_propagation_upload` does for every upload of a
+/// Distro Sync of a send; the claim is that function's. The sealed message must be addressed to the
+/// `lxmf.delivery` of `distro_public_key` and no other. Blocks while a stamp is mined. As
+/// Retichat-android's `build_direct_upload`.
+pub fn build_direct_upload(
+    distro_public_key: &[u8],
+    sealed: &[u8],
+    stamp: &[u8],
+    sync_sig: &[u8],
+    with_claim: bool,
+    stamp_cost: u32,
+) -> Result<Vec<u8>, String> {
+    if sealed.len() <= DEST_LEN {
+        return Err(format!("a sealed message is longer than {DEST_LEN} bytes, this is {}", sealed.len()));
+    }
+    let recipient = Identity::from_public_key(distro_public_key)?;
+    let destination = Destination::new_outbound(
+        Some(recipient),
+        DestinationType::Single,
+        "lxmf".to_string(),
+        vec!["delivery".to_string()],
+    )?;
+    if destination.hash != sealed[..DEST_LEN] {
+        return Err("the distro's key does not produce the sealed message's destination".to_string());
+    }
+    let mut stamped = Vec::with_capacity(sealed.len() + stamp.len());
+    stamped.extend_from_slice(sealed);
+    stamped.extend_from_slice(stamp);
+    if stamp.len() == lxmf_rust::lx_stamper::STAMP_SIZE && lxmf_rust::lx_stamper::validate_pn_stamp(&stamped, stamp_cost).is_some() {
+        return sealed_upload_with_stamp(distro_public_key, sealed, sync_sig, with_claim, stamp, now_seconds());
+    }
+    reticulum_rust::log(
+        format!(
+            "[distro-direct] the sender's stamp on {} is below the node's cost of {stamp_cost} now: a new stamp is mined for its upload",
+            reticulum_rust::hexrep(&sealed[..DEST_LEN], false),
+        ),
+        reticulum_rust::LOG_NOTICE,
+        false,
+        false,
+    );
+    build_sealed_propagation_upload(distro_public_key, sealed, sync_sig, with_claim, stamp_cost)
+}
+
 /// The envelope of a sealed upload with its stamp and timebase given
 /// ([`build_sealed_propagation_upload`] mines the one and reads the other).
 ///
@@ -629,6 +675,36 @@ mod tests {
         assert_eq!(claim.distro_pubkey.to_vec(), key);
         assert_eq!(claim.sig, sealed.sig);
         assert!(lxmf_rust::distro::verify_sync_claim(claim, &sync_transient_id(&sealed.sealed), &sealed.sealed).is_ok());
+    }
+
+    /// RFed SPEC §17.15: a message received direct goes up with the sender's own stamp, unless the
+    /// node's cost has risen above it. As Retichat-android's
+    /// `a_direct_upload_keeps_the_senders_stamp_while_it_meets_the_cost`.
+    #[test]
+    fn a_direct_upload_keeps_the_senders_stamp_while_it_meets_the_cost() {
+        let (distro, _hash, msg) = distro_message("received direct");
+        let packed = pack_message(&Arc::new(Mutex::new(msg))).unwrap();
+        let key = distro.get_public_key().unwrap();
+        let sealed = lxmf_rust::distro::seal_for_sync(&distro, &packed).unwrap();
+        let (stamp, value) = generate_stamp(&sync_transient_id(&sealed.sealed), 3, WORKBLOCK_EXPAND_ROUNDS_PN);
+        let stamp = stamp.unwrap();
+
+        let kept = build_direct_upload(&key, &sealed.sealed, &stamp, &sealed.sig, true, 3).unwrap();
+        let (_, data, extension) = sealed_parts(&kept);
+        assert!(extension.is_some(), "the claim, as for a Distro Sync of a send");
+        assert_eq!(&data[..data.len() - 32], &sealed.sealed[..]);
+        assert_eq!(&data[data.len() - 32..], &stamp[..], "the sender's stamp, unchanged");
+
+        // The node's cost rose above the stamp: a new one, at the new cost.
+        let cost = value + 1;
+        let restamped = build_direct_upload(&key, &sealed.sealed, &stamp, &sealed.sig, false, cost).unwrap();
+        let (_, data, extension) = sealed_parts(&restamped);
+        assert!(extension.is_none());
+        assert_eq!(&data[..data.len() - 32], &sealed.sealed[..]);
+        assert!(lxmf_rust::lx_stamper::validate_pn_stamp(&data, cost).is_some());
+        // A stamp that is no stamp is replaced too; another distro's key is refused.
+        assert!(build_direct_upload(&key, &sealed.sealed, &[1, 2, 3], &sealed.sig, false, 0).is_ok());
+        assert!(build_direct_upload(&Identity::new(true).get_public_key().unwrap(), &sealed.sealed, &stamp, &sealed.sig, false, 0).is_err());
     }
 
     /// A stored claim RFed would refuse (a signature over another message, another distro's key, a
