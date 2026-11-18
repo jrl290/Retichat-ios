@@ -258,6 +258,17 @@ func testChatRepositoryWiring() {
           "the copy's registry handle is released on every path: when not sent, when under another hash, and by the offline side")
     check(!submit.contains("defer { DistroMessageFFI.destroy(copy) }"),
           "the handle is not released before the offline side has made its copy")
+    // 2026-11-18 device test: the router packs the copy inside the hand-over, and a first send to a
+    // new distro whose key had not arrived failed there while this logged "submitted". The log now
+    // reads the copy's state; the FAILED report still ends the attempt by hash, so the path is
+    // unchanged (the copy still goes to the offline side, and the method still returns true).
+    check(inOrder(["DistroMessageFFI.sendViaAppLinks(copy)", "copyHash.hexString != hashHex",
+                   "if DistroMessageFFI.state(copy) == 0xFF {", "failed as it was handed over", "} else {",
+                   "submitted\")", "offline.fallbackSent(", "return true"],
+                  in: submit),
+          "a copy the router failed as it was handed over is logged as failed, not submitted")
+    check(submit.components(separatedBy: "submitted\")").count - 1 == 1,
+          "\"submitted\" is logged in one place only, for a copy the router did not fail at once")
     check(!retry.contains("pendingOutbound[") && !submit.contains("pendingOutbound["),
           "the copy registers no second pending entry (it would overwrite the DIRECT one)")
 

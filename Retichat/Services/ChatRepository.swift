@@ -2526,7 +2526,18 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
             DistroMessageFFI.destroy(copy)
             return false
         }
-        print("[Retichat] propagated copy of \(hashHex.prefix(8)) submitted")
+        // The router packs the copy inside the hand-over (handle_outbound), so
+        // one it could not pack is FAILED by now: the address's key not known
+        // yet ("Missing destination for propagated delivery", in its log just
+        // above). That FAILED reaches the pending entry by hash, as any copy's
+        // does, and ends the attempt; only the log line differs. Until
+        // 2026-11-18 it said "submitted" either way: a first send to a new
+        // distro showed failed while its log read as sent.
+        if DistroMessageFFI.state(copy) == 0xFF {
+            print("[Retichat] propagated copy of \(hashHex.prefix(8)) failed as it was handed over: the router's log says why")
+        } else {
+            print("[Retichat] propagated copy of \(hashHex.prefix(8)) submitted")
+        }
         offline.fallbackSent(peer: peer, handle: copy, messageId: hashHex, release: { DistroMessageFFI.destroy(copy) })
         return true
     }
