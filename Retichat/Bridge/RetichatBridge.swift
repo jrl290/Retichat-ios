@@ -836,6 +836,104 @@ nonisolated func interfaceUpEvent(context: UnsafeMutableRawPointer?, name: Unsaf
     InterfaceUpEvents.deliver(name: String(decoding: UnsafeBufferPointer(start: name, count: Int(nameLen)), as: UTF8.self))
 }
 
+// MARK: Offline use of a distro address (RFed SPEC §17.15): the C callbacks
+
+/// The handlers of `RetichatBridge.distroDirectRegister`, read on stack threads.
+nonisolated private enum DistroDirectEvents {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var take: ((Data, Data, Data) -> Int32)?
+    private nonisolated(unsafe) static var offline: ((Data, String, Bool) -> Void)?
+    private nonisolated(unsafe) static var lookup: ((Data, [String]) -> Void)?
+
+    static func set(take: ((Data, Data, Data) -> Int32)?, offline: ((Data, String, Bool) -> Void)?,
+                    lookup: ((Data, [String]) -> Void)?) {
+        lock.lock(); defer { lock.unlock() }
+        self.take = take
+        self.offline = offline
+        self.lookup = lookup
+    }
+
+    static func handlers() -> (take: ((Data, Data, Data) -> Int32)?, offline: ((Data, String, Bool) -> Void)?,
+                               lookup: ((Data, [String]) -> Void)?) {
+        lock.lock(); defer { lock.unlock() }
+        return (take, offline, lookup)
+    }
+}
+
+/// retichat_direct_take_t: a copy that came to the offline address. Its answer waits for this.
+nonisolated func distroDirectTakeEvent(
+    context: UnsafeMutableRawPointer?,
+    distro: UnsafePointer<UInt8>?, distroLen: UInt32,
+    sealed: UnsafePointer<UInt8>?, sealedLen: UInt32,
+    stamp: UnsafePointer<UInt8>?, stampLen: UInt32
+) -> Int32 {
+    guard let distro, let sealed, let stamp, let take = DistroDirectEvents.handlers().take else { return 0 }
+    return take(Data(bytes: distro, count: Int(distroLen)), Data(bytes: sealed, count: Int(sealedLen)),
+                Data(bytes: stamp, count: Int(stampLen)))
+}
+
+/// retichat_direct_offline_t: an offline address announced or answered for. Must not block.
+nonisolated func distroDirectOfflineEvent(
+    context: UnsafeMutableRawPointer?,
+    distro: UnsafePointer<UInt8>?, distroLen: UInt32,
+    random: UnsafePointer<CChar>?, back: Int32
+) {
+    guard let distro, let random, let offline = DistroDirectEvents.handlers().offline else { return }
+    offline(Data(bytes: distro, count: Int(distroLen)), String(cString: random), back != 0)
+}
+
+/// retichat_direct_lookup_t: a lookup address answered for. Must not block.
+nonisolated func distroDirectLookupEvent(
+    context: UnsafeMutableRawPointer?,
+    distro: UnsafePointer<UInt8>?, distroLen: UInt32,
+    randoms: UnsafePointer<CChar>?
+) {
+    guard let distro, let randoms, let lookup = DistroDirectEvents.handlers().lookup else { return }
+    let named = String(cString: randoms).split(separator: "\n").map(String.init)
+    lookup(Data(bytes: distro, count: Int(distroLen)), named)
+}
+
+/// The host side of one send to an offline address (`RetichatBridge.distroDirectSend`).
+nonisolated final class DistroDirectOutcomeBox: @unchecked Sendable {
+    let handler: (Int32) -> Void
+    init(_ handler: @escaping (Int32) -> Void) { self.handler = handler }
+}
+
+/// retichat_direct_outcome_t: how the send ended, told once, on a stack thread.
+nonisolated func distroDirectOutcomeEvent(context: UnsafeMutableRawPointer?, bits: Int32) {
+    guard let context else { return }
+    Unmanaged<DistroDirectOutcomeBox>.fromOpaque(context).takeUnretainedValue().handler(bits)
+}
+
+/// retichat_upload_release_t for a send to an offline address: the library is done with the context.
+nonisolated func distroDirectRelease(context: UnsafeMutableRawPointer?) {
+    guard let context else { return }
+    Unmanaged<DistroDirectOutcomeBox>.fromOpaque(context).release()
+}
+
+/// The one handler of `RetichatBridge.interfaceEdgesRegister`, read on stack threads.
+nonisolated private enum InterfaceEdgeEvents {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var handler: (() -> Void)?
+
+    static func set(_ handler: (() -> Void)?) {
+        lock.lock(); defer { lock.unlock() }
+        self.handler = handler
+    }
+
+    static func deliver() {
+        lock.lock()
+        let current = handler
+        lock.unlock()
+        current?()
+    }
+}
+
+/// retichat_interface_edge_t: an interface came up or went down. Must not block.
+nonisolated func interfaceEdgeEvent(context: UnsafeMutableRawPointer?) {
+    InterfaceEdgeEvents.deliver()
+}
+
 extension RetichatBridge {
 
     /// `LinkHandle::status()`, as `propagationLink` reports it.
@@ -1084,6 +1182,198 @@ extension RetichatBridge {
     /// the up-edge it waits for came meanwhile, and it goes at once.
     nonisolated func interfaceCameUpSince(_ mark: UInt64) -> Bool {
         retichat_interface_came_up_since(mark) == 1
+    }
+
+    // MARK: Offline use of a distro address (RFed SPEC §17.15)
+
+    /// What an offline address's answer says, as bits (`distroDirectRegister`'s take, `distroDirectSend`'s outcome).
+    nonisolated enum DistroDirect {
+        /// The device holds the message afterwards, newly or already.
+        static let held: Int32 = 1
+        /// The device is back: it reaches RFed again, or its offline toggle is off.
+        static let back: Int32 = 2
+    }
+
+    /// Be told what comes to this device's offline address (`take`, which returns the
+    /// answer's bits and may block while the message is kept), and every offline address
+    /// (`offline`) and lookup answer (`lookup`) heard, each checked against the identity
+    /// that announced it. All on stack threads. One registration at a time: register again
+    /// after each start; `distroDirectUnregister` ends it at the stop.
+    nonisolated func distroDirectRegister(take: @escaping (Data, Data, Data) -> Int32,
+                                          offline: @escaping (Data, String, Bool) -> Void,
+                                          lookup: @escaping (Data, [String]) -> Void) -> Bool {
+        DistroDirectEvents.set(take: take, offline: offline, lookup: lookup)
+        let ok = retichat_distro_direct_register(distroDirectTakeEvent, distroDirectOfflineEvent, distroDirectLookupEvent, nil) == 0
+        if !ok { DistroDirectEvents.set(take: nil, offline: nil, lookup: nil) }
+        return ok
+    }
+
+    /// Stop telling the handlers: a copy that comes meanwhile is refused, said in the log.
+    nonisolated func distroDirectUnregister() {
+        DistroDirectEvents.set(take: nil, offline: nil, lookup: nil)
+        retichat_distro_direct_unregister()
+    }
+
+    /// Hold the distro's offline address `rfed.distro.direct.<random>` (its ratchets kept at
+    /// `ratchetsPath`) and its lookup address until the app restarts, with `distroHandle`'s
+    /// key. A copy's stamp is checked against the cost of `node`, the RFed node's own
+    /// lxmf.propagation. Their app_data is `[random, back]` and `lookup`. Held already: the
+    /// node and app_data are set again. The offline address's hash, or nil with the error
+    /// slot set.
+    nonisolated func distroDirectHold(distroHandle: UInt64, random: String, ratchetsPath: String, node: Data?,
+                                      back: Bool, lookup: [String]) -> Data? {
+        var outLen: UInt32 = 0
+        let nodeBytes = node ?? Data()
+        let ptr = random.withCString { randomPtr in
+            ratchetsPath.withCString { pathPtr in
+                lookup.joined(separator: "\n").withCString { lookupPtr in
+                    nodeBytes.withUnsafeBytes { nodeBuf in
+                        retichat_distro_direct_hold(distroHandle, randomPtr, pathPtr,
+                                                    nodeBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(nodeBytes.count),
+                                                    back ? 1 : 0, lookupPtr, &outLen)
+                    }
+                }
+            }
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return Data(bytes: ptr, count: Int(outLen))
+    }
+
+    /// The held offline address's app_data becomes `[random, back]` and its lookup's `lookup`.
+    /// False with the error slot set.
+    nonisolated func distroDirectSetAppData(offline: Data, back: Bool, lookup: [String]) -> Bool {
+        lookup.joined(separator: "\n").withCString { lookupPtr in
+            offline.withUnsafeBytes { buf in
+                retichat_distro_direct_set_app_data(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(offline.count),
+                                                    back ? 1 : 0, lookupPtr) == 0
+            }
+        }
+    }
+
+    /// Announce the held offline address on each of `interfaces` that is up. How many went,
+    /// or -1 with the error slot set.
+    nonisolated func distroDirectAnnounce(offline: Data, interfaces: [String]) -> Int32 {
+        interfaces.joined(separator: "\n").withCString { namesPtr in
+            offline.withUnsafeBytes { buf in
+                retichat_distro_direct_announce(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(offline.count), namesPtr)
+            }
+        }
+    }
+
+    /// The §17.13 Distro Sync proof of `sealed`, a message to the distro received direct.
+    /// Nil with the error slot set.
+    nonisolated func distroDirectSign(distroHandle: UInt64, sealed: Data) -> Data? {
+        var outLen: UInt32 = 0
+        let ptr = sealed.withUnsafeBytes { buf in
+            retichat_distro_direct_sign(distroHandle, buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(sealed.count), &outLen)
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return Data(bytes: ptr, count: Int(outLen))
+    }
+
+    /// One upload of a message received direct for the node `node`: `sealed` and the
+    /// sender's `stamp` unchanged while it meets the node's cost (a new stamp when the cost
+    /// has risen above it), the claim only when `withClaim`. BLOCKS while a stamp is mined:
+    /// never on the main thread. Nil with the error slot set; nothing has left.
+    nonisolated func propagationBuildDirectUpload(distroPublicKey: Data, sealed: Data, stamp: Data, syncSig: Data,
+                                                  withClaim: Bool, node: Data) -> Data? {
+        var outLen: UInt32 = 0
+        let ptr = distroPublicKey.withUnsafeBytes { key in
+            sealed.withUnsafeBytes { sealedBuf in
+                stamp.withUnsafeBytes { stampBuf in
+                    syncSig.withUnsafeBytes { sigBuf in
+                        node.withUnsafeBytes { nodeBuf in
+                            retichat_propagation_build_direct_upload(
+                                key.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(distroPublicKey.count),
+                                sealedBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(sealed.count),
+                                stampBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(stamp.count),
+                                sigBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(syncSig.count),
+                                withClaim ? 1 : 0,
+                                nodeBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(node.count),
+                                &outLen)
+                        }
+                    }
+                }
+            }
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return Data(bytes: ptr, count: Int(outLen))
+    }
+
+    /// A sender's copy of the outbound message `handle`, a message to a distro the router
+    /// has taken through propagation: `msgpack [ bin sealed, bin stamp ]`, the same sealed
+    /// message and stamp RFed gets; the stamp is made at `node`'s cost when the router has
+    /// not made it yet. BLOCKS while a stamp is mined: never on the main thread. Nil with
+    /// the error slot set.
+    nonisolated func distroDirectCopy(handle: UInt64, node: Data) -> Data? {
+        var outLen: UInt32 = 0
+        let ptr = node.withUnsafeBytes { buf in
+            retichat_distro_direct_copy(handle, buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(node.count), &outLen)
+        }
+        guard let ptr else { return nil }
+        defer { rns_free_bytes(ptr, outLen) }
+        return Data(bytes: ptr, count: Int(outLen))
+    }
+
+    /// Send `copy` to the offline address `random` of the distro `distro` (its
+    /// lxmf.delivery): one packet with a proof asked for when it fits, otherwise one
+    /// `/distro/direct` request. 1 when it went (`outcome` hears, once, on a stack thread:
+    /// `DistroDirect.held`, `.back`, or 0 for a failure), 0 when no path to the address is
+    /// known (nothing went), -1 with the error slot set.
+    nonisolated func distroDirectSend(distro: Data, random: String, copy: Data, outcome: @escaping (Int32) -> Void) -> Int32 {
+        let box = Unmanaged.passRetained(DistroDirectOutcomeBox(outcome)).toOpaque()
+        return random.withCString { randomPtr in
+            distro.withUnsafeBytes { distroBuf in
+                copy.withUnsafeBytes { copyBuf in
+                    // The library owns the box from here: it releases it once, whatever comes.
+                    retichat_distro_direct_send(distroBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(distro.count),
+                                                randomPtr,
+                                                copyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(copy.count),
+                                                distroDirectOutcomeEvent, distroDirectRelease, box)
+                }
+            }
+        }
+    }
+
+    /// Path requests over each of `interfaces` for each offline address `randoms` of
+    /// `distro` and, `withLookup`, its lookup address. How many went, or -1.
+    nonisolated func distroDirectAsk(distro: Data, randoms: [String], withLookup: Bool, interfaces: [String]) -> Int32 {
+        randoms.joined(separator: "\n").withCString { randomsPtr in
+            interfaces.joined(separator: "\n").withCString { namesPtr in
+                distro.withUnsafeBytes { buf in
+                    retichat_distro_direct_ask(buf.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt32(distro.count),
+                                               randomsPtr, withLookup ? 1 : 0, namesPtr)
+                }
+            }
+        }
+    }
+
+    /// The names of the Reticulum interfaces online now.
+    nonisolated func onlineInterfaces() -> [String] {
+        var outLen: UInt32 = 0
+        guard let ptr = retichat_online_interfaces(&outLen) else { return [] }
+        defer { rns_free_bytes(ptr, outLen) }
+        return String(decoding: UnsafeBufferPointer(start: ptr, count: Int(outLen)), as: UTF8.self)
+            .split(separator: "\n").map(String.init)
+    }
+
+    /// Register `handler` for every Reticulum interface up- and down-edge (Transport's own),
+    /// on a thread of the stack's own; it must not block. Cleared at the stop
+    /// (`interfaceEdgesClear`) and registered again at each start.
+    nonisolated func interfaceEdgesRegister(handler: @escaping () -> Void) -> Bool {
+        InterfaceEdgeEvents.set(handler)
+        let ok = retichat_interface_edges_register(interfaceEdgeEvent, nil) == 0
+        if !ok { InterfaceEdgeEvents.set(nil) }
+        return ok
+    }
+
+    /// Forget the handler (the stack is stopping).
+    nonisolated func interfaceEdgesClear() {
+        InterfaceEdgeEvents.set(nil)
+        retichat_interface_edges_clear()
     }
 
     // MARK: Member statuses and keys (RFed-spec Group.md, 2026-10-06)

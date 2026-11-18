@@ -142,11 +142,21 @@ nonisolated final class FFIPropagationPort: PropagationPort, @unchecked Sendable
         let packed = entry.packed
         let sealed = entry.sealed
         let syncSig = entry.syncSig
+        let stamp = entry.stamp
+        let direct = entry.kind == .direct
         let bridge = bridge
         // Mining the stamp blocks: it runs on its own thread, never the caller's.
         return try await Task.detached(priority: .utility) { () throws -> Data in
             let upload: Data?
             switch how {
+            case .sealed(let withClaim) where direct:
+                // A message received direct (RFed SPEC §17.15) goes as it came: the sender's sealed
+                // message and stamp, which a new one replaces only when the node's cost has risen above it.
+                guard let sealed, let syncSig, let stamp else {
+                    throw DistroOutboxFailure(message: "a message received direct is kept with its sealed bytes, sync signature and the sender's stamp")
+                }
+                upload = bridge.propagationBuildDirectUpload(distroPublicKey: key, sealed: sealed, stamp: stamp, syncSig: syncSig,
+                                                             withClaim: withClaim, node: node)
             case .sealed(let withClaim):
                 guard let sealed, let syncSig else { throw DistroOutboxFailure(message: "the sealed entry lost its seal") }
                 upload = bridge.propagationBuildSealedUpload(distroPublicKey: key, sealed: sealed, syncSig: syncSig,
@@ -261,6 +271,28 @@ nonisolated private enum PropagationLinkTarget {
             print("[DistroOutbox] propagation link recovered \(id.prefix(8))")
             current.outbox.spawn { await current.outbox.onLinkRecovered(id) }
         }
+    }
+
+    /// RFed brought the message `msgHash` (a pull or a live delivery): a message received
+    /// direct with that hash is owed no more (RFed SPEC §17.15, DistroOutbox.onBrought).
+    static func brought(_ msgHash: String) {
+        lock.lock()
+        let current = target
+        lock.unlock()
+        guard let current else { return }
+        current.outbox.spawn { await current.outbox.onBrought(msgHash) }
+    }
+
+    /// A pull of the distro finished with every round answered: what was received direct and
+    /// not brought goes now (RFed SPEC §17.15, DistroOutbox.onPulled). A pull's `brought` events
+    /// are spawned before this one; should the actor run them out of order, the one cost is an
+    /// upload RFed already holds, which it takes and does nothing with.
+    static func pulled() {
+        lock.lock()
+        let current = target
+        lock.unlock()
+        guard let current else { return }
+        current.outbox.spawn { await current.outbox.onPulled() }
     }
 
     /// A Reticulum interface came online: what never left the device goes now, if the
@@ -566,6 +598,44 @@ final class DistroOutboxRuntime: ObservableObject {
             msgHash: hash, packed: packed, label: label,
             sealed: sealed?.sealed, syncSig: sealed?.syncSig))
     }
+
+    // MARK: A message received direct (RFed SPEC §17.15)
+
+    /// A message this device took at its offline address: `sealed`, the sender's sealed
+    /// message to `distro`, and the sender's `stamp`, with its LXMF hash `msgHash` as the
+    /// unwrap read it. It is owed to RFed as a sent copy is (DESIGN_PRINCIPLES §3; James,
+    /// 2026-11-17: "like sent copies"): signed for the Distro Sync proof once, now, with
+    /// `signer`, the distro handle that opened it, then kept until the node proves it and
+    /// uploaded as it came, after the pull at the next coming-up unless that pull brings it.
+    /// Never throws.
+    func oweDirect(distro: DistroInfo, signer: UInt64, msgHash: String, sealed: Data, stamp: Data) async {
+        guard let outbox = ensureOutbox() else { return }
+        refreshNode()
+        let label = "the message \(msgHash.prefix(8)) received direct (§17.15)"
+        let bridge = bridge
+        let sig = await Task.detached(priority: .userInitiated) { () -> (Data?, String) in
+            let sig = bridge.distroDirectSign(distroHandle: signer, sealed: sealed)
+            // Read on this thread, at once: the Rust error slot is thread-local.
+            return (sig, sig == nil ? DistroMessageFFI.rnsLastError() : "")
+        }.value
+        guard let syncSig = sig.0 else {
+            fail("\(label) was not owed to the distro: no Distro Sync proof could be made (\(sig.1))")
+            return
+        }
+        await outbox.owe(OwedEntry(
+            id: "direct:\(msgHash)", kind: .direct,
+            distro: distro.deliveryHashHex, distroKey: distro.publicKeyHex,
+            msgHash: msgHash, packed: Data(), label: label,
+            sealed: sealed, syncSig: syncSig, stamp: stamp))
+    }
+
+    /// RFed brought the message `msgHash`, in a pull or a live delivery: a message received
+    /// direct with that hash is owed no more (§17.15). From any thread.
+    nonisolated static func brought(_ msgHash: String) { PropagationLinkTarget.brought(msgHash) }
+
+    /// A pull of the distro finished with every round answered: the messages received direct
+    /// that it did not bring go now (§17.15). From any thread.
+    nonisolated static func pulled() { PropagationLinkTarget.pulled() }
 
     private func fail(_ message: String) {
         print("[DistroOutbox] \(message)")

@@ -752,6 +752,12 @@ final class RfedDistroClient: ObservableObject {
             }
         }
         if isCurrent(k) { status.lastPullCount = total }
+        if isCurrent(k), unfinished == nil, !more {
+            // Drained: what this device took at its offline address and RFed did not bring goes
+            // now (RFed SPEC §17.15, after the pull). Queued behind the pull's own blobs, which
+            // say what RFed brought.
+            Self.blobQueue.async { DistroOutboxRuntime.pulled() }
+        }
         return .init(blobs: total, unfinished: unfinished, morePending: unfinished == nil && more)
     }
 
@@ -832,10 +838,53 @@ final class RfedDistroClient: ObservableObject {
         for blob in blobs { ingestBlob(blob, shownByNSE: true) }
     }
 
+    /// A copy that came to this device's offline address (RFed SPEC §17.15), its stamp
+    /// already checked against the RFed node's cost: opened and kept as a blob from RFed
+    /// is (`unwrapAndDeliver`), in order with them (the same serial queue), then owed to
+    /// RFed as it came, so the distro's other devices get it, unless this device held it
+    /// already. True when the device holds it afterwards, newly or already: the packet's
+    /// proof, or the request's `held`. On the thread that waits for that answer.
+    nonisolated static func takeDirect(sealed: Data, stamp: Data) -> Bool {
+        blobQueue.sync {
+            var opened: (hash: String, heldBefore: Bool, distroHex: String)?
+            let held = unwrapAndDeliver(sealed, shownByNSE: false, receivedDirect: { parsed, srcHex, distroHex in
+                let hash = parsed.hash ?? ""
+                let heldBefore = seen.contains(DistroCodec.seenKey(sourceHex: srcHex, timestamp: parsed.timestamp))
+                    || (hash.count == 64 && (seen.contains(DistroGroupSync.groupSeenKey(hashHex: hash))
+                                             || seen.contains(DistroGroupSync.syncSeenKey(hashHex: hash))))
+                opened = (hash, heldBefore, distroHex)
+            })
+            guard let opened else { return held }
+            if !held {
+                print("[Distro] a message received direct was not kept (§17.15)")
+            } else if opened.heldBefore {
+                print("[Distro] a message received direct was held already (§17.15): nothing more is owed for it")
+            } else if opened.hash.count != 64 {
+                print("[Distro] a message received direct has no LXMF hash: kept, and not copied to the distro's other devices (§17.15)")
+            } else {
+                Task { @MainActor in
+                    guard let (distro, signer) = DistroManager.shared.signing(), distro.deliveryHashHex == opened.distroHex else {
+                        print("[Distro] a message received direct is not owed: the distro that took it is no longer held (§17.15)")
+                        return
+                    }
+                    await DistroOutboxRuntime.shared.oweDirect(distro: distro, signer: signer, msgHash: opened.hash,
+                                                               sealed: sealed, stamp: stamp)
+                }
+            }
+            return held
+        }
+    }
+
     /// True when the blob is held now (handed on, or seen already), false
     /// when it was refused, rejected, another distro's, or unreadable.
+    /// `receivedDirect` is told what was opened, before it is routed, when the
+    /// blob came to the offline address (`takeDirect`); a blob from RFed
+    /// instead settles what is owed for it as received direct (§17.15).
     @discardableResult
-    nonisolated private static func unwrapAndDeliver(_ blob: Data, shownByNSE: Bool) -> Bool {
+    nonisolated private static func unwrapAndDeliver(
+        _ blob: Data, shownByNSE: Bool,
+        receivedDirect: ((DistroUnwrapped, String, String) -> Void)? = nil
+    ) -> Bool {
         let h = DistroManager.shared.handle
         guard h != 0 else {
             print("[Distro] blob dropped: no distro loaded")
@@ -870,6 +919,13 @@ final class RfedDistroClient: ObservableObject {
             return false
         }
         let srcHex = src.hexString
+        if let receivedDirect {
+            receivedDirect(parsed, srcHex, distroHex)
+        } else if let hash = parsed.hash, hash.count == 64 {
+            // RFed brought it: a copy of it this device took at its offline address is owed to
+            // RFed no more (RFed SPEC §17.15).
+            DistroOutboxRuntime.brought(hash)
+        }
 
         // RFed SPEC §17.12: a channel membership message from another device of this
         // distro. Read before the generic fan-out dedupe and before the delivery-

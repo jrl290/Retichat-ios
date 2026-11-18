@@ -7,6 +7,7 @@
 
 import Foundation
 import CryptoKit
+import Security
 
 final class UserPreferences {
     static let shared = UserPreferences()
@@ -462,5 +463,66 @@ final class UserPreferences {
         let material = nameHashTrunc + identityBytes
         let destHashFull = SHA256.hash(data: material)
         return Data(destHashFull.prefix(16)).hexString
+    }
+}
+
+// MARK: - Offline use of a distro address (RFed SPEC §17.15)
+
+/// Read and written off the main actor (DistroOffline's queue, the Settings switch), so they
+/// go to UserDefaults directly, under keys of their own.
+extension UserPreferences {
+    private nonisolated static let distroOfflineKey = "distro_offline_enabled"
+    private nonisolated static let distroDirectRandomPrefix = "distro_direct_random:"
+    private nonisolated static let distroDirectKeptPrefix = "distro_direct_kept:"
+    private nonisolated static let distroContactsKey = "distro_contacts"
+    private nonisolated static let distroDirectLock = NSLock()
+
+    /// Offline use of the distro address (RFed SPEC §17.15): while this is on and the device
+    /// can reach neither RFed nor the internet, it holds an offline address of its own and
+    /// announces it on its mesh connections, so senders nearby can reach it directly. Off by
+    /// default; it may stay on.
+    nonisolated static var distroOfflineEnabled: Bool {
+        UserDefaults.standard.bool(forKey: distroOfflineKey)
+    }
+
+    nonisolated static func setDistroOfflineEnabled(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: distroOfflineKey)
+    }
+
+    /// This device's random part for the distro `distroHex` (§17.15): 16 lowercase hex
+    /// characters from 8 random bytes, made the first time and kept, so its offline address
+    /// stays the same across offline periods and restarts. Nil when 8 random bytes could not
+    /// be had: an address that would change at the next start is never held.
+    nonisolated static func distroOfflineRandom(distroHex: String) -> String? {
+        distroDirectLock.lock(); defer { distroDirectLock.unlock() }
+        let key = distroDirectRandomPrefix + distroHex.lowercased()
+        // 16 lowercase hex characters (DistroOfflineRules.isRandomPart, written out: this file stands alone in its tests).
+        if let kept = UserDefaults.standard.string(forKey: key), kept.utf8.count == 16,
+           kept.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) { return kept }
+        var bytes = [UInt8](repeating: 0, count: 8)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return nil }
+        let random = bytes.map { String(format: "%02x", $0) }.joined()
+        UserDefaults.standard.set(random, forKey: key)
+        return random
+    }
+
+    /// The random parts of `distroHex`'s offline addresses this device keeps as a sender (§17.15).
+    nonisolated static func distroOfflineKept(distroHex: String) -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: distroDirectKeptPrefix + distroHex.lowercased()) ?? [])
+    }
+
+    /// Keep `random` as an offline address of `distroHex`; false when it was kept already.
+    nonisolated static func keepDistroOfflineAddress(distroHex: String, random: String) -> Bool {
+        distroDirectLock.lock(); defer { distroDirectLock.unlock() }
+        let key = distroDirectKeptPrefix + distroHex.lowercased()
+        var kept = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        guard kept.insert(random).inserted else { return false }
+        UserDefaults.standard.set(kept.sorted(), forKey: key)
+        return true
+    }
+
+    /// `isDistroContact`, off the main actor: the distro flag a past announce of `hex` carried.
+    nonisolated static func isDistroContactKnown(_ hex: String) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: distroContactsKey) ?? []).contains(hex.lowercased())
     }
 }

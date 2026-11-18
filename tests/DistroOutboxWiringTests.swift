@@ -315,8 +315,11 @@ func anInterfaceComingBackIsTheStacksOwnUpEdgeHandedToTheOutboxFromOnePlace() {
     let stop = body(runtime, "func stop() {", "// MARK: What the user's actions owe")
     check(stop.contains("bridge.interfaceUpClear()") && stop.contains("interfaceUpRegistered = false"),
           "stop clears it, so a start registers it again")
-    check(count(code(rust), "Transport::add_interface_up_listener(") == 1, "the glue adds one listener for the process")
+    // One for the outbox's up-edge, and since 2026-11-18 one for offline use of the distro address
+    // (RFed SPEC §17.15), which hears the down-edges too: each added once for the process.
+    check(count(code(rust), "Transport::add_interface_up_listener(") == 2, "the glue adds one listener for the process, per relay")
     check(rust.contains("INTERFACE_UP_HOOKED.call_once("), "once, whatever the number of starts")
+    check(rust.contains("INTERFACE_EDGE_HOOKED.call_once("), "the edges' relay too")
     // The outbox reads only the port's answer for "never left": nothing else decides it.
     let outbox = code(read("Retichat/Services/DistroOutbox.swift"))
     check(count(outbox, "return .neverLeft") == 1, "one never-left decision, the port's nil with the link up")

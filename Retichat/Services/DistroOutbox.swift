@@ -67,6 +67,17 @@
 //     and asked once the record is made (app-links `UpEdgeMark`): an up-edge that
 //     came meanwhile sends it at once (`goesIfAnInterfaceCameUp`).
 //
+//  A fourth kind is owed since 2026-11-17 (RFed SPEC §17.15; James: "like sent
+//  copies"): a message this device took at its offline address, received
+//  direct from a sender over a mesh while it could not reach RFed. It is not
+//  D's own message but a sender's, already sealed, with the sender's stamp: the
+//  device uploads it as it came (`OwedEntry.stamp`) with its own Distro Sync
+//  proof, so RFed delivers it to the distro's other devices. Every rule above
+//  applies to it, with one order of its own (DESIGN_PRINCIPLES §5): at a
+//  coming-up it goes after the pull that coming-up starts (`onPulled`), and a
+//  pull or a live delivery that brings the message settles it instead
+//  (`onBrought`). Taken while the propagation link is up, it goes at once.
+//
 //  An entry may also carry the message sealed once, when it was owed, for the
 //  distro sync proof (RFed SPEC §17.13; DISTRO-SYNC-PROOF-DESIGN.md §5): every
 //  upload of it carries the same sealed bytes, and the proof only to the
@@ -94,10 +105,14 @@ nonisolated enum OwedKind: String, Sendable {
     /// never replaced by a later one, and kept when the device gives the distro up, as a sent
     /// copy is.
     case group
+    /// A message this device took at its offline address (RFed SPEC §17.15): a sender's
+    /// message to the distro, uploaded as it came, with the sender's stamp. Kept when the
+    /// device gives the distro up, as a sent copy is.
+    case direct
 }
 
 /// One thing owed. `id` is `channel:<channel hash>`, `sent:<LXMF message
-/// hash>` or `group:<LXMF message hash>`; `msgHash` is the LXMF message hash of `packed`, which is what tells
+/// hash>`, `group:<LXMF message hash>` or `direct:<LXMF message hash>`; `msgHash` is the LXMF message hash of `packed`, which is what tells
 /// one message from another under the same id. `distro` is D's `lxmf.delivery`
 /// hash and `distroKey` D's public key (hex), so a sent copy is still encrypted
 /// to its own distro after the device gives that distro up. A channel entry adds
@@ -125,6 +140,11 @@ nonisolated struct OwedEntry: Equatable, Sendable, CustomStringConvertible {
     /// it is built the legacy way and carries no proof (`UploadBuild`).
     var sealed: Data? = nil
     var syncSig: Data? = nil
+    /// A message received direct (RFed SPEC §17.15, `.direct`) has no `packed` of its own
+    /// (it is empty): it is the sender's `sealed` message, with the sender's `stamp`, which
+    /// its upload carries unchanged while the node's cost allows, and this device's
+    /// `syncSig` over it. All three are always there. Nil for every other kind.
+    var stamp: Data? = nil
 
     /// The same message, as packed (not another action under the same id).
     func sameMessage(_ other: OwedEntry?) -> Bool {
@@ -528,7 +548,8 @@ actor DistroOutbox {
     /// One already owed under its id (an earlier join or leave of the same
     /// channel) is replaced and never goes, even if its upload is being built. It
     /// is the user's own action, and reads no failure record: only the user's own
-    /// send, join or leave calls it.
+    /// send, join or leave calls it, and a message this device took at its offline
+    /// address (§17.15), which is owed once, when it is taken.
     func owe(_ entry: OwedEntry) async {
         // The message this one replaces is owed no more: its failure record, if
         // any, goes with it, and only its own.
@@ -617,6 +638,10 @@ actor DistroOutbox {
             // yielded: a later action on the channel may have replaced it, an
             // upload made meanwhile been proved, or the distro changed.
             if !stillOwed(entry) { continue }
+            // A message received direct goes after the pull this coming-up starts, unless that
+            // pull brings it (§17.15, `onPulled`). With its distro no longer held no pull brings
+            // it: it goes now. While what is held is not known yet, it waits for the pull.
+            if entry.kind == .direct && (!distroKnown() || heldDistro()?.delivery == entry.distro) { continue }
             if distroAttemptOpen(entry, linkId) { continue }
             if unprovedSince(entry, comingUp) {
                 log.info("\(entry.label) was not proved since this flush began: it waits for the propagation link's next coming-up (DESIGN_PRINCIPLES §3, the distro exception)")
@@ -648,6 +673,51 @@ actor DistroOutbox {
     /// message's own record is read, never that of another action under the same id.
     private func unprovedSince(_ entry: OwedEntry, _ comingUp: Int64) -> Bool {
         unproved.since(entry, comingUp: comingUp)
+    }
+
+    // MARK: A message received direct (RFed SPEC §17.15)
+
+    /// A pull of what RFed holds for the distro finished, every round of it answered
+    /// (DESIGN_PRINCIPLES §5, "after the pull"): upload on the propagation link, if it is up,
+    /// each message received direct that is still owed. The pull, and any live delivery
+    /// before it, settled the ones RFed brought (`onBrought`); what is left RFed does not
+    /// have. It is no coming-up and counts none: an upload of one of them decided not proved
+    /// at the coming-up current now waits for the next coming-up and its pull, as a flush
+    /// leaves it (`unprovedSince`), so nothing is sent again on its own failure. Called by
+    /// DistroOutboxRuntime after a drained pull, and from nowhere else.
+    func onPulled() async {
+        guard !stopped, let held = port.held(), held.active else { return }
+        let linkId = held.id
+        let comingUp = propComingUps
+        let owedNow = order.compactMap { entries[$0] }
+            .filter { $0.kind == .direct && !writing.contains("\($0.id)|\($0.msgHash)") }
+        if owedNow.isEmpty { return }
+        log.info("The pull is done: \(owedNow.count) message(s) received direct that RFed did not bring go now (§17.15)")
+        for entry in owedNow {
+            if stopped || !linkUp(linkId) {
+                log.info("Propagation link gone mid-flush: the messages received direct wait for its next coming-up and pull")
+                return
+            }
+            if !stillOwed(entry) || distroAttemptOpen(entry, linkId) { continue }
+            if unprovedSince(entry, comingUp) {
+                log.info("\(entry.label) was not proved since the propagation link last came up: it waits for its next coming-up (DESIGN_PRINCIPLES §3, the distro exception)")
+                continue
+            }
+            await uploadOwed(linkId, entry, comingUp: comingUp)
+        }
+    }
+
+    /// RFed brought the message `msgHash` (a pull, or a live delivery): RFed holds it, so its
+    /// upload as a message received direct is owed no more (§17.15). One already on its way
+    /// is left to its outcome, which finds it owed no more and says so. A message with nothing
+    /// owed under it changes nothing.
+    func onBrought(_ msgHash: String) {
+        let id = "direct:\(msgHash)"
+        guard let entry = entries[id], entry.kind == .direct, entry.msgHash == msgHash else { return }
+        remove(id)
+        unproved.forget(entry)
+        persistRemoval(entry)
+        log.info("\(entry.label): RFed brought it, so it is owed no more (§17.15)")
     }
 
     // MARK: An interface comes back online
@@ -1101,6 +1171,8 @@ actor DistroOutbox {
             log.info("The \(entry.op ?? "?") of #\(entry.name ?? "?") (at \(entry.atMs.map(String.init) ?? "?")) propagated to the distro as a \(how): the propagation node proved it (§17.12)")
         } else if entry.kind == .group {
             log.info("\(entry.label) propagated to the distro as a \(how): the propagation node proved it (§17.14)")
+        } else if entry.kind == .direct {
+            log.info("\(entry.label) propagated to the distro as a \(how): the propagation node proved it (§17.15)")
         } else {
             log.info("Sent-copy for \((entry.toHex ?? "").prefix(8)) propagated to the distro as a \(how): the propagation node proved it (§17.11)")
         }

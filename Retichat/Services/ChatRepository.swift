@@ -572,6 +572,15 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // this never starts it.
         DistroOutboxRuntime.shared.start(client: client)
 
+        // Offline use of the distro address (RFed SPEC §17.15): listen to the link to RFed, to the
+        // interfaces' edges and to what comes to the offline address. It holds and announces
+        // nothing until the device is offline.
+        DistroOffline.shared.start(
+            configDir: configDir,
+            rnodeNames: Set(rnodeRows.map(\.name)),
+            collect: { [weak self] why in Task { @MainActor in self?.collectAll?(why) } },
+            delivered: { [weak self] id in Task { @MainActor in self?.onDistroDirectDelivered(messageId: id) } })
+
         // Register with rfed notify service so the relay can wake this device.
         registerRfedNotify()
 
@@ -644,6 +653,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         // nothing is sent. The stack's shutdown drops the link callbacks; the next
         // start registers them again.
         DistroOutboxRuntime.shared.stop()
+        DistroOffline.shared.stop()
         ConnectionStateManager.shared.deregister()
         // The next stack sets rfed.link up again (its push handlers, with that stack's identity).
         RfedLink.shared.reset()
@@ -1475,6 +1485,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let deviceHash = client.destHash
         let deviceHandle = client.identityHandle
         let bridgeRef = bridge
+        let offlineRef = DistroOffline.shared
 
         // Enqueued on the serial ffiQueue straight from the main actor, so
         // messages reach the router in the order they were sent. A detached
@@ -1545,6 +1556,9 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 return
             }
             let msgHashHex = msgHashData.hexString
+            // RFed SPEC §17.15: the same sealed message goes to the distro's offline devices over
+            // a mesh too, made on a thread of its own.
+            if toDistro { offlineRef.sentToDistro(distro: destData, handle: msgHandle, messageId: msgHashHex) }
 
             // Hop back to @MainActor for database writes and UI updates.
             Task { @MainActor [weak self] in
@@ -2020,6 +2034,7 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
         let propagatedMethod = LxmfMethod.propagated
         let bridgeRef = bridge
         let distroHex = DistroManager.shared.deliveryHashHex
+        let offlineRef = DistroOffline.shared
         ffiQueue.async { [weak self] in
             let toDistro = knownDistro || bridgeRef.peerIsDistro(destHash: destData)
             let method = toDistro ? propagatedMethod : linkMethod
@@ -2046,6 +2061,8 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
                 return
             }
             let hashHex = hash.hexString
+            // RFed SPEC §17.15: a reaction to a distro goes to its offline devices too.
+            if toDistro { offlineRef.sentToDistro(distro: destData, handle: handle, messageId: hashHex) }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 // The text message's attempts (OutboundAttempts): no row has this id, so no
@@ -2525,6 +2542,14 @@ final class ChatRepository: ObservableObject, MessageCallback, AnnounceCallback,
     /// ChatRepository.kt: DELIVERED upgrades SENT; success states (SENT,
     /// DELIVERED) are never downgraded by non-success states (pending, failed,
     /// propagating).
+    /// An offline device of the distro `messageId` was sent to proved it, or answered that it
+    /// holds it (RFed SPEC §17.15): the message is delivered, as any delivery shows it. Nothing
+    /// downgrades it after (`updateDeliveryState` keeps success).
+    func onDistroDirectDelivered(messageId: String) {
+        print("[Retichat] delivery: \(messageId.prefix(8)) reached an offline device of its distro (§17.15)")
+        updateDeliveryState(messageId: messageId, state: DeliveryState.delivered)
+    }
+
     private func updateDeliveryState(messageId: String, state: Int) {
         guard let ctx = modelContext else { return }
         let descriptor = FetchDescriptor<MessageEntity>(

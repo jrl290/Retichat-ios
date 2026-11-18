@@ -27,6 +27,8 @@ struct IdentityView: View {
     @State private var addDeviceHash = ""
     @State private var busy = false
     @State private var toast: String?
+    /// RFed SPEC §17.15: offline use of the distro address, off by default (James, 2026-11-17).
+    @State private var offlineUse = UserPreferences.distroOfflineEnabled
 
     var body: some View {
         ZStack {
@@ -117,6 +119,20 @@ struct IdentityView: View {
                 Text(registrationLine(distroClient.status))
                     .font(.caption2)
                     .foregroundColor(.retichatOnSurfaceVariant)
+
+                Toggle(isOn: Binding(
+                    get: { offlineUse },
+                    set: { on in
+                        offlineUse = on
+                        DistroOffline.shared.setEnabled(on)
+                    })) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Offline use")
+                            .foregroundColor(.retichatOnSurface)
+                        hint("When this device can reach neither RFed nor the internet, people nearby on the mesh can still send your distro's mail straight to it. While it does, anyone listening on the mesh can tell that this device belongs to your distro.")
+                    }
+                }
+                .tint(.retichatPrimary)
 
                 HStack(spacing: 8) {
                     Button("Add another device") {

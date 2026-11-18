@@ -501,12 +501,16 @@ final class ChannelMembershipEntity {
 /// write that owes it, for both kinds; nil on a row owed before they existed, which
 /// is built the legacy way. Optional attributes with no default store value: a
 /// store written before them opens by SwiftData's lightweight migration, its rows
-/// with both nil (tests/DistroSyncMigrationTests.swift). Retichat-android's
-/// `distro_outbox` table, field for field.
+/// with both nil (tests/DistroSyncMigrationTests.swift). `stamp` is the sender's
+/// stamp on a message received direct (RFed SPEC §17.15, kind "direct", 2026-11-18),
+/// which its upload carries unchanged while the node's cost allows; such a row has an
+/// empty `packed` and always `sealed`, `syncSig` and `stamp`. Nil on every other row,
+/// and on every row of a store written before it (tests/DistroDirectMigrationTests.swift).
+/// Retichat-android's `distro_outbox` table, field for field.
 @Model
 final class DistroOutboxEntity {
     @Attribute(.unique) var id: String
-    var kind: String                              // "channel" | "sent" | "group"
+    var kind: String                              // "channel" | "sent" | "group" | "direct"
     var distro: String
     var distroKey: String
     var msgHash: String
@@ -519,10 +523,11 @@ final class DistroOutboxEntity {
     var seq: Int
     var sealed: Data?
     var syncSig: Data?
+    var stamp: Data?
 
     init(id: String, kind: String, distro: String, distroKey: String, msgHash: String, packed: Data,
          label: String, op: String? = nil, name: String? = nil, atMs: Int? = nil, toHex: String? = nil,
-         seq: Int, sealed: Data? = nil, syncSig: Data? = nil) {
+         seq: Int, sealed: Data? = nil, syncSig: Data? = nil, stamp: Data? = nil) {
         self.id = id
         self.kind = kind
         self.distro = distro
@@ -537,6 +542,7 @@ final class DistroOutboxEntity {
         self.seq = seq
         self.sealed = sealed
         self.syncSig = syncSig
+        self.stamp = stamp
     }
 }
 

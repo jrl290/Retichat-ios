@@ -1225,6 +1225,119 @@ uint64_t retichat_interface_up_mark(void);
 /// owed; 1 means the up-edge it waits for came meanwhile, and it goes at once.
 int32_t retichat_interface_came_up_since(uint64_t mark);
 
+#pragma mark - Offline use of a distro address (RFed SPEC §17.15, 2026-11-17)
+
+/// A copy that came to this device's offline address of the distro `distro`
+/// (its lxmf.delivery), its stamp already checked against the RFed node's
+/// cost: open it, keep it, and return the answer's bits (1 the device holds the
+/// message afterwards, newly or already; 2 the device is back). The packet's
+/// proof, or the request's answer, waits for it. Pointers valid only during
+/// the call; runs on a stack thread.
+typedef int32_t (*retichat_direct_take_t)(void *context,
+                                          const uint8_t *distro, uint32_t distro_len,
+                                          const uint8_t *sealed, uint32_t sealed_len,
+                                          const uint8_t *stamp, uint32_t stamp_len);
+
+/// An offline address of `distro` announced or answered for: its random part
+/// (NUL-terminated) and whether it says the device is back. Must not block.
+typedef void (*retichat_direct_offline_t)(void *context,
+                                          const uint8_t *distro, uint32_t distro_len,
+                                          const char *random, int32_t back);
+
+/// `distro`'s lookup address answered for: the random parts it names,
+/// newline-separated (empty once that device is back). Must not block.
+typedef void (*retichat_direct_lookup_t)(void *context,
+                                         const uint8_t *distro, uint32_t distro_len,
+                                         const char *randoms);
+
+/// Tell the host what comes to the offline address and every offline address
+/// and lookup answer heard. One registration at a time. 0, or -1 (rns_last_error).
+int32_t retichat_distro_direct_register(retichat_direct_take_t take,
+                                        retichat_direct_offline_t offline,
+                                        retichat_direct_lookup_t lookup,
+                                        void *context);
+
+/// Tell no one (the stack is stopping): a copy that comes meanwhile is refused.
+void retichat_distro_direct_unregister(void);
+
+/// Hold the distro's offline address rfed.distro.direct.<random> (ratchets at
+/// ratchets_path) and its lookup address until the app restarts; a copy's
+/// stamp is checked against `node`'s cost (the RFed node's own
+/// lxmf.propagation, 16 bytes). Their app_data is [random, back] and `lookup`
+/// (newline-separated random parts). Held already: node and app_data set
+/// again. The offline address's hash (heap bytes), or NULL (rns_last_error).
+uint8_t *retichat_distro_direct_hold(uint64_t distro_handle, const char *random, const char *ratchets_path,
+                                     const uint8_t *node, uint32_t node_len,
+                                     int32_t back, const char *lookup, uint32_t *out_len);
+
+/// The held offline address's app_data becomes [random, back] and its lookup's
+/// `lookup` (newline-separated). 0, or -1 (rns_last_error).
+int32_t retichat_distro_direct_set_app_data(const uint8_t *offline, uint32_t offline_len,
+                                            int32_t back, const char *lookup);
+
+/// Announce the held offline address on each interface in `interfaces`
+/// (newline-separated) that is up. How many went, or -1 (rns_last_error).
+int32_t retichat_distro_direct_announce(const uint8_t *offline, uint32_t offline_len, const char *interfaces);
+
+/// The §17.13 Distro Sync proof of `sealed`, a message to the distro received
+/// direct: D's 64-byte signature. Heap bytes, or NULL (rns_last_error).
+uint8_t *retichat_distro_direct_sign(uint64_t distro_handle, const uint8_t *sealed, uint32_t sealed_len,
+                                     uint32_t *out_len);
+
+/// One upload of a message received direct for the node `node`: `sealed` and
+/// the sender's `stamp` unchanged while it meets the node's cost, a new stamp
+/// when the cost has risen above it, the claim only when with_claim is
+/// non-zero. BLOCKS while a stamp is mined. Heap bytes, or NULL (rns_last_error).
+uint8_t *retichat_propagation_build_direct_upload(const uint8_t *distro_public_key, uint32_t key_len,
+                                                  const uint8_t *sealed, uint32_t sealed_len,
+                                                  const uint8_t *stamp, uint32_t stamp_len,
+                                                  const uint8_t *sig, uint32_t sig_len,
+                                                  int32_t with_claim,
+                                                  const uint8_t *node, uint32_t node_len,
+                                                  uint32_t *out_len);
+
+/// A sender's copy of the outbound message `handle` (a message to a distro the
+/// router has taken through propagation): msgpack [bin sealed, bin stamp], the
+/// sealed message and stamp RFed gets; the stamp is made at `node`'s cost when
+/// the router has not made it yet. BLOCKS while a stamp is mined. Heap bytes,
+/// or NULL (rns_last_error).
+uint8_t *retichat_distro_direct_copy(uint64_t handle, const uint8_t *node, uint32_t node_len, uint32_t *out_len);
+
+/// How one send to an offline address ended, told once on a stack thread: 1
+/// held, 2 back, 0 failed.
+typedef void (*retichat_direct_outcome_t)(void *context, int32_t bits);
+
+/// Send `copy` to the offline address `random` of `distro` (16 bytes): one
+/// packet when it fits, otherwise one /distro/direct request. `context` is owned
+/// by the library from this call on: release(context) is called exactly once,
+/// after the outcome or at once when nothing went. 1 it went, 0 no path is
+/// known (nothing went), -1 (rns_last_error).
+int32_t retichat_distro_direct_send(const uint8_t *distro, uint32_t distro_len, const char *random,
+                                    const uint8_t *copy, uint32_t copy_len,
+                                    retichat_direct_outcome_t outcome, retichat_upload_release_t release,
+                                    void *context);
+
+/// Path requests over each interface in `interfaces` (newline-separated) for
+/// each offline address of `distro` named in `randoms` (newline-separated) and,
+/// with with_lookup non-zero, its lookup address. How many went, or -1.
+int32_t retichat_distro_direct_ask(const uint8_t *distro, uint32_t distro_len, const char *randoms,
+                                   int32_t with_lookup, const char *interfaces);
+
+/// The names of the Reticulum interfaces online now, newline-separated UTF-8
+/// (heap bytes; empty for none).
+uint8_t *retichat_online_interfaces(uint32_t *out_len);
+
+/// A Reticulum interface came up or went down (Transport's own edge). Runs on
+/// a thread of its own; must not block.
+typedef void (*retichat_interface_edge_t)(void *context);
+
+/// Tell the host at every interface up- and down-edge. One host callback at a
+/// time. 0, or -1 (rns_last_error) when callback is NULL.
+int32_t retichat_interface_edges_register(retichat_interface_edge_t callback, void *context);
+
+/// Stop telling the host (the stack is stopping).
+void retichat_interface_edges_clear(void);
+
 #pragma mark - Member statuses and keys (RFed-spec Group.md, 2026-10-06)
 
 /// The delivery callback with what the group follow-up needs of an accept or a

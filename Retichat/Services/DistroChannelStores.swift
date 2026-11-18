@@ -124,7 +124,7 @@ nonisolated enum DistroOutboxRows {
                            distroKey: entry.distroKey, msgHash: entry.msgHash, packed: entry.packed,
                            label: entry.label, op: entry.op, name: entry.name,
                            atMs: entry.atMs.map { Int($0) }, toHex: entry.toHex, seq: seq,
-                           sealed: entry.sealed, syncSig: entry.syncSig)
+                           sealed: entry.sealed, syncSig: entry.syncSig, stamp: entry.stamp)
     }
 
     /// The row of an id already stored, made `entry` (the same fields `row` writes).
@@ -142,15 +142,20 @@ nonisolated enum DistroOutboxRows {
         row.seq = seq
         row.sealed = entry.sealed
         row.syncSig = entry.syncSig
+        row.stamp = entry.stamp
     }
 
     /// Nil for a row of a kind this build does not know: it is left alone and never uploaded.
     static func entry(_ row: DistroOutboxEntity) -> OwedEntry? {
         guard let kind = OwedKind(rawValue: row.kind) else { return nil }
+        // A message received direct is uploaded only as it came (RFed SPEC §17.15): sealed, with the
+        // sender's stamp and this device's sync signature. A row without all three cannot be, and is
+        // left alone.
+        if kind == .direct && (row.sealed == nil || row.syncSig == nil || row.stamp == nil) { return nil }
         return OwedEntry(id: row.id, kind: kind, distro: row.distro, distroKey: row.distroKey,
                          msgHash: row.msgHash, packed: row.packed, label: row.label,
                          op: row.op, name: row.name, atMs: row.atMs.map { Int64($0) }, toHex: row.toHex,
-                         sealed: row.sealed, syncSig: row.syncSig)
+                         sealed: row.sealed, syncSig: row.syncSig, stamp: row.stamp)
     }
 }
 

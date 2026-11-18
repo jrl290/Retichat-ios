@@ -2073,7 +2073,9 @@ func anOwedUploadIsMadeByFivePathsAndNoOther() {
     // the up-edge's pass or, when the up-edge came while the upload was being sent, once its
     // never-left is recorded (the UpEdgeMark contract, 2026-10-10).
     // Anything else calling either would send an upload again on its own failure.
-    checkEqual(callersOf("uploadOwed"), ["sendDistroOutbox", "sendDistroNeverLeft", "uploadOwedAtOnce"], "callers of uploadOwed")
+    // Since 2026-11-17 a sixth, onPulled (RFed SPEC §17.15): a message received direct goes after the
+    // pull, and reads the failure record with the coming-up current then, as the pass does.
+    checkEqual(callersOf("uploadOwed"), ["sendDistroOutbox", "onPulled", "sendDistroNeverLeft", "uploadOwedAtOnce"], "callers of uploadOwed")
     checkEqual(callersOf("uploadOwedAtOnce"), ["owe", "uploadOwed", "goesIfAnInterfaceCameUp"], "callers of uploadOwedAtOnce")
     // The upload it makes has one caller too.
     checkEqual(callersOf("uploadFor"), ["uploadOwed"], "callers of uploadFor")
@@ -2184,6 +2186,151 @@ func theOutboxStartsNoLinkAndWaitsOnNoClock() {
 
 // MARK: - the mutation run: each case, in turn
 
+// MARK: - a message received direct (RFed SPEC §17.15)
+
+func direct(_ hash: String, distro: HeldDistro = d1) -> OwedEntry {
+    OwedEntry(id: "direct:\(hash)", kind: .direct, distro: distro.delivery, distroKey: distro.publicKey,
+              msgHash: hash, packed: Data(), label: "the message \(hash.prefix(8)) received direct (§17.15)",
+              sealed: Data("sealed-\(hash)".utf8), syncSig: Data(repeating: 7, count: 64), stamp: Data(repeating: 5, count: 32))
+}
+
+func aMessageReceivedDirectWhileTheLinkIsUpGoesAtOnce() async {
+    await withRig { rig in
+        rig.link("L1")
+        let m = direct("m1")
+        await rig.outbox.owe(m)
+        await rig.settle()
+        checkEqual(rig.port.uploads(of: m.id).count, 1, "uploaded at once")
+        nth(rig.port.sent, 0).proved()
+        await rig.settle()
+        check(await rig.outbox.owed().isEmpty, "settled by the proof")
+        check(rig.lines.info.contains { $0.contains("received direct") && $0.contains("propagated to the distro") }, "said propagated")
+    }
+}
+
+func atAComingUpAMessageReceivedDirectWaitsForThePullAndGoesAfterIt() async {
+    await withRig { rig in
+        let m = direct("m1")
+        let s = sentCopy("s1")
+        await rig.outbox.owe(m)
+        await rig.outbox.owe(s)
+        rig.link("L1")
+        await rig.outbox.onLinkEstablished("L1")
+        await rig.settle()
+        // The sent copy goes at the coming-up; the message received direct waits for the pull.
+        checkEqual(rig.port.uploads(of: s.id).count, 1, "the sent copy went")
+        checkEqual(rig.port.uploads(of: m.id).count, 0, "the message received direct waits")
+        await rig.outbox.onPulled()
+        await rig.settle()
+        checkEqual(rig.port.uploads(of: m.id).count, 1, "it goes after the pull")
+    }
+}
+
+func whatRfedBringsIsOwedNoMoreAndThePullSendsNothingForIt() async {
+    await withRig { rig in
+        let m = direct("m1")
+        let other = direct("m2")
+        await rig.outbox.owe(m)
+        await rig.outbox.owe(other)
+        rig.link("L1")
+        await rig.outbox.onLinkEstablished("L1")
+        // The pull brings m1 (or a live delivery did): only m2 is still owed.
+        await rig.outbox.onBrought("m1")
+        await rig.settle()
+        checkEqual(await rig.outbox.owed().map(\.id), [other.id], "m1 owed no more")
+        check(!rig.store.has(m.id), "and gone from storage")
+        await rig.outbox.onPulled()
+        await rig.settle()
+        checkEqual(rig.port.uploads(of: m.id).count, 0, "m1 never went")
+        checkEqual(rig.port.uploads(of: other.id).count, 1, "m2 went")
+        // A hash nothing is owed under, or one owed as another kind, changes nothing.
+        await rig.outbox.owe(sentCopy("s1"))
+        await rig.outbox.onBrought("s1")
+        await rig.outbox.onBrought("unknown")
+        check(await rig.outbox.owed().contains { $0.id == "sent:s1" }, "a sent copy is not settled by it")
+    }
+}
+
+func anUploadOfAMessageReceivedDirectNotProvedWaitsForTheNextComingUpAndItsPull() async {
+    await withRig { rig in
+        let m = direct("m1")
+        await rig.outbox.owe(m)
+        rig.link("L1")
+        await rig.outbox.onLinkEstablished("L1")
+        await rig.outbox.onPulled()
+        await rig.settle()
+        nth(rig.port.uploads(of: m.id), 0).lost()
+        await rig.settle()
+        // Another pull at the same coming-up (a wake's) does not send it again.
+        await rig.outbox.onPulled()
+        await rig.settle()
+        checkEqual(rig.port.uploads(of: m.id).count, 1, "not again on its own failure")
+        // The next coming-up's pass leaves it for its pull, which sends it.
+        rig.link("L2")
+        await rig.outbox.onLinkEstablished("L2")
+        await rig.settle()
+        checkEqual(rig.port.uploads(of: m.id).count, 1, "the pass leaves it for the pull")
+        await rig.outbox.onPulled()
+        await rig.settle()
+        checkEqual(links(rig.port.uploads(of: m.id)), ["L1", "L2"], "it goes after the next pull")
+    }
+}
+
+func withItsDistroGivenUpNoPullBringsAMessageReceivedDirectSoItGoesInThePass() async {
+    await withRig { rig in
+        let m = direct("m1", distro: d1)
+        await rig.outbox.owe(m)
+        // The device now holds another distro: no pull of d1 comes, and the message is still owed to d1.
+        rig.setDistro(d2)
+        await rig.outbox.onDistroChanged()
+        checkEqual(await rig.outbox.owed(), [m], "still owed")
+        rig.link("L1")
+        await rig.outbox.onLinkEstablished("L1")
+        await rig.settle()
+        checkEqual(rig.port.uploads(of: m.id).count, 1, "it goes in the pass")
+        checkEqual(rig.port.uploads(of: m.id).map(\.key), [String(d1.publicKey.prefix(4))], "with its own distro's key")
+    }
+}
+
+func aPullWithTheLinkDownSendsNothingAndAPullWithItUpDoes() async {
+    await withRig { rig in
+        let m = direct("m1")
+        await rig.outbox.owe(m)
+        await rig.outbox.onPulled()
+        rig.link("L1", active: false)
+        await rig.outbox.onPulled()
+        await rig.settle()
+        check(rig.port.sent.isEmpty, "nothing went with no link up")
+        rig.link("L1")
+        await rig.outbox.onPulled()
+        await rig.settle()
+        checkEqual(rig.port.uploads(of: m.id).count, 1, "it goes once the link is up")
+    }
+}
+
+func aMessageReceivedDirectGoesAfterThePullAndNeverOnItsOwnFailure() {
+    // RFed SPEC §17.15: an event the runtime tells after a drained pull; nothing in the outbox calls it.
+    checkEqual(callersOf("onPulled"), [], "onPulled is called from the runtime alone")
+    checkEqual(callersOf("onBrought"), [], "onBrought is called from the runtime alone")
+    guard let from = outboxCode.range(of: "func onPulled("), let to = outboxCode.range(of: "func onBrought(") else {
+        check(false, "onPulled is in the source")
+        return
+    }
+    let pulled = String(outboxCode[from.lowerBound..<to.lowerBound])
+    // No coming-up of its own: it takes the one current now and reads the failure record with it.
+    check(!pulled.contains("propComingUps += 1"), "it counts no coming-up")
+    check(pulled.contains("let comingUp = propComingUps"), "it takes the coming-up current now")
+    checkEqual(pulled.components(separatedBy: "uploadOwed(").count - 1, 1, "one upload call")
+    check(pulled.contains("await uploadOwed(linkId, entry, comingUp: comingUp)"), "with the coming-up")
+    for guardText in ["!stopped", "held.active", "$0.kind == .direct", "!stillOwed(entry)", "distroAttemptOpen(entry, linkId)",
+                      "unprovedSince(entry, comingUp)", "!linkUp(linkId)"] {
+        check(pulled.contains(guardText), "onPulled checks \(guardText)")
+    }
+    // The pass leaves it for the pull while its distro is held, or not known yet.
+    check(outboxCode.contains("if entry.kind == .direct && (!distroKnown() || heldDistro()?.delivery == entry.distro) { continue }"),
+          "the pass leaves it for the pull")
+}
+
 let allTests: [(String, () async -> Void)] = [
     ("an entry is kept before anything can yield and waits for the link when it is not up", anEntryIsKeptBeforeAnythingCanYieldAndWaitsForTheLinkWhenItIsNotUp),
     ("with the link up it goes at once and only the node's proof settles it", withTheLinkUpItGoesAtOnceAndOnlyTheNodesProofSettlesIt),
@@ -2250,6 +2397,12 @@ let allTests: [(String, () async -> Void)] = [
     ("an up-edge while a packet was refused sends it at once; an interface still down waits with no loop", anUpEdgeWhileAPacketWasRefusedSendsItAtOnceAndAnInterfaceStillDownWaitsWithNoLoop),
     ("a never-left after the stack's stop decides nothing and the up-edge sends nothing", aNeverLeftAfterTheStacksStopDecidesNothingAndTheUpEdgeSendsNothing),
     ("a sealed entry keeps its seal and proof; a sent copy owed to a distro given up still builds with it", aSealedEntryKeepsItsSealAndProofThroughTheOutboxAndASentCopyOwedToADistroGivenUpStillBuildsWithIt),
+    ("a message received direct while the link is up goes at once", aMessageReceivedDirectWhileTheLinkIsUpGoesAtOnce),
+    ("at a coming-up a message received direct waits for the pull and goes after it", atAComingUpAMessageReceivedDirectWaitsForThePullAndGoesAfterIt),
+    ("what RFed brings is owed no more and the pull sends nothing for it", whatRfedBringsIsOwedNoMoreAndThePullSendsNothingForIt),
+    ("an upload of a message received direct not proved waits for the next coming-up and its pull", anUploadOfAMessageReceivedDirectNotProvedWaitsForTheNextComingUpAndItsPull),
+    ("with its distro given up no pull brings a message received direct, so it goes in the pass", withItsDistroGivenUpNoPullBringsAMessageReceivedDirectSoItGoesInThePass),
+    ("a pull with the link down sends nothing, and a pull with it up does", aPullWithTheLinkDownSendsNothingAndAPullWithItUpDoes),
 ]
 
 @main
@@ -2272,6 +2425,7 @@ enum DistroOutboxTests {
             ("the third ruling's send is the loss of an upload on another link and nothing else", theThirdRulingsSendIsTheLossOfAnUploadOnAnotherLinkAndNothingElse),
             ("an upload is decided only by its proof, its loss or the stack's stop", anUploadIsDecidedOnlyByItsProofItsLossOrTheStacksStop),
             ("the outbox starts no link and waits on no clock", theOutboxStartsNoLinkAndWaitsOnNoClock),
+            ("a message received direct goes after the pull and never on its own failure", aMessageReceivedDirectGoesAfterThePullAndNeverOnItsOwnFailure),
         ]
         for (name, run) in pins {
             currentTest = name

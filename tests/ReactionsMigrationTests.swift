@@ -10,10 +10,15 @@
 //  - the lookups ChatRepository.reactionTarget makes find a message by its id, its lxmfHash or its
 //    post id only within its own chat.
 //
+// The old store is written by a328913's own model and store mapping, as that build wrote it (since
+// 2026-11-18 the current mapping reads a column a328913's model does not have).
+//
 // Run from the workspace root with:
 //
 //   git -C Retichat-ios show a328913:Retichat/Models/Models.swift \
 //     > /private/tmp/claude-501/ReactionsOldModels.swift && \
+//   git -C Retichat-ios show a328913:Retichat/Services/DistroChannelStores.swift \
+//     > /private/tmp/claude-501/ReactionsOldStores.swift && \
 //   swiftc -parse-as-library -o /private/tmp/claude-501/reactions-old-store \
 //     /private/tmp/claude-501/ReactionsOldModels.swift \
 //     Retichat-ios/Retichat/Bridge/LxmfFields.swift \
@@ -21,7 +26,7 @@
 //     Retichat-ios/Retichat/Services/DistroGroupSync.swift \
 //     Retichat-ios/Retichat/Services/DistroOutbox.swift \
 //     Retichat-ios/Retichat/Services/DistroChannelSync.swift \
-//     Retichat-ios/Retichat/Services/DistroChannelStores.swift \
+//     /private/tmp/claude-501/ReactionsOldStores.swift \
 //     Retichat-ios/tests/ReactionsMigrationOldStore.swift && \
 //   swiftc -parse-as-library -o /private/tmp/claude-501/reactions-migration \
 //     Retichat-ios/Retichat/Models/Models.swift \
