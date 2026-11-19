@@ -121,7 +121,8 @@ nonisolated final class DistroOffline: @unchecked Sendable {
     /// The stack is up (ChatRepository.finishStartService): listen to the link to RFed, to the
     /// interfaces' edges and to what comes to the offline address. What was held in an earlier
     /// start stays held (Reticulum keeps it until the app restarts), and so does being offline;
-    /// what the new stack's link to RFed says decides from here. `collect` asks RFed for what
+    /// what the new stack's link to RFed says decides from here, and the mesh connections
+    /// already up count as come up (startedWithMeshUp). `collect` asks RFed for what
     /// it holds (a device that holds no link to it); `delivered` shows a message delivered.
     @MainActor
     func start(configDir: String, rnodeNames: Set<String>, collect: @escaping (String) -> Void,
@@ -167,6 +168,8 @@ nonisolated final class DistroOffline: @unchecked Sendable {
         }) {
             say("interface edges not registered: \(DistroMessageFFI.rnsLastError())")
         }
+        // After the registrations: what an announce brings finds them in place.
+        queue.async { self.startedWithMeshUp() }
         if rfedNode.count == 32 {
             RfedLink.shared.setStatusListener(nodeHex: rfedNode, owner: "distro-offline") { [weak self] status in
                 guard let self else { return }
@@ -207,12 +210,7 @@ nonisolated final class DistroOffline: @unchecked Sendable {
         let meshUp = now.filter { !online.contains($0) && isMesh($0) }
         online = now
         if !meshUp.isEmpty {
-            // The sender: each distro is asked for once more, at its next send.
-            asked.removeAll()
-            heard.removeAll()
-            for list in copies.values { for copy in list { copy.afterAsk = false } }
-            // The device: offline, it announces on a mesh connection that comes up.
-            if offline, let pair = held { announce(pair, on: meshUp, why: "the mesh connection \(meshUp.joined(separator: ", ")) came up") }
+            meshCameUp(meshUp, why: "the mesh connection \(meshUp.joined(separator: ", ")) came up")
             // A device that holds no link to RFed (a slow route) tries RFed when a mesh
             // connection comes up, and decides from that attempt (§17.15).
             if UserPreferences.distroOfflineEnabled, rfedReached != true, let collect {
@@ -223,6 +221,31 @@ nonisolated final class DistroOffline: @unchecked Sendable {
             }
         }
         evaluate("the interfaces changed")
+    }
+
+    /// Mesh connections came up (§17.15): the sender asks for each distro once more, at its
+    /// next send, and an offline device announces its offline address on them. For one that
+    /// comes up while the stack runs (interfacesChanged) and for those already up when it
+    /// starts (startedWithMeshUp).
+    private func meshCameUp(_ meshUp: [String], why: String) {
+        // The sender: each distro is asked for once more, at its next send.
+        asked.removeAll()
+        heard.removeAll()
+        for list in copies.values { for copy in list { copy.afterAsk = false } }
+        // The device: offline, it announces on a mesh connection that comes up.
+        if offline, let pair = held { announce(pair, on: meshUp, why: why) }
+    }
+
+    /// A new stack's mesh connections are new ones, whether they came up before `start` or
+    /// after it: those already up count as come up here, as a later one does in
+    /// interfacesChanged. Settings' Apply restarts the stack inside the app (stopService,
+    /// startService), and its connections come up before `start` runs, so until 2026-11-18
+    /// the old stack's asked and heard carried over and the next send to a distro did not
+    /// ask. Not interfacesChanged's attempt at RFed: the stack's own start tries RFed.
+    private func startedWithMeshUp() {
+        guard started else { return }
+        let meshUp = online.filter(isMesh)
+        if !meshUp.isEmpty { meshCameUp(meshUp, why: "the stack started with \(meshUp.joined(separator: ", ")) up") }
     }
 
     private func onRfedStatus(_ status: UInt8) {

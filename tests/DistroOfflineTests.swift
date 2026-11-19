@@ -195,6 +195,47 @@ func theDeviceAnnouncesItsLookupAndTheSenderWatchesEachDistroItKnows() {
           "a fall-back's clone is let go once its copy is dropped")
 }
 
+/// The text of a method, from its signature to the first line that closes a method at four spaces.
+func method(_ signature: String, in text: String) -> String {
+    guard let start = text.range(of: signature),
+          let end = text.range(of: "\n    }\n", range: start.upperBound..<text.endIndex) else { return "" }
+    return String(text[start.lowerBound..<end.upperBound])
+}
+
+func inOrder(_ needles: [String], in text: String) -> Bool {
+    var from = text.startIndex
+    for needle in needles {
+        guard let r = text.range(of: needle, range: from..<text.endIndex) else { return false }
+        from = r.upperBound
+    }
+    return true
+}
+
+/// 2026-11-18 (James: "Yes, build it"): Settings' Apply restarts the stack inside the app, and the
+/// new stack's connections come up before `start` runs. Those already up count as come up there,
+/// so the next send to a distro asks once more and an offline device announces on them; until
+/// then the old stack's asked and heard carried over (the M5 test: Android's next send did not ask).
+func aStackStartCountsTheMeshConnectionsAlreadyUpAsComeUp() {
+    let offline = source("Retichat/Services/DistroOffline.swift")
+    checkEqual(offline.components(separatedBy: "asked.removeAll()").count - 1, 1, "asked is cleared in one place")
+    checkEqual(offline.components(separatedBy: "heard.removeAll()").count - 1, 1, "heard is cleared in one place")
+    let cameUp = method("    private func meshCameUp(_ meshUp: [String], why: String) {", in: offline)
+    check(inOrder(["asked.removeAll()", "heard.removeAll()", "copy.afterAsk = false",
+                   "if offline, let pair = held { announce(pair, on: meshUp, why: why) }"], in: cameUp),
+          "the sender asks once more, and an offline device announces on the connections")
+    let changed = method("    private func interfacesChanged() {", in: offline)
+    check(changed.contains("meshCameUp(meshUp, why: \"the mesh connection"), "a connection that comes up while the stack runs")
+    let atStart = method("    private func startedWithMeshUp() {", in: offline)
+    check(inOrder(["guard started else { return }", "let meshUp = online.filter(isMesh)",
+                   "if !meshUp.isEmpty { meshCameUp(meshUp, why: \"the stack started with"], in: atStart),
+          "the connections up when the stack starts, measured against the start's own baseline")
+    check(!atStart.contains("collect"), "not the attempt at RFed: the stack's start makes its own")
+    let start = method("    func start(configDir: String,", in: offline)
+    check(inOrder(["self.online = self.bridge.onlineInterfaces()", "bridge.distroDirectRegister(",
+                   "bridge.interfaceEdgesRegister(", "queue.async { self.startedWithMeshUp() }"], in: start),
+          "at each start, on the queue after the baseline, once the registrations are in place")
+}
+
 let tests: [(String, () -> Void)] = [
     ("a random part is sixteen lowercase hex characters", aRandomPartIsSixteenLowercaseHexCharacters),
     ("a mesh connection is an RTNode over Bluetooth or a saved RNode, and every other is internet", aMeshConnectionIsAnRtnodeOverBluetoothOrASavedRnodeAndEveryOtherIsInternet),
@@ -208,6 +249,7 @@ let tests: [(String, () -> Void)] = [
     ("the device announces only on its mesh connections and never on a timer", theDeviceAnnouncesOnlyOnItsMeshConnectionsAndNeverOnATimer),
     ("the stack starts and stops it, and the distro sends hand it each message", theStackStartsAndStopsItAndTheDistroSendsHandItEachMessage),
     ("the device announces its lookup and the sender watches each distro it knows", theDeviceAnnouncesItsLookupAndTheSenderWatchesEachDistroItKnows),
+    ("a stack start counts the mesh connections already up as come up", aStackStartCountsTheMeshConnectionsAlreadyUpAsComeUp),
 ]
 
 @main
